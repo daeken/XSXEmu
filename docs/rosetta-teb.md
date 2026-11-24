@@ -412,6 +412,34 @@ remains an independent pre-entry blocker for guarded startup. Other
 unsupported guard metadata is not normalized. Only owned fixtures are
 executed for this profile.
 
+## Offline one-hop CFG linker slots
+
+Read-only inspection of `libHttpClient.GDK.dll` found active CFG (319 GFIDs
+with 5-byte entries), but no active XFG, CastGuard, or GuardMemcpy flags. Its
+`0x140` load config uses a different linker form: the CFG check and XFG check
+slots share a veneer to `ret 0`, the CFG dispatch slot uses a veneer to
+`jmp rax`, and the XFG dispatch and table-dispatch slots share a veneer to
+`jmp [rip+disp32]` through the CFG dispatch slot. Each veneer is exactly one
+direct `jmp rel32`; both instructions are file-backed in same-image RX
+sections. The CastGuard cell is a file-backed read-only zero qword in
+`.00cfg`, not the writable data cell described above.
+
+`xsxemu inspect FILE --offline-guard-slots` checks this exact one-hop form on
+an independently trusted file. It checks slot disjointness, exact fixups on
+the validated VA words, absence of fixups over either instruction span or the
+null cell, and existing CFG table rules. It does not follow additional jumps
+or add any CFG targets. The existing child still enforces active CFG and
+routes calls through its admitted, flag-clear XFG slots to terminal gates;
+this offline check does not admit the new form to either startup lane.
+
+GuardMemcpy is separate: the DLL's `+0x138` field points to a slot whose code
+is a RIP-relative indirect jump through the ordinary `VCRUNTIME140.dll`
+`memcpy` import, not a CFG or XFG target. The offline guard-slot check reports
+only whether that field and CodeIntegrity are nonzero; it does not validate
+the GuardMemcpy slot/import, interpret CodeIntegrity, or read or verify its
+embedded certificate. The existing catalog inspection and signing admission
+rules are unchanged. No title or supplied DLL code was executed.
+
 ## Opt-in child: address-taken IAT validation
 
 The static TLS child validates an address-taken IAT table using the GFID

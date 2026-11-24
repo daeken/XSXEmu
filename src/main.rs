@@ -34,6 +34,7 @@ const MAX_IMAGE: usize = 512 * 1024 * 1024;
 const USAGE: &str = "Usage: xsxemu <inspect|map|audit|run> <image.exe> [options]\n\
     inspect [--symbols]     List headers, imports, exports and startup metadata\n\
     inspect option: --offline-catalog-metadata  Inspect CodeIntegrity and embedded certificate envelopes on a trusted PE\n\
+    inspect option: --offline-guard-slots  Check the one-hop CFG linker slot form on a trusted PE\n\
     map [--base ADDRESS]   Materialize a non-executable image and apply relocations\n\
     audit [--dll-dir DIR] [--symbols]  Resolve the static import graph without executing\n\
     run [--dll-dir DIR]    Start a trusted image (x86-64 macOS/Rosetta only; not sandboxed)\n\
@@ -67,6 +68,7 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
     let mut roots = Vec::new();
     let mut symbols = false;
     let mut offline_catalog = false;
+    let mut offline_guard_slots = false;
     let mut base = None;
     let mut schema = None;
     let mut rust_providers = false;
@@ -77,6 +79,7 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
         match (command, arg.to_str()) {
             ("inspect" | "audit", Some("--symbols")) => symbols = true,
             ("inspect", Some("--offline-catalog-metadata")) => offline_catalog = true,
+            ("inspect", Some("--offline-guard-slots")) => offline_guard_slots = true,
             ("audit" | "run", Some("--dll-dir")) => roots.push(PathBuf::from(
                 options.next().ok_or("--dll-dir requires a path")?,
             )),
@@ -117,6 +120,12 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
         })
         .transpose()?;
     match command {
+        "inspect" if offline_guard_slots => {
+            if symbols || offline_catalog {
+                return Err("--offline-guard-slots cannot be combined with --symbols or --offline-catalog-metadata".into());
+            }
+            inspect_guard_slots(&image)?;
+        }
         "inspect" if offline_catalog => {
             if symbols {
                 return Err("--offline-catalog-metadata cannot be combined with --symbols".into());
@@ -169,6 +178,24 @@ pub(crate) fn read_image(path: &Path) -> Result<Vec<u8>> {
         return Err(format!("{} exceeds file size limit", path.display()).into());
     }
     Ok(bytes)
+}
+
+fn inspect_guard_slots(path: &Path) -> Result<()> {
+    let bytes = read_image(path)?;
+    let summary = win_cfg::CfgProfile::parse_offline_guard_slots(&Pe::parse(&bytes)?)?;
+    println!(
+        "Active CFG: GuardFlags={:#010x}, {} GFIDs",
+        summary.guard_flags, summary.gfid_count
+    );
+    println!(
+        "CFG and flag-clear XFG slots: one same-image RX rel32 hop to each linker stub; CastGuard cell: read-only zero"
+    );
+    println!(
+        "GuardMemcpy field present: {}; CodeIntegrity fields present: {} (not validated by this inspection)",
+        summary.guard_memcpy_field_present, summary.code_integrity_fields_present
+    );
+    println!("Offline guard slot form only: signature/catalog not verified; no startup admission");
+    Ok(())
 }
 
 fn inspect_catalog(path: &Path) -> Result<()> {

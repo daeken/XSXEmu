@@ -75,12 +75,21 @@ pub struct OfflineCatalogEnvelope {
     pub embedded: DataDirectory,
 }
 
+#[derive(Debug)]
+pub struct OfflineGuardSlots {
+    pub guard_flags: u32,
+    pub gfid_count: usize,
+    pub guard_memcpy_field_present: bool,
+    pub code_integrity_fields_present: bool,
+}
+
 #[derive(Clone, Copy)]
 enum Profile {
     Standard,
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
     TlsChild,
     OfflineCatalog,
+    OfflineGuardSlots,
 }
 
 /// A validated, strictly RVA-sorted GFID table borrowing the on-disk image.
@@ -248,6 +257,43 @@ impl DormantSlots {
 const COMPANION_CALLABLE: usize = 3;
 const COMPANION_FIELDS: [usize; COMPANION_CALLABLE + 1] = [0x118, 0x120, 0x128, 0x130];
 const COMPANION_END: usize = 0x138;
+const GUARD_MEMCPY_END: usize = 0x140;
+
+#[derive(Clone, Copy)]
+enum CompanionForm {
+    Direct,
+    OneHop,
+}
+
+/// Recognize exactly one direct near jump. Both byte spans must be backed by
+/// this PE, in RX (nonwritable) sections. No thunk recursion or IAT lookup.
+fn companion_terminal(
+    pe: &Pe<'_>,
+    rva: u32,
+    len: usize,
+    form: CompanionForm,
+    code: &mut Vec<Range<u32>>,
+) -> Result<u32> {
+    let terminal = match form {
+        CompanionForm::Direct => rva,
+        CompanionForm::OneHop => {
+            validate_aux_code(pe, rva, 5)?;
+            let veneer = range(rva, 5)?;
+            let jump = pe.rva_slice(rva, 5)?;
+            if jump[0] != 0xe9 {
+                return Err(PeError::Invalid("expected one companion rel32 jump"));
+            }
+            let disp = i32::from_le_bytes(jump[1..5].try_into().unwrap());
+            let target = u32::try_from(i64::from(veneer.end) + i64::from(disp))
+                .map_err(|_| PeError::Invalid("companion rel32 target outside image"))?;
+            code.push(veneer);
+            target
+        }
+    };
+    validate_aux_code(pe, terminal, len)?;
+    code.push(range(terminal, len)?);
+    Ok(terminal)
+}
 
 /// Flag-clear XFG linker defaults and a null CastGuard failure-mode data cell
 /// in an otherwise actively CFG-guarded image. Never a source of CFG targets.
@@ -270,8 +316,13 @@ impl CompanionSlots {
         ranges: &[Range<u32>],
         check: u32,
         dispatch: u32,
+        form: CompanionForm,
     ) -> Result<Self> {
-        if raw.len() != COMPANION_END || config.end - config.start != COMPANION_END as u32 {
+        let size = match form {
+            CompanionForm::Direct => COMPANION_END,
+            CompanionForm::OneHop => GUARD_MEMCPY_END,
+        };
+        if raw.len() != size || config.end - config.start != size as u32 {
             return Err(PeError::Unsupported("companion guard load-config size"));
         }
         let mut slots = [0; COMPANION_FIELDS.len()];
@@ -280,7 +331,16 @@ impl CompanionSlots {
             let span = if i < COMPANION_CALLABLE {
                 slot_range(pe, rva)?
             } else {
-                null_castguard_data(pe, rva)?
+                match form {
+                    CompanionForm::Direct => null_castguard_data(pe, rva)?,
+                    CompanionForm::OneHop => {
+                        let span = slot_range(pe, rva)?;
+                        if nonzero(pe.rva_slice(rva, 8)?) {
+                            return Err(PeError::Invalid("nonzero companion CastGuard data"));
+                        }
+                        span
+                    }
+                }
             };
             if slots[..i].contains(&rva) || ranges.iter().any(|r| overlaps(r, &span)) {
                 return Err(PeError::Invalid(
@@ -294,19 +354,30 @@ impl CompanionSlots {
         if value(check)? != value(xcheck)? || value(xdispatch)? != value(xtable)? {
             return Err(PeError::Invalid("unexpected companion XFG slot values"));
         }
-        let ret = preferred_rva(pe, value(check)?)?;
-        let jmp = preferred_rva(pe, value(dispatch)?)?;
-        let xjmp = preferred_rva(pe, value(xdispatch)?)?;
-        let code = [range(ret, 3)?, range(jmp, 2)?, range(xjmp, 6)?];
-        for span in &code {
-            validate_aux_code(pe, span.start, (span.end - span.start) as usize)?;
+        let mut code = Vec::with_capacity(6);
+        let ret = companion_terminal(pe, preferred_rva(pe, value(check)?)?, 3, form, &mut code)?;
+        let jmp = companion_terminal(pe, preferred_rva(pe, value(dispatch)?)?, 2, form, &mut code)?;
+        let xjmp = companion_terminal(
+            pe,
+            preferred_rva(pe, value(xdispatch)?)?,
+            6,
+            form,
+            &mut code,
+        )?;
+        if matches!(form, CompanionForm::OneHop)
+            && code
+                .iter()
+                .enumerate()
+                .any(|(i, span)| code[..i].iter().any(|other| overlaps(span, other)))
+        {
+            return Err(PeError::Invalid("overlapping one-hop companion code spans"));
         }
         let xfg = pe.rva_slice(xjmp, 6)?;
         let disp = i32::from_le_bytes(xfg[2..].try_into().unwrap());
         if pe.rva_slice(ret, 3)? != [0xc2, 0, 0]
             || pe.rva_slice(jmp, 2)? != [0xff, 0xe0]
             || xfg[..2] != [0xff, 0x25]
-            || i64::from(code[2].end) + i64::from(disp) != i64::from(dispatch)
+            || i64::from(xjmp) + 6 + i64::from(disp) != i64::from(dispatch)
         {
             return Err(PeError::Invalid(
                 "unexpected companion guard target instructions",
@@ -326,9 +397,13 @@ impl CompanionSlots {
         }
         expected.extend([check, dispatch]);
         expected.extend(&slots[..COMPANION_CALLABLE]);
+        // Keep the trailing GuardMemcpy field opaque. Check the CFG/XFG/
+        // CastGuard prefix, including relocations that straddle its end.
+        let prefix = config.start..config.start + COMPANION_END as u32;
         for fix in pe.relocations()? {
             let fix_range = range(fix, 8)?;
-            if ranges.iter().any(|r| overlaps(r, &fix_range))
+            if overlaps(&prefix, &fix_range)
+                || ranges[1..].iter().any(|r| overlaps(r, &fix_range))
                 || slots.iter().any(|&s| s.abs_diff(fix) < 8)
                 || code.iter().any(|r| overlaps(r, &fix_range))
             {
@@ -397,6 +472,34 @@ impl<'a> CfgProfile<'a> {
             _ => None,
         }
         .ok_or(PeError::Unsupported("missing offline catalog envelope"))
+    }
+
+    /// Parse one precise extended CFG linker layout for inspection only. Do
+    /// not expose these results as a startup profile or a certificate decision.
+    pub fn parse_offline_guard_slots(pe: &Pe<'a>) -> Result<OfflineGuardSlots> {
+        if pe.dll_characteristics & 0x0080 != 0 {
+            return Err(PeError::Unsupported(
+                "FORCE_INTEGRITY requires Windows signature verification",
+            ));
+        }
+        if pe.dll_characteristics & DLL_GUARD_CF == 0 {
+            return Err(PeError::Unsupported(
+                "offline guard slots require active CFG",
+            ));
+        }
+        let Self::Guarded(cfg) = Self::parse_profile(pe, Profile::OfflineGuardSlots)? else {
+            return Err(PeError::Invalid("missing active CFG"));
+        };
+        let dir = pe
+            .directory(LOAD_CONFIG)
+            .ok_or(PeError::Invalid("missing load config"))?;
+        let raw = pe.rva_slice(dir.rva, GUARD_MEMCPY_END)?;
+        Ok(OfflineGuardSlots {
+            guard_flags: cfg.flags(),
+            gfid_count: cfg.entries().len(),
+            guard_memcpy_field_present: nonzero(&raw[COMPANION_END..]),
+            code_integrity_fields_present: nonzero(&raw[CFG_END..CODE_INTEGRITY_END]),
+        })
     }
 
     fn parse_profile(pe: &Pe<'a>, profile: Profile) -> Result<Self> {
@@ -550,7 +653,8 @@ impl<'a> CfgMetadata<'a> {
         };
         let address_taken_iat =
             AddressTakenIat::parse(pe, declared, flags, stride, static_tls, &mut ranges)?;
-        let companion = if nonzero(declared.get(EH_END..).unwrap_or_default()) {
+        let one_hop = matches!(profile, Profile::OfflineGuardSlots);
+        let companion = if one_hop || nonzero(declared.get(EH_END..).unwrap_or_default()) {
             if matches!(profile, Profile::Standard) {
                 return Err(PeError::Unsupported(
                     "post-EHCONT load-config fields on CFG image",
@@ -564,6 +668,11 @@ impl<'a> CfgMetadata<'a> {
                 &ranges,
                 check_slot_rva,
                 dispatch_slot_rva,
+                if one_hop {
+                    CompanionForm::OneHop
+                } else {
+                    CompanionForm::Direct
+                },
             )?)
         } else {
             None
@@ -576,7 +685,11 @@ impl<'a> CfgMetadata<'a> {
             ));
         }
         let ci = tail_between(declared, CFG_END, CODE_INTEGRITY_END);
-        if !matches!(profile, Profile::OfflineCatalog) && nonzero(ci) {
+        if !matches!(
+            profile,
+            Profile::OfflineCatalog | Profile::OfflineGuardSlots
+        ) && nonzero(ci)
+        {
             return Err(PeError::Unsupported(
                 "CodeIntegrity load-config fields on CFG image",
             ));
@@ -1243,6 +1356,198 @@ pub(super) mod tests {
             let mut f = fixture(extra, 0);
             f[TABLE + offset] = bits;
             assert!(parse(&f).is_err());
+        }
+    }
+
+    const HOP_SLOTS: [u32; 6] = [0x2180, 0x2188, 0x2190, 0x2198, 0x21a0, 0x21a8];
+    const VENEERS: [u32; 3] = [0x1090, 0x10a0, 0x10b0];
+    const TERMINALS: [u32; 3] = [0x1150, 0x1040, 0x1170];
+    const FIXUPS: usize = LC + 0x308;
+
+    fn text_file(rva: u32) -> usize {
+        0x400 + (rva - 0x1000) as usize
+    }
+
+    fn write_hop(file: &mut [u8], from: u32, to: u32) {
+        let off = text_file(from);
+        file[off] = 0xe9;
+        put32(file, off + 1, to.wrapping_sub(from + 5));
+    }
+
+    fn one_hop_fixture() -> Vec<u8> {
+        let mut f = catalog_fixture();
+        put32(&mut f, LC, GUARD_MEMCPY_END as u32);
+        put32(&mut f, DIR + 4, GUARD_MEMCPY_END as u32);
+        // Deliberate sentinel; this inspector doesn't dereference GuardMemcpy.
+        put64(&mut f, LC + COMPANION_END, u64::MAX);
+        for ((field, slot), veneer) in [CHECK, DISPATCH, 0x118, 0x120, 0x128, 0x130]
+            .into_iter()
+            .zip(HOP_SLOTS)
+            .zip([
+                VENEERS[0], VENEERS[1], VENEERS[0], VENEERS[2], VENEERS[2], 0,
+            ])
+        {
+            put64(&mut f, LC + field, BASE + u64::from(slot));
+            if veneer != 0 {
+                put64(
+                    &mut f,
+                    LC + (slot - 0x2000) as usize,
+                    BASE + u64::from(veneer),
+                );
+            }
+        }
+        for (from, to) in VENEERS.into_iter().zip(TERMINALS) {
+            write_hop(&mut f, from, to);
+        }
+        let [ret, jmp, xjmp] = TERMINALS.map(text_file);
+        f[ret..ret + 3].copy_from_slice(&[0xc2, 0, 0]);
+        f[jmp..jmp + 2].copy_from_slice(&[0xff, 0xe0]);
+        f[xjmp..xjmp + 2].copy_from_slice(&[0xff, 0x25]);
+        put32(&mut f, xjmp + 2, HOP_SLOTS[1] - (TERMINALS[2] + 6));
+        let fixes = [CHECK, DISPATCH, FUNCTION_TABLE, 0x118, 0x120, 0x128, 0x130]
+            .map(|f| f as u16)
+            .into_iter()
+            .chain(HOP_SLOTS[..5].iter().map(|&rva| (rva - 0x2000) as u16));
+        let dir = OPT + 112 + 5 * 8;
+        put32(&mut f, dir, 0x2300);
+        put32(&mut f, dir + 4, 32);
+        put32(&mut f, FIXUPS - 8, 0x2000);
+        put32(&mut f, FIXUPS - 4, 32);
+        for (i, fix) in fixes.enumerate() {
+            put16(&mut f, FIXUPS + i * 2, 0xa000 | fix);
+        }
+        f
+    }
+
+    fn parse_one_hop(file: &[u8]) -> Result<OfflineGuardSlots> {
+        CfgProfile::parse_offline_guard_slots(&Pe::parse(file)?)
+    }
+
+    #[test]
+    fn offline_one_hop_checks_guard_slots_without_admitting_startup() {
+        let f = one_hop_fixture();
+        let report = parse_one_hop(&f).unwrap();
+        assert_eq!(report.gfid_count, 4);
+        assert_eq!(report.guard_flags, 0x1000_0000 | REQUIRED | ES);
+        assert!(report.guard_memcpy_field_present);
+        assert!(report.code_integrity_fields_present);
+        let pe = Pe::parse(&f).unwrap();
+        let CfgProfile::Guarded(cfg) =
+            CfgProfile::parse_profile(&pe, Profile::OfflineGuardSlots).unwrap()
+        else {
+            panic!("one-hop parsing must not classify an active image as dormant");
+        };
+        let control = fixture(1, ES);
+        assert!(
+            cfg.entries()
+                .eq(parse(&control).unwrap().unwrap().entries())
+        );
+        for rva in VENEERS.into_iter().chain(TERMINALS) {
+            assert!(!cfg.permits_rva(rva, ExportSuppression::Disabled));
+        }
+        assert!(parse_catalog(&f).is_err());
+        assert!(parse(&f).is_err());
+        let mut without_other_fields = f;
+        put64(&mut without_other_fields, LC + COMPANION_END, 0);
+        without_other_fields[LC + CFG_END..LC + CODE_INTEGRITY_END].fill(0);
+        let report = parse_one_hop(&without_other_fields).unwrap();
+        assert!(!report.guard_memcpy_field_present);
+        assert!(!report.code_integrity_fields_present);
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        assert!(CfgProfile::parse_tls_child(&Pe::parse(&without_other_fields).unwrap()).is_err());
+        for lane in ["run", "__static-tls-child", "audit", "map"] {
+            let err = crate::cli(
+                [lane, "never-opened.exe", "--offline-guard-slots"]
+                    .into_iter()
+                    .map(Into::into),
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("unexpected option"),
+                "{lane}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn offline_one_hop_does_not_follow_other_control_transfers() {
+        for to in [0, 0x11fe, 0x1200, 0x2180, 0x3010, u32::MAX, VENEERS[1]] {
+            let mut f = one_hop_fixture();
+            write_hop(&mut f, VENEERS[0], to);
+            assert!(parse_one_hop(&f).is_err(), "branch to {to:#x}");
+        }
+        for op in [0xc2, 0xe8, 0xeb, 0xff] {
+            let mut f = one_hop_fixture();
+            f[text_file(VENEERS[0])] = op;
+            assert!(parse_one_hop(&f).is_err(), "alternate opcode {op:#x}");
+        }
+        for offset in TERMINALS
+            .map(text_file)
+            .into_iter()
+            .chain([text_file(TERMINALS[2]) + 2])
+        {
+            let mut f = one_hop_fixture();
+            f[offset] ^= 1;
+            assert!(parse_one_hop(&f).is_err(), "modified stub at {offset:#x}");
+        }
+        for bits in [0xe000_0020, 0x2000_0020] {
+            let mut f = one_hop_fixture();
+            put32(&mut f, TEXT + 36, bits);
+            assert!(parse_one_hop(&f).is_err(), "section rights {bits:#x}");
+        }
+        let mut f = one_hop_fixture();
+        put64(&mut f, LC + (HOP_SLOTS[1] - 0x2000) as usize, BASE + 0x11fd);
+        assert!(parse_one_hop(&f).is_err(), "truncated veneer");
+    }
+
+    #[test]
+    fn offline_one_hop_rejects_active_extension_flags_and_changed_slots() {
+        for flag in [0x0080_0000, 0x0100_0000, 0x0200_0000] {
+            // XFG, CastGuard, GuardMemcpy
+            let mut f = one_hop_fixture();
+            let flags = u32_at(&f, LC + GUARD_FLAGS);
+            put32(&mut f, LC + GUARD_FLAGS, flags | flag);
+            assert!(matches!(
+                parse_one_hop(&f),
+                Err(PeError::Unsupported("GuardFlags requirements"))
+            ));
+        }
+        for (offset, value) in [
+            (OPT + 70, 0x80),                              // force integrity
+            (OPT + 71, 0),                                 // no CFG characteristic
+            (LC + GUARD_FLAGS + 1, 1),                     // missing GFID table flag
+            (LC + 0x128, 0x98),                            // XFG dispatch slot alias
+            (LC + 0x130, 0xa9),                            // unaligned CastGuard cell
+            (LC + (HOP_SLOTS[2] - 0x2000) as usize, 0x91), // changed XFG check target
+            (LC + (HOP_SLOTS[5] - 0x2000) as usize, 1),    // non-null CastGuard
+            (TABLE + 4, 0x80),                             // invalid GFID flags still rejected
+        ] {
+            let mut f = one_hop_fixture();
+            f[offset] = value;
+            assert!(parse_one_hop(&f).is_err(), "mutation at {offset:#x}");
+        }
+    }
+
+    #[test]
+    fn offline_one_hop_validates_relocations_of_vas_and_instruction_spans() {
+        for change in [0, 0xa070, 0xa1a8, 0xa137] {
+            let mut f = one_hop_fixture();
+            put16(&mut f, FIXUPS + 22, change);
+            assert!(parse_one_hop(&f).is_err(), "changed fixup {change:#x}");
+        }
+        for rva in VENEERS.into_iter().chain(TERMINALS) {
+            let mut f = one_hop_fixture();
+            put32(&mut f, OPT + 112 + 5 * 8 + 4, 44);
+            put32(&mut f, FIXUPS + 24, 0x1000);
+            put32(&mut f, FIXUPS + 28, 12);
+            put16(&mut f, FIXUPS + 32, 0xa000 | ((rva - 1) & 0xfff) as u16);
+            assert!(
+                matches!(
+                    parse_one_hop(&f),
+                    Err(PeError::Invalid("unexpected companion guard relocation"))
+                ),
+                "relocation overlaps {rva:#x}"
+            );
         }
     }
 
