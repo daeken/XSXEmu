@@ -14,8 +14,9 @@ d=$(mktemp -d)
 trap 'rm -rf "$d"' EXIT
 trap 'exit 1' HUP INT TERM
 cargo build --locked --manifest-path "$root/Cargo.toml" --target-dir "$d/target" \
-    --features metal-probe --bin shader-metal-probe
+    --features metal-probe --bin shader-metal-probe --bin shader-metal-render-probe
 p=$d/target/debug/shader-metal-probe
+r=$d/target/debug/shader-metal-render-probe
 language=metal3.1
 {
     printf 'SDK=macosx\ncompile-flags=-std=%s -c\nlink-flags=(defaults)\n' "$language"
@@ -79,3 +80,32 @@ reject_stale 'changed same-name metallib' "$d/modified.metallib" "$d/keyed.metal
 reject_stale 'stale compiler profile' "$d/store.metallib" "$d/keyed.metalar" "$d/stale.profile"
 reject_stale 'modified archive bytes' "$d/store.metallib" "$d/changed.metalar" "$d/compiler.profile"
 MTL_DEBUG_LAYER=0 reject_stale 'different API validation setting' "$d/store.metallib" "$d/keyed.metalar" "$d/compiler.profile"
+
+"$r" --emit-msl > "$d/render.metal"
+compile render
+"$r" --load-metallib "$d/render.metallib"
+"$r" --bake-archive "$d/render.metallib" "$d/render.metalar"
+"$r" --replay-archive "$d/render.metallib" "$d/render.metalar"
+sed 's/return color;/return color.bgra;/' "$d/render.metal" > "$d/modified-render.metal"
+if cmp -s "$d/render.metal" "$d/modified-render.metal"; then
+    echo 'owned fragment mutation did not apply' >&2
+    exit 1
+fi
+compile modified-render
+# The mutated metallib is valid and observably different without the archive.
+if "$r" --load-metallib "$d/modified-render.metallib" > "$d/render-modified.log" 2>&1 ||
+    ! grep -Fq 'pixel (0,0): expected [255, 0, 0, 255], got [0, 0, 255, 255]' "$d/render-modified.log"; then
+    cat "$d/render-modified.log" >&2
+    echo 'owned fragment mutation did not produce its expected pixel change' >&2
+    exit 1
+fi
+if "$r" --replay-archive "$d/modified-render.metallib" "$d/render.metalar" > "$d/render-miss.log" 2>&1; then
+    echo 'changed fragment unexpectedly hit original archive' >&2
+    exit 1
+fi
+if ! grep -Fq 'in binary archives' "$d/render-miss.log"; then
+    cat "$d/render-miss.log" >&2
+    echo 'changed fragment failed for a reason other than the observed strict archive miss' >&2
+    exit 1
+fi
+printf '%s\n' 'strict render archive refused the independently compiled same-name changed fragment'

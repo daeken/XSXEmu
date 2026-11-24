@@ -92,9 +92,24 @@ fn oracle_distinguishes_mask_scissor_depth_test_and_depth_write() {
 }
 
 #[cfg(target_os = "macos")]
+mod metal_artifact;
+
+#[cfg(target_os = "macos")]
 mod gpu {
     use super::*;
     use metal::*;
+    use std::path::Path;
+
+    fn strict_pipeline(
+        dev: &DeviceRef,
+        desc: &RenderPipelineDescriptorRef,
+    ) -> Result<RenderPipelineState, String> {
+        dev.new_render_pipeline_state_with_reflection(
+            desc,
+            MTLPipelineOption::FailOnBinaryArchiveMiss,
+        )
+        .map(|(pipeline, _)| pipeline)
+    }
 
     const COLOR: MTLPixelFormat = MTLPixelFormat::RGBA8Unorm;
     const DEPTH: MTLPixelFormat = MTLPixelFormat::Depth32Float;
@@ -151,16 +166,73 @@ fragment float4 owned_fragment(constant float4 &color [[buffer(0)]]) { return co
     }
 
     pub fn run() -> Result<(), String> {
-        if std::env::args_os().len() != 1 {
-            return Err("usage: shader-metal-render-probe".into());
-        }
+        let args: Vec<_> = std::env::args_os().skip(1).collect();
+        let (library, archive) = match args.as_slice() {
+            [] => (None, None),
+            [mode] if mode == "--emit-msl" => {
+                print!("{MSL}");
+                return Ok(());
+            }
+            [mode, lib] if mode == "--load-metallib" => (Some(Path::new(lib)), None),
+            [mode, lib, path] if mode == "--bake-archive" || mode == "--replay-archive" => {
+                (Some(Path::new(lib)), Some((Path::new(path), mode == "--bake-archive")))
+            }
+            _ => return Err("usage: shader-metal-render-probe [--emit-msl | --load-metallib LIB | --bake-archive LIB ARCHIVE | --replay-archive LIB ARCHIVE]".into()),
+        };
         let dev = Device::system_default().ok_or("no Metal device")?;
-        let queue = dev.new_command_queue();
-        let lib = dev.new_library_with_source(MSL, &CompileOptions::new())?;
+        let lib = if let Some(path) = library {
+            // Apply the same regular-file check as the compute fixture.
+            metal_artifact::file_url(path, false).map_err(|e| e.to_string())?;
+            dev.new_library_with_file(path)?
+        } else {
+            dev.new_library_with_source(MSL, &CompileOptions::new())?
+        };
         let all_desc = pipeline_descriptor(&lib, ColorWrites::Rgba)?;
         let green_desc = pipeline_descriptor(&lib, ColorWrites::Green)?;
-        let all = dev.new_render_pipeline_state(&all_desc)?;
-        let green = dev.new_render_pipeline_state(&green_desc)?;
+        let (all, green) = match archive {
+            None => (
+                dev.new_render_pipeline_state(&all_desc)?,
+                dev.new_render_pipeline_state(&green_desc)?,
+            ),
+            Some((path, bake)) => {
+                let url = metal_artifact::file_url(path, bake).map_err(|e| e.to_string())?;
+                let desc = BinaryArchiveDescriptor::new();
+                if !bake {
+                    desc.set_url(&url);
+                }
+                let archive = dev.new_binary_archive_with_descriptor(&desc)?;
+                all_desc.set_binary_archives(&[&archive]);
+                green_desc.set_binary_archives(&[&archive]);
+                if bake {
+                    if strict_pipeline(&dev, &all_desc).is_ok()
+                        || strict_pipeline(&dev, &green_desc).is_ok()
+                    {
+                        return Err("expected strict misses for both render descriptors with an empty binary archive".into());
+                    }
+                    all_desc.set_binary_archives(&[]);
+                    green_desc.set_binary_archives(&[]);
+                    if !archive.add_render_pipeline_functions_with_descriptor(&all_desc)?
+                        || !archive.add_render_pipeline_functions_with_descriptor(&green_desc)?
+                        || !archive.serialize_to_url(&url)?
+                    {
+                        return Err("Metal did not write the owned render archive".into());
+                    }
+                    println!(
+                        "{}: empty archive refused; baked both owned render descriptors",
+                        dev.name()
+                    );
+                    return Ok(());
+                }
+                let all = strict_pipeline(&dev, &all_desc)?;
+                let green = strict_pipeline(&dev, &green_desc)?;
+                println!(
+                    "{}: both owned render pipelines created with FailOnBinaryArchiveMiss",
+                    dev.name()
+                );
+                (all, green)
+            }
+        };
+        let queue = dev.new_command_queue();
         let write = depth_state(&dev, true);
         let retain = depth_state(&dev, false);
         for overlay_depth_write in [true, false] {
