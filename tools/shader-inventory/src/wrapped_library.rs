@@ -67,6 +67,23 @@ const GRAPHICS_STAGES: [u16; 3] = [0, 1, 13];
 type SourceKey = (u16, [u8; 16]);
 
 #[derive(Default)]
+struct SourceFamily {
+    count: usize,
+    invariant: Option<SourceInterface>,
+}
+
+impl SourceFamily {
+    fn add(&mut self, interface: SourceInterface) {
+        if self.count == 0 {
+            self.invariant = Some(interface);
+        } else if self.invariant.as_ref() != Some(&interface) {
+            self.invariant = None;
+        }
+        self.count += 1;
+    }
+}
+
+#[derive(Default)]
 struct GraphicsCoverage {
     complete_unique: usize,
     complete_multi: usize,
@@ -235,8 +252,7 @@ pub(super) fn run(
         p.nonzero_site_word = site_programs.contains(&id);
     }
 
-    let mut source_counts = HashMap::<SourceKey, usize>::new();
-    let mut interfaces = HashMap::<SourceKey, SourceInterface>::new();
+    let mut sources = HashMap::<SourceKey, SourceFamily>::new();
     let mut counts = BTreeMap::<u16, Payloads>::new();
     let (mut bytes, mut inflate) = (Vec::new(), Vec::new());
     let (mut files, mut joined_wrappers, mut work) = (0, 0, 0usize);
@@ -265,9 +281,6 @@ pub(super) fn run(
             continue;
         };
         joined_wrappers += 1;
-        let key = (stage, key);
-        let count = source_counts.entry(key).or_default();
-        *count += 1;
         if GRAPHICS_STAGES.contains(&stage) {
             let tag = if stage == 0 { b"ISG1" } else { b"OSG1" };
             let mut matches = parts.iter().filter(|(t, _)| *t == tag);
@@ -277,11 +290,7 @@ pub(super) fn run(
             }
             let interface =
                 SourceInterface::parse(table).ok_or("invalid graphics source signature")?;
-            if *count == 1 {
-                interfaces.insert(key, interface);
-            } else {
-                interfaces.remove(&key);
-            }
+            sources.entry((stage, key)).or_default().add(interface);
         }
         let candidates = programs.get_mut(&stage).ok_or("missing program stage")?;
         let mut eligible = Vec::with_capacity(ids.len());
@@ -377,11 +386,12 @@ pub(super) fn run(
     // A row uses the digest on its exact metadata reference, not all digests
     // ever seen for the same program. Unknown slots stay in the grouping key.
     let mut graphics_rows = BTreeMap::<Vec<usize>, GraphicsCoverage>::new();
-    let mut source_links = BTreeMap::<usize, SourceLinkage>::new();
+    let mut source_links = BTreeMap::<(usize, bool), SourceLinkage>::new();
+    let mut divergent = BTreeMap::<usize, usize>::new();
     for pso in library.graphics() {
         let mut slots = Vec::new();
         let mut candidates = Vec::new();
-        let mut signatures = [None; 3];
+        let mut families = [None; 3];
         for (slot, item) in pso.slots.into_iter().enumerate() {
             let Some(item) = item else { continue };
             slots.push(slot);
@@ -392,17 +402,22 @@ pub(super) fn run(
                 let key = graphics_keys
                     .get(&(slot, id))
                     .ok_or("missing checked stage key")?;
-                candidates.push(source_counts.get(key).copied().unwrap_or(0));
-                signatures[slot] = interfaces.get(key);
+                let family = sources.get(key);
+                candidates.push(family.map_or(0, |f| f.count));
+                families[slot] = family;
             }
         }
         if let [0, upstream @ (1 | 2)] = slots.as_slice()
-            && let (Some(producer), Some(consumer)) = (signatures[*upstream], signatures[0])
+            && let (Some(producer), Some(consumer)) = (families[*upstream], families[0])
         {
-            source_links
-                .entry(*upstream)
-                .or_default()
-                .add(producer, consumer);
+            if let (Some(output), Some(input)) = (&producer.invariant, &consumer.invariant) {
+                source_links
+                    .entry((*upstream, producer.count > 1 || consumer.count > 1))
+                    .or_default()
+                    .add(output, input);
+            } else {
+                *divergent.entry(*upstream).or_default() += 1;
+            }
         }
         graphics_rows.entry(slots).or_default().add(candidates);
     }
@@ -412,10 +427,22 @@ pub(super) fn run(
             c.complete_unique, c.complete_multi, c.missing, c.missing_and_multi, c.no_known_slots,
         );
     }
-    for (slot, c) in source_links {
+    for ((slot, multi), c) in source_links {
+        let cohort = if multi {
+            "Invariant multi-candidate"
+        } else {
+            "Unique-source"
+        };
         println!(
-            "  Unique-source {} -> PS ordinary DXBC linkage hypotheses: {c:?}",
+            "  {cohort} {} -> PS ordinary DXBC linkage hypotheses: {c:?}",
             stage_name(GRAPHICS_STAGES[slot])
+        );
+    }
+    for slot in [1, 2] {
+        println!(
+            "  {} -> PS complete rows with differing candidate projections: {}",
+            stage_name(GRAPHICS_STAGES[slot]),
+            divergent.get(&slot).copied().unwrap_or(0)
         );
     }
     for (stage, stage_programs) in programs {
@@ -499,6 +526,24 @@ pub(super) fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn source_family_does_not_recover_invariance_after_a_disagreement() {
+        // One checked ordinary row, followed by its owned semantic string.
+        let mut table = [0u8; 42];
+        for (at, value) in [(0, 1u32), (4, 8), (12, 40), (24, 3), (32, 1)] {
+            table[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        table[40] = b'x';
+        let mut f = SourceFamily::default();
+        f.add(SourceInterface::default());
+        f.add(SourceInterface::default());
+        assert!(f.invariant.is_some());
+        f.add(SourceInterface::parse(&table).unwrap());
+        f.add(SourceInterface::default());
+        assert_eq!(f.count, 4);
+        assert!(f.invariant.is_none());
+    }
+
     #[test]
     fn graphics_coverage_does_not_hide_missing_or_ambiguous_slots() {
         let mut c = GraphicsCoverage::default();

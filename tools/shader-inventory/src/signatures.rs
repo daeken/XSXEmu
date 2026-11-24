@@ -25,6 +25,7 @@ fn key(name: &[u8], index: usize) -> Key {
     (name.to_ascii_lowercase(), index)
 }
 
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
 struct SignatureRow {
     key: Key,
     register: usize,
@@ -82,7 +83,9 @@ fn check(bytes: &[u8]) -> Option<(Count, Vec<SignatureRow>)> {
     Some((count, keys))
 }
 
-#[derive(Default)]
+// Equality is over only this ordinary-row projection and the number of
+// excluded system rows, not all signature fields or all system semantics.
+#[derive(Default, PartialEq, Eq)]
 pub(super) struct SourceInterface {
     ordinary: BTreeMap<Key, Vec<SignatureRow>>,
     system_rows: usize,
@@ -106,6 +109,9 @@ impl SourceInterface {
                     .or_default()
                     .push(row);
             }
+        }
+        for shapes in result.ordinary.values_mut() {
+            shapes.sort_unstable();
         }
         result
     }
@@ -1301,6 +1307,20 @@ mod tests {
             component_type: 3,
             system: false,
         }
+    }
+
+    #[test]
+    fn source_interface_equality_preserves_row_multiplicity_not_order() {
+        let shape = || SignatureRow {
+            register: 2,
+            ..sig(key(b"ordinary", 4))
+        };
+        let alternate = || sig(key(b"ORDINARY", 4));
+        let a = SourceInterface::from_rows(vec![shape(), alternate()]);
+        let b = SourceInterface::from_rows(vec![alternate(), shape()]);
+        let shorter = SourceInterface::from_rows(vec![shape()]);
+        assert!(a == b);
+        assert!(a != shorter);
     }
 
     #[test]
