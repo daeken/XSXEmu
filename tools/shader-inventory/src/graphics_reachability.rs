@@ -403,6 +403,35 @@ fn export_shape(first: u32, len: usize, text: &str) -> Option<ExportShape> {
     })
 }
 
+// Public encoding fields only; no register indices or literal data retained.
+fn nearest_form(name: &str, w: u32, len: usize, text: &str) -> String {
+    let source = w & 0x1ff;
+    match name {
+        "v_mov_b32_e32" | "v_cvt_pkrtz_f16_f32_e32" => {
+            if (256..=511).contains(&source) {
+                format!("{name}/VGPR/{len}B")
+            } else if source <= 105 {
+                format!("{name}/SGPR/{len}B")
+            } else {
+                format!("{name}/selector-{source}/{len}B")
+            }
+        }
+        "s_nop" | "s_inst_prefetch" if len == 4 => format!("{name}/simm16-{}", w & 0xffff),
+        "exp" => match export_shape(w, len, text) {
+            Some(s) => format!(
+                "exp/target-{}/en-{}/flags-{}{}{}",
+                s.raw_target,
+                s.en,
+                if s.compr { 'C' } else { '-' },
+                if s.done { 'D' } else { '-' },
+                if s.vm { 'V' } else { '-' }
+            ),
+            None => "exp/unclassified".into(),
+        },
+        _ => format!("{name}/{len}B/operands-unclassified"),
+    }
+}
+
 const NEAREST_DISTANCES: usize = 3;
 const NEAREST_ROWS: usize = 6;
 
@@ -433,7 +462,7 @@ impl NearestGaps {
         for (sites, patterns) in self.0 {
             let paths: usize = patterns.values().sum();
             println!(
-                "    nearest: {sites} unsupported sites in each of {paths} complete graphs; {} mnemonic patterns",
+                "    nearest: {sites} unsupported sites in each of {paths} complete graphs; {} form patterns",
                 patterns.len()
             );
             let mut rows: Vec<_> = patterns.into_iter().collect();
@@ -452,7 +481,7 @@ impl NearestGaps {
             }
             if shown < paths {
                 println!(
-                    "      {} complete graphs in other mnemonic patterns",
+                    "      {} complete graphs in other form patterns",
                     paths - shown
                 );
             }
@@ -478,6 +507,7 @@ impl LiftGaps {
     fn observe(&mut self, dis: &mut Disassembler, bytes: &[u8]) -> Result<Exports, ResultClass> {
         use crate::graphics_decode::{Op, decode};
         let mut missing = BTreeMap::<String, usize>::new();
+        let mut forms = BTreeMap::new();
         let mut legacy_shapes = BTreeMap::new();
         let mut export_shapes = BTreeMap::new();
         let (mut sites, mut accepted) = (0, 0);
@@ -524,10 +554,15 @@ impl LiftGaps {
             }
             if matches {
                 accepted += 1;
-            } else if let Some(n) = missing.get_mut(name) {
-                *n += 1;
             } else {
-                missing.insert(name.to_owned(), 1);
+                *forms
+                    .entry(nearest_form(name, words[0], len, text))
+                    .or_insert(0) += 1;
+                if let Some(n) = missing.get_mut(name) {
+                    *n += 1;
+                } else {
+                    missing.insert(name.to_owned(), 1);
+                }
             }
         });
         if result.is_ok() {
@@ -537,7 +572,7 @@ impl LiftGaps {
             self.only_exp_gap += usize::from(!export_shapes.is_empty() && missing.len() == 1);
             self.sites += sites;
             self.accepted_sites += accepted;
-            self.nearest.observe(sites - accepted, &missing);
+            self.nearest.observe(sites - accepted, &forms);
             for (key, count) in export_shapes {
                 let total = self.export_shapes.entry(key).or_default();
                 total.0 += 1;
