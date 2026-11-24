@@ -17,12 +17,10 @@ const METHODS: &[(usize, &str)] = &[
     (0, "QueryInterface"),
     (1, "AddRef"),
     (2, "Release"),
-    (3, "GetCurrentTimestamp"),
     (4, "GetCurrentReading"),
     (5, "GetNextReading"),
     (6, "GetPreviousReading"),
     (9, "RegisterDeviceCallback"),
-    (12, "StopCallback"),
     (13, "UnregisterCallback"),
     (16, "FindDeviceFromId"),
 ];

@@ -1,8 +1,4 @@
-use std::{
-    io::Write,
-    sync::{LazyLock, Mutex},
-    time::Instant,
-};
+use std::{io::Write, sync::Mutex};
 
 const E_POINTER: i32 = 0x8000_4003u32 as i32;
 const E_NOINTERFACE: i32 = 0x8000_4002u32 as i32;
@@ -33,7 +29,6 @@ static SERVICE: Mutex<Service> = Mutex::new(Service {
     objects: [const { None }; 16],
     next_token: 1,
 });
-static CLOCK: LazyLock<Instant> = LazyLock::new(Instant::now);
 
 fn report(args: std::fmt::Arguments<'_>) {
     let _ = writeln!(std::io::stderr().lock(), "xsxemu: GameInput {args}");
@@ -82,7 +77,6 @@ pub(crate) unsafe extern "win64" fn create(out: *mut usize, vtable: usize) -> i3
     });
     drop(service);
     unsafe { out.write_unaligned(ptr) };
-    LazyLock::force(&CLOCK);
     report(format_args!("created v0 service (no devices)"));
     0
 }
@@ -127,11 +121,6 @@ pub(crate) extern "win64" fn release(this: usize) -> u32 {
         service.objects[index] = None;
     }
     refs
-}
-
-pub(crate) extern "win64" fn timestamp(this: usize) -> u64 {
-    service().index(this);
-    CLOCK.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
 }
 
 unsafe fn absent(this: usize, out: *mut usize, code: i32) -> i32 {
@@ -179,8 +168,8 @@ pub(crate) unsafe extern "win64" fn find(this: usize, id: usize, out: *mut usize
 pub(crate) unsafe extern "win64" fn register(
     this: usize,
     device: usize,
-    _kind: u32,
-    _status: u32,
+    kind: u32,
+    status: u32,
     enumeration: u32,
     _context: usize,
     callback: usize,
@@ -190,7 +179,14 @@ pub(crate) unsafe extern "win64" fn register(
         return E_POINTER;
     }
     unsafe { out.write_unaligned(0) };
-    if device != 0 || callback == 0 || enumeration > 2 {
+    // Local scope: only the two observed blocking enumeration shapes.
+    // Match 0x40000 as an opaque value, not as a public kind assumption.
+    if device != 0
+        || !matches!(kind, 0x10 | 0x40000)
+        || status != 1
+        || enumeration != 2
+        || callback == 0
+    {
         return E_INVALIDARG;
     }
     let mut service = service();
@@ -201,17 +197,12 @@ pub(crate) unsafe extern "win64" fn register(
     let Some(slot) = service.object(this).tokens.iter_mut().find(|t| **t == 0) else {
         return E_OUTOFMEMORY;
     };
-    // A fixed empty population makes every enumeration complete with zero
-    // deliveries. No callbacks or context pointers are ever invoked/read.
+    // Blocking enumeration over a fixed empty population completes with
+    // zero deliveries. No callbacks or context pointers are invoked/read.
     *slot = token;
     service.next_token = next;
     unsafe { out.write_unaligned(token) };
     0
-}
-
-pub(crate) extern "win64" fn stop_callback(this: usize, _token: u64) {
-    // Already quiescent; only UnregisterCallback removes a registration.
-    service().index(this);
 }
 
 pub(crate) extern "win64" fn unregister(this: usize, token: u64, _timeout_us: u64) -> u8 {

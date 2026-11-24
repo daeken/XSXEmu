@@ -419,20 +419,29 @@ Microsoft's [GameInputCreate reference](https://learn.microsoft.com/en-us/gaming
 defines `HRESULT GameInputCreate(IGameInput** out)`. In the pinned Scarlett
 image the caller at RVA `0x59258c3` passes a cleared output slot, checks the
 signed HRESULT and hits `INT3` on failure. Success caches the instance via
-`AddRef`/`Release`; a null instance is not a fallback. Static callers use the
-v0 layout: device callback registration at byte offset `0x48` includes
-blocking enumeration for keyboard (`0x10`) and gamepad (`0x40000`).
+`AddRef`/`Release`; a null instance is not a fallback. The v0
+[registration method](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/input/gameinput/interfaces/igameinput/methods/igameinput_registerdevicecallback)
+at byte offset `0x48` is called at RVAs `0x43a109f` and `0x592586a`. The
+register arguments are `this`, null device, kind (`0x10` or opaque
+`0x40000`), and status filter `1`; the stack holds enumeration `2`
+(blocking), context, callback and a 64-bit token output. The two shapes
+are accepted as exact filters; other shapes return `E_INVALIDARG`. The
+fixture verifies that neither shape invokes its callback.
 
-The facade supplies `IUnknown` and v0 `IGameInput` identity, object
-reference counts, monotonic microsecond timestamps, and actual empty
-registrations with tracked tokens and zero deliveries. It returns
-`GAMEINPUT_E_READING_NOT_FOUND` for current/next/previous reading requests
-and `GAMEINPUT_E_DEVICE_NOT_FOUND` for device-ID lookup (null outputs).
-There are no devices, workers or host input dependencies. Unmodeled
-vtable slots stop the child with the slot number rather than report
-success. An owned Win64 fixture covers the ordinal gate and checked
-GuardCF calls (including the eight-argument registration ABI); it does
-not establish further live title progress.
+The facade supplies `IUnknown` and v0 `IGameInput` identity, reference
+counts and synchronous empty enumeration. Tokens are scoped to the
+creating object and cannot be reused after unregister or release.
+The inspected callers at RVAs `0x2211b9f`, `0x43a1e6b`, `0x2211c4c`
+and `0x22127b6` pass trailing output pointers and check HRESULT at
+vtable byte offsets `0x20`, `0x28`, `0x30` and `0x80` respectively.
+For these empty results it clears the pointer and uses the documented
+`GAMEINPUT_E_READING_NOT_FOUND` for current/next/previous reading; for
+device-ID lookup `GAMEINPUT_E_DEVICE_NOT_FOUND` is the local policy for
+an empty registry. There are no devices, workers or host input
+dependencies. Unmodeled vtable slots stop the child with the slot number.
+An owned Win64 fixture checks the ordinal gate, relocated guest vtable
+addresses, checked calls, exact output writes and token isolation. It
+does not establish further live title progress.
 
 `GetModuleFileNameW` reads the registered UTF-16 guest path: a null handle
 selects the root EXE, and a non-null handle must exactly match a mapped image

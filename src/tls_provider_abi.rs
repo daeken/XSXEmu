@@ -113,8 +113,6 @@ audited_bridges! {
         gi::add_ref, (this: usize) -> u32;
     xsxemu_tls_gi_release, gi_release: b"gameinput.dll", b"Release",
         gi::release, (this: usize) -> u32;
-    xsxemu_tls_gi_timestamp, gi_timestamp: b"gameinput.dll", b"GetCurrentTimestamp",
-        gi::timestamp, (this: usize) -> u64;
     xsxemu_tls_gi_current, gi_current: b"gameinput.dll", b"GetCurrentReading",
         gi::current, (this: usize, kind: u32, device: usize, out: *mut usize) -> i32;
     xsxemu_tls_gi_next, gi_next: b"gameinput.dll", b"GetNextReading",
@@ -123,8 +121,6 @@ audited_bridges! {
         gi::adjacent, (this: usize, reference: usize, kind: u32, device: usize, out: *mut usize) -> i32;
     xsxemu_tls_gi_register, gi_register: b"gameinput.dll", b"RegisterDeviceCallback",
         gi::register, (this: usize, device: usize, kind: u32, status: u32, enumeration: u32, context: usize, callback: usize, out: *mut u64) -> i32;
-    xsxemu_tls_gi_stop, gi_stop: b"gameinput.dll", b"StopCallback",
-        gi::stop_callback, (this: usize, token: u64) -> ();
     xsxemu_tls_gi_unregister, gi_unregister: b"gameinput.dll", b"UnregisterCallback",
         gi::unregister, (this: usize, token: u64, timeout_us: u64) -> u8;
     xsxemu_tls_gi_find, gi_find: b"gameinput.dll", b"FindDeviceFromId",
