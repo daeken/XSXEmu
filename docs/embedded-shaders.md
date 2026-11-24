@@ -37,4 +37,20 @@ The observed strict profile is an ACCC part with magic `FSPX`, `u32` version 1, 
 | 6 | Dword-sized span starting at `+0x100`, at least 36 bytes. The first three 12-byte groups have high halfword `0xd580` in their first dword. The low halfwords at offsets 0 and 12 match digest bytes `[0..2]` and `[8..10]`; the dwords at 8 and 20 match `[4..8]` and `[12..16]`. This partial fingerprint is not evidence that the prefix is safe to skip, nor does the scan infer executable bounds. |
 | 7 | Same checked item/footer **framing** as the PS/0/9 compute layout: `0x403` head, 32-byte `0x41`/`0x42` items and 32-byte `0x43` footer. Footer bytes `[4..20]` equal the 16 bytes after the first word of the container's 20-byte `HASH` part in **29/29**. This is stored-byte correspondence, not a recomputed hash, identity across representations, or descriptor binding. |
 
-The `RTS0` version word is 2 in all 29 FSPX containers; the scanner checks that word, not the parameters or runtime binding. The FSPX layout-to-RTS0 parameter correspondence is an independent next check. Record framing was hypothesized using Leonida's `docs/embedded_shaders.md` and `docs/fspx.md` as factual references and checked here with our own parser and fixtures. None of these counts are PSO, translation, Metal compilation, or execution coverage.
+Record framing was hypothesized using Leonida's `docs/embedded_shaders.md` and `docs/fspx.md` as factual references and checked here with our own parser and fixtures. None of these counts are PSO, translation, Metal compilation, or execution coverage.
+
+## FSPX layout versus same-container RTS0
+
+A separate numeric audit accepts the observed RTS0 version-2 wire layout, not general root signatures. The 24-byte header supplies parameter count/offset at `+4/+8`, static sampler count/offset at `+12/+16` and zero flags at `+20`. Parameter headers are 12-byte `(type, visibility, payload offset)` rows. Table bodies are 8-byte `(range count, range offset)` pairs; their ranges are 24-byte rows with class, count, first register and space in their first four words. A root CBV body is 12 bytes with register and space first. Each 52-byte static sampler has register, space and visibility at `+40/+44/+48`. Offsets address the RTS0 payload. Claimed extents are aligned, bounded and disjoint, with at most 64 rows per table; visibility-all and finite space-zero declarations only. Other root parameter types are unsupported for this audit. Range offsets into descriptor heaps, flags in parameter bodies and sampler state are not interpreted.
+
+Of **29/29** accepted roots, all **150 layout items** (90 tag `0x41`, 60 tag `0x42`) have the item's word 3 in at least one same-container declaration interval, **41** in exactly one and **109** in multiple. The comparison deliberately ignores layout register class and uses declaration multiplicity, not a deduplicated set of register numbers. Grouping by tag and word 1 produces these falsifiable class hypotheses:
+
+| Tag | Word 1 | Single / multiple declarations | Classes present among the numeric candidates for every item in the group |
+|---|---|---:|---|
+| `0x41` | `0x102` | 1 / 28 | CBV |
+| `0x41` | `0x300` | 17 / 8 | SRV |
+| `0x41` | `0x303` | 3 / 32 | UAV |
+| `0x41` | `0x401` | 0 / 1 | All four classes, so no class is distinguished |
+| `0x42` | `0x000` | 20 / 40 | None; no single class covers all these items |
+
+This is stronger than finding a register number somewhere in a root signature, but it is not enough to decode an item into a root slot or to assign a descriptor class in the translator. Other fields, variant selection, live user-data and descriptor-heap contents remain unknown. Neither the FSPX class hypotheses nor static roots can be transferred to FSSM/library profiles without independent checks.

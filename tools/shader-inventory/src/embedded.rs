@@ -1,4 +1,6 @@
 //! Count-only survey of shader envelopes in file-backed PE sections.
+#[path = "embedded_root.rs"]
+mod embedded_root;
 use crate::{BLOB_LIMIT, dxbc_chunks, span, stage_name, word, xbch_payload};
 use std::{collections::BTreeMap, fs::File, io::Read, path::Path};
 use xsxemu::{
@@ -39,7 +41,7 @@ fn psv<'a>(parts: &Parts<'a>) -> Option<(u16, &'a [u8])> {
     Some((u16::from(*data.get(28)?), data.get(..56)?))
 }
 
-fn fspx(bytes: &[u8], xyz: [usize; 3], digest: &[u8]) -> Option<Dispatch> {
+fn fspx<'a>(bytes: &'a [u8], xyz: [usize; 3], digest: &[u8]) -> Option<(Dispatch, &'a [u8])> {
     const DIRECTORY_END: usize = 80;
     if !bytes.starts_with(b"FSPX")
         || word(bytes, 4)? != 1
@@ -102,7 +104,7 @@ fn fspx(bytes: &[u8], xyz: [usize; 3], digest: &[u8]) -> Option<Dispatch> {
     {
         return None;
     }
-    Some(state)
+    Some((state, resources))
 }
 
 fn dxil_nominal(bytes: &[u8], plain_size: bool) -> Option<(usize, &[u8])> {
@@ -134,7 +136,10 @@ impl Profile {
     }
 }
 
-fn profile(parts: &Parts<'_>, scratch: &mut Vec<u8>) -> Option<(Profile, u16)> {
+fn profile<'a>(
+    parts: &Parts<'a>,
+    scratch: &mut Vec<u8>,
+) -> Option<(Profile, u16, Option<&'a [u8]>)> {
     let (stage, psv) = psv(parts)?;
     match (part(parts, b"ACCC"), part(parts, b"DXIL")) {
         (Some(acc), None) => {
@@ -143,7 +148,7 @@ fn profile(parts: &Parts<'_>, scratch: &mut Vec<u8>) -> Option<(Profile, u16)> {
                 return None;
             }
             let xyz = [word(psv, 40)?, word(psv, 44)?, word(psv, 48)?];
-            let state = fspx(acc, xyz, &hash[4..])?;
+            let (state, layout) = fspx(acc, xyz, &hash[4..])?;
             Some((
                 if state.wave32 {
                     Profile::FspxWave32
@@ -151,6 +156,7 @@ fn profile(parts: &Parts<'_>, scratch: &mut Vec<u8>) -> Option<(Profile, u16)> {
                     Profile::FspxWave64
                 },
                 stage,
+                Some(layout),
             ))
         }
         (None, Some(dxil)) => {
@@ -200,7 +206,7 @@ fn profile(parts: &Parts<'_>, scratch: &mut Vec<u8>) -> Option<(Profile, u16)> {
                 return None;
             };
             xbch_payload(&dxil[records.get(&0xd)?.clone()], scratch)?;
-            Some((family, stage))
+            Some((family, stage, None))
         }
         _ => None,
     }
@@ -213,6 +219,7 @@ struct Census {
     containers: usize,
     rts0: usize,
     profiles: BTreeMap<(Profile, u16), usize>,
+    audit: embedded_root::Audit,
 }
 impl Census {
     fn scan(&mut self, section: &[u8], scratch: &mut Vec<u8>) {
@@ -231,8 +238,11 @@ impl Census {
             };
             self.containers += 1;
             self.rts0 += usize::from(part(&parts, b"RTS0").is_some());
-            if let Some(key) = profile(&parts, scratch) {
-                *self.profiles.entry(key).or_default() += 1;
+            if let Some((family, stage, layout)) = profile(&parts, scratch) {
+                *self.profiles.entry((family, stage)).or_default() += 1;
+                if let Some((root, layout)) = part(&parts, b"RTS0").zip(layout) {
+                    self.audit.add(root, layout);
+                }
             } else {
                 self.unsupported += 1;
             }
@@ -281,6 +291,7 @@ pub fn run(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
             family.label()
         );
     }
+    census.audit.print();
     Ok(())
 }
 
@@ -379,6 +390,7 @@ mod tests {
                 (b"RTS0", &[2, 0, 0, 0]),
             ]);
             profile(&envelope(&dxbc).unwrap(), &mut Vec::new())
+                .map(|(family, stage, _)| (family, stage))
         };
         assert_eq!(check(&f, &psv), Some((Profile::FspxWave32, 5)));
         psv[40] = 31;
@@ -431,6 +443,7 @@ mod tests {
         let check = |d: &[u8]| {
             let dxbc = container(&[(b"PSV0", &psv), (b"DXIL", d)]);
             profile(&envelope(&dxbc).unwrap(), &mut Vec::new())
+                .map(|(family, stage, _)| (family, stage))
         };
         assert_eq!(check(&d), Some((Profile::NobcFssm, 0)));
         for at in [16, 40, 48, 67, start + 16, start + 24] {
