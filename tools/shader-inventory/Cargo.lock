@@ -225,7 +225,12 @@ dependencies = [
  "flate2",
  "libloading",
  "metal",
+ "xsxemu",
 ]
+
+[[package]]
+name = "xsxemu"
+version = "0.1.0"
 
 [[package]]
 name = "zlib-rs"

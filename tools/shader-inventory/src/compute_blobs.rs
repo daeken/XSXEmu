@@ -2,53 +2,7 @@
 use crate::word;
 use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-struct Dispatch {
-    xyz: [usize; 3],
-    wave32: bool,
-    mode_word: usize,
-    resource_word: usize,
-}
-impl Dispatch {
-    fn parse(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != 28 {
-            return None;
-        }
-        let xy = word(bytes, 12)?;
-        let zw = word(bytes, 16)?;
-        let xyz = [xy & 0xffff, xy >> 16, zw & 0xffff];
-        let threads = xyz.into_iter().try_fold(1usize, usize::checked_mul)?;
-        if !(1..=1024).contains(&threads) {
-            return None;
-        }
-        Some(Self {
-            xyz,
-            wave32: zw & (1 << 20) != 0,
-            mode_word: word(bytes, 20)?,
-            resource_word: word(bytes, 24)?,
-        })
-    }
-}
-
-fn layout(bytes: &[u8]) -> Option<[usize; 2]> {
-    let size = bytes.len().checked_sub(56)?;
-    if size % 32 != 0 || word(bytes, 0)? & 0xff != 3 || word(bytes, 20)? & 0xff != 0x40 {
-        return None;
-    }
-    let (items, tail) = bytes.get(24..)?.split_at(size);
-    if word(tail, 0)? != 0x43 || tail[20..].iter().any(|&b| b != 0) {
-        return None;
-    }
-    let mut hits = [0, 0];
-    for item in items.chunks_exact(32) {
-        match word(item, 0)? {
-            0x41 => hits[0] += 1,
-            0x42 => hits[1] += 1,
-            _ => return None,
-        }
-    }
-    Some(hits)
-}
+use xsxemu::compute_metadata::{Dispatch, layout_item_counts};
 
 #[derive(Default)]
 pub(super) struct Audit {
@@ -82,7 +36,7 @@ impl Audit {
             return Err("invalid opaque compute envelope size");
         }
         let hits = blob(l)
-            .and_then(layout)
+            .and_then(layout_item_counts)
             .ok_or("invalid compute layout framing")?;
         self.dispatch_ref.insert(d);
         self.envelope_ref.insert(e);
@@ -145,32 +99,5 @@ impl Audit {
         println!(
             "Leaf framing and observed launch fields only; no proprietary body data, resource semantics, shader decode or execution"
         );
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn bounded_dispatch_words_and_tagged_layout() {
-        let mut d = [0; 28];
-        d[12..20].copy_from_slice(&[32, 0, 1, 0, 1, 0, 16, 0]);
-        let got = Dispatch::parse(&d).unwrap();
-        assert_eq!(got.xyz, [32, 1, 1]);
-        assert!(got.wave32);
-        assert!(Dispatch::parse(&d[..27]).is_none());
-        d[13] = 8;
-        assert!(Dispatch::parse(&d).is_none());
-        let mut l = [0; 120];
-        for (at, tag) in [(0, 3), (20, 0x40), (24, 0x41), (56, 0x42), (88, 0x43)] {
-            l[at] = tag;
-        }
-        assert_eq!(layout(&l), Some([1, 1]));
-        assert!(layout(&l[..119]).is_none());
-        l[119] = 1;
-        assert!(layout(&l).is_none());
-        l[119] = 0;
-        l[56] = 0x43;
-        assert!(layout(&l).is_none());
     }
 }
