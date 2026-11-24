@@ -70,6 +70,8 @@ mod gpu {
         Source,
         PackedSource(bool),
         PackedLoad(&'a Path, bool),
+        MultiSource,
+        MultiLoad(&'a Path),
         DepthSource,
         DepthLoad(&'a Path),
         Load(&'a Path, bool),
@@ -99,6 +101,12 @@ mod gpu {
         let args: Vec<_> = std::env::args_os().skip(1).collect();
         let mode = match args.as_slice() {
             [] => Mode::Source,
+            [mode] if mode == "--multi-source" => Mode::MultiSource,
+            [mode, lib] if mode == "--load-multi-metallib" => Mode::MultiLoad(Path::new(lib)),
+            [mode] if mode == "--emit-multi-msl" => {
+                print!("{}", graphics_lift::translate_multi_vertex_fixture().map_err(|e| format!("multi lift rejected: {e:?}"))?);
+                return Ok(());
+            }
             [mode] if mode == "--depth-source" => Mode::DepthSource,
             [mode, lib] if mode == "--load-depth-metallib" => Mode::DepthLoad(Path::new(lib)),
             [mode] if mode == "--emit-depth-msl" => {
@@ -119,7 +127,7 @@ mod gpu {
             [mode, lib] if mode == "--load-metallib" || mode == "--load-mutated-metallib" => Mode::Load(Path::new(lib), mode == "--load-mutated-metallib"),
             [mode, lib, archive] if mode == "--expect-owned-metal-miss" => Mode::ExpectStrictMiss(Path::new(lib), Path::new(archive)),
             [mode, lib, archive, compiler] if mode == "--bake-archive" || mode == "--replay-archive" || mode == "--replay-mutated-archive" => Mode::Archive(Path::new(lib), Path::new(archive), mode == "--bake-archive", mode == "--replay-mutated-archive", owned_graphics_artifact::compiler_profile(compiler)?),
-            _ => return Err("usage: shader-metal-graphics-lift [--packed-rg-source | --emit-packed-rg-msl | --load-packed-rg-metallib LIB | --depth-source | --emit-depth-msl | --load-depth-metallib LIB | --packed-source | --emit-packed-msl | --load-packed-metallib LIB | --emit-msl | --emit-mutated-msl | --load-metallib LIB | --load-mutated-metallib LIB | {--bake-archive|--replay-archive|--replay-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-owned-metal-miss MUTATED_LIB ARCHIVE]".into()),
+            _ => return Err("usage: shader-metal-graphics-lift [--multi-source | --emit-multi-msl | --load-multi-metallib LIB | --packed-rg-source | --emit-packed-rg-msl | --load-packed-rg-metallib LIB | --depth-source | --emit-depth-msl | --load-depth-metallib LIB | --packed-source | --emit-packed-msl | --load-packed-metallib LIB | --emit-msl | --emit-mutated-msl | --load-metallib LIB | --load-mutated-metallib LIB | {--bake-archive|--replay-archive|--replay-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-owned-metal-miss MUTATED_LIB ARCHIVE]".into()),
         };
         if matches!(mode, Mode::Archive(..) | Mode::ExpectStrictMiss(..))
             && std::env::var_os("MTL_SHADER_VALIDATION").is_some()
@@ -144,9 +152,12 @@ mod gpu {
         let packed = matches!(mode, Mode::PackedSource(_) | Mode::PackedLoad(..));
         let partial = matches!(mode, Mode::PackedSource(true) | Mode::PackedLoad(_, true));
         let depth = matches!(mode, Mode::DepthSource | Mode::DepthLoad(_));
+        let multi = matches!(mode, Mode::MultiSource | Mode::MultiLoad(_));
         let lib = match mode {
-            Mode::Source | Mode::PackedSource(_) | Mode::DepthSource => {
-                let msl = if depth {
+            Mode::Source | Mode::PackedSource(_) | Mode::DepthSource | Mode::MultiSource => {
+                let msl = if multi {
+                    graphics_lift::translate_multi_vertex_fixture()
+                } else if depth {
                     graphics_lift::translate_depth_fixture()
                 } else if packed {
                     graphics_lift::translate_packed_color_fixture(partial)
@@ -159,6 +170,7 @@ mod gpu {
                 dev.new_library_with_source(&msl, &options)?
             }
             Mode::PackedLoad(path, _)
+            | Mode::MultiLoad(path)
             | Mode::DepthLoad(path)
             | Mode::Load(path, _)
             | Mode::Archive(path, _, _, _, _)
@@ -169,7 +181,9 @@ mod gpu {
         };
         let desc = RenderPipelineDescriptor::new();
         const DEPTH_FORMAT: MTLPixelFormat = MTLPixelFormat::Depth32Float;
-        let (format, pixel_bytes, default_ps) = if depth {
+        let (format, pixel_bytes, default_ps) = if multi {
+            (MTLPixelFormat::RGBA32Float, 16, "multi_ps")
+        } else if depth {
             desc.set_depth_attachment_pixel_format(DEPTH_FORMAT);
             (MTLPixelFormat::RGBA32Float, 16, "depth_ps")
         } else if packed {
@@ -181,14 +195,15 @@ mod gpu {
         } else {
             (MTLPixelFormat::RGBA8Unorm, 4, "translated_ps")
         };
-        let (vs, ps) = admitted
-            .as_ref()
-            .map_or(("translated_vs", default_ps), |(job, _)| {
+        let (vs, ps) = admitted.as_ref().map_or(
+            (if multi { "multi_vs" } else { "translated_vs" }, default_ps),
+            |(job, _)| {
                 (
                     job.stages()[0].translated_entry.as_str(),
                     job.stages()[1].translated_entry.as_str(),
                 )
-            });
+            },
+        );
         let vs = lib.get_function(vs, None)?;
         let ps = lib.get_function(ps, None)?;
         desc.set_vertex_function(Some(&vs));
@@ -308,6 +323,17 @@ mod gpu {
             std::mem::size_of_val(&vertices) as u64,
             vertices.as_ptr().cast(),
         );
+        if multi {
+            let mut data = [[[0.0f32; 4]; 8]; 3];
+            for (v, row) in data.iter_mut().enumerate() {
+                row[0].copy_from_slice(&vertices[v][..4]);
+                for n in 1..=7 {
+                    let k = n as f32;
+                    row[n] = [k + if v == 1 { 2. } else { 0. }, k + 8., k + 16., k + 24.];
+                }
+            }
+            enc.set_vertex_bytes(0, std::mem::size_of_val(&data) as u64, data.as_ptr().cast());
+        }
         if let Some(state) = depth_state.as_ref() {
             enc.set_depth_stencil_state(state);
             for (x, clip_z, inputs) in [
@@ -385,7 +411,13 @@ mod gpu {
                 let got = &pixels[at..at + pixel_bytes];
                 let ordinary;
                 let fp32;
-                let expected: &[u8] = if depth {
+                let expected: &[u8] = if multi {
+                    // Independent analytic sum: sum 1²..7² = 140, sum 1..7 = 28.
+                    // dyadic pixel centers, with the same X gradient in each varying.
+                    let rgba: [f32; 4] = [(2240 + 28 * (2 * x + 1)) as f32 / 16., 364., 588., 812.];
+                    fp32 = rgba.map(f32::to_le_bytes).as_flattened().to_owned();
+                    &fp32
+                } else if depth {
                     fp32 = expected_depth(x, y, false, true)
                         .map(f32::to_le_bytes)
                         .as_flattened()
@@ -420,7 +452,7 @@ mod gpu {
             println!("published owned graphics artifact identity");
         }
         println!(
-            "{} translated GFX10 VS+PS (mutated={mutated}, packed={packed}, partial={partial}, depth={depth}): {n}/{n} pixels matched",
+            "{} translated GFX10 VS+PS (mutated={mutated}, packed={packed}, partial={partial}, depth={depth}, multi={multi}): {n}/{n} pixels matched",
             dev.name(),
             n = SIDE * SIDE
         );

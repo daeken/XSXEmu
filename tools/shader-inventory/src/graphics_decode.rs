@@ -5,7 +5,7 @@ pub(crate) struct Vgpr(pub u8);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Target {
     Position,
-    Parameter,
+    Parameter(u8),
     Color,
 }
 
@@ -245,7 +245,7 @@ pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeErro
         let target = match (w >> 4) & 63 {
             0 => Target::Color,
             12 => Target::Position,
-            32 => Target::Parameter,
+            n @ 32..=38 if w & 0x800 == 0 || n == 32 => Target::Parameter(n as u8 - 32),
             _ => return Err(DecodeError::Unsupported(pc)),
         };
         return Ok((

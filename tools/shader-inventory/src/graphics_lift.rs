@@ -6,6 +6,7 @@ use crate::graphics_decode::{DecodeError, FloatSource, Op, Target, Vgpr, decode}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Stage {
     Vertex,
+    MultiVertex,
     Pixel,
     PackedPixel,
     PackedRgPixel,
@@ -32,6 +33,26 @@ const VS: &[u32] = &[
     0x0302_0100, // exp pos0 v0, v1, v2, v3 done
     0xbf81_0000, // s_endpgm
 ];
+const MULTI_VS: &[u32] = &[
+    0xf800_020f,
+    0x0706_0504,
+    0xf800_021f,
+    0x0b0a_0908,
+    0xf800_022f,
+    0x0f0e_0d0c,
+    0xf800_023f,
+    0x1312_1110,
+    0xf800_024f,
+    0x1716_1514,
+    0xf800_025f,
+    0x1b1a_1918,
+    0xf800_026f,
+    0x1f1e_1d1c,
+    0xf800_08cf,
+    0x0302_0100,
+    0xbf81_0000,
+];
+
 const PS: &[u32] = &[
     0x0608_00ff,
     0x3e80_0000, // v_add_f32_e32 v4, 0.25, v0
@@ -65,6 +86,7 @@ impl Stage {
     fn input_registers(self) -> usize {
         match self {
             Stage::Vertex => 8,
+            Stage::MultiVertex => 32,
             Stage::Pixel => 4,
             Stage::PackedPixel => 2,
             Stage::PackedRgPixel => 2,
@@ -74,7 +96,17 @@ impl Stage {
 
     fn exports(self) -> &'static [(Target, bool)] {
         match self {
-            Stage::Vertex => &[(Target::Parameter, false), (Target::Position, true)],
+            Stage::Vertex => &[(Target::Parameter(0), false), (Target::Position, true)],
+            Stage::MultiVertex => &[
+                (Target::Parameter(0), false),
+                (Target::Parameter(1), false),
+                (Target::Parameter(2), false),
+                (Target::Parameter(3), false),
+                (Target::Parameter(4), false),
+                (Target::Parameter(5), false),
+                (Target::Parameter(6), false),
+                (Target::Position, true),
+            ],
             Stage::Pixel => &[(Target::Color, true)],
             Stage::PackedPixel | Stage::PackedRgPixel | Stage::DepthPixel => &[],
         }
@@ -189,10 +221,10 @@ fn lift(stage: Stage, words: &[u32]) -> Result<Vec<Op>, Reject> {
 }
 
 fn body(out: &mut String, ops: &[Op]) {
-    emit_body(out, ops, "out");
+    emit_body(out, ops, "out", false);
 }
 
-fn emit_body(out: &mut String, ops: &[Op], packed_color_lvalue: &str) {
+fn emit_body(out: &mut String, ops: &[Op], packed_color_lvalue: &str, multi: bool) {
     for op in ops {
         match *op {
             Op::Move {
@@ -242,7 +274,11 @@ fn emit_body(out: &mut String, ops: &[Op], packed_color_lvalue: &str) {
             } => {
                 let field = match target {
                     Target::Position => "out.position",
-                    Target::Parameter => "out.parameter",
+                    Target::Parameter(0) if !multi => "out.parameter",
+                    Target::Parameter(n) => {
+                        writeln!(out, "  out.param{n} = as_type<float4>(uint4(r[{a}], r[{b}], r[{c}], r[{d}]));").unwrap();
+                        continue;
+                    }
                     Target::Color => "out",
                 };
                 writeln!(
@@ -404,7 +440,39 @@ fragment DepthOutputs depth_ps(constant uint4 &input [[buffer(0)]]) {\n\
   uint r[256]; DepthOutputs out;\n\
   r[0] = input.x; r[1] = input.y; r[2] = input.z;\n",
     );
-    emit_body(&mut msl, &ps, "out.color");
+    emit_body(&mut msl, &ps, "out.color", false);
+    Ok(msl)
+}
+
+#[allow(dead_code)] // Separate linkage probe; the fragment consumer is authored.
+pub fn translate_multi_vertex_fixture() -> Result<String, Reject> {
+    let vs = lift(Stage::MultiVertex, MULTI_VS)?;
+    let mut msl = MSL_HEADER.to_owned();
+    msl.push_str("struct MultiOut { float4 position [[position]];\n");
+    for n in 0..7 {
+        writeln!(
+            msl,
+            "  float4 param{n} [[user(param{n}), center_no_perspective]];"
+        )
+        .unwrap();
+    }
+    msl.push_str("};\nstruct MultiIn {\n");
+    // Reverse declaration order to ensure links use explicit varying names.
+    for n in (0..7).rev() {
+        writeln!(
+            msl,
+            "  float4 input{n} [[user(param{n}), center_no_perspective]];"
+        )
+        .unwrap();
+    }
+    msl.push_str("};\nvertex MultiOut multi_vs(uint vid [[vertex_id]], const device uint4 *input [[buffer(0)]]) {\n  uint r[256]; MultiOut out;\n");
+    msl.push_str("  for (uint i = 0; i < 8; ++i) { uint4 p = input[8 * vid + i]; for (uint j = 0; j < 4; ++j) r[4 * i + j] = p[j]; }\n");
+    emit_body(&mut msl, &vs, "out", true);
+    msl.push_str("fragment float4 multi_ps(MultiIn in [[stage_in]]) {\n  float4 color = 0.0f;\n");
+    for n in 0..7 {
+        writeln!(msl, "  color += {}.0f * in.input{n};", n + 1).unwrap();
+    }
+    msl.push_str("  return color;\n}\n");
     Ok(msl)
 }
 
@@ -440,6 +508,12 @@ mod tests {
             process::{Command, Stdio},
         };
         let asm = "v_mov_b32_e32 v8, v4\nexp param0 v8, v5, v6, v7\nexp pos0 v0, v1, v2, v3 done\ns_endpgm\nv_add_f32_e32 v4, 0.25, v0\nv_fma_f32 v5, v1, v2, v3\nv_mul_legacy_f32_e32 v6, v5, v4\nv_mul_legacy_f32_e32 v6, 0.5, v6\nv_mul_legacy_f32_e32 v7, 0, v3\nexp mrt0 v4, v5, v6, v7 done\ns_endpgm\nv_mul_legacy_f32_e32 v2, v0, v1\nv_mul_legacy_f32_e32 v3, 0.25, v1\nv_fmac_f32_e32 v4, v0, v1\nv_cvt_pkrtz_f16_f32_e32 v5, v0, v1\ns_inst_prefetch 3\nv_mov_b32_e32 v6, 0\ns_nop 0\nv_mov_b32_e32 v7, 0.5\nv_mov_b32_e32 v8, 1.0\nv_mov_b32_e32 v9, 0x7fc12345\nexp mrt0 v1, v1, v0, v0 done compr vm\ns_endpgm\nexp mrt0 v1, v1, off, off done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrtz v2, off, off, off done vm\ns_endpgm\n";
+        let mut asm = asm.to_owned();
+        for n in 0..7 {
+            let r = 4 + 4 * n;
+            writeln!(asm, "exp param{n} v{r}, v{}, v{}, v{}", r + 1, r + 2, r + 3).unwrap();
+        }
+        asm.push_str("exp pos0 v0, v1, v2, v3 done\ns_endpgm\n");
         let expected: Vec<u8> = VS
             .iter()
             .chain(PS)
@@ -451,6 +525,7 @@ mod tests {
             .chain(PACKED_PS)
             .chain(PACKED_RG_PS)
             .chain(DEPTH_PS)
+            .chain(MULTI_VS)
             .flat_map(|w| w.to_le_bytes())
             .collect();
         for cpu in ["gfx1013", "gfx1030"] {
@@ -509,6 +584,24 @@ mod tests {
             decode(&[PACKED_PS[0], 0x10001], 0),
             Err(DecodeError::Unsupported(0))
         );
+    }
+
+    #[test]
+    fn multi_vertex_requires_exact_owned_slots_and_defined_inputs() {
+        assert_eq!(lift(Stage::MultiVertex, MULTI_VS).unwrap().len(), 9);
+        assert_eq!(lift(Stage::Vertex, MULTI_VS), Err(Reject::BadExports(2)));
+        let mut vs = MULTI_VS.to_vec();
+        vs[2] = vs[0];
+        assert_eq!(lift(Stage::MultiVertex, &vs), Err(Reject::BadExports(2)));
+        vs[2] = MULTI_VS[2];
+        vs[3] = 32;
+        assert_eq!(
+            lift(Stage::MultiVertex, &vs),
+            Err(Reject::Uninitialized(2, 32))
+        );
+        for header in [0xf800_027f, 0xf800_0a1f, 0xf800_061f, 0xf800_0213] {
+            assert_eq!(decode(&[header, 1], 0), Err(DecodeError::Unsupported(0)));
+        }
     }
 
     #[test]

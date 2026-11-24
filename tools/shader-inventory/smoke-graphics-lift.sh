@@ -78,3 +78,9 @@ compile packed-rg
 "$p" --emit-depth-msl > "$d/depth.metal"
 compile depth
 "$p" --load-depth-metallib "$d/depth.metallib"
+
+# Seven explicit native PARAM outputs linked by name with a synthetic consumer.
+"$p" --multi-source
+"$p" --emit-multi-msl > "$d/multi.metal"
+compile multi
+"$p" --load-multi-metallib "$d/multi.metallib"
