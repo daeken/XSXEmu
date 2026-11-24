@@ -270,16 +270,18 @@ general import bridge nor a sandbox for other images.
 ## Opt-in child: audited provider bridges
 
 `run <trusted-fixture.exe> --experimental-static-tls --rust-providers` permits
-30 exact Win32 provider identities based on the observed pinned UCRT fixture
-trace. Registry aliases are accepted only if they resolve to an audited
-identity; ntdll `Rtl*LastWin32Error` identities are distinct. Win32 `Tls*`
-slots are provider-managed and separate from the PE static TLS vector at
-`GS:[0x58]`.
+only exact Win32 provider identities with audited bridges. Registry aliases
+are accepted only if they resolve to an audited identity; ntdll
+`Rtl*LastWin32Error` identities are distinct. Win32 `Tls*` slots are
+provider-managed and separate from the PE static TLS vector at `GS:[0x58]`.
 
 `LoadLibraryExW` keeps the ordinary provider's argument validation but
 searches an intentionally empty namespace, even for DLLs in the static
 import graph. Well-formed requests return `NULL` with `ERROR_MOD_NOT_FOUND`;
 invalid or unsupported requests return their validation errors instead.
+`RtlPcToFileHeader` looks up PCs only in the mapped guest image graph, which
+is registered before process attach. It returns and writes the image base
+(or null for an unknown PC), without changing LastError.
 `GetProcAddress` and `FreeLibrary` aren't bridged. Unbridged
 providers fail before entry unless `--trace-missing-imports` is enabled,
 which treats well-formed unavailable or unbridged slots as callable, not

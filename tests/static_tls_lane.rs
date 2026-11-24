@@ -236,7 +236,7 @@ fn image(kind: Kind) -> Vec<u8> {
     }
     if matches!(kind, Kind::Bridge) {
         let imports = LINK + 0x780;
-        dir(&mut b, 1, imports, 140);
+        dir(&mut b, 1, imports, 160);
         w32(&mut b, file(imports), LINK + 0x30);
         w32(&mut b, file(imports) + 12, LINK + 0xd0);
         w32(&mut b, file(imports) + 16, IAT);
@@ -349,6 +349,18 @@ fn image(kind: Kind) -> Vec<u8> {
         );
         put(&mut b, file(LINK) + 0x75a, b"HeapSize\0");
         put(&mut b, file(LINK) + 0x76a, b"HeapReAlloc\0");
+
+        let rtl = imports + 120;
+        w32(&mut b, file(rtl), LINK + 0x820);
+        w32(&mut b, file(rtl) + 12, LINK + 0x830);
+        w32(&mut b, file(rtl) + 16, IAT + 272);
+        w64(&mut b, file(LINK) + 0x820, LINK + 0x860);
+        put(
+            &mut b,
+            file(LINK) + 0x830,
+            b"api-ms-win-core-rtlsupport-l1-1-0.dll\0",
+        );
+        put(&mut b, file(LINK) + 0x862, b"RtlPcToFileHeader\0");
     }
     b
 }

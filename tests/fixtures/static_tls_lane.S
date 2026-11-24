@@ -164,6 +164,20 @@ Lbridge_cb:
     testl %eax, %eax             /* new guest TEB is zero-initialized */
     jne Lbad
     movl $0x89345678, %gs:0x68   /* direct guest store, observed at entry */
+    /* Resolve this callback's PC on the first process attach. */
+    leaq Ltext(%rip), %r11
+    leaq Lbridge_cb(%rip), %rcx
+    leaq 32(%rsp), %rdx
+    movq $-1, (%rdx)
+    callq *{iat_delta}+272(%r11) /* RtlPcToFileHeader */
+    leaq Ltext(%rip), %r11
+    leaq -{text_rva}(%r11), %rcx
+    cmpq %rcx, %rax
+    jne Lbad
+    cmpq %rcx, 32(%rsp)
+    jne Lbad
+    cmpl $0x89345678, %gs:0x68
+    jne Lbad
     addq $40, %rsp
     retq
 Lbridge_detach:
@@ -246,6 +260,19 @@ Lbridge_entry:
     cmpl $0x89345678, %eax
     jne Lbad
     bridge_cfg 8                /* SetLastError writes the guest TEB DWORD */
+    cmpl $0xfedcba98, %gs:0x68
+    jne Lbad
+    /* A host bridge can be dispatched by CFG, but is not a guest image. */
+    leaq Ltext(%rip), %r11
+    movq {iat_delta}+272(%r11), %rax
+    movq %rax, %rcx
+    leaq 48(%rsp), %rdx
+    movq $-1, (%rdx)
+    callq *{dispatch_delta}(%r11) /* RtlPcToFileHeader */
+    testq %rax, %rax
+    jne Lbad
+    cmpq $0, 48(%rsp)
+    jne Lbad
     cmpl $0xfedcba98, %gs:0x68
     jne Lbad
     /* Exact scalar results and arguments across the same boundary. */

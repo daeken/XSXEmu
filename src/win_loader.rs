@@ -123,6 +123,7 @@ pub(crate) mod native {
     use std::{
         cell::{Cell, RefCell},
         collections::{HashMap, HashSet},
+        ffi::c_void,
     };
 
     const ERROR_INVALID_HANDLE: u32 = 6;
@@ -685,13 +686,18 @@ pub(crate) mod native {
                         .address()
                         .unwrap()
                 );
-                assert_eq!(rtl_pc_to_file_header(host_pc, &mut out), 0);
-                assert_eq!(out, 0);
+                let mut base = DLL as *mut c_void;
+                assert!(rtl_pc_to_file_header(host_pc as *mut c_void, &mut base).is_null());
+                assert!(base.is_null());
                 assert_eq!(last_error(), ERROR_INVALID_HANDLE);
-                assert_eq!(rtl_pc_to_file_header(DLL + 0xfff, &mut out), DLL);
-                assert_eq!(out, DLL);
-                assert_eq!(rtl_pc_to_file_header(DLL + 0x1000, &mut out), 0);
-                assert_eq!(out, 0);
+                assert_eq!(
+                    rtl_pc_to_file_header((DLL + 0xfff) as *mut c_void, &mut base),
+                    DLL as *mut c_void
+                );
+                assert_eq!(base, DLL as *mut c_void);
+                assert!(rtl_pc_to_file_header((DLL + 0x1000) as *mut c_void, &mut base).is_null());
+                assert!(base.is_null());
+                assert_eq!(last_error(), ERROR_INVALID_HANDLE);
             }
             drop(scope);
             assert_eq!(unsafe { get_module_handle_w(ptr::null()) }, 0);
@@ -758,9 +764,8 @@ pub(crate) mod native {
             .ok_or(ERROR_INVALID_PARAMETER)
     }
 
-    // This TLS child never installs the dynamic loader. Preserve the normal
-    // validation and missing-module result, but structurally cannot yield a
-    // handle even if the regular provider's graph changes in the future.
+    // The TLS child may inspect mapped image ranges but cannot acquire module
+    // handles. Preserve validation and always report a miss for valid loads.
     #[cfg(target_os = "macos")]
     pub(crate) unsafe extern "win64" fn tls_child_load_library_ex_w(
         name: *const u16,
@@ -919,11 +924,15 @@ pub(crate) mod native {
         })
     }
 
-    pub(super) unsafe extern "win64" fn rtl_pc_to_file_header(pc: usize, out: *mut usize) -> usize {
+    pub(crate) unsafe extern "win64" fn rtl_pc_to_file_header(
+        pc: *mut c_void,
+        out: *mut *mut c_void,
+    ) -> *mut c_void {
         if out.is_null() {
-            return 0;
+            return std::ptr::null_mut();
         }
-        let base = graph(|g| g.and_then(|g| g.containing(pc)).map_or(0, |m| m.base));
+        let base = graph(|g| g.and_then(|g| g.containing(pc as usize)).map(|m| m.base))
+            .map_or(std::ptr::null_mut(), |base| base as *mut c_void);
         unsafe { out.write(base) };
         base
     }

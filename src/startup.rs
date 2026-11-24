@@ -462,18 +462,8 @@ mod native {
                 mem.validate_target(pe.entry_rva as usize)?;
             }
         }
-        if let Some(tls) = tls {
-            if rust_providers {
-                win_proc::init_process(images[0].0)?;
-            }
-            // The existing check/dispatch thunks are GS-neutral leaf assembly.
-            // Only exact PE GFIDs and explicitly bound bridge/trace entries are
-            // registered. No loader or unwind provider is installed.
-            let _cfg_registration = targets.map(Targets::install).transpose()?;
-            let outcome = tls_runtime::run(&tls, images, &pes, &memories, attach_order);
-            win_fls::native::finish_initial_thread()?;
-            return outcome;
-        }
+        // Install the mapped image graph before either execution lane can run
+        // an attach callback, and keep it alive until after detach.
         let _loader = win_loader::register(
             images
                 .iter()
@@ -483,6 +473,17 @@ mod native {
             api_set,
             rust_providers,
         )?;
+        if let Some(tls) = tls {
+            if rust_providers {
+                win_proc::init_process(images[0].0)?;
+            }
+            // Only exact PE GFIDs and explicitly bound bridge/trace entries are
+            // registered. No unwind or dynamic symbol lookup is enabled.
+            let _cfg_registration = targets.map(Targets::install).transpose()?;
+            let outcome = tls_runtime::run(&tls, images, &pes, &memories, attach_order);
+            win_fls::native::finish_initial_thread()?;
+            return outcome;
+        }
         let mut unwind_registrations = Vec::<win_unwind::Registration>::new();
         for (pe, mem) in pes.iter().zip(&memories) {
             let (rva, size) = if let Some(dir) = pe.directory(3) {
