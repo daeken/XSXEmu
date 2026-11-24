@@ -75,7 +75,7 @@ enum Export {
     Color(u8, bool), // MRT ordinal and nonzero raw EN field
     Mrtz(u8),
     Position(u8, u8),
-    Primitive(u8),
+    Primitive { en: u8, bits_10_to_12: u8 },
     Parameter(u8, u8),
     Null,
     Other,
@@ -96,13 +96,44 @@ fn export(first: u32, len: usize, text: &str) -> Option<Export> {
         (i @ 12..=16, name) if name.as_bytes() == [b'p', b'o', b's', b'0' + i as u8 - 12] => {
             Export::Position(i as u8 - 12, (first & 15) as u8)
         }
-        (20, "prim") => Export::Primitive((first & 15) as u8),
+        (20, "prim") => Export::Primitive {
+            en: (first & 15) as u8,
+            bits_10_to_12: ((first >> 10) & 7) as u8,
+        },
         (i @ 32..=63, name) if name == format!("param{}", i - 32) => {
             Export::Parameter(i as u8 - 32, (first & 15) as u8)
         }
         _ => Export::Other,
     };
     Some(class)
+}
+
+// Aggregate the checked PRIM instructions only; no interpretation of their source values.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PrimitiveSites {
+    sites: usize,
+    raw_bits_10_to_12: [usize; 8],
+    successor_pos0: usize,
+    successor_other_export: usize,
+    successor_end: usize,
+    successor_jump: usize,
+    successor_fork: usize,
+    successor_other: usize,
+}
+
+impl PrimitiveSites {
+    fn add_site(&mut self, bits_10_to_12: u8, successor: &Instruction<Option<Export>>) {
+        self.sites += 1;
+        self.raw_bits_10_to_12[usize::from(bits_10_to_12)] += 1;
+        match (successor.op, successor.flow) {
+            (Some(Export::Position(0, _)), _) => self.successor_pos0 += 1,
+            (Some(_), _) => self.successor_other_export += 1,
+            (_, Flow::Stop) => self.successor_end += 1,
+            (_, Flow::Jump(_)) => self.successor_jump += 1,
+            (_, Flow::Fork(_)) => self.successor_fork += 1,
+            _ => self.successor_other += 1,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -112,6 +143,7 @@ struct Exports {
     mrtz_masks: u16,
     positions: [u16; 5], // bit for each raw EN value, per position target
     primitive_en_values: u16,
+    primitive_sites: PrimitiveSites,
     active_parameters: u32,
     parameter_en_union: [u8; 32],
     disabled_parameters: u32,
@@ -168,13 +200,26 @@ fn project_exports(
         Ok(graph) if !graph.values().any(|i| i.flow == Flow::Stop) => Err(ResultClass::NoExit),
         Ok(graph) => {
             let mut exports = Exports::default();
-            for export in graph.values().filter_map(|i| i.op) {
+            for (&pc, instruction) in &graph {
+                let Some(export) = instruction.op else {
+                    continue;
+                };
                 match export {
                     Export::Color(i, true) => exports.color |= 1 << i,
                     Export::Color(i, false) => exports.disabled_color |= 1 << i,
                     Export::Mrtz(en) => exports.mrtz_masks |= 1 << en,
                     Export::Position(i, en) => exports.positions[i as usize] |= 1 << en,
-                    Export::Primitive(en) => exports.primitive_en_values |= 1 << en,
+                    Export::Primitive { en, bits_10_to_12 } => {
+                        exports.primitive_en_values |= 1 << en;
+                        if allow_checked_message_fallthrough {
+                            // Require the successor validated by the walker, not arbitrary adjacent bytes.
+                            let successor = graph
+                                .get(&(pc + instruction.width))
+                                .filter(|_| instruction.flow == Flow::Next)
+                                .ok_or(ResultClass::BadSuccessor)?;
+                            exports.primitive_sites.add_site(bits_10_to_12, successor);
+                        }
+                    }
                     Export::Parameter(i, 0) => exports.disabled_parameters |= 1 << i,
                     Export::Parameter(i, en) => {
                         exports.active_parameters |= 1 << i;
@@ -270,6 +315,33 @@ impl VertexExports {
     }
 }
 
+#[derive(Debug, Default)]
+struct PrimitiveCensus {
+    sites_per_payload: BTreeMap<usize, usize>,
+    combined: PrimitiveSites,
+}
+
+impl PrimitiveCensus {
+    fn add(&mut self, sites: PrimitiveSites) {
+        *self.sites_per_payload.entry(sites.sites).or_default() += 1;
+        self.combined.sites += sites.sites;
+        for (total, count) in self
+            .combined
+            .raw_bits_10_to_12
+            .iter_mut()
+            .zip(sites.raw_bits_10_to_12)
+        {
+            *total += count;
+        }
+        self.combined.successor_pos0 += sites.successor_pos0;
+        self.combined.successor_other_export += sites.successor_other_export;
+        self.combined.successor_end += sites.successor_end;
+        self.combined.successor_jump += sites.successor_jump;
+        self.combined.successor_fork += sites.successor_fork;
+        self.combined.successor_other += sites.successor_other;
+    }
+}
+
 #[derive(Default)]
 struct Counts {
     payloads: usize,
@@ -280,6 +352,7 @@ struct Counts {
     different_vertex_exports: usize,
     message_projection: [BTreeMap<ResultClass, usize>; 2],
     mesh_exports: [VertexExports; 2],
+    mesh_prim: [PrimitiveCensus; 2],
 }
 
 pub fn run(lib: &OsStr, cpu: Cpu, root: &Path) -> Result<(), Box<dyn Error>> {
@@ -338,11 +411,12 @@ pub fn run(lib: &OsStr, cpu: Cpu, root: &Path) -> Result<(), Box<dyn Error>> {
             }
         }
         if matches!(stage, 3 | 7) {
-            for (((outcome, dis), tally), exports) in outcomes
+            for ((((outcome, dis), tally), exports), primitive) in outcomes
                 .iter()
                 .zip(&mut waves)
                 .zip(&mut c.message_projection)
                 .zip(&mut c.mesh_exports)
+                .zip(&mut c.mesh_prim)
             {
                 if matches!(outcome, Err(ResultClass::SendMsg(class)) if *class != SendMsgClass::Unclassified)
                 {
@@ -351,6 +425,7 @@ pub fn run(lib: &OsStr, cpu: Cpu, root: &Path) -> Result<(), Box<dyn Error>> {
                         && let Ok(projected) = &result
                     {
                         exports.add(*projected);
+                        primitive.add(projected.primitive_sites);
                     }
                     let class = result_class(result);
                     *tally.entry(class).or_default() += 1;
@@ -395,6 +470,9 @@ pub fn run(lib: &OsStr, cpu: Cpu, root: &Path) -> Result<(), Box<dyn Error>> {
         if stage == 7 {
             for (width, exports) in [64, 32].into_iter().zip(c.mesh_exports) {
                 println!("  wave{width} separate mesh export counts: {exports:?}");
+            }
+            for (width, primitive) in [64, 32].into_iter().zip(c.mesh_prim) {
+                println!("  wave{width} separate mesh PRIM site counts: {primitive:?}");
             }
         }
         if stage == 4 {
@@ -803,8 +881,11 @@ mod tests {
             Some(Export::Other)
         );
         assert_eq!(
-            export(0xf800_0141, 8, "exp prim v0, off, off, off"),
-            Some(Export::Primitive(1))
+            export(0xf800_0941, 8, "exp prim v0, off, off, off done"),
+            Some(Export::Primitive {
+                en: 1,
+                bits_10_to_12: 2
+            })
         );
         let mut a = VertexExports::default();
         a.add(Exports {
@@ -899,6 +980,38 @@ mod tests {
             sendmsg_class(0xbf90_0009, 4, "s_sendmsg 9"),
             SendMsgClass::Unclassified
         );
+    }
+
+    #[test]
+    fn projected_prim_followed_by_checked_exit_is_not_itself_an_exit() {
+        let Some(path) = std::env::var_os("LLVM_DISASM_LIB") else {
+            return;
+        };
+        let _serial_llvm = crate::llvm::test_lock();
+        let llvm = Llvm::load(&path).unwrap();
+        let words = [0xbf90_0009u32, 0xf800_0941, 0, 0xbf81_0000];
+        let bytes: Vec<_> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        for cpu in [Cpu::Gfx1013, Cpu::Gfx1030] {
+            for wave32 in [false, true] {
+                let mut dis = llvm.context(cpu, wave32).unwrap();
+                let (strict, projected) = wrapped_mesh_exports(&mut dis, &bytes);
+                assert_eq!(strict, ResultClass::SendMsg(SendMsgClass::GsAllocReq));
+                let sites = projected.unwrap().unwrap().primitive_sites;
+                assert_eq!(
+                    sites,
+                    PrimitiveSites {
+                        sites: 1,
+                        raw_bits_10_to_12: [0, 0, 1, 0, 0, 0, 0, 0],
+                        successor_end: 1,
+                        ..Default::default()
+                    }
+                );
+                assert_eq!(
+                    project_exports(&mut dis, &bytes[..12], true),
+                    Err(ResultClass::BadSuccessor)
+                );
+            }
+        }
     }
 
     #[test]

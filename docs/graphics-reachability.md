@@ -32,6 +32,8 @@ Under this hypothesis all 195 GS payloads complete in both CPU passes with no ch
 
 In the complete mesh projections, every payload has both raw `EN=0` and `EN=15` at checked `POS0` exports, and only `EN=1` at checked `PRIM` exports (public target 20 and LLVM symbolic `prim`). `POS1` occurs in 1,906 (`gfx1013`) and 1,644 (`gfx1030`) payloads; no higher `POS` occurs. Nonempty enabled `PARAM` sets are present in 7,543 and 6,785 payloads, respectively, all dense from ordinal zero. No zero-enable `PARAM`, color, `MRTZ`, `NULL`, or unclassified export is seen in these complete projections. The masks describe reachable instruction encodings across a graph, not which sites execute or how primitive payloads or null vertices are interpreted.
 
+Counting reachable instruction starts, every complete mesh projection contains exactly two checked `PRIM` sites: 18,564 sites for `gfx1013` or 16,516 for `gfx1030`, independently under either wave setting. Every first dword has raw bit 11 set and bits 10 and 12 clear. In the validated local graph, the immediate fallthrough successor of each is a non-export linear instruction, not `POS0`, another `EXP`, a direct jump or fork, or `s_endpgm`. The raw bit does not terminate the projected graph. Two static sites do not imply two primitive exports execute or identify the primitive count, indices, or payload semantics.
+
 ### Same-wrapper mesh output comparison
 
 ```sh
