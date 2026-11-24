@@ -81,6 +81,12 @@ mod native {
         let overlap = match cfg {
             CfgProfile::None => false,
             CfgProfile::Guarded(cfg) => {
+                if cfg.overlaps_address_taken_iat_metadata_write(rva) {
+                    return Err(
+                        "security cookie or IAT patch overlaps CFG address-taken IAT metadata"
+                            .into(),
+                    );
+                }
                 if cfg.overlaps_companion_config_write(rva) {
                     return Err(
                         "security cookie or IAT patch overlaps companion guard load config".into(),
@@ -102,6 +108,53 @@ mod native {
         };
         if overlap {
             return Err("security cookie or IAT patch overlaps a CFG slot".into());
+        }
+        Ok(())
+    }
+
+    fn validate_address_taken_iat(
+        images: &[(&str, &[u8])],
+        cfgs: &[CfgProfile<'_>],
+        bindings: &[(usize, u32, BindingTarget)],
+    ) -> Result<()> {
+        use crate::win_cfg::ExportSuppression;
+
+        // Index only actual LinkPlan bindings, never on-disk IAT contents or
+        // diagnostic traps. PatchWrites already validated uniqueness and writes.
+        let mut indexed = None;
+        for (i, profile) in cfgs.iter().enumerate() {
+            let CfgProfile::Guarded(cfg) = profile else {
+                continue;
+            };
+            for slot in cfg.address_taken_iat_slots() {
+                let index = indexed.get_or_insert_with(|| {
+                    let mut entries = bindings.to_vec();
+                    entries.sort_unstable_by_key(|&(module, rva, _)| (module, rva));
+                    entries
+                });
+                let error = |why| {
+                    format!(
+                        "{}: CFG address-taken IAT slot {slot:#010x}: {why}",
+                        images[i].0
+                    )
+                };
+                let pos = index
+                    .binary_search_by_key(&(i, slot), |&(module, rva, _)| (module, rva))
+                    .map_err(|_| error("no resolved static binding"))?;
+                let BindingTarget::Pe(target) = index[pos].2 else {
+                    return Err(error("only static PE function bindings are supported").into());
+                };
+                // Windows can make export-suppressed targets callable at import
+                // snap time. We never do: require the exact target to already
+                // be independently admitted by the same policy as Targets.
+                if !matches!(cfgs.get(target.module), Some(CfgProfile::Guarded(dst))
+                    if dst.permits_rva(target.export_rva, ExportSuppression::Enabled))
+                {
+                    return Err(
+                        error("target is not an independently permitted exact CFG entry").into(),
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -228,6 +281,9 @@ mod native {
                 tls_runtime::PatchWrites::validate(&pes, bindings, missing, &cfgs, rust_providers)
             })
             .transpose()?;
+        if static_tls {
+            validate_address_taken_iat(images, &cfgs, bindings)?;
+        }
         validate_trap_slots(&pes, bindings, missing)?;
         let mut targets = cfgs
             .iter()
@@ -320,6 +376,7 @@ mod native {
                     }
                     let mut readonly = slots.map(slot_range).to_vec();
                     readonly.extend(cfg.companion_config_range());
+                    readonly.extend(cfg.address_taken_iat_readonly_ranges());
                     // XFG is not implemented; route attempts to a terminal gate,
                     // never to the active CFG thunk or the candidate target.
                     for (&rva, trap) in cfg

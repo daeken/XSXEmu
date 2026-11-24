@@ -650,7 +650,11 @@ fn companion_near_misses_refuse_admission() {
     w16(&mut b, file(RELOC) + 46, 0xa000 | (LOAD + 0xa0 - RO));
     dir.write("owned.dll", &image(Kind::Dll));
     dir.write("companion.exe", &b);
-    expect(run(&exe, &[OPT]), 1, "CFG address-taken IAT table");
+    expect(
+        run(&exe, &[OPT]),
+        1,
+        "CFG address-taken IAT fields or flags",
+    );
 
     let mut b = original;
     w64(&mut b, file(RO) + 16, PREFERRED + CAST); // TLS AddressOfIndex
@@ -660,6 +664,119 @@ fn companion_near_misses_refuse_admission() {
         1,
         "IAT, security-cookie, or GuardCF write conflict",
     );
+}
+
+const AT_IAT_SLOT: usize = RO + 0x600;
+const AT_IAT_ROWS: usize = COMPANION_GFIDS + 8;
+const AT_IAT_ENTRY: usize = TEXT + 0x900;
+
+fn address_taken_iat_fixture() -> (Vec<u8>, Vec<u8>) {
+    let mut exe = companion_image(Kind::Exe);
+    let mut dll = companion_image(Kind::Dll);
+    for image in [&mut exe, &mut dll] {
+        w32(image, file(LOAD) + 0x90, 0x1000_4500);
+    }
+    // Keep the static TLS path on the root; this DLL exports a leaf only.
+    dir(&mut dll, 9, 0, 0);
+    w32(&mut dll, OP + 16, 0);
+    const LEAF: usize = AT_IAT_ENTRY;
+    put(&mut dll, file(LEAF), &[0xb8, 47, 0, 0, 0, 0xc3]); // mov eax,47; ret
+    w32(&mut dll, file(LINK) + 0x30, LEAF);
+    w32(&mut dll, file(COMPANION_GFIDS), LEAF);
+
+    // This fixture only needs TLS to select the lane, not lifecycle checks.
+    put(&mut exe, file(AT_IAT_ENTRY + 0x20), &[0xc3]);
+    w64(&mut exe, file(ARRAY), PREFERRED + AT_IAT_ENTRY + 0x20);
+    dir(&mut exe, 12, AT_IAT_SLOT, 16);
+    w32(&mut exe, file(LINK) + 16, AT_IAT_SLOT);
+    w64(&mut exe, file(LOAD) + 0xa0, PREFERRED + AT_IAT_ROWS);
+    w64(&mut exe, file(LOAD) + 0xa8, 1);
+    w32(&mut exe, file(AT_IAT_ROWS), AT_IAT_SLOT);
+    w16(&mut exe, file(RELOC) + 46, 0xa000 | (LOAD + 0xa0 - RO));
+
+    // Load the snapped import into RAX, then call the real CFG dispatch slot.
+    w32(&mut exe, OP + 16, AT_IAT_ENTRY);
+    let entry = file(AT_IAT_ENTRY);
+    put(&mut exe, entry, &[0x48, 0x83, 0xec, 0x28, 0x48, 0x8b, 0x05]);
+    w32(&mut exe, entry + 7, AT_IAT_SLOT - (AT_IAT_ENTRY + 11));
+    put(&mut exe, entry + 11, &[0xff, 0x15]);
+    w32(&mut exe, entry + 13, DISPATCH - (AT_IAT_ENTRY + 17));
+    put(&mut exe, entry + 17, &[0x48, 0x83, 0xc4, 0x28, 0xc3]);
+    (exe, dll)
+}
+
+#[test]
+fn address_taken_iat_requires_an_independently_callable_static_pe_export() {
+    if !rosetta() {
+        return;
+    }
+    let dir = Scratch::new();
+    let (original, provider) = address_taken_iat_fixture();
+    let exe = dir.write("importer.exe", &original);
+    dir.write("owned.dll", &provider);
+    expect(run(&exe, &[OPT]), 47, "Guest entry returned 47");
+
+    let mut b = original.clone();
+    // LEA instead of MOV: CFG must still reject the IAT storage address.
+    b[file(AT_IAT_ENTRY) + 5] = 0x8d;
+    dir.write("importer.exe", &b);
+    expect(run(&exe, &[OPT]), 1, "child terminated by signal 4");
+
+    dir.write("importer.exe", &original);
+    for flag in [1, 2] {
+        // FID-suppressed and export-suppressed, respectively.
+        let mut dll = provider.clone();
+        dll[file(COMPANION_GFIDS) + 4] = flag;
+        dir.write("owned.dll", &dll);
+        expect(
+            run(&exe, &[OPT]),
+            1,
+            "not an independently permitted exact CFG entry",
+        );
+    }
+    let mut dll = provider.clone();
+    w32(&mut dll, file(LINK) + 0x30, AT_IAT_ENTRY + 1);
+    dir.write("owned.dll", &dll);
+    expect(
+        run(&exe, &[OPT]),
+        1,
+        "not an independently permitted exact CFG entry",
+    );
+
+    // A well-formed absent import may ordinarily get a terminal trap, but
+    // that does not prove an address-taken import binding.
+    let mut b = original.clone();
+    put(&mut b, file(LINK) + 0x72, b"Gone\0");
+    dir.write("importer.exe", &b);
+    expect(
+        run(&exe, &[OPT, "--trace-missing-imports"]),
+        1,
+        "no resolved static binding",
+    );
+
+    dir.write("owned.dll", &provider);
+    for (offset, value, message) in [
+        (file(AT_IAT_ROWS) + 4, 1, "CFG address-taken IAT rows"),
+        (file(LOAD) + 0xa8, 2, "CFG address-taken IAT rows"),
+        (
+            file(RELOC) + 47,
+            0,
+            "missing CFG address-taken IAT relocation",
+        ),
+    ] {
+        let mut b = original.clone();
+        b[offset] = value;
+        dir.write("importer.exe", &b);
+        expect(run(&exe, &[OPT]), 1, message);
+    }
+    let mut b = original;
+    // Being inside the IAT directory is not proof of import membership.
+    w32(&mut b, file(AT_IAT_ROWS), AT_IAT_SLOT + 8);
+    dir.write("importer.exe", &b);
+    expect(run(&exe, &[OPT]), 1, "no resolved static binding");
+    self::dir(&mut b, 9, 0, 0);
+    dir.write("importer.exe", &b);
+    expect(run(&exe, &[]), 1, "CFG address-taken IAT table");
 }
 
 #[test]

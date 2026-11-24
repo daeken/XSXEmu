@@ -14,6 +14,8 @@ const FUNCTION_COUNT: usize = 0x88;
 const GUARD_FLAGS: usize = 0x90;
 const CFG_END: usize = 0x94;
 const CODE_INTEGRITY_END: usize = 0xa0;
+const AT_IAT_TABLE: usize = 0xa0;
+const AT_IAT_END: usize = 0xb0;
 const VOLATILE_METADATA: usize = 0x100;
 const EH_TABLE: usize = 0x108;
 const EH_COUNT: usize = 0x110;
@@ -78,7 +80,23 @@ pub struct CfgMetadata<'a> {
         not(all(target_os = "macos", target_arch = "x86_64")),
         allow(dead_code)
     )]
+    address_taken_iat: Option<AddressTakenIat<'a>>,
+    #[cfg_attr(
+        not(all(target_os = "macos", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
     companion: Option<CompanionSlots>,
+}
+
+#[derive(Debug)]
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "x86_64")),
+    allow(dead_code)
+)]
+struct AddressTakenIat<'a> {
+    table: &'a [u8],
+    span: Range<u32>,
+    config: Range<u32>,
 }
 
 #[derive(Debug)]
@@ -284,7 +302,7 @@ impl CompanionSlots {
             .map(|off| config.start + off as u32)
             .to_vec();
         expected.extend([CHECK, DISPATCH, FUNCTION_TABLE].map(|off| config.start + off as u32));
-        for off in [0x58, VOLATILE_METADATA, EH_TABLE] {
+        for off in [0x58, AT_IAT_TABLE, VOLATILE_METADATA, EH_TABLE] {
             if u64_at(raw, off) != 0 {
                 expected.push(config.start + off as u32);
             }
@@ -399,6 +417,33 @@ impl CfgMetadata<'_> {
             .map(|c| c.config.start as usize..c.config.end as usize)
     }
 
+    pub fn address_taken_iat_slots(&self) -> impl Iterator<Item = u32> + '_ {
+        self.address_taken_iat.iter().flat_map(|iat| {
+            iat.table
+                .chunks_exact(self.stride)
+                .map(|row| u32_at(row, 0))
+        })
+    }
+
+    pub fn address_taken_iat_readonly_ranges(&self) -> impl Iterator<Item = Range<usize>> + '_ {
+        self.address_taken_iat.iter().flat_map(|iat| {
+            [&iat.config, &iat.span]
+                .map(|r| r.start as usize..r.end as usize)
+                .into_iter()
+                .chain(
+                    self.address_taken_iat_slots()
+                        .map(|rva| rva as usize..rva as usize + 8),
+                )
+        })
+    }
+
+    pub fn overlaps_address_taken_iat_metadata_write(&self, rva: u32) -> bool {
+        let write = rva..rva.saturating_add(8);
+        self.address_taken_iat
+            .as_ref()
+            .is_some_and(|iat| overlaps(&iat.config, &write) || overlaps(&iat.span, &write))
+    }
+
     pub fn overlaps_companion_config_write(&self, rva: u32) -> bool {
         self.companion
             .as_ref()
@@ -462,9 +507,8 @@ impl<'a> CfgMetadata<'a> {
             }
         }
         validate_auxiliary(pe, declared, rva, flags, stride, &mut ranges)?;
-        if nonzero(tail_between(declared, 0xa0, 0xb0)) {
-            return Err(PeError::Unsupported("CFG address-taken IAT table"));
-        }
+        let address_taken_iat =
+            AddressTakenIat::parse(pe, declared, flags, stride, static_tls, &mut ranges)?;
         let companion = if nonzero(declared.get(EH_END..).unwrap_or_default()) {
             if !static_tls {
                 return Err(PeError::Unsupported(
@@ -528,6 +572,7 @@ impl<'a> CfgMetadata<'a> {
             stride,
             table,
             companion,
+            address_taken_iat,
         })
     }
 
@@ -580,6 +625,85 @@ impl<'a> CfgMetadata<'a> {
     pub fn permits_rva(&self, rva: u32, export_suppression: ExportSuppression) -> bool {
         self.entry_for_rva(rva)
             .is_some_and(|entry| entry.permitted(export_suppression))
+    }
+}
+
+impl<'a> AddressTakenIat<'a> {
+    fn parse(
+        pe: &Pe<'a>,
+        raw: &[u8],
+        flags: u32,
+        stride: usize,
+        static_tls: bool,
+        ranges: &mut Vec<Range<u32>>,
+    ) -> Result<Option<Self>> {
+        let fields = tail_between(raw, AT_IAT_TABLE, AT_IAT_END);
+        if !nonzero(fields) {
+            return Ok(None);
+        }
+        if !static_tls {
+            return Err(PeError::Unsupported("CFG address-taken IAT table"));
+        }
+        if fields.len() != 16 || flags & CF_EXPORT_SUPPRESSION_INFO_PRESENT == 0 {
+            return Err(PeError::Invalid("CFG address-taken IAT fields or flags"));
+        }
+        let (va, count) = (u64_at(fields, 0), u64_at(fields, 8));
+        if va == 0 || count == 0 {
+            return Err(PeError::Invalid("CFG address-taken IAT VA/count"));
+        }
+        if count > MAX_AUX_ROWS as u64 {
+            return Err(PeError::Unsupported("CFG address-taken IAT row budget"));
+        }
+        let rva = preferred_rva(pe, va)?;
+        let table = aux_data(pe, ranges, rva, count as usize * stride)?;
+        let span = ranges.last().unwrap().clone();
+        let config = ranges[0].clone();
+
+        // MS PE metadata (Export suppression): GFID stride, but reserved-zero
+        // metadata and strictly sorted IAT *slot* RVAs, not code RVAs.
+        // https://learn.microsoft.com/en-us/windows/win32/secbp/pe-metadata#export-suppression
+        let dir = pe
+            .directory(12)
+            .ok_or(PeError::Invalid("missing CFG address-taken IAT directory"))?;
+        let iat = range(dir.rva, dir.size as usize)?;
+        let mut previous = 0;
+        for row in table.chunks_exact(stride) {
+            let slot = u32_at(row, 0);
+            if slot <= previous || nonzero(&row[4..]) {
+                return Err(PeError::Invalid("CFG address-taken IAT rows"));
+            }
+            let cell = slot_range(pe, slot)?;
+            if cell.start < iat.start
+                || cell.end > iat.end
+                || ranges.iter().any(|r| overlaps(r, &cell))
+            {
+                return Err(PeError::Invalid("CFG address-taken IAT slot range"));
+            }
+            previous = slot;
+        }
+
+        let field = config.start + AT_IAT_TABLE as u32;
+        let fields = field..config.start + AT_IAT_END as u32;
+        let mut fixed = false;
+        for fix in pe.relocations()? {
+            let write = range(fix, 8)?;
+            if overlaps(&span, &write) || overlaps(&fields, &write) {
+                if fix != field || fixed {
+                    return Err(PeError::Invalid(
+                        "unexpected CFG address-taken IAT relocation",
+                    ));
+                }
+                fixed = true;
+            }
+        }
+        if pe.directory(5).is_some() && !fixed {
+            return Err(PeError::Invalid("missing CFG address-taken IAT relocation"));
+        }
+        Ok(Some(Self {
+            table,
+            span,
+            config,
+        }))
     }
 }
 
