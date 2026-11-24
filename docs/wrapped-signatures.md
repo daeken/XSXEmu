@@ -30,11 +30,11 @@ Both signature chunks start with a little-endian entry count and row offset 8, f
 | MS | 9,282 | 0 | 74,393 | 32,487 |
 | Total | 26,503 | 105,152 | 119,226 | 45,827 |
 
-No input row has secondary bits outside its primary mask. An input-style subset rule is therefore unsuitable as a validator for outputs. The empty MS inputs do not imply absence of resource, payload or other launch data. This command does not decode PSV0 tables after the resource rows, resolve producer/consumer pairs, infer interpolation or hardware export indices, or establish a Metal stage interface. An owned fixture checks offset bounds, mask asymmetry, a name without a terminator, and unsupported fields.
+No input row has secondary bits outside its primary mask. An input-style subset rule is therefore unsuitable as a validator for outputs. The empty MS inputs do not imply absence of resource, payload or other launch data. This command does not resolve producer/consumer pairs, infer interpolation or hardware export indices, or establish a Metal stage interface. An owned fixture checks offset bounds, mask asymmetry, a name without a terminator, and unsupported fields.
 
 ## PSV0 resource declarations
 
-After the 52-byte runtime-info block, the payload has a `u32` row count at `+56`. If nonzero, a `u32` stride at `+60` is 24 in every checked file, with rows starting at `+64`. If zero, no stride word is consumed. The six little-endian row words are resource type, register space, lower bound, upper bound, kind and flags. The checker verifies type in 1–8, ordered bounds, and complete table extent. The remaining payload is outside this check.
+After the 52-byte runtime-info block, the payload has a `u32` row count at `+56`. If nonzero, a `u32` stride at `+60` is 24 in every checked file, with rows starting at `+64`. If zero, no stride word is consumed. The six little-endian row words are resource type, register space, lower bound, upper bound, kind and flags. The checker verifies type in 1–8, ordered bounds, and complete table extent. The resource checker stops at the end of this table; the element checker starts there.
 
 | Stage | Rows | Files with zero rows | Nonzero space | Nonzero flags |
 |---|---:|---:|---:|---:|
@@ -46,3 +46,9 @@ After the 52-byte runtime-info block, the payload has a `u32` row count at `+56`
 | Total | 445,394 | 635 | 191,045 | 954 |
 
 Every lower bound equals its upper bound in the checked corpus; the parser accepts ordered non-singleton declarations rather than assuming the observed singleton property is a wire requirement. The resource rows give source register-space evidence, not an assignment to an Xbox root slot or SGPR. The zero-count/no-stride case, ordered bounds and truncated rows are checked on owned data.
+
+## PSV0 signature element tables
+
+After the resources, a `u32` byte length prefixes a dword-aligned NUL-terminated string table. A `u32` entry count then prefixes that many `u32` semantic indices. Payload bytes `32`, `33` and `34` count the input, output and patch/primitive element groups. If their sum is nonzero, a `u32` stride of 16 precedes those elements. If the sum is zero, there is no stride word. An element's first two words address the string table (byte offset) and semantic-index table (row index), and byte 8 gives the number of semantic indices used. Both ranges are checked. Names can be empty here, unlike `ISG1`/`OSG1`; the remaining packing and interpolation bytes are not decoded, except that byte 15 must be zero.
+
+All 26,503 files agree on `PSV0` versus `ISG1`/`OSG1` input and output **row counts** independently; none has patch/primitive rows. This does not show that corresponding rows have the same semantics, register layout or masks. 12,918 files have bytes after these tables; the scanner reports their presence but does not interpret them. The owned fixture checks scope and bounds of both references and demonstrates that tail bytes remain unparsed.

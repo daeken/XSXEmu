@@ -74,6 +74,46 @@ fn resource_rows(psv: &[u8], stage: u16) -> Option<&[u8]> {
     Some(rows)
 }
 
+fn psv_elements(psv: &[u8], at: usize) -> Option<([usize; 3], usize)> {
+    let size = word(psv, at)?;
+    let start = at.checked_add(4)?;
+    let end = start.checked_add(size)?;
+    let strings = psv.get(start..end)?;
+    if size % 4 != 0 || strings.last() != Some(&0) {
+        return None;
+    }
+    let indices = word(psv, end)?;
+    let at = end.checked_add(4)?.checked_add(indices.checked_mul(4)?)?;
+    let counts = [
+        usize::from(*psv.get(32)?),
+        usize::from(*psv.get(33)?),
+        usize::from(*psv.get(34)?),
+    ];
+    let n: usize = counts.iter().sum();
+    let end = if n == 0 {
+        at
+    } else {
+        if word(psv, at)? != 16 {
+            return None;
+        }
+        let start = at.checked_add(4)?;
+        let end = start.checked_add(n * 16)?;
+        for r in psv.get(start..end)?.chunks_exact(16) {
+            let label = strings.get(word(r, 0)?..)?;
+            let e = label.iter().take(256).position(|&b| b == 0)?;
+            if !label[..e].is_ascii()
+                || r[8] == 0
+                || r[15] != 0
+                || word(r, 4)?.checked_add(usize::from(r[8]))? > indices
+            {
+                return None;
+            }
+        }
+        end
+    };
+    Some((counts, psv.len().checked_sub(end)?))
+}
+
 #[derive(Default)]
 struct Resources {
     rows: usize,
@@ -98,6 +138,7 @@ pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
     let mut groups = BTreeMap::<u16, (usize, [Count; 2], Resources)>::new();
     let mut bytes = Vec::new();
     let mut files = 0;
+    let (mut count_disagreements, mut patch_rows, mut opaque_suffixes) = (0, 0, 0);
     for entry in fs::read_dir(path)? {
         let entry = entry?;
         if entry.path().extension().and_then(|ext| ext.to_str()) != Some("dxbc")
@@ -127,18 +168,33 @@ pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
         )?;
         let psv = part(b"PSV0").ok_or("missing unique PSV0")?;
         let rows = resource_rows(psv, stage).ok_or("unsupported PSV0 resource table or stage")?;
+        let elems_at = if rows.is_empty() { 60 } else { 64 + rows.len() };
+        let (element_counts, opaque) =
+            psv_elements(psv, elems_at).ok_or("unsupported PSV0 element table")?;
+        patch_rows += element_counts[2];
+        opaque_suffixes += usize::from(opaque != 0);
         let totals = groups.entry(stage).or_default();
         totals.2.add(rows);
         totals.0 += 1;
-        for (tag, total) in [b"ISG1", b"OSG1"].into_iter().zip(totals.1.iter_mut()) {
+        let mut same = true;
+        for (i, (tag, total)) in [b"ISG1", b"OSG1"]
+            .into_iter()
+            .zip(totals.1.iter_mut())
+            .enumerate()
+        {
             let c = part(tag)
                 .and_then(check)
                 .ok_or("invalid or unsupported wrapped signature")?;
+            same &= element_counts[i] == c.entries;
             total.entries += c.entries;
             total.system += c.system;
             total.secondary_outside += c.secondary_outside;
         }
+        count_disagreements += usize::from(!same);
     }
+    println!(
+        "PSV0 element tables: {count_disagreements} files differ from DXBC input/output row counts; {patch_rows} patch/primitive rows; {opaque_suffixes} files with unparsed bytes after elements"
+    );
     println!(
         "{files} wrapped DXBC files with agreeing DXIL/PSV0 stages and checked ISG1/OSG1 rows"
     );
@@ -165,6 +221,20 @@ pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn validates_psv_semantic_indices_and_reports_opaque_tail() {
+        let mut psv = [0; 97];
+        for (at, v) in [(32, 1), (60, 4), (64, b'X'), (68, 1), (76, 16), (88, 1)] {
+            psv[at] = v;
+        }
+        assert_eq!(psv_elements(&psv, 60), Some(([1, 0, 0], 1)));
+        psv[88] = 2;
+        assert!(psv_elements(&psv, 60).is_none());
+        psv[88] = 1;
+        psv[80] = 4;
+        assert!(psv_elements(&psv, 60).is_none());
+    }
+
     #[test]
     fn resource_table_zero_count_has_no_stride() {
         let mut psv = [0; 88];
