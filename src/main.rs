@@ -42,6 +42,7 @@ const USAGE: &str = "Usage: xsxemu <inspect|map|audit|run> <image.exe> [options]
     run option: --trace-missing-imports  Treat missing static imports as callable and stop on first call (not data imports)\n\
     run option: --experimental-static-tls  Trusted PE-only startup in a disposable Rosetta child\n\
     run option: --trusted-offline  Ignore opaque CodeIntegrity and volatile hints (requires --experimental-static-tls)\n\
+    run option: --map-extra-dll PATH  Map an extra PE DLL (trusted-offline static TLS only)\n\
     audit/run options: --api-set SCHEMA.dll, --rust-providers";
 
 fn main() -> ExitCode {
@@ -77,6 +78,7 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
     let mut trace_missing_imports = false;
     let mut experimental_tls = false;
     let mut trusted_offline = false;
+    let mut map_extra_dll = None;
     let mut startup_profile = None;
     let mut options = args.iter();
     while let Some(arg) = options.next() {
@@ -110,6 +112,11 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
             ("run", Some("--trace-missing-imports")) => trace_missing_imports = true,
             ("run", Some("--experimental-static-tls")) => experimental_tls = true,
             ("run", Some("--trusted-offline")) => trusted_offline = true,
+            ("run", Some("--map-extra-dll")) if map_extra_dll.is_none() => {
+                map_extra_dll = Some(PathBuf::from(
+                    options.next().ok_or("--map-extra-dll requires a path")?,
+                ));
+            }
             ("map", Some("--base")) if base.is_none() => {
                 base = Some(parse_base(
                     options.next().ok_or("--base requires an address")?,
@@ -117,6 +124,11 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
             }
             _ => return Err(format!("unexpected option {arg:?}\n{USAGE}").into()),
         }
+    }
+    if map_extra_dll.is_some() && !(trusted_offline && experimental_tls) {
+        return Err(
+            "--map-extra-dll requires --trusted-offline and --experimental-static-tls".into(),
+        );
     }
     if trusted_offline && !experimental_tls {
         return Err("--trusted-offline requires --experimental-static-tls".into());
@@ -166,6 +178,7 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
                     api_set: schema.as_ref(),
                     rust_providers,
                     trace_missing_imports,
+                    map_extra_dll: map_extra_dll.as_deref(),
                 },
                 if tls_child {
                     Some(if trusted_offline {

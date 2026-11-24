@@ -396,6 +396,7 @@ pub struct Options<'a> {
     pub api_set: Option<&'a ApiSet>,
     pub rust_providers: bool,
     pub trace_missing_imports: bool,
+    pub map_extra_dll: Option<&'a Path>,
 }
 
 struct Builder<'a> {
@@ -536,7 +537,7 @@ impl Builder<'_> {
         }
     }
 
-    fn close(mut self) -> LinkPlan {
+    fn close(mut self) -> Result<LinkPlan, LinkError> {
         // Loading only inserts a work item. This loop visits each module once even if imports
         // form cycles; a forwarder also queues its provider's imports for the census.
         let mut index = 0;
@@ -565,7 +566,43 @@ impl Builder<'_> {
             }
             index += 1;
         }
-        self.plan
+        // The explicit, export-only image is appended only after the static
+        // graph closes. It cannot satisfy or redirect any static import.
+        if let Some(path) = self.options.map_extra_dll {
+            let error = |why| LinkError::new(path, "map extra DLL", why);
+            if self.plan.modules.len() >= self.max_images {
+                return Err(error("graph image limit reached"));
+            }
+            let (extra, _) = parse_image(path, ImageKind::Dll, &mut self.remaining_bytes)?;
+            if extra.name.len() <= 4
+                || !extra.name[extra.name.len() - 4..].eq_ignore_ascii_case(b".dll")
+                || extra.name.contains(&b':')
+                || has_separator(&extra.name)
+            {
+                return Err(error("expected a DLL basename"));
+            }
+            if self
+                .plan
+                .modules
+                .iter()
+                .any(|m| m.name.eq_ignore_ascii_case(&extra.name))
+            {
+                return Err(error("duplicate mapped module basename"));
+            }
+            let pe =
+                Pe::parse(&extra.image).map_err(|e| LinkError::new(path, "parse extra DLL", e))?;
+            if pe.entry_rva != 0
+                || [1, 9, 13]
+                    .into_iter()
+                    .any(|dir| pe.directory(dir).is_some())
+            {
+                return Err(error(
+                    "requires an entryless DLL without imports, delay imports or TLS",
+                ));
+            }
+            self.plan.modules.push(extra);
+        }
+        Ok(self.plan)
     }
 }
 
@@ -627,7 +664,7 @@ fn build(
             .chain(std::iter::once(sibling.to_owned())),
         options.trace_missing_imports,
     )?;
-    Ok(Builder {
+    Builder {
         options,
         plan: LinkPlan {
             modules: vec![root],
@@ -638,7 +675,7 @@ fn build(
         max_images,
         remaining_bytes,
     }
-    .close())
+    .close()
 }
 
 #[cfg(test)]

@@ -1517,7 +1517,13 @@ fn mapped_sync_facade_exports_must_already_be_callable_cfg_entries() {
     let wake = TEXT + f.sync_wake as usize;
     let scratch = Scratch::new();
     let flags = [OPT, "--rust-providers"];
+    let set_module_name = |exe: &mut [u8], name: &str| {
+        for (i, unit) in name.encode_utf16().chain(Some(0)).enumerate() {
+            w16(exe, file(MODULE_PATHS) + 2 * i, unit as usize);
+        }
+    };
     let mut exe = image(Kind::Guarded);
+    set_module_name(&mut exe, DLL);
     w32(&mut exe, OP + 16, TEXT + f.sync_entry as usize);
     // Libraryloader and critical-section bridges plus one static PE import
     // to root the facade. No special API-set lookup rule.
@@ -1585,9 +1591,66 @@ fn mapped_sync_facade_exports_must_already_be_callable_cfg_entries() {
     put(&mut dll, file(LINK) + 0x50, DLL.as_bytes());
     put(&mut dll, file(LINK) + 0x80, SLEEP);
     put(&mut dll, file(LINK) + 0xa0, WAKE);
-    scratch.write(DLL, &dll);
+    let dll_path = scratch.write(DLL, &dll);
     let exe_path = scratch.write("sync-facade.exe", &exe);
     expect(run(&exe_path, &flags), 46, "Guest entry returned 46");
+    expect(
+        run(
+            &exe_path,
+            &[
+                OPT,
+                TRUSTED,
+                "--rust-providers",
+                "--map-extra-dll",
+                dll_path.to_str().unwrap(),
+            ],
+        ),
+        1,
+        "duplicate mapped module basename",
+    );
+
+    // By default a file under the API-set basename is not a mapped module.
+    // Explicit rooting uses that actual basename without changing resolution.
+    const CONTRACT: &str = "api-ms-win-core-synch-l1-2-0.dll";
+    let contract_path = scratch.write(CONTRACT, &dll);
+    let contract_path = contract_path.to_str().unwrap();
+    let mut rooted = exe.clone();
+    set_module_name(&mut rooted, CONTRACT);
+    w32(&mut rooted, file(MODE), 3);
+    let static_desc = file(LINK) + 40;
+    rooted[static_desc..static_desc + 20].fill(0);
+    dir(&mut rooted, 1, LINK, 60);
+    let rooted_path = scratch.write("explicit-sync.exe", &rooted);
+    expect(
+        run(&rooted_path, &[OPT, TRUSTED, "--rust-providers"]),
+        48,
+        "Guest entry returned 48",
+    );
+    expect(
+        run(
+            &rooted_path,
+            &[OPT, "--rust-providers", "--map-extra-dll", contract_path],
+        ),
+        1,
+        "--map-extra-dll requires --trusted-offline and --experimental-static-tls",
+    );
+    let opt_in = [
+        OPT,
+        TRUSTED,
+        "--rust-providers",
+        "--map-extra-dll",
+        contract_path,
+    ];
+    expect(run(&rooted_path, &opt_in), 46, "Guest entry returned 46");
+    rooted[static_desc..static_desc + 20].copy_from_slice(&exe[static_desc..static_desc + 20]);
+    dir(&mut rooted, 1, LINK, 80);
+    put(&mut rooted, file(LINK) + 0x100, CONTRACT.as_bytes());
+    scratch.write("explicit-sync.exe", &rooted);
+    expect(
+        run(&rooted_path, &opt_in),
+        1,
+        "missing symbol api-ms-win-core-synch-l1-2-0.dll!WakeAllConditionVariable",
+    );
 
     w32(&mut exe, file(MODE), 2);
     scratch.write("sync-facade.exe", &exe);

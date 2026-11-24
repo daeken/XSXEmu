@@ -956,10 +956,18 @@ Lsync_entry:
     movslq 0x3c(%rax), %rcx
     cmpl $0x4550, (%rax,%rcx)
     jne Lbad
-    leaq Lsync_module(%rip), %rcx
+    leaq {module_paths_delta}(%r11), %rcx
     callq *{iat_delta}(%r11)
     testq %rax, %rax
-    je Lbad
+    jne 2f
+    leaq Ltext(%rip), %r11
+    cmpl $3, {mode_delta}(%r11)
+    jne Lbad
+    cmpl $126, %gs:0x68                  /* ERROR_MOD_NOT_FOUND */
+    jne Lbad
+    movl $48, %eax
+    jmp Lsync_exit
+2:
     movq %rax, %rbx
     cmpw $0x5a4d, (%rax)
     jne Lbad
@@ -1002,7 +1010,9 @@ Lsync_entry:
     jne Lbad
     leaq 32(%rsp), %rcx
     leaq 40(%rsp), %rdx
-    movl {mode_delta}(%r11), %r9d         /* mode 0 = poll, 2 = wait */
+    xorl %r9d, %r9d                      /* Poll except in mode 2. */
+    cmpl $2, {mode_delta}(%r11)
+    sete %r9b
     callq *{dispatch_delta}(%r11)
     testl %eax, %eax
     jne Lbad
@@ -1029,6 +1039,7 @@ Lsync_return:
     cmpl $1, {mode_delta}(%r11)
     sete %al
     addl $46, %eax
+Lsync_exit:
     addq $80, %rsp
     popq %rbx
     retq
@@ -1036,8 +1047,5 @@ Lsync_sleep_name:
     .asciz "SleepConditionVariableCS"
 Lsync_wake_name:
     .asciz "WakeAllConditionVariable"
-.p2align 1
-Lsync_module:
-    .short 'o','w','n','e','d','-','s','y','n','c','.','d','l','l',0
 Lend:
     .org Ltext + {capacity}, 0xcc

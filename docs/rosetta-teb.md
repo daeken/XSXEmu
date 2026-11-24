@@ -284,6 +284,12 @@ graph: null selects the root EXE, and non-null names use the ordinary mapped
 module lookup. It neither loads images nor creates handles for Rust providers
 or API-set contracts. Success preserves `LastError`; an unmatched name
 returns `NULL` and sets `ERROR_MOD_NOT_FOUND` in the guest TEB.
+`run --experimental-static-tls --trusted-offline --map-extra-dll PATH`
+explicitly maps one additional trusted, entryless PE DLL without imports,
+delay imports or TLS. It uses the file's actual basename and mapped base;
+duplicate mapped basenames are refused. The extra PE is appended after
+static binding, so the option does not change API-set routing or static
+imports. The usual mapping and CFG validation still apply.
 `GetModuleFileNameW` reads the registered UTF-16 guest path: a null handle
 selects the root EXE, and a non-null handle must exactly match a mapped image
 base. It performs no filesystem lookup. Success preserves `LastError`;
