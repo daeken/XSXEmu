@@ -520,6 +520,14 @@ pub(super) fn run(
     // A row uses the digest on its exact metadata reference, not all digests
     // ever seen for the same program. Unknown slots stay in the grouping key.
     let mut graphics_rows = BTreeMap::<Vec<usize>, GraphicsCoverage>::new();
+    let mut state_sizes_by_ps = HashMap::<ProgramId, HashSet<usize>>::new();
+    let mut state_ps_profiles = BTreeMap::<
+        Vec<usize>,
+        (
+            HashMap<_, (HashSet<usize>, HashSet<_>)>,
+            HashMap<_, HashSet<usize>>,
+        ),
+    >::new();
     let mut state_sizes = BTreeMap::<Vec<usize>, BTreeMap<usize, HashSet<_>>>::new();
     let mut layouts_seen = HashMap::<_, Option<Layout>>::new();
     let mut format_matches = [0usize; 7];
@@ -586,6 +594,20 @@ pub(super) fn run(
             .entry(state.len())
             .or_default()
             .insert(pso.state);
+        if let Some(pixel) = pso.slots[0] {
+            let size = state.len();
+            state_sizes_by_ps
+                .entry(pixel.program)
+                .or_default()
+                .insert(size);
+            let (programs, metadata) = state_ps_profiles.entry(slots.clone()).or_default();
+            let (sizes, states) = programs.entry(pixel.program).or_default();
+            sizes.insert(size);
+            states.insert(pso.state);
+            if let Some(id) = pixel.metadata {
+                metadata.entry(id).or_default().insert(size);
+            }
+        }
         let extent = match layouts_seen.entry(pso.input_layout) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut().as_ref(),
             std::collections::hash_map::Entry::Vacant(entry) => {
@@ -659,6 +681,30 @@ pub(super) fn run(
     println!(
         "  Graphics layout blobs: {} distinct; unsupported extent: {layout_other}; (count, zero suffix bytes) histogram: {layout_shapes:?}",
         layouts_seen.len()
+    );
+    for (slots, (programs, metadata)) in state_ps_profiles {
+        println!(
+            "  Graphics state sharing, slots {slots:?}: {} PS programs ({} multi-size, {} multi-state-ID); {} PS metadata IDs ({} multi-size)",
+            programs.len(),
+            programs
+                .values()
+                .filter(|(sizes, _)| sizes.len() > 1)
+                .count(),
+            programs
+                .values()
+                .filter(|(_, states)| states.len() > 1)
+                .count(),
+            metadata.len(),
+            metadata.values().filter(|sizes| sizes.len() > 1).count()
+        );
+    }
+    println!(
+        "  Graphics state sizes across slot patterns: {} PS programs, {} multi-size",
+        state_sizes_by_ps.len(),
+        state_sizes_by_ps
+            .values()
+            .filter(|sizes| sizes.len() > 1)
+            .count()
     );
     println!("  Graphics layout D3D12 input-element field hypothesis: {vertex_fields:?}");
     for (slots, counts) in vs_layout {
