@@ -6,7 +6,11 @@ use std::mem::{offset_of, size_of};
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[path = "../darwin-probe-mask.rs"]
+mod probe_mask;
 mod signal_policy;
+
+use probe_mask::signal;
 
 const PROVIDER_INT: u64 = 0x13ae_0011_f0e1_d2c3;
 const PROVIDER_DOUBLE: u64 = (-2.75f64).to_bits();
@@ -107,7 +111,6 @@ unsafe extern "C" {
     fn __error() -> *mut c_int;
     fn pthread_self() -> usize;
     fn pthread_kill(thread: usize, sig: c_int) -> c_int;
-    fn signal(sig: c_int, handler: Option<unsafe extern "C" fn(c_int)>) -> usize;
     fn run_boundary(ctx: *const Context) -> u64;
     fn signal_handler(sig: c_int);
     fn signal_window(ctx: *const Context, guest: u64, resumed: *mut Slots);

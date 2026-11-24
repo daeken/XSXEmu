@@ -1,37 +1,18 @@
 //! Signal experiments only. The runner owns the child, deadline, and fault marker.
-use super::{Context, HOST_IN, PROVIDER_OK, host_slots, run_boundary, signal, write_host};
+use super::probe_mask::{BLOCKED, SigSet, apply, bit, fault_defaults, mask, signal};
+use super::{Context, HOST_IN, PROVIDER_OK, host_slots, run_boundary, write_host};
 use std::arch::global_asm;
 use std::ffi::{c_int, c_void};
 use std::fs::OpenOptions;
 use std::mem::offset_of;
 use std::os::fd::AsRawFd;
-use std::ptr::{null, null_mut};
+use std::ptr::null_mut;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::SeqCst};
 use std::time::{Duration, Instant};
 
-// Darwin's 32-bit sigset_t and signal/mask constants. Leave fault/abort-like
-// signals to their default disposition, not to a guest-GS host handler. Some
-// of these numbers can also be sent asynchronously; this is not a source filter.
-type SigSet = u32;
-const SIG_SETMASK: c_int = 3;
-const FAULT_LIKE: [c_int; 8] = [4, 5, 6, 7, 8, 10, 11, 12];
-const SIGKILL: c_int = 9;
-const SIGSTOP: c_int = 17;
 const SIGNALS: [c_int; 3] = [30, 31, 14]; // SIGUSR1, SIGUSR2, SIGALRM
-const fn bit(sig: c_int) -> SigSet {
-    1 << (sig - 1)
-}
 const TEST_BITS: SigSet = bit(SIGNALS[0]) | bit(SIGNALS[1]) | bit(SIGNALS[2]);
 const RESERVED: SigSet = bit(SIGNALS[1]);
-const BLOCKED: SigSet = {
-    let mut mask = 0x7fff_ffff & !(bit(SIGKILL) | bit(SIGSTOP));
-    let mut i = 0;
-    while i < FAULT_LIKE.len() {
-        mask &= !bit(FAULT_LIKE[i]);
-        i += 1;
-    }
-    mask
-};
 
 // Assembly accesses aligned atomics using x86 TSO; a fresh child uses them once.
 #[repr(C)]
@@ -85,7 +66,6 @@ Lpolicy_observed:
 );
 
 unsafe extern "C" {
-    fn pthread_sigmask(how: c_int, set: *const SigSet, old: *mut SigSet) -> c_int;
     fn sigpending(set: *mut SigSet) -> c_int;
     fn policy_observer(sig: c_int);
     fn fault_window(ctx: *const Context, fault: u32, marker: *mut u8, page: *mut c_void);
@@ -99,46 +79,12 @@ unsafe extern "C" {
     ) -> *mut c_void;
 }
 
-fn mask(set: Option<SigSet>) -> Result<SigSet, String> {
-    let mut old = 0;
-    let rc = unsafe { pthread_sigmask(SIG_SETMASK, set.as_ref().map_or(null(), |s| s), &mut old) };
-    if rc != 0 {
-        return Err(format!("pthread_sigmask: {rc}"));
-    }
-    Ok(old)
-}
-
 fn pending() -> Result<SigSet, String> {
     let mut set = 0;
     if unsafe { sigpending(&mut set) } != 0 {
         return Err(format!("sigpending: {}", std::io::Error::last_os_error()));
     }
     Ok(set & TEST_BITS)
-}
-
-fn fault_defaults(original: SigSet) -> Result<(), String> {
-    for sig in FAULT_LIKE {
-        if original & bit(sig) != 0 {
-            return Err(format!(
-                "refusing entry: fault-like signal {sig} initially blocked"
-            ));
-        }
-        // Rust itself may have installed a stack-overflow handler. The owned
-        // child deliberately tests termination, not handler entry or recovery.
-        if unsafe { signal(sig, None) } == usize::MAX {
-            return Err(format!("could not set SIG_DFL for signal {sig}"));
-        }
-    }
-    Ok(())
-}
-
-fn apply(set: SigSet, expected_old: SigSet) -> Result<(), String> {
-    if mask(Some(set))? != expected_old || mask(None)? != set {
-        return Err(format!(
-            "unexpected effective mask changing {expected_old:#x} to {set:#x}"
-        ));
-    }
-    Ok(())
 }
 
 fn deferred(expected: SigSet) -> Result<(), String> {

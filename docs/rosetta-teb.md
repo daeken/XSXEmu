@@ -222,6 +222,44 @@ continue, resume guest execution, or run cleanup in-process with unknown GS.
 This is containment by child failure, not a guest security sandbox or a
 replacement for a controlled execution engine.
 
+## Standalone original PE proof
+
+```sh
+tools/probe_rosetta_tls_owned_pe.sh
+```
+
+The runner takes no arguments. It builds and runs a single-threaded x86_64
+child under Rosetta with a ten-second deadline. The child generates a fixed
+import-free AMD64 PE32+ EXE in memory from original assembly, not from an
+external image. It uses `Pe::materialize_into` at a nonpreferred address,
+checks all six DIR64 relocations, gives the EXE's TLS module index zero via
+`static_tls::Plan`, and seals the mapping with `GuestMemory`. The planner
+snapshots a relocated pointer and a nonzero seed and adds eight zero bytes
+in a 16-byte-aligned block; the PE's initially nonzero index DWORD is patched
+to zero. The test TEB points to the planner's vector at `GS:[0x58]`.
+
+A single assembly window calls the mapped PE's TLS callback (process attach),
+EXE entry, then the same callback (process detach). Each call reads the image's
+index DWORD and follows `GS:[0x58]` to the block. Each checks the relocated
+pointer and the previous phase's values before mutating both the initialized
+state and the zero-fill word. The callback also checks the mapped image base,
+reason, and the fixture's null reserved argument. On macOS 27.0.1 (26A434)
+under Rosetta, entry returned 42 and the host read final TLS state
+`0x33300303` with scratch `0xc3`. The boundary checked the restored host
+`GS:[0]` and `GS:[0x30]` before returning to Rust; the child then restored and
+verified the original signal mask. The runner requires both a success record
+and exit status zero.
+
+Only the private setter, assembly boundary, and mapped PE execute while guest
+GS is active. The child shares the preceding signal probe's mask and default
+fault dispositions, with no handlers or recovery added for the PE. Guest
+invariant failures and GS mismatches trap; faults, unexpected exits, and
+timeouts fail the probe. The detach call is an explicit normal-return fixture
+step, not an emulation of process teardown. No imports or providers, extra
+threads, UCRT or title code, or OS security changes are involved. Production
+startup still rejects static TLS; this is not an execution option for other
+images or a security boundary.
+
 ## Controlled execution plan
 
 1. Separate loading from execution. Reuse PE static TLS metadata but check
