@@ -12,11 +12,12 @@ use crate::{
     word,
 };
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     ffi::OsStr,
     fs::{self, File},
     io::Read,
+    ops::Bound::{Excluded, Included},
     path::Path,
 };
 
@@ -220,18 +221,23 @@ impl PcPattern {
         };
     }
 
-    fn classify(&self, pc: usize, size: usize, first: u32, extent: usize) -> IndirectShape {
+    fn literal(&self, pc: usize, size: usize, first: u32) -> Option<(usize, usize)> {
         let PcStep::High {
             pair,
             base,
             literal,
         } = self.step
         else {
+            return None;
+        };
+        (self.next == Some(pc) && size == 4 && first == (0xbe80_2000 | pair))
+            .then_some((base, literal))
+    }
+
+    fn classify(&self, pc: usize, size: usize, first: u32, extent: usize) -> IndirectShape {
+        let Some((base, literal)) = self.literal(pc, size, first) else {
             return IndirectShape::Unmatched;
         };
-        if self.next != Some(pc) || size != 4 || first != 0xbe80_2000 | pair {
-            return IndirectShape::Unmatched;
-        }
         // Public reference arithmetic: a literal low word plus a carry into
         // a zero-addend high word, not a sign-extended 32-bit displacement.
         if !literal.is_multiple_of(4) {
@@ -335,6 +341,116 @@ pub(crate) fn reference_walk_result(dis: &mut Disassembler, bytes: &[u8]) -> &'s
     }
 }
 
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum TargetOverlap {
+    KnownStart,
+    KnownInterior,
+    Unvisited,
+}
+
+fn frontier_target<T>(graph: &BTreeMap<usize, Instruction<T>>, target: usize) -> TargetOverlap {
+    match graph.range(..=target).next_back() {
+        Some((&start, _)) if start == target => TargetOverlap::KnownStart,
+        Some((&start, op)) if target - start < op.width => TargetOverlap::KnownInterior,
+        _ => TargetOverlap::Unvisited,
+    }
+}
+
+fn branch_entries<T>(graph: &BTreeMap<usize, Instruction<T>>) -> BTreeSet<usize> {
+    let mut entries = BTreeSet::new();
+    for (&pc, op) in graph {
+        let next = pc + op.width;
+        let (Flow::Jump(delta) | Flow::Fork(delta)) = op.flow else {
+            continue;
+        };
+        entries.extend(cfg::relative(next, delta));
+        if matches!(op.flow, Flow::Fork(_)) {
+            entries.insert(next);
+        }
+    }
+    entries
+}
+
+#[derive(Default)]
+struct IndirectFrontier {
+    incomplete: BTreeMap<&'static str, usize>,
+    unmatched: usize,
+    windows: BTreeMap<(bool, TargetOverlap), usize>,
+}
+
+impl IndirectFrontier {
+    fn add(&mut self, dis: &mut Disassembler, bytes: &[u8]) {
+        // Separate projection: SETPC is a cut, not an exit or an admitted edge.
+        // Do not report from a partially visited projection on another error.
+        let mut scratch = [0; 1024];
+        let mut pattern = PcPattern::default();
+        let mut unsupported = "decode";
+        let graph = cfg::walk_extent(bytes.len() / 4, |pc| {
+            let tail = &bytes[pc * 4..];
+            let (size, line) = dis.one(tail, pc * 4, &mut scratch)?;
+            let first = u32::from_le_bytes(tail[..4].try_into().ok()?);
+            let name = line.split_ascii_whitespace().next()?;
+            let (flow, cut) = if name == "s_setpc_b64" {
+                let candidate = pattern
+                    .literal(pc, size, first)
+                    .and_then(|(base, literal)| {
+                        let target = base.checked_add(literal)?;
+                        (target.is_multiple_of(4) && target < bytes.len())
+                            .then_some((base / 4 - 1, target / 4))
+                    });
+                (Flow::Stop, Some(candidate))
+            } else {
+                let Some(flow) = control(name, first, size) else {
+                    unsupported = "other control";
+                    return None;
+                };
+                (flow, None)
+            };
+            pattern.observe(pc, size, name, first, tail, flow);
+            Some(Instruction {
+                width: size / 4,
+                flow,
+                op: cut,
+            })
+        });
+        let graph = match graph {
+            Ok(graph) => graph,
+            Err(e) => {
+                let reason = match e {
+                    cfg::Error::UnsupportedEncoding => unsupported,
+                    cfg::Error::BadSuccessor => "outside span",
+                    cfg::Error::BadWidth => "invalid width",
+                    cfg::Error::OverlappingInstructions => "overlap",
+                };
+                *self.incomplete.entry(reason).or_default() += 1;
+                return;
+            }
+        };
+        // The matched window is contiguous. Width/overlap validation rules
+        // out external straightline predecessors to its interior, so collect
+        // both kinds of branch successor once across the checked graph.
+        let entries = branch_entries(&graph);
+        for (&pc, node) in &graph {
+            match node.op {
+                None => (),
+                Some(None) => self.unmatched += 1,
+                Some(Some((start, target))) => {
+                    *self
+                        .windows
+                        .entry((
+                            entries
+                                .range((Excluded(start), Included(pc)))
+                                .next()
+                                .is_some(),
+                            frontier_target(&graph, target),
+                        ))
+                        .or_default() += 1;
+                }
+            }
+        }
+    }
+}
+
 // Deliberately only a triage filter. Does not validate operands, ABI bindings,
 // waits, floating-point mode, ordering, scalar reads or raw buffer semantics.
 fn shortlist(meta: &Metadata, p: &ProgramCounts) -> bool {
@@ -413,6 +529,7 @@ struct Report {
     small_ops: Histogram<String>,
     small_features: Histogram<&'static str>,
     blockers: BTreeMap<Blocker, usize>,
+    indirect_frontier: IndirectFrontier,
     paired_linear: BTreeMap<LinearResult, usize>,
 }
 
@@ -483,7 +600,13 @@ impl Report {
                 self.ops.merge(p.ops);
                 self.features.merge(p.features);
             }
-            Err(reason) => *self.blockers.entry(reason).or_default() += 1,
+            Err(reason) => {
+                if matches!(reason, Blocker::IndirectPc(_)) {
+                    self.indirect_frontier
+                        .add(&mut waves[usize::from(meta.wave32)], bytes);
+                }
+                *self.blockers.entry(reason).or_default() += 1;
+            }
         }
         candidate
     }
@@ -513,6 +636,12 @@ impl Report {
             // Enum Debug only contains internal labels and an LLVM mnemonic, never operands or PCs.
             println!("first blocker {blocker:?}: payloads={n}");
         }
+        println!(
+            "Indirect-cut frontier: incomplete_payloads={:?} unmatched_sites={} sites by (direct edge to materialization interior, candidate target overlap)={:?}",
+            self.indirect_frontier.incomplete,
+            self.indirect_frontier.unmatched,
+            self.indirect_frontier.windows
+        );
         println!(
             "Backend triage (not translated): small-wave32-filter={} with-execz-and-uint-gt-cmpx={} with-scc-branch={} single-raw-store-1x1x1={} smallest-single-store-nodes={:?}",
             self.shortlisted,
@@ -650,6 +779,42 @@ mod tests {
         ] {
             assert_eq!(control(name, first, size), None);
         }
+    }
+
+    #[test]
+    fn frontier_checks_both_branch_edges_and_distinguishes_extension_words() {
+        let graph = BTreeMap::from([
+            (
+                0,
+                Instruction {
+                    width: 1,
+                    flow: Flow::Fork(2),
+                    op: (),
+                },
+            ),
+            (
+                1,
+                Instruction {
+                    width: 2,
+                    flow: Flow::Next,
+                    op: (),
+                },
+            ),
+            (
+                3,
+                Instruction {
+                    width: 1,
+                    flow: Flow::Stop,
+                    op: (),
+                },
+            ),
+        ]);
+        let entries = branch_entries(&graph);
+        assert_eq!(entries, BTreeSet::from([1, 3]));
+        assert_eq!(entries.range((Excluded(1), Included(3))).next(), Some(&3));
+        assert_eq!(frontier_target(&graph, 1), TargetOverlap::KnownStart);
+        assert_eq!(frontier_target(&graph, 2), TargetOverlap::KnownInterior);
+        assert_eq!(frontier_target(&graph, 4), TargetOverlap::Unvisited);
     }
 
     #[test]
