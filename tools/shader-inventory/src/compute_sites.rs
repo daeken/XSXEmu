@@ -173,19 +173,7 @@ impl Hypothesis {
     }
 }
 
-pub(crate) fn graphics_items(blob: &[u8]) -> Option<&[u8]> {
-    let end = blob.len().checked_sub(32)?;
-    let items = blob.get(16..end)?;
-    (items.len() % 32 == 0
-        && word(blob, 0)? == 2
-        && word(blob, 12)? & 255 == 0x40
-        && word(blob, end)? == 0x43
-        && blob[end + 20..].iter().all(|&b| b == 0)
-        && items
-            .chunks_exact(32)
-            .all(|item| matches!(word(item, 0), Some(0x41 | 0x42))))
-    .then_some(items)
-}
+use xsx_shader_inventory::source_families::graphics_items;
 
 fn prefix_shape(code: &[u8], digest: &[u8]) -> usize {
     if !has_digest_prefix(code, digest) {

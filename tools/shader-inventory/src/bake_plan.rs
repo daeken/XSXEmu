@@ -1,4 +1,6 @@
 //! Read-only, aggregate-only readiness plan for a pinned inflated PS/0/9 library.
+#[path = "bake_sources.rs"]
+mod bake_sources;
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, fmt::Write, fs::File, io::Read, process::ExitCode};
 use xsxemu::{
@@ -171,9 +173,10 @@ fn parse_fingerprint(text: &std::ffi::OsStr) -> Option<[u8; 32]> {
 
 fn run() -> Result<String, &'static str> {
     let mut args = std::env::args_os().skip(1);
-    const USAGE: &str = "usage: shader-bake-plan <inflated library.bin> <expected SHA-256 hex>";
+    const USAGE: &str = "usage: shader-bake-plan <inflated library.bin> <expected SHA-256 hex> [wrapped DXBC directory]";
     let path = args.next().ok_or(USAGE)?;
     let hash = args.next().ok_or(USAGE)?;
+    let wrapped = args.next();
     if args.next().is_some() {
         return Err(USAGE);
     }
@@ -194,7 +197,14 @@ fn run() -> Result<String, &'static str> {
         Invalid::Fingerprint => "inflated library fingerprint mismatch",
         Invalid::Structure => "invalid inflated PS/0/9 library structure",
     })?;
-    Ok(plan.summarize())
+    let mut report = plan.summarize();
+    if let Some(wrapped) = wrapped {
+        bake_sources::Families::read(std::path::Path::new(&wrapped))?
+            .summarize(&plan.library, &mut report);
+    } else {
+        report.push_str("source-family evidence: not supplied\n");
+    }
+    Ok(report)
 }
 
 fn main() -> ExitCode {

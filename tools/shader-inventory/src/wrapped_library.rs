@@ -1,7 +1,6 @@
 //! Test byte-equality hypotheses inside stage/digest candidate families, not native ABI equivalence.
 use crate::{
     ARCHIVE_LIMIT, BLOB_LIMIT,
-    compute_sites::graphics_items,
     coverage::Metadata,
     coverage::code,
     dxbc_chunks,
@@ -69,8 +68,9 @@ struct Payloads {
     unsupported_compute_profiles: usize,
 }
 
-const GRAPHICS_STAGES: [u16; 3] = [0, 1, 13];
-type SourceKey = (u16, [u8; 16]);
+use xsx_shader_inventory::source_families::{
+    GRAPHICS_STAGES, SourceKey, graphics_items, metadata_digest as digest, wrapped_key,
+};
 
 #[derive(Default)]
 struct SourceFamily {
@@ -313,11 +313,6 @@ fn layout_extent(blob: &[u8]) -> Option<Layout> {
     ))
 }
 
-fn digest(blob: &[u8]) -> Option<[u8; 16]> {
-    let start = blob.len().checked_sub(32)?;
-    blob.get(start + 4..start + 20)?.try_into().ok()
-}
-
 // Same raw c0/c8 interpretation as the compute census, but no instruction,
 // alignment, suffix, or launch assertion is made for a graphics payload here.
 fn extent(fssm: &[u8]) -> Option<&[u8]> {
@@ -477,14 +472,7 @@ pub(super) fn run(
         }
         bounded(&entry.path(), BLOB_LIMIT, &mut bytes)?;
         let parts = dxbc_chunks(&bytes).ok_or("invalid DXBC directory")?;
-        let dxil = crate::dxil_chunk(&bytes).ok_or("missing unique DXIL")?;
-        let stage = (word(dxil, 0).ok_or("truncated stage label")? >> 16) as u16;
-        let mut hashes = parts.iter().filter(|(tag, _)| *tag == b"HASH");
-        let (_, hash) = hashes.next().ok_or("missing HASH")?;
-        if hash.len() != 20 || hashes.next().is_some() {
-            return Err("invalid HASH framing".into());
-        }
-        let key: [u8; 16] = hash[4..].try_into()?;
+        let (stage, key) = wrapped_key(&parts).ok_or("invalid stage/digest framing")?;
         let Some(ids) = index.get(&(stage, key)) else {
             continue;
         };

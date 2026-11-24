@@ -18,6 +18,7 @@ use std::{
     io::{Read, Seek, SeekFrom},
     ops::Range,
 };
+use xsx_shader_inventory::source_families::dxbc_chunks;
 
 const ARCHIVE_LIMIT: usize = 512 << 20;
 const BLOB_LIMIT: usize = 8 << 20;
@@ -81,36 +82,6 @@ impl PublicHeader {
         let end = file_len.checked_sub(self.word_0c)?;
         (self.data_start < end && self.word_0c % 16 == 0).then_some(self.data_start..end)
     }
-}
-
-fn dxbc_chunks(data: &[u8]) -> Option<Vec<(&[u8], &[u8])>> {
-    if !data.starts_with(b"DXBC") || word(data, 24)? != data.len() {
-        return None;
-    }
-    let count = word(data, 28)?;
-    if count > 64 {
-        return None;
-    }
-    let table_end = 32 + count * 4;
-    let mut chunks = Vec::with_capacity(count);
-    let mut occupied = Vec::<Range<usize>>::with_capacity(count);
-    for at in (32..table_end).step_by(4) {
-        let chunk = word(data, at)?;
-        if chunk < table_end || chunk > data.len().checked_sub(8)? {
-            return None;
-        }
-        let payload = span(chunk + 8, word(data, chunk + 4)?)?;
-        if occupied
-            .iter()
-            .any(|other| chunk < other.end && other.start < payload.end)
-        {
-            return None;
-        }
-        let bytes = data.get(payload.clone())?;
-        occupied.push(chunk..payload.end);
-        chunks.push((&data[chunk..chunk + 4], bytes));
-    }
-    Some(chunks)
 }
 
 fn dxil_chunk(data: &[u8]) -> Option<&[u8]> {
