@@ -1,0 +1,48 @@
+# Compiled shader pipeline library: PS/0/9 joins
+
+Scope: one read-only local extraction, the inflated `pipeline/library.bin` discussed in [shader-archive.md](shader-archive.md). This is not a native FSSM, general FSPX, or runtime PSO specification. The archive scanner documents the 4,205 zlib streams; offsets here address their concatenated, inflated bytes. Layout observations below come from walking the binary tables independently, comparing all PSO rows and stage IDs with the local extraction's JSON as a secondary check. Leonida's `docs/shader_library.md` is a factual reference only, not an implementation dependency.
+
+## Envelope and tables
+
+All integers are little-endian. Offsets below are in bytes. Header size is `0x80`; `+0x00` is the four-byte magic `50 53 00 09`; `+0x04` and `+0x24` are NUL-padded 32-byte and 36-byte labels; `+0x48` is an opaque u64; `+0x50..+0x60` are four u32 row counts (graphics, compute, blobs, programs); `+0x60` and `+0x64` are u32 sizes of the blob and program arenas. No semantics assigned to `+0x68..+0x80`.
+
+| Section | Inflated start | Row count | Row stride / arena bytes |
+|---|---:|---:|---:|
+| Graphics PSOs | 128 | 25,471 | 112 |
+| Compute PSOs | 2,852,880 | 2,693 | 24 |
+| Blob table | 2,917,512 | 54,576 | 8 |
+| Program table | 3,354,120 | 21,522 | 8 |
+| Blob arena | 3,526,296 | — | 31,120,020 |
+| Program arena | 34,646,316 | — | 240,894,464 |
+| End (exclusive) | 275,540,780 | — | — |
+
+Derive boundaries by checked count × stride and cumulative additions, requiring exact file length. Blob/program IDs are **zero-based table row indices**, not offsets. Each table entry is `(u32 offset, u32 size)` relative to its own arena. The observed blob spans are nonempty and tile their arena in ID order. Program spans are nonempty and increasing without overlap, with starts aligned to 256 bytes *relative to their arena*, not the file. Their stored sizes are 52–239,464 bytes. All inter-program gaps (2,064,676 bytes) and the final 24-byte tail were zero, outside the table-declared spans. A table span is not a verified executable range; prologues, internal termination and reachability are separate concerns.
+
+## PSO references
+
+| Record | Byte offset | Width | Interpretation |
+|---|---|---:|---|
+| Both | `0x00` | u64 | Opaque PSO key (extraction labels it `hash`); algorithm and runtime correspondence unproven |
+| Graphics | `0x08` | u32 | State blob ID |
+| Graphics | `0x0c` | u32 | Pipeline/input-layout blob ID; not a complete portable input layout spec |
+| Graphics | `0x10,18,20,28,30` | 5 × u64 | Opaque words; no reconstruction semantics inferred |
+| Graphics | `0x38 + 8s` | u32 | Program ID for slot `s`, 0–6 |
+| Graphics | `0x3c + 8s` | u32 | Stage metadata blob ID for slot `s`, 0–6 |
+| Compute | `0x08` | u32 | Dispatch-state blob ID (all observed sizes 28 bytes) |
+| Compute | `0x0c` | u32 | Additional opaque blob ID (all observed sizes 20 bytes) |
+| Compute | `0x10` | u32 | Program ID (CS) |
+| Compute | `0x14` | u32 | Layout blob ID |
+
+All four compute IDs and both graphics state/layout IDs are mandatory. In a graphics slot, `0xffffffff` means absent in **each** ID field. All observed present slots 0–2 have metadata; slot 6 has a real program and absent metadata. An absent metadata slot is not an absent program. Never substitute program ID for blob ID or select the last stage blob seen by key.
+
+| Stage / slot | PSO references | Distinct programs | Distinct associated stage/layout blobs |
+|---|---:|---:|---:|
+| CS (compute) | 2,693 | 2,684 | 2,684 |
+| PS (slot 0) | 24,111 | 9,996 | 9,333 |
+| VS (slot 1) | 13,409 | 1,343 | 1,241 |
+| MS (slot 2) | 12,062 | 7,498 | 7,060 |
+| Unknown (slot 6) | 2 | 1 | 0 |
+
+Slots 3–5 are absent everywhere; slot 6's shader stage is unidentified. Graphics combinations: 13,383 PS+VS, 10,726 MS+PS, 1,336 MS-only, 24 VS-only, two PS+VS+slot-6. All 21,522 program IDs are referenced, each by only one stage and with a consistent optional stage/layout blob in this sample. The inverse is not unique: e.g. 9,996 PS programs map to 9,333 blob IDs. All 54,576 blob IDs are referenced; the eight nonempty blob roles (graphics state and input layout, PS/VS/MS metadata, compute state/opaque/layout) are pairwise disjoint. Graphics state/input-layout use 5,680/25,229 distinct IDs; compute dispatch/opaque use 665/2,684. Each of the 2,693 compute keys is different despite nine excess rows over unique full reference tuples (2,676 tuples once, seven twice, one three times). Graphics keys are all distinct and do not intersect compute keys; only 25,229 graphics tuples of state/layout and stage pairs are distinct (excluding the opaque words and key). Neither tuple nor PSO key is a verified Metal cache key.
+
+The secondary sidecar check matched every PSO key, graphics top-level reference and named program slot, and compute dispatch reference and program. The sidecar summaries omit some references; range validation of those fields was done against the binary, not inferred from JSON. The binary gives a useful provenance graph, not a pipeline that can yet be baked: root/descriptor binding, complete fixed-function state, input/output linkage, the opaque fields, unidentified stage, source variants, and runtime-key correspondence remain open.
