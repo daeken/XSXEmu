@@ -45,6 +45,7 @@ struct SignatureRow {
     register: usize,
     primary: u8,
     component_type: usize,
+    secondary: u8,
     system_code: usize,
 }
 
@@ -93,6 +94,7 @@ fn check(bytes: &[u8]) -> Option<(Count, Vec<SignatureRow>)> {
             primary,
             component_type,
             system_code,
+            secondary,
         });
         count.entries += 1;
         count.system += usize::from(system_code != 0);
@@ -202,6 +204,10 @@ pub(super) struct SourceLinkage {
     producer_narrower: usize,
     register_different: usize,
     mask_different: usize,
+    comparable_secondary: usize,
+    nonzero_input_secondary: usize,
+    input_secondary_intersects_output_secondary: usize,
+    pairs_with_secondary_intersection: usize,
 }
 
 impl SourceLinkage {
@@ -210,6 +216,7 @@ impl SourceLinkage {
         self.pairs_empty_ordinary_inputs += usize::from(consumer.ordinary.is_empty());
         self.excluded_system_inputs += consumer.system_rows;
         let mut clear = !consumer.ordinary.is_empty();
+        let mut secondary_intersection = false;
         for (key, inputs) in &consumer.ordinary {
             let outputs = producer
                 .ordinary
@@ -232,10 +239,21 @@ impl SourceLinkage {
                 self.producer_narrower += usize::from(narrower);
                 self.register_different += usize::from(output.register != input.register);
                 self.mask_different += usize::from(output.primary != input.primary);
+                if output.register == input.register && output.primary == input.primary {
+                    self.comparable_secondary += 1;
+                    // DXBC input secondary marks reads; output secondary
+                    // marks never-writes, including bits outside primary.
+                    let reads = input.secondary & input.primary;
+                    self.nonzero_input_secondary += usize::from(reads != 0);
+                    let intersects = reads & output.secondary != 0;
+                    self.input_secondary_intersects_output_secondary += usize::from(intersects);
+                    secondary_intersection |= intersects;
+                }
                 clear &= !type_different && !narrower;
             }
         }
         self.pairs_clear += usize::from(clear);
+        self.pairs_with_secondary_intersection += usize::from(secondary_intersection);
     }
 }
 
@@ -1387,6 +1405,7 @@ mod tests {
             primary: 1,
             component_type: 3,
             system_code: 0,
+            secondary: 0,
         }
     }
 
@@ -1440,6 +1459,29 @@ mod tests {
         let shorter = SourceInterface::from_rows(vec![shape()]);
         assert!(a == b);
         assert!(a != shorter);
+    }
+
+    #[test]
+    fn secondary_intersections_count_only_read_lanes_at_agreeing_packing() {
+        let row = |secondary, register| SignatureRow {
+            primary: 0b0011,
+            secondary,
+            register,
+            ..sig(key(b"test", 0))
+        };
+        let input = SourceInterface::from_rows(vec![row(0b0001, 0)]);
+        let output =
+            |secondary, register| SourceInterface::from_rows(vec![row(secondary, register)]);
+        let mut c = SourceLinkage::default();
+        c.add(&output(0b1100, 0), &input);
+        c.add(&output(0b1101, 1), &input);
+        assert_eq!(c.comparable_secondary, 1);
+        assert_eq!(c.input_secondary_intersects_output_secondary, 0);
+        c.add(&output(0b1101, 0), &input);
+        assert_eq!(c.comparable_secondary, 2);
+        assert_eq!(c.nonzero_input_secondary, 2);
+        assert_eq!(c.input_secondary_intersects_output_secondary, 1);
+        assert_eq!(c.pairs_with_secondary_intersection, 1);
     }
 
     #[test]
