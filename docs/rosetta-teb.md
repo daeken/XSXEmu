@@ -462,6 +462,30 @@ ends with signal 5. Read-only PE inspection distinguishes three gates:
   options on the System32 path. Missing required exports also yield
   `0x89240101`, but that check is downstream of the observed miss.
 
+The AMD64 caller supplies the following arguments in register order. This
+is a call-site contract, not a declaration of the missing DLL's API:
+
+| Export | Inputs used by Scarlett | Result consumed |
+| --- | --- | --- |
+| `InitializeApiImplEx2` | `RCX=0x633600002712`, `RDX=0x65f400001edd`, `R8=flags \| 2` on the ordinary path, `R9=options` | Signed 32-bit HRESULT |
+| `InitializeApiImplEx` | Same packed `RCX`/`RDX` and `R8` values; no options argument | Signed 32-bit HRESULT |
+| `InitializeApiImpl` | `ECX=0x6336`, `EDX=0x2712` (split first packed value) | Signed 32-bit HRESULT |
+| `QueryApiImpl` | Pointers to class GUID, interface GUID, and writable object-pointer slot | Signed 32-bit HRESULT |
+| `XErrorReport` | HRESULT in `ECX`, pointer to narrow NUL-terminated message in `RDX` | Ignored at inspected init/query error sites |
+| `UninitializeApiImpl` | No arguments at the inspected call sites | Ignored at inspected sites |
+
+The ordinary initializer choice at RVAs `0x55e2c9f`–`0x55e2d09` falls back
+on **missing exports**, not on a negative result from the selected
+initializer. The caller does not access the options struct on this path,
+where it passes null. The independent Leonida (`runtime/shims/xgameruntime.cpp`)
+and xcl (`crates/xcl/src/hle/xgameruntime/api.rs`) reference implementations
+agree on the export roles but disagree about scalar widths in Ex/Ex2 and
+whether report/uninitialize return a value. Preserve the full observed
+register values at the boundary; the call sites cannot establish which
+high bits the real callee reads or its ignored return types. The PC
+references do not establish Scarlett's non-null options layout or exact
+version negotiation.
+
 The statically reachable success path already needs more than DLL presence.
 Startup setup at `0x5a91c40` reaches the initially empty task queue field
 at `0x71b90a0`. Via `0x1d109e0` and `0x55dd794`, it queries
@@ -473,6 +497,23 @@ query's object is released via slot 2. The queue wrapper handles an error;
 this evidence does not establish that every queue call must succeed or
 that these are the only interfaces needed before device creation. None
 of these runtime calls was observed executing in the failing trace.
+
+The GUID uses the Windows mixed-endian in-memory layout. A successful
+query must write a real object pointer: the thunk dereferences it with
+no null check, then loads a method from the vtable at object offset zero.
+Method dispatch passes `this` in `RCX`; slot 29 (`+0xe8`) takes no other
+observed arguments and its result is ignored, while slot 12 (`+0x60`)
+receives the two modes in `EDX`/`R8D` and writable queue output in `R9`,
+returning an HRESULT in `EAX`. Slot 2 (`+0x10`) is called even when the
+method returns a failing HRESULT. The query helper maps
+`REGDB_E_CLASSNOTREG` (`0x80040154`) to `0x89240107` and reports it, rather
+than inventing an object. The cleanup path checked at RVA `0x2212c90`
+only acts on a non-null queue: it uses slot 22 (`XTaskQueueTerminate`),
+optionally loops on slot 16 (`XTaskQueueDispatch`, port 1, timeout 0,
+boolean in `AL`), then uses slot 17 (`XTaskQueueCloseHandle`) and clears
+the stored handle. This proves a queue handle has lifecycle obligations;
+it does not establish that cleanup or other queue work executes before
+device creation. No owned or real runtime was run for this ABI audit.
 
 Local input inventory was limited to loose files in the title directory,
 its `win11-arm64-reference` tree, the standalone `windlls` tree, and a
