@@ -696,6 +696,44 @@ pub(super) fn run(
         "  Graphics layout blobs: {} distinct; unsupported extent: {layout_other}; (count, zero suffix bytes) histogram: {layout_shapes:?}",
         layouts_seen.len()
     );
+    if let (Some((vs, _)), Some((ms, _))) = (
+        state_ps_profiles.get(&[0, 1][..]),
+        state_ps_profiles.get(&[0, 2][..]),
+    ) {
+        let mut counts = [0; 6];
+        for (id, (_, vs_states)) in vs {
+            let Some((_, ms_states)) = ms.get(id) else {
+                continue;
+            };
+            counts[0] += 1;
+            for (extra, any, invariant) in [(0, 2, 3), (8, 4, 5)] {
+                let mut pair = [HashSet::new(), HashSet::new()];
+                let mut all_nonempty = true;
+                for (i, ids, base) in [(0, vs_states, 380), (1, ms_states, 464)] {
+                    for id in ids {
+                        let blob = library.blob(*id).ok_or("missing graphics state span")?;
+                        // Require a nonempty suffix at the original baseline for both tests.
+                        if blob.len() > base {
+                            pair[i].insert(&blob[base - extra..]);
+                        } else {
+                            all_nonempty = false;
+                        }
+                    }
+                }
+                if extra == 0 && pair.iter().all(|set| !set.is_empty()) {
+                    counts[1] += 1;
+                }
+                if !pair[0].is_disjoint(&pair[1]) {
+                    counts[any] += 1;
+                    counts[invariant] +=
+                        usize::from(all_nonempty && pair.iter().all(|set| set.len() == 1));
+                }
+            }
+        }
+        println!(
+            "  PS programs shared by VS/MS cohorts [total, both nonempty, any equal suffix, invariant, any equal suffix plus previous eight, invariant]: {counts:?}"
+        );
+    }
     for (slots, (programs, metadata)) in state_ps_profiles {
         if let Some(base) = state_base(&slots) {
             let mut split = [0; 4];
