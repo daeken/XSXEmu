@@ -1,6 +1,6 @@
 # Prioritizing reachable compute translation
 
-The read-only inventory now accepts a **local extracted native FSSM directory**. It does not extract anything or open the archive/TOC in this mode. It ignores the separately compiled pipeline library. There are no emitted per-file records, shader names, offsets, operands, disassembly or bytes.
+The read-only inventory now accepts a **local extracted native FSSM directory**. It does not extract anything or open the archive/TOC in this mode. The separately compiled pipeline library and DLL-embedded shaders are outside this census. There are no emitted per-file records, shader names, offsets, operands, disassembly or bytes.
 
 ```sh
 M=tools/shader-inventory/Cargo.toml
@@ -26,14 +26,16 @@ LLVM **21.1.6**; **26,698** native inputs, **2,689** compute, no read/header/spa
 | Complete graphs with multiple exit nodes | 660 | 202 |
 | Complete graphs with a nonforward edge | 1,974 | 557 |
 | Complete graphs that skip at least one dword | 1,548 | 410 |
+| Complete graphs whose linear walk rejects a skipped word | 1,004 | 77 |
+| Complete graphs whose linear walk rejects an extension word | 0 | 0 |
 | First blocker: LLVM instruction reject | 0 | 1,471 |
 | First blocker: unmodeled `s_setpc_b64` | 13 | 12 |
 
-The earlier linear `gfx1013` walk completed only 1,680 spans. Reachability keeps skipped bytes out of both the decoded-opcode denominator and the blocker count; skipped words are not all necessarily data. The `gfx1030` run is an independent reference, not a fallback and not a candidate to merge into the `gfx1013` report.
+The earlier archive linear `gfx1013` walk completed 1,680 spans. The paired counters here compare each *complete* graph to a linear walk of the same extracted payload, locating the first linear reject either outside the graph or inside a reachable instruction's extension. They exclude graphs that already stopped at reachable blockers. Skipped words are not all necessarily data; the paired comparison shows precisely which linear rejects do not block the reachable graph. The `gfx1030` run is an independent reference, not a fallback and not a candidate to merge into the `gfx1013` report.
 
 ## What to translate first
 
-Filter complete graphs to 1D wave32 groups of at most 32 threads, with forward-only edges, no LDS, no scratch or group-size input in observed metadata, and no image, atomic, barrier, flat/global, explicit scratch, lane transfer/swizzle or SDWA indicators. This is a shortlist, not a support claim. On `gfx1013` it leaves **18** payloads. Of these, **16** contain vector buffers and **16** have `s_load_dwordx4` and `s_waitcnt`; **12** have `s_cbranch_execz`, **10** of them also have `v_cmpx_gt_u32_e32`. **Two** `1×1×1` payloads have a single raw store site under the mnemonic screen; the smaller graph has **10** nodes. No shader was run to establish these counts.
+Filter complete graphs to 1D wave32 groups of at most 32 threads, with forward-only edges, no LDS, no scratch or group-size input in observed metadata, and no image, atomic, barrier, flat/global, explicit scratch, lane transfer/swizzle or SDWA indicators. This is a shortlist, not a support claim. On `gfx1013` it leaves **18** payloads. Of these, **16** contain vector buffers and **16** have `s_load_dwordx4` and `s_waitcnt`; **12** have `s_cbranch_execz`, **10** of them also have `v_cmpx_gt_u32_e32`. Only **one** shortlisted graph contains an SCC branch, so SCC lowering is deferred behind EXEC plus memory. **Two** `1×1×1` payloads have a single raw store site under the mnemonic screen; the smaller graph has **10** nodes. No shader was run to establish these counts.
 
 The first owned step implements the comparison/branch pair rather than adding arbitrary ALU opcodes. `exec_fixture.s` is an original GFX10.3 wave32 fixture, checked with LLVM assembly. Its typed Rust model intersects EXEC with an unsigned inline-constant comparison, then takes `s_cbranch_execz` on an empty mask. Generated MSL keeps even guest-inactive lanes on the uniform scalar path; `simd_any` decides the branch, only guest-active lanes write payload values, and the two distinct exits have test-only markers. Apple M4 API/GPU validation matched **165/165 CPU/Metal words** across five cases, including strict boundary comparison, sparse survivors, and EXEC empty initially or emptied by compare. The CPU suite also tests a surviving bit-31 lane. This subset does not model EXEC restore, SCC/VCC branches, wave64, partial host SIMD groups, loops, or guest descriptor bindings.
 

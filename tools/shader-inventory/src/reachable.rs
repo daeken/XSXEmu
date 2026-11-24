@@ -90,6 +90,43 @@ struct ProgramCounts {
     dwords: usize,
     exits: usize,
     backward_edges: usize,
+    linear: LinearResult,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+enum LinearResult {
+    #[default]
+    Complete,
+    RejectOnSkippedWord,
+    RejectOnExtensionWord,
+}
+
+fn compare_linear(
+    dis: &mut Disassembler,
+    bytes: &[u8],
+    graph: &BTreeMap<usize, Instruction<()>>,
+    scratch: &mut [u8; 1024],
+) -> LinearResult {
+    let mut pc = 0;
+    while pc < bytes.len() / 4 {
+        // Same bytes, PC and MC profile: reuse a decoded width only at a known
+        // instruction start. Decode skipped regions from the linear PC, even
+        // when it has moved into an extension word after losing synchronization.
+        if let Some(inst) = graph.get(&pc) {
+            pc += inst.width;
+        } else if let Some((size, _)) = dis.one(&bytes[pc * 4..], pc * 4, scratch) {
+            pc += size / 4;
+        } else if graph
+            .range(..pc)
+            .next_back()
+            .is_some_and(|(&start, inst)| pc - start < inst.width)
+        {
+            return LinearResult::RejectOnExtensionWord;
+        } else {
+            return LinearResult::RejectOnSkippedWord;
+        }
+    }
+    LinearResult::Complete
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -149,6 +186,9 @@ fn analyze(dis: &mut Disassembler, bytes: &[u8]) -> Result<ProgramCounts, Blocke
     }
     if counts.exits == 0 {
         return Err(Blocker::NoExit);
+    }
+    if counts.dwords < bytes.len() / 4 {
+        counts.linear = compare_linear(dis, bytes, &graph, &mut scratch);
     }
     Ok(counts)
 }
@@ -213,6 +253,7 @@ struct Report {
     steps: usize,
     shortlisted: usize,
     exec_branch_and_cmpx_gt: usize,
+    shortlist_scc_branch: usize,
     small_single_raw_store: usize,
     smallest_store_steps: Option<usize>,
     ops: Histogram<String>,
@@ -220,6 +261,7 @@ struct Report {
     small_ops: Histogram<String>,
     small_features: Histogram<&'static str>,
     blockers: BTreeMap<Blocker, usize>,
+    paired_linear: BTreeMap<LinearResult, usize>,
 }
 
 impl Report {
@@ -232,6 +274,7 @@ impl Report {
             Ok(p) => {
                 self.complete += 1;
                 self.steps += p.steps;
+                *self.paired_linear.entry(p.linear).or_default() += 1;
                 self.multiple_exits += usize::from(p.exits > 1);
                 self.backward_edge += usize::from(p.backward_edges > 0);
                 let skipped = bytes.len() / 4 - p.dwords;
@@ -239,6 +282,10 @@ impl Report {
                 self.skipped_payloads += usize::from(skipped > 0);
                 if shortlist(&meta, &p) {
                     self.shortlisted += 1;
+                    self.shortlist_scc_branch += usize::from(
+                        p.ops.contains_key("s_cbranch_scc0")
+                            || p.ops.contains_key("s_cbranch_scc1"),
+                    );
                     self.exec_branch_and_cmpx_gt += usize::from(
                         p.ops.contains_key("s_cbranch_execz")
                             && p.ops.contains_key("v_cmpx_gt_u32_e32"),
@@ -291,14 +338,18 @@ impl Report {
             self.skipped_payloads,
             self.skipped_words
         );
+        for (linear, n) in self.paired_linear {
+            println!("paired linear {linear:?} (complete reachable graphs only): payloads={n}");
+        }
         for (blocker, n) in self.blockers {
             // Enum Debug only contains internal labels and an LLVM mnemonic, never operands or PCs.
             println!("first blocker {blocker:?}: payloads={n}");
         }
         println!(
-            "Backend triage (not translated): small-wave32-filter={} with-execz-and-uint-gt-cmpx={} single-raw-store-1x1x1={} smallest-single-store-nodes={:?}",
+            "Backend triage (not translated): small-wave32-filter={} with-execz-and-uint-gt-cmpx={} with-scc-branch={} single-raw-store-1x1x1={} smallest-single-store-nodes={:?}",
             self.shortlisted,
             self.exec_branch_and_cmpx_gt,
+            self.shortlist_scc_branch,
             self.small_single_raw_store,
             self.smallest_store_steps
         );
@@ -415,9 +466,17 @@ mod tests {
         ];
         let graph = analyze(&mut dis, &bytes(&skipped)).unwrap();
         assert_eq!((graph.steps, graph.dwords, graph.exits), (4, 5, 1));
+        assert_eq!(graph.linear, LinearResult::RejectOnSkippedWord);
+        // Linear decoding at skipped dword 1 consumes dword 2 as its literal.
+        // Its next decode then fails in the actual reachable op's literal.
+        let extension = [0xbf820001, 0x3a0202ff, 0x3a0202ff, 0xffffffff, 0xbf810000];
+        let graph = analyze(&mut dis, &bytes(&extension)).unwrap();
+        assert_eq!((graph.steps, graph.dwords, graph.exits), (3, 4, 1));
+        assert_eq!(graph.linear, LinearResult::RejectOnExtensionWord);
         let fork = [0x7da80088, 0xbf880002, 0x4a020100, 0xbf810000, 0xbf810000];
         let graph = analyze(&mut dis, &bytes(&fork)).unwrap();
         assert_eq!((graph.steps, graph.exits), (5, 2));
+        assert_eq!(graph.linear, LinearResult::Complete);
         for (code, reason) in [
             ([0xbf820000, 0xffffffff], Blocker::Decode),
             ([0xbf820002, 0xbf810000], Blocker::OutsideSpan),
