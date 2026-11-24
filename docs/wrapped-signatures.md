@@ -38,6 +38,8 @@ The 52-byte block begins after its size word. Payload offsets `+20` and `+24` ar
 
 Four of 2,689 CS wrappers declare `(32, 32)` wave bounds. All other wrappers have `(0, 0xffffffff)`, the unspecified pair; this is not evidence for wave64 or for a particular native wave mode. All CS and MS wrappers have three nonzero thread dimensions; all PS, VS and GS wrappers have three zero dimensions. These are source declarations, not validated native launch dimensions or Metal device limits.
 
+For PS, payload bytes `+4` and `+5` are the `DepthOutput` and `SampleFrequency` flags. `SampleFrequency` is zero throughout. All 1,171 wrappers with `DepthOutput = 1` have exactly one unallocated PSV0 output element with semantic kind `Depth` (1,156), `DepthLessEqual` (12), or `DepthGreaterEqual` (3). The 10,930 remaining PS wrappers have no depth-kind or unallocated output element. “Unallocated” here means outside the packed vector signature, not absent from shader outputs or proof of native depth export behavior.
+
 ## PSV0 resource declarations
 
 After the 52-byte runtime-info block, the payload has a `u32` row count at `+56`. If nonzero, a `u32` stride at `+60` is 24 in every checked file, with rows starting at `+64`. If zero, no stride word is consumed. The six little-endian row words are resource type, register space, lower bound, upper bound, kind and flags. The checker verifies type in 1–8, ordered bounds, and complete table extent. The resource checker stops at the end of this table; the element checker starts there.
@@ -76,7 +78,7 @@ The public DXC `PSVSignatureElement0` layout gives the following remaining field
 |---|---|
 | +9 | Start row, meaningful only if allocated |
 | +10 | Column count (bits 0–3), start column (4–5), allocated (6), zero bit (7) |
-| +11/+12/+13 | Semantic kind, component type, interpolation mode; meanings not compared here |
+| +11/+12/+13 | Semantic kind, component type, interpolation mode; pixel depth kinds checked above, component type and interpolation not compared |
 | +14 | Dynamic-index mask (0–3), output stream (4–5), zero bits (6–7) |
 | +15 | Reserved zero byte |
 

@@ -102,6 +102,7 @@ enum Semantic {
 #[derive(Debug, PartialEq, Eq)]
 struct Element {
     semantic: Semantic,
+    kind: u8,
     packing: Option<Packing>,
     dynamic: bool,
 }
@@ -146,6 +147,7 @@ struct Runtime {
     zero_dims: usize,
     positive_dims: usize,
     partial_dims: usize,
+    depth: PixelDepth,
 }
 
 impl Runtime {
@@ -168,6 +170,37 @@ impl Runtime {
             3 => self.positive_dims += 1,
             _ => self.partial_dims += 1,
         }
+        Some(())
+    }
+}
+
+#[derive(Default, Debug, PartialEq, Eq)]
+struct PixelDepth {
+    declared: usize,
+    sample_frequency: usize,
+    kinds: [usize; 3],
+    files_disagreeing: usize,
+}
+
+impl PixelDepth {
+    fn add(&mut self, declared: u8, sample: u8, outputs: &[Element]) -> Option<()> {
+        if declared > 1 || sample > 1 {
+            return None;
+        }
+        let mut depth_count = 0;
+        let mut allocation_disagrees = false;
+        for r in outputs {
+            let depth = (17..=19).contains(&r.kind);
+            if depth {
+                depth_count += 1;
+                self.kinds[usize::from(r.kind - 17)] += 1;
+            }
+            allocation_disagrees |= depth != r.packing.is_none();
+        }
+        self.declared += usize::from(declared);
+        self.sample_frequency += usize::from(sample);
+        self.files_disagreeing +=
+            usize::from(depth_count != usize::from(declared) || allocation_disagrees);
         Some(())
     }
 }
@@ -219,6 +252,7 @@ fn psv_elements(psv: &[u8], at: usize) -> Option<([Vec<Element>; 3], &[u8])> {
                         (1, _) => Semantic::Single(key(&label[..e], word(index_bytes, first * 4)?)),
                         _ => Semantic::MultiRow,
                     },
+                    kind: r[11],
                     packing: packing(r)?,
                     dynamic: r[14] & 15 != 0,
                 });
@@ -465,6 +499,13 @@ pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
         let totals = groups.entry(stage).or_default();
         totals.resources.add(rows);
         totals.runtime.add(psv).ok_or("invalid PSV0 runtime info")?;
+        if stage == 0 {
+            totals
+                .runtime
+                .depth
+                .add(psv[4], psv[5], &elements[1])
+                .ok_or("unsupported PSV0 pixel runtime flags")?;
+        }
         totals.files += 1;
         let mut same = true;
         let mut occupancy = [[[0; 256]; 4]; 2];
@@ -539,6 +580,13 @@ pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
             runtime.positive_dims,
             runtime.partial_dims
         );
+        if stage == 0 {
+            let p = runtime.depth;
+            println!(
+                "  PSV0 pixel: {} depth declared, {} sample frequency; output depth kind counts {:?}, {} files where depth flags/kinds/allocation disagree",
+                p.declared, p.sample_frequency, p.kinds, p.files_disagreeing
+            );
+        }
         println!(
             "  PSV0: {} resource rows; {} files without rows, {} nonzero spaces, {} non-singleton ranges, {} nonzero flags",
             resources.rows,
@@ -667,6 +715,7 @@ mod tests {
         Element {
             semantic,
             packing: None,
+            kind: 0,
             dynamic: false,
         }
     }
@@ -677,6 +726,29 @@ mod tests {
             register: 0,
             primary: 1,
         }
+    }
+
+    #[test]
+    fn depth_check_counts_semantic_kinds_even_when_header_disagrees() {
+        let depth = Element {
+            kind: 18,
+            ..element(Semantic::Nameless)
+        };
+        let mut counts = PixelDepth::default();
+        counts.add(1, 0, std::slice::from_ref(&depth)).unwrap();
+        assert_eq!(counts.files_disagreeing, 0);
+        counts.add(0, 0, &[depth]).unwrap();
+        assert_eq!(
+            counts,
+            PixelDepth {
+                declared: 1,
+                sample_frequency: 0,
+                kinds: [0, 2, 0],
+                files_disagreeing: 1
+            }
+        );
+        counts.add(0, 0, &[element(Semantic::Nameless)]).unwrap();
+        assert_eq!(counts.files_disagreeing, 2); // Unallocated alone is not proof of depth.
     }
 
     #[test]
