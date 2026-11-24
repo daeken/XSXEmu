@@ -1,7 +1,11 @@
 //! Owned mesh/fragment fixture, not a retail launch or linkage model.
 #[cfg(target_os = "macos")]
+mod metal_artifact;
+
+#[cfg(target_os = "macos")]
 mod gpu {
     use metal::*;
+    use std::path::Path;
 
     const SOURCE: &str = r#"
 #include <metal_stdlib>
@@ -25,12 +29,129 @@ fragment float4 owned_mesh_fragment(Fragment in [[stage_in]]) {
 }
 "#;
 
+    // The SDK's macOS 15 mesh archive methods are not wrapped by metal 0.33.
+    #[allow(unexpected_cfgs)]
+    fn archive_pipeline(
+        dev: &DeviceRef,
+        desc: &MeshRenderPipelineDescriptorRef,
+        path: &Path,
+        bake: bool,
+    ) -> Result<RenderPipelineState, String> {
+        use metal::{
+            foreign_types::ForeignType,
+            objc::{
+                msg_send,
+                runtime::{BOOL, Object, YES},
+                sel, sel_impl,
+            },
+        };
+        if std::env::var_os("MTL_SHADER_VALIDATION").is_some() {
+            return Err("owned mesh archive requires GPU instrumentation disabled (unset MTL_SHADER_VALIDATION)".into());
+        }
+        let url = super::metal_artifact::file_url(path, bake).map_err(|e| e.to_string())?;
+        let archive_desc = BinaryArchiveDescriptor::new();
+        if !bake {
+            archive_desc.set_url(&url);
+        }
+        let archive = dev.new_binary_archive_with_descriptor(&archive_desc)?;
+        let strict = || unsafe {
+            let mut error: *mut Object = std::ptr::null_mut();
+            let reflection: *mut *mut Object = std::ptr::null_mut();
+            let raw: *mut MTLRenderPipelineState = msg_send![dev, newRenderPipelineStateWithMeshDescriptor:desc
+                options:MTLPipelineOption::FailOnBinaryArchiveMiss reflection:reflection error:&mut error];
+            if raw.is_null() {
+                let message = if error.is_null() {
+                    "unknown Metal error".into()
+                } else {
+                    let ns: *mut Object = msg_send![error, localizedDescription];
+                    let text: *const std::ffi::c_char = msg_send![ns, UTF8String];
+                    if text.is_null() {
+                        "missing NSError description".into()
+                    } else {
+                        std::ffi::CStr::from_ptr(text)
+                            .to_string_lossy()
+                            .lines()
+                            .next()
+                            .unwrap_or("empty NSError description")
+                            .trim()
+                            .to_owned()
+                    }
+                };
+                Err(format!("strict mesh pipeline: {message}"))
+            } else {
+                // The create selector returns an owned (+1) reference.
+                Ok(RenderPipelineState::from_ptr(raw))
+            }
+        };
+        // All receivers and arguments stay live across these synchronous Metal calls.
+        unsafe {
+            let supported: BOOL = msg_send![desc, respondsToSelector:sel!(setBinaryArchives:)];
+            if supported != YES {
+                return Err("mesh pipeline binary archives require macOS 15 or newer".into());
+            }
+            let supported: BOOL = msg_send![&*archive, respondsToSelector:sel!(addMeshRenderPipelineFunctionsWithDescriptor:error:)];
+            if supported != YES {
+                return Err("mesh archive insertion unavailable".into());
+            }
+            let archives = Array::<BinaryArchive>::from_slice(&[&archive]);
+            let _: () = msg_send![desc, setBinaryArchives:archives];
+            if bake {
+                let miss = strict()
+                    .err()
+                    .ok_or("unexpected strict mesh hit in empty archive")?;
+                if !miss.contains("in binary archives") {
+                    return Err(format!("expected empty mesh archive miss: {miss}"));
+                }
+                println!("empty archive rejected: {miss}");
+                let mut error: *mut Object = std::ptr::null_mut();
+                let added: BOOL = msg_send![&*archive, addMeshRenderPipelineFunctionsWithDescriptor:desc error:&mut error];
+                if added != YES {
+                    return Err("failed to add owned mesh descriptor to archive".into());
+                }
+            }
+        }
+        if bake && !archive.serialize_to_url(&url)? {
+            return Err("failed to serialize owned mesh archive".into());
+        }
+        let pipeline = strict()?;
+        println!("strict owned mesh archive hit");
+        Ok(pipeline)
+    }
+
     pub fn run() -> Result<(), String> {
+        let args: Vec<_> = std::env::args_os().skip(1).collect();
+        let (path, archive, mutate_expected) = match args.as_slice() {
+            [] => (None, None, false),
+            [mode] if mode == "--emit-msl" => {
+                print!("{SOURCE}");
+                return Ok(());
+            }
+            [mode, path] if mode == "--load-metallib" || mode == "--load-mutated-metallib" => (
+                Some(Path::new(path)),
+                None,
+                mode == "--load-mutated-metallib",
+            ),
+            [mode, lib, path] if mode == "--bake-archive" || mode == "--replay-archive" => (
+                Some(Path::new(lib)),
+                Some((Path::new(path), mode == "--bake-archive")),
+                false,
+            ),
+            _ => {
+                return Err(
+                    "usage: shader-metal-mesh-probe [--emit-msl | --load-metallib LIB | --load-mutated-metallib LIB | --bake-archive LIB ARCHIVE | --replay-archive LIB ARCHIVE]".into(),
+                );
+            }
+        };
         let dev = Device::system_default().ok_or("missing Metal device")?;
         if !dev.supports_family(MTLGPUFamily::Apple7) {
             return Err("owned mesh probe requires Apple GPU family 7 or newer".into());
         }
-        let lib = dev.new_library_with_source(SOURCE, &CompileOptions::new())?;
+        let lib = if let Some(path) = path {
+            super::metal_artifact::file_url(path, false).map_err(|e| e.to_string())?;
+            dev.new_library_with_file(path)?
+        } else {
+            dev.new_library_with_source(SOURCE, &CompileOptions::new())?
+        };
         let mesh = lib.get_function("owned_mesh", None)?;
         let frag = lib.get_function("owned_mesh_fragment", None)?;
         let desc = MeshRenderPipelineDescriptor::new();
@@ -42,7 +163,11 @@ fragment float4 owned_mesh_fragment(Fragment in [[stage_in]]) {
             .object_at(0)
             .ok_or("missing color slot")?
             .set_pixel_format(format);
-        let pipeline = dev.new_mesh_render_pipeline_state(&desc)?;
+        let pipeline = if let Some((path, bake)) = archive {
+            archive_pipeline(&dev, &desc, path, bake)?
+        } else {
+            dev.new_mesh_render_pipeline_state(&desc)?
+        };
         let queue = dev.new_command_queue();
         let tex_desc = TextureDescriptor::new();
         const SIDE: usize = 8;
@@ -54,7 +179,8 @@ fragment float4 owned_mesh_fragment(Fragment in [[stage_in]]) {
         tex_desc.set_storage_mode(MTLStorageMode::Private);
         tex_desc.set_usage(MTLTextureUsage::RenderTarget);
         let color = dev.new_texture(&tex_desc);
-        for (count, expected) in [(0u32, [255, 0, 0, 255]), (1, [0, 255, 255, 255])] {
+        let blue = if mutate_expected { 0 } else { 255 };
+        for (count, expected) in [(0u32, [255, 0, 0, 255]), (1, [0, 255, blue, 255])] {
             let pass = RenderPassDescriptor::new();
             let c = pass
                 .color_attachments()

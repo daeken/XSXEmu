@@ -27,7 +27,16 @@ MTL_DEBUG_LAYER=1 cargo run --locked --manifest-path tools/shader-inventory/Carg
   --features metal-probe --bin shader-metal-mesh-probe
 ```
 
-On Apple M4 (macOS 27.0.1), the source-compiled, no-object-stage mesh/fragment pipeline matched all 64 `RGBA8Unorm` pixels with primitive count zero (only the red clear color survives) and all 64 with count one (cyan from separate vertex green and flat per-primitive blue inputs). The same mesh threadgroup, triangle vertices, indices and primitive payload are supplied in both draws; only the explicit primitive count changes. This checks a local Metal lowering target for distinct vertex and primitive outputs and for suppressing rasterization by emitting zero primitives. It does not map the title's `PRIM` word, infer an Xbox message effect, or bake a mesh PSO archive.
+On Apple M4 (macOS 27.0.1), the source-compiled, no-object-stage mesh/fragment pipeline matched all 64 `RGBA8Unorm` pixels with primitive count zero (only the red clear color survives) and all 64 with count one (cyan from separate vertex green and flat per-primitive blue inputs). The same mesh threadgroup, triangle vertices, indices and primitive payload are supplied in both draws; only the explicit primitive count changes. This checks a local Metal lowering target for distinct vertex and primitive outputs and for suppressing rasterization by emitting zero primitives. It does not map the title's `PRIM` word or infer an Xbox message effect.
+
+For the same owned mesh fixture, run the offline and strict archive smoke with the optional Xcode MetalToolchain installed:
+
+```sh
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  sh tools/shader-inventory/smoke-mesh-metallib.sh
+```
+
+The script uses the public macOS 15 mesh binary archive API. On Apple M4, the offline metallib and the serialized archive loaded in a fresh process with `FailOnBinaryArchiveMiss` each reproduce the 128/128 pixels. The empty archive misses. An independent offline rebuild changes only the mesh stage's primitive blue payload to zero, preserving both entry names; standalone drawing turns cyan to green for count one, while replay against the original archive fails specifically at the mesh function. Scratch artifacts are not a portable cache, and this is not a title PSO bake.
 
 ## Offline library and strict PSO replay
 
