@@ -238,6 +238,11 @@ fn print_histogram<K: Ord + std::fmt::Display>(hist: Histogram<K>, class: &str) 
     }
 }
 
+// Count only launch register fields, not user-data contents or binding identities.
+fn launch_register_fields(rsrc2: usize) -> (usize, usize, usize) {
+    ((rsrc2 >> 1) & 31, (rsrc2 >> 7) & 7, (rsrc2 >> 11) & 3)
+}
+
 #[derive(Default)]
 struct Report {
     candidates: usize,
@@ -256,6 +261,10 @@ struct Report {
     shortlist_scc_branch: usize,
     small_single_raw_store: usize,
     smallest_store_steps: Option<usize>,
+    small_launch_fields: BTreeMap<(usize, usize, usize), usize>,
+    raw_store_launch_fields: BTreeMap<(usize, usize, usize), usize>,
+    smallest_store_features: Histogram<&'static str>,
+
     ops: Histogram<String>,
     features: Histogram<&'static str>,
     small_ops: Histogram<String>,
@@ -282,6 +291,8 @@ impl Report {
                 self.skipped_payloads += usize::from(skipped > 0);
                 if shortlist(&meta, &p) {
                     self.shortlisted += 1;
+                    let launch = launch_register_fields(meta.rsrc2);
+                    *self.small_launch_fields.entry(launch).or_default() += 1;
                     self.shortlist_scc_branch += usize::from(
                         p.ops.contains_key("s_cbranch_scc0")
                             || p.ops.contains_key("s_cbranch_scc1"),
@@ -307,8 +318,14 @@ impl Report {
                         .any(|(name, _)| name.starts_with("buffer_store_dword"));
                     if meta.group == [1, 1, 1] && stores == 1 && raw {
                         self.small_single_raw_store += 1;
-                        self.smallest_store_steps =
-                            Some(self.smallest_store_steps.unwrap_or(usize::MAX).min(p.steps));
+                        *self.raw_store_launch_fields.entry(launch).or_default() += 1;
+                        if self.smallest_store_steps.is_none_or(|n| p.steps < n) {
+                            self.smallest_store_steps = Some(p.steps);
+                            self.smallest_store_features = Histogram::default();
+                        }
+                        if self.smallest_store_steps == Some(p.steps) {
+                            self.smallest_store_features.merge(p.features.clone());
+                        }
                     }
                     self.small_ops.merge(p.ops.clone());
                     self.small_features.merge(p.features.clone());
@@ -353,6 +370,17 @@ impl Report {
             self.small_single_raw_store,
             self.smallest_store_steps
         );
+        for (class, fields) in [
+            ("shortlist", self.small_launch_fields),
+            ("single-raw-store", self.raw_store_launch_fields),
+        ] {
+            for ((user_sgprs, tgid_mask, tidig_comp), n) in fields {
+                println!(
+                    "{class} launch fields: user_sgprs={user_sgprs} tgid_xyz_mask={tgid_mask} tidig_comp={tidig_comp} payloads={n}"
+                );
+            }
+        }
+        print_histogram(self.smallest_store_features, "smallest raw-store feature");
         print_histogram(self.features, "feature");
         print_histogram(self.ops, "opcode");
         print_histogram(self.small_features, "shortlist feature");
@@ -422,6 +450,15 @@ pub fn run(lib: &OsStr, cpu: Cpu, root: &Path) -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn isolates_observed_launch_register_fields() {
+        assert_eq!(
+            launch_register_fields((31 << 1) | (7 << 7) | (3 << 11) | (1 << 10) | 1),
+            (31, 7, 3)
+        );
+        assert_eq!(launch_register_fields(0x998 | 0x1ff << 15), (12, 3, 1));
+    }
 
     #[test]
     fn control_requires_supported_mnemonic_width_and_encoding() {
