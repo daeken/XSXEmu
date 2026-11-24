@@ -8,6 +8,7 @@ enum Stage {
     Vertex,
     Pixel,
     PackedPixel,
+    DepthPixel,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -49,19 +50,37 @@ const PACKED_PS: &[u32] = &[
     0xbf81_0000,
 ];
 
+const DEPTH_PS: &[u32] = &[
+    0xf800_040f,
+    1, // exp mrt0 v1, v1, v0, v0 compr
+    0xf800_1881,
+    2, // exp mrtz v2, off, off, off done vm
+    0xbf81_0000,
+];
+
 impl Stage {
     fn input_registers(self) -> usize {
         match self {
             Stage::Vertex => 8,
             Stage::Pixel => 4,
             Stage::PackedPixel => 2,
+            Stage::DepthPixel => 3,
         }
     }
 
     fn exports(self) -> &'static [(Target, bool)] {
         match self {
             Stage::Vertex => &[(Target::Parameter, false), (Target::Position, true)],
-            Stage::Pixel | Stage::PackedPixel => &[(Target::Color, true)],
+            Stage::Pixel => &[(Target::Color, true)],
+            Stage::PackedPixel | Stage::DepthPixel => &[],
+        }
+    }
+
+    fn export_count(self) -> usize {
+        match self {
+            Stage::PackedPixel => 1,
+            Stage::DepthPixel => 2,
+            _ => self.exports().len(),
         }
     }
 }
@@ -85,7 +104,7 @@ fn lift(stage: Stage, words: &[u32]) -> Result<Vec<Op>, Reject> {
                 .then_some(())
                 .ok_or(Reject::Uninitialized(pc, r))
         };
-        if exported == stage.exports().len() && op != Op::End {
+        if exported == stage.export_count() && op != Op::End {
             return Err(Reject::BadEnd(pc));
         }
         match op {
@@ -107,9 +126,7 @@ fn lift(stage: Stage, words: &[u32]) -> Result<Vec<Op>, Reject> {
                 live[usize::from(dst.0)] = true;
             }
             Op::Export { target, src, done } => {
-                if stage == Stage::PackedPixel
-                    || stage.exports().get(exported) != Some(&(target, done))
-                {
+                if stage.exports().get(exported) != Some(&(target, done)) {
                     return Err(Reject::BadExports(pc));
                 }
                 for r in src {
@@ -118,9 +135,14 @@ fn lift(stage: Stage, words: &[u32]) -> Result<Vec<Op>, Reject> {
                 exported += 1;
             }
             Op::PackedColor0 { src, done, vm } => {
-                // Owned contract: one final FP16_ABGR export, no EXEC changes,
-                // no discard or other writes. Metal raster coverage is the valid mask.
-                if stage != Stage::PackedPixel || !done || !vm || exported != 0 {
+                // An explicit FP16_ABGR target. Neither profile changes EXEC;
+                // the final export must communicate ordinary raster coverage.
+                let valid = match stage {
+                    Stage::PackedPixel => done && vm,
+                    Stage::DepthPixel => !done && !vm,
+                    _ => false,
+                };
+                if !valid || exported != 0 {
                     return Err(Reject::BadExports(pc));
                 }
                 for r in src {
@@ -128,8 +150,15 @@ fn lift(stage: Stage, words: &[u32]) -> Result<Vec<Op>, Reject> {
                 }
                 exported += 1;
             }
+            Op::FinalPixelDepth { src } => {
+                if stage != Stage::DepthPixel || exported != 1 {
+                    return Err(Reject::BadExports(pc));
+                }
+                require(src)?;
+                exported += 1;
+            }
             Op::End => {
-                if pc + width != words.len() || exported != stage.exports().len() {
+                if pc + width != words.len() || exported != stage.export_count() {
                     return Err(Reject::BadEnd(pc));
                 }
                 ops.push(op);
@@ -143,6 +172,10 @@ fn lift(stage: Stage, words: &[u32]) -> Result<Vec<Op>, Reject> {
 }
 
 fn body(out: &mut String, ops: &[Op]) {
+    emit_body(out, ops, "out");
+}
+
+fn emit_body(out: &mut String, ops: &[Op], packed_color_lvalue: &str) {
     for op in ops {
         match *op {
             Op::Move {
@@ -198,7 +231,10 @@ fn body(out: &mut String, ops: &[Op]) {
                 src: [Vgpr(rg), Vgpr(ba)],
                 ..
             } => {
-                writeln!(out, "  out = float4(float(as_type<half>(ushort(r[{rg}]))), float(as_type<half>(ushort(r[{rg}] >> 16))), float(as_type<half>(ushort(r[{ba}]))), float(as_type<half>(ushort(r[{ba}] >> 16))));").unwrap();
+                writeln!(out, "  {packed_color_lvalue} = float4(float(as_type<half>(ushort(r[{rg}]))), float(as_type<half>(ushort(r[{rg}] >> 16))), float(as_type<half>(ushort(r[{ba}]))), float(as_type<half>(ushort(r[{ba}] >> 16))));").unwrap();
+            }
+            Op::FinalPixelDepth { src: Vgpr(r) } => {
+                writeln!(out, "  out.depth = as_type<float>(r[{r}]);").unwrap();
             }
             Op::End => out.push_str("  return out;\n}\n"),
         }
@@ -277,6 +313,21 @@ pub fn translate_packed_color_fixture() -> Result<String, Reject> {
     Ok(msl)
 }
 
+#[allow(dead_code)] // Separate owned depth probe, not the keyed graphics fixture.
+pub fn translate_depth_fixture() -> Result<String, Reject> {
+    let vs = lift(Stage::Vertex, VS)?;
+    let ps = lift(Stage::DepthPixel, DEPTH_PS)?;
+    let mut msl = vertex_module(&vs);
+    msl.push_str(
+        "struct DepthOutputs { float4 color [[color(0)]]; float depth [[depth(any)]]; };\n\
+fragment DepthOutputs depth_ps(constant uint4 &input [[buffer(0)]]) {\n\
+  uint r[256]; DepthOutputs out;\n\
+  r[0] = input.x; r[1] = input.y; r[2] = input.z;\n",
+    );
+    emit_body(&mut msl, &ps, "out.color");
+    Ok(msl)
+}
+
 fn vertex_module(vs: &[Op]) -> String {
     // Only the entry/binding convention and one interpolation rule are authored
     // here. All moves, arithmetic, output operands and returns come from the lift.
@@ -308,7 +359,7 @@ mod tests {
             io::Write,
             process::{Command, Stdio},
         };
-        let asm = "v_mov_b32_e32 v8, v4\nexp param0 v8, v5, v6, v7\nexp pos0 v0, v1, v2, v3 done\ns_endpgm\nv_add_f32_e32 v4, 0.25, v0\nv_fma_f32 v5, v1, v2, v3\nv_mul_legacy_f32_e32 v6, v5, v4\nv_mul_legacy_f32_e32 v6, 0.5, v6\nv_mul_legacy_f32_e32 v7, 0, v3\nexp mrt0 v4, v5, v6, v7 done\ns_endpgm\nv_mul_legacy_f32_e32 v2, v0, v1\nv_mul_legacy_f32_e32 v3, 0.25, v1\nv_fmac_f32_e32 v4, v0, v1\nexp mrt0 v1, v1, v0, v0 done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\n";
+        let asm = "v_mov_b32_e32 v8, v4\nexp param0 v8, v5, v6, v7\nexp pos0 v0, v1, v2, v3 done\ns_endpgm\nv_add_f32_e32 v4, 0.25, v0\nv_fma_f32 v5, v1, v2, v3\nv_mul_legacy_f32_e32 v6, v5, v4\nv_mul_legacy_f32_e32 v6, 0.5, v6\nv_mul_legacy_f32_e32 v7, 0, v3\nexp mrt0 v4, v5, v6, v7 done\ns_endpgm\nv_mul_legacy_f32_e32 v2, v0, v1\nv_mul_legacy_f32_e32 v3, 0.25, v1\nv_fmac_f32_e32 v4, v0, v1\nexp mrt0 v1, v1, v0, v0 done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrtz v2, off, off, off done vm\ns_endpgm\n";
         let expected: Vec<u8> = VS
             .iter()
             .chain(PS)
@@ -316,7 +367,7 @@ mod tests {
             .chain(EDGE_LITERAL)
             .chain(EDGE_FMAC)
             .chain(PACKED_PS)
-            .chain(&[0xf800_040f, 0x0000_0001])
+            .chain(DEPTH_PS)
             .flat_map(|w| w.to_le_bytes())
             .collect();
         for cpu in ["gfx1013", "gfx1030"] {
@@ -373,6 +424,41 @@ mod tests {
         }
         assert_eq!(
             decode(&[PACKED_PS[0], 0x10001], 0),
+            Err(DecodeError::Unsupported(0))
+        );
+    }
+
+    #[test]
+    fn depth_profile_requires_color_then_depth_and_a_real_end() {
+        assert_eq!(lift(Stage::DepthPixel, DEPTH_PS).unwrap().len(), 3);
+        assert_eq!(
+            lift(Stage::DepthPixel, &DEPTH_PS[..4]),
+            Err(Reject::BadEnd(4))
+        );
+        let mut ps = DEPTH_PS.to_vec();
+        ps[0] = PACKED_PS[0]; // premature DONE+VM
+        assert_eq!(lift(Stage::DepthPixel, &ps), Err(Reject::BadExports(0)));
+        ps[0] = DEPTH_PS[0];
+        ps[3] = 3;
+        assert_eq!(
+            lift(Stage::DepthPixel, &ps),
+            Err(Reject::Uninitialized(2, 3))
+        );
+        assert_eq!(
+            lift(Stage::PackedPixel, &DEPTH_PS[2..]),
+            Err(Reject::BadExports(0))
+        );
+        for header in [
+            0xf800_0081,
+            0xf800_0881,
+            0xf800_1081,
+            0xf800_1883,
+            0xf800_1c81,
+        ] {
+            assert_eq!(decode(&[header, 2], 0), Err(DecodeError::Unsupported(0)));
+        }
+        assert_eq!(
+            decode(&[DEPTH_PS[2], 0x0102], 0),
             Err(DecodeError::Unsupported(0))
         );
     }

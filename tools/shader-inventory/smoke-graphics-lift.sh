@@ -66,3 +66,9 @@ expect_mismatch --replay-archive "$d/owned.metallib" "$d/owned.metalar" "$compil
 "$p" --emit-packed-msl > "$d/packed.metal"
 compile packed
 "$p" --load-packed-metallib "$d/packed.metallib"
+
+# Scalar depth with explicit Depth32Float and overlapping draws.
+"$p" --depth-source
+"$p" --emit-depth-msl > "$d/depth.metal"
+compile depth
+"$p" --load-depth-metallib "$d/depth.metallib"

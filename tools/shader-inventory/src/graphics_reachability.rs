@@ -447,7 +447,9 @@ impl LiftGaps {
                         Op::FmaF32 {
                             accumulate: false, ..
                         } => name == "v_fma_f32",
-                        Op::Export { .. } | Op::PackedColor0 { .. } => name == "exp",
+                        Op::Export { .. }
+                        | Op::PackedColor0 { .. }
+                        | Op::FinalPixelDepth { .. } => name == "exp",
                         Op::End => name == "s_endpgm",
                     }
             });

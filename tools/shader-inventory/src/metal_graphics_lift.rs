@@ -25,6 +25,41 @@ fn expected(x: usize, mutated: bool) -> [u8; 4] {
     [gradient, 255, ((red_numerator * 255 + 32) / 64) as u8, 0]
 }
 
+// Independent integer depth oracle (depth in eighths), with literal expected
+// colors rather than extracting values from the native ABI input words.
+#[cfg(any(test, target_os = "macos"))]
+fn expected_depth(x: usize, y: usize, raster: bool, writes: bool) -> [f32; 4] {
+    let mut z = 4;
+    let mut color = [1., 0., 1., 0.];
+    for (xs, vertex_z, shader_z, rgba) in [
+        (2..6, 7, 1, [-2., 0.25, 1.5, -0.5]),
+        (4..8, 1, 2, [0., 1., 0., 1.]),
+    ] {
+        let candidate = if raster { vertex_z } else { shader_z };
+        if xs.contains(&x) && (1..6).contains(&y) && candidate < z {
+            color = rgba;
+            if writes {
+                z = candidate;
+            }
+        }
+    }
+    color
+}
+
+#[test]
+fn depth_oracle_distinguishes_raster_depth_and_disabled_writes() {
+    assert_ne!(
+        expected_depth(2, 1, false, true),
+        expected_depth(2, 1, true, true)
+    );
+    assert_ne!(
+        expected_depth(4, 1, false, true),
+        expected_depth(4, 1, false, false)
+    );
+    assert_eq!(expected_depth(6, 1, false, true), [0., 1., 0., 1.]);
+    assert_eq!(expected_depth(0, 0, false, true), [1., 0., 1., 0.]);
+}
+
 #[cfg(target_os = "macos")]
 mod gpu {
     use super::*;
@@ -35,6 +70,8 @@ mod gpu {
         Source,
         PackedSource,
         PackedLoad(&'a Path),
+        DepthSource,
+        DepthLoad(&'a Path),
         Load(&'a Path, bool),
         Archive(&'a Path, &'a Path, bool, bool, [u8; 32]),
         ExpectStrictMiss(&'a Path, &'a Path),
@@ -62,6 +99,12 @@ mod gpu {
         let args: Vec<_> = std::env::args_os().skip(1).collect();
         let mode = match args.as_slice() {
             [] => Mode::Source,
+            [mode] if mode == "--depth-source" => Mode::DepthSource,
+            [mode, lib] if mode == "--load-depth-metallib" => Mode::DepthLoad(Path::new(lib)),
+            [mode] if mode == "--emit-depth-msl" => {
+                print!("{}", graphics_lift::translate_depth_fixture().map_err(|e| format!("depth lift rejected: {e:?}"))?);
+                return Ok(());
+            }
             [mode] if mode == "--packed-source" => Mode::PackedSource,
             [mode, lib] if mode == "--load-packed-metallib" => Mode::PackedLoad(Path::new(lib)),
             [mode] if mode == "--emit-packed-msl" => {
@@ -76,7 +119,7 @@ mod gpu {
             [mode, lib] if mode == "--load-metallib" || mode == "--load-mutated-metallib" => Mode::Load(Path::new(lib), mode == "--load-mutated-metallib"),
             [mode, lib, archive] if mode == "--expect-owned-metal-miss" => Mode::ExpectStrictMiss(Path::new(lib), Path::new(archive)),
             [mode, lib, archive, compiler] if mode == "--bake-archive" || mode == "--replay-archive" || mode == "--replay-mutated-archive" => Mode::Archive(Path::new(lib), Path::new(archive), mode == "--bake-archive", mode == "--replay-mutated-archive", owned_graphics_artifact::compiler_profile(compiler)?),
-            _ => return Err("usage: shader-metal-graphics-lift [--packed-source | --emit-packed-msl | --load-packed-metallib LIB | --emit-msl | --emit-mutated-msl | --load-metallib LIB | --load-mutated-metallib LIB | {--bake-archive|--replay-archive|--replay-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-owned-metal-miss MUTATED_LIB ARCHIVE]".into()),
+            _ => return Err("usage: shader-metal-graphics-lift [--depth-source | --emit-depth-msl | --load-depth-metallib LIB | --packed-source | --emit-packed-msl | --load-packed-metallib LIB | --emit-msl | --emit-mutated-msl | --load-metallib LIB | --load-mutated-metallib LIB | {--bake-archive|--replay-archive|--replay-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-owned-metal-miss MUTATED_LIB ARCHIVE]".into()),
         };
         if matches!(mode, Mode::Archive(..) | Mode::ExpectStrictMiss(..))
             && std::env::var_os("MTL_SHADER_VALIDATION").is_some()
@@ -99,9 +142,12 @@ mod gpu {
             None
         };
         let packed = matches!(mode, Mode::PackedSource | Mode::PackedLoad(_));
+        let depth = matches!(mode, Mode::DepthSource | Mode::DepthLoad(_));
         let lib = match mode {
-            Mode::Source | Mode::PackedSource => {
-                let msl = if packed {
+            Mode::Source | Mode::PackedSource | Mode::DepthSource => {
+                let msl = if depth {
+                    graphics_lift::translate_depth_fixture()
+                } else if packed {
                     graphics_lift::translate_packed_color_fixture()
                 } else {
                     graphics_lift::translate_fixture(None)
@@ -112,6 +158,7 @@ mod gpu {
                 dev.new_library_with_source(&msl, &options)?
             }
             Mode::PackedLoad(path)
+            | Mode::DepthLoad(path)
             | Mode::Load(path, _)
             | Mode::Archive(path, _, _, _, _)
             | Mode::ExpectStrictMiss(path, _) => {
@@ -120,7 +167,11 @@ mod gpu {
             }
         };
         let desc = RenderPipelineDescriptor::new();
-        let (format, pixel_bytes, default_ps) = if packed {
+        const DEPTH_FORMAT: MTLPixelFormat = MTLPixelFormat::Depth32Float;
+        let (format, pixel_bytes, default_ps) = if depth {
+            desc.set_depth_attachment_pixel_format(DEPTH_FORMAT);
+            (MTLPixelFormat::RGBA32Float, 16, "depth_ps")
+        } else if packed {
             (MTLPixelFormat::RGBA32Float, 16, "packed_ps")
         } else {
             (MTLPixelFormat::RGBA8Unorm, 4, "translated_ps")
@@ -213,6 +264,21 @@ mod gpu {
         attachment.set_clear_color(MTLClearColor::new(1., 0., 1., 0.));
         attachment.set_load_action(MTLLoadAction::Clear);
         attachment.set_store_action(MTLStoreAction::Store);
+        let depth_texture = depth.then(|| {
+            texture_desc.set_pixel_format(DEPTH_FORMAT);
+            dev.new_texture(&texture_desc)
+        });
+        let depth_state = depth_texture.as_ref().map(|texture| {
+            let attachment = pass.depth_attachment().expect("depth attachment");
+            attachment.set_texture(Some(texture));
+            attachment.set_clear_depth(0.5);
+            attachment.set_load_action(MTLLoadAction::Clear);
+            attachment.set_store_action(MTLStoreAction::DontCare);
+            let descriptor = DepthStencilDescriptor::new();
+            descriptor.set_depth_compare_function(MTLCompareFunction::Less);
+            descriptor.set_depth_write_enabled(true);
+            dev.new_depth_stencil_state(&descriptor)
+        });
         let queue = dev.new_command_queue();
         let cmd = queue.new_command_buffer();
         let enc = cmd.new_render_command_encoder(pass);
@@ -228,7 +294,31 @@ mod gpu {
             std::mem::size_of_val(&vertices) as u64,
             vertices.as_ptr().cast(),
         );
-        if packed {
+        if let Some(state) = depth_state.as_ref() {
+            enc.set_depth_stencil_state(state);
+            for (x, clip_z, inputs) in [
+                (2, 0.875f32, [0xb800_3e00u32, 0x3400_c000, 0x3e00_0000, 0]),
+                (4, 0.125f32, [0x3c00_0000u32, 0x3c00_0000, 0x3e80_0000, 0]),
+            ] {
+                let mut tri = vertices;
+                for vertex in &mut tri {
+                    vertex[2] = clip_z;
+                }
+                enc.set_vertex_bytes(0, std::mem::size_of_val(&tri) as u64, tri.as_ptr().cast());
+                enc.set_scissor_rect(MTLScissorRect {
+                    x,
+                    y: 1,
+                    width: 4,
+                    height: 5,
+                });
+                enc.set_fragment_bytes(
+                    0,
+                    std::mem::size_of_val(&inputs) as u64,
+                    inputs.as_ptr().cast(),
+                );
+                enc.draw_primitives(MTLPrimitiveType::Triangle, 0, 3);
+            }
+        } else if packed {
             enc.set_scissor_rect(MTLScissorRect {
                 x: 2,
                 y: 1,
@@ -242,7 +332,9 @@ mod gpu {
                 inputs.as_ptr().cast(),
             );
         }
-        enc.draw_primitives(MTLPrimitiveType::Triangle, 0, 3);
+        if !depth {
+            enc.draw_primitives(MTLPrimitiveType::Triangle, 0, 3);
+        }
         enc.end_encoding();
         let readback = dev.new_buffer(BYTES as u64, MTLResourceOptions::StorageModeShared);
         let ptr = readback.contents().cast::<u8>();
@@ -279,7 +371,13 @@ mod gpu {
                 let got = &pixels[at..at + pixel_bytes];
                 let ordinary;
                 let fp32;
-                let expected: &[u8] = if packed {
+                let expected: &[u8] = if depth {
+                    fp32 = expected_depth(x, y, false, true)
+                        .map(f32::to_le_bytes)
+                        .as_flattened()
+                        .to_owned();
+                    &fp32
+                } else if packed {
                     // Independent numeric oracle; this does not unpack input dwords.
                     let rgba: [f32; 4] = if (2..6).contains(&x) && (1..6).contains(&y) {
                         [-2., 0.25, 1.5, -0.5]
@@ -304,7 +402,7 @@ mod gpu {
             println!("published owned graphics artifact identity");
         }
         println!(
-            "{} translated GFX10 VS+PS (mutated={mutated}, packed={packed}): {n}/{n} pixels matched",
+            "{} translated GFX10 VS+PS (mutated={mutated}, packed={packed}, depth={depth}): {n}/{n} pixels matched",
             dev.name(),
             n = SIDE * SIDE
         );

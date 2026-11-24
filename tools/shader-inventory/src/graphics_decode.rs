@@ -47,6 +47,9 @@ pub(crate) enum Op {
         done: bool,
         vm: bool,
     },
+    FinalPixelDepth {
+        src: Vgpr,
+    },
     End,
 }
 
@@ -144,6 +147,20 @@ pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeErro
                     Vgpr((fields >> 18) as u8),
                 ],
                 accumulate: false,
+            },
+        ));
+    }
+    // MRTZ, scalar float Z only, DONE+VM, no reserved bits. Off operands
+    // must have the canonical zero source bytes for this subset.
+    if w == 0xf800_1881 {
+        let fields = ext()?;
+        if fields >> 8 != 0 {
+            return Err(DecodeError::Unsupported(pc));
+        }
+        return Ok((
+            2,
+            Op::FinalPixelDepth {
+                src: Vgpr(fields as u8),
             },
         ));
     }
