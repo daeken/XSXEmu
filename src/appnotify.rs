@@ -111,4 +111,63 @@ pub(crate) mod native {
     pub(crate) extern "win64" fn unregister_constrained(token: usize) {
         unregister(Kind::Constrained, token);
     }
+
+    #[cfg(test)]
+    #[test]
+    fn cross_kind_and_stale_tokens_cannot_remove_live_registrations() {
+        let mut state = 0;
+        let mut constrained = 0;
+        assert_eq!(unsafe { register_state(1, 0, &mut state) }, 0);
+        assert_eq!(unsafe { register_constrained(2, 0, &mut constrained) }, 0);
+        assert_ne!(state, constrained);
+        let live = |token, kind| {
+            REGISTRY
+                .lock()
+                .unwrap()
+                .slots
+                .iter()
+                .flatten()
+                .any(|r| r.token == token && r.kind == kind)
+        };
+        unregister_state(constrained);
+        unregister_constrained(state);
+        assert!(live(state, Kind::State));
+        assert!(live(constrained, Kind::Constrained));
+
+        unregister_state(state);
+        assert!(!live(state, Kind::State));
+        let mut replacement = 0;
+        assert_eq!(unsafe { register_state(1, 0, &mut replacement) }, 0);
+        assert_ne!(state, replacement);
+        unregister_state(state);
+        assert!(live(replacement, Kind::State));
+        assert!(live(constrained, Kind::Constrained));
+
+        let mut output = usize::MAX;
+        assert_eq!(unsafe { register_constrained(0, 0, &mut output) }, 87);
+        assert_eq!(output, 0);
+        assert_eq!(unsafe { register_state(1, 0, std::ptr::null_mut()) }, 87);
+        unregister_state(replacement);
+        unregister_constrained(constrained);
+        assert!(REGISTRY.lock().unwrap().slots.iter().all(Option::is_none));
+
+        // Model an already-full registry without logging dozens of registrations.
+        {
+            let mut registry = REGISTRY.lock().unwrap();
+            let start = registry.next;
+            for (index, slot) in registry.slots.iter_mut().enumerate() {
+                *slot = Some(Registration {
+                    token: start + index,
+                    kind: Kind::State,
+                    _callback: 1,
+                    _context: 0,
+                });
+            }
+            registry.next += registry.slots.len();
+        }
+        output = usize::MAX;
+        assert_eq!(unsafe { register_state(1, 0, &mut output) }, 8);
+        assert_eq!(output, 0);
+        REGISTRY.lock().unwrap().slots.fill(None);
+    }
 }
