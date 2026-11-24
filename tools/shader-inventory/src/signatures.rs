@@ -89,7 +89,7 @@ enum Element {
     Single(Key),
 }
 
-fn psv_elements(psv: &[u8], at: usize) -> Option<([Vec<Element>; 3], usize)> {
+fn psv_elements(psv: &[u8], at: usize) -> Option<([Vec<Element>; 3], &[u8])> {
     let size = word(psv, at)?;
     let start = at.checked_add(4)?;
     let end = start.checked_add(size)?;
@@ -138,7 +138,56 @@ fn psv_elements(psv: &[u8], at: usize) -> Option<([Vec<Element>; 3], usize)> {
         }
         end
     };
-    Some((groups, psv.len().checked_sub(end)?))
+    Some((groups, psv.get(end..)?))
+}
+
+#[derive(Default, Debug, PartialEq, Eq)]
+struct Dependencies {
+    files: usize,
+    dwords: usize,
+    masks_with_high_bits: usize,
+}
+
+impl Dependencies {
+    // DXC's PSVRuntimeInfo1 layout, restricted to observed stages and no ViewID.
+    // One packed output-component mask per input component, separately by stream.
+    fn add(&mut self, header: &[u8], mut tail: &[u8]) -> Option<()> {
+        if *header.get(29)? != 0 {
+            return None;
+        }
+        let streams = match *header.get(28)? {
+            0 | 1 | 5 => 1,
+            2 => 4,
+            13 => 0, // Mesh has no input-to-output table in this profile.
+            _ => return None,
+        };
+        let inputs = usize::from(*header.get(35)?);
+        let outputs = header.get(36..36 + streams)?;
+        let length = tail.len();
+        let mut high = 0;
+        for &vectors in outputs {
+            let vectors = usize::from(vectors);
+            if vectors == 0 || inputs == 0 {
+                continue;
+            }
+            let stride = 4 * vectors.div_ceil(8);
+            let size = 4 * inputs * stride;
+            let table = tail.get(..size)?;
+            if vectors % 8 != 0 {
+                for mask in table.chunks_exact(stride) {
+                    high += usize::from(word(mask, stride - 4)? >> (4 * (vectors % 8)) != 0);
+                }
+            }
+            tail = &tail[size..];
+        }
+        if !tail.is_empty() {
+            return None;
+        }
+        self.files += usize::from(length != 0);
+        self.dwords += length / 4;
+        self.masks_with_high_bits += high;
+        Some(())
+    }
 }
 
 #[derive(Default, Debug, PartialEq, Eq)]
@@ -194,10 +243,10 @@ impl Resources {
 }
 
 pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
-    let mut groups = BTreeMap::<u16, (usize, [Count; 2], Resources)>::new();
+    let mut groups = BTreeMap::<u16, (usize, [Count; 2], Resources, Dependencies)>::new();
     let mut bytes = Vec::new();
     let mut files = 0;
-    let (mut count_disagreements, mut patch_rows, mut opaque_suffixes) = (0, 0, 0);
+    let (mut count_disagreements, mut patch_rows) = (0, 0);
     let mut correspondence = [Correspondence::default(), Correspondence::default()];
     for entry in fs::read_dir(path)? {
         let entry = entry?;
@@ -229,12 +278,15 @@ pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
         let psv = part(b"PSV0").ok_or("missing unique PSV0")?;
         let rows = resource_rows(psv, stage).ok_or("unsupported PSV0 resource table or stage")?;
         let elems_at = if rows.is_empty() { 60 } else { 64 + rows.len() };
-        let (elements, opaque) =
+        let (elements, suffix) =
             psv_elements(psv, elems_at).ok_or("unsupported PSV0 element table")?;
         patch_rows += elements[2].len();
-        opaque_suffixes += usize::from(opaque != 0);
         let totals = groups.entry(stage).or_default();
         totals.2.add(rows);
+        totals
+            .3
+            .add(psv, suffix)
+            .ok_or("unsupported PSV0 dependency profile or invalid suffix extent")?;
         totals.0 += 1;
         let mut same = true;
         for (i, (tag, total)) in [b"ISG1", b"OSG1"]
@@ -254,7 +306,7 @@ pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
         count_disagreements += usize::from(!same);
     }
     println!(
-        "PSV0 element tables: {count_disagreements} files differ from DXBC input/output row counts; {patch_rows} patch/primitive rows; {opaque_suffixes} files with unparsed bytes after elements"
+        "PSV0 element tables: {count_disagreements} files differ from DXBC input/output row counts; {patch_rows} patch/primitive rows"
     );
     println!(
         "{files} wrapped DXBC files with agreeing DXIL/PSV0 stages and checked ISG1/OSG1 rows"
@@ -265,7 +317,7 @@ pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
             c.named_single, c.unmatched, c.ordinal_mismatch, c.nameless_single, c.multi
         );
     }
-    for (stage, (files, sizes, resources)) in groups {
+    for (stage, (files, sizes, resources, deps)) in groups {
         println!("{} (stage {stage}): {files} files", stage_name(stage));
         println!(
             "  PSV0: {} resource rows; {} files without rows, {} nonzero spaces, {} non-singleton ranges, {} nonzero flags",
@@ -274,6 +326,10 @@ pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
             resources.nonzero_space,
             resources.nonunit,
             resources.flags_nonzero
+        );
+        println!(
+            "  PSV0 dependencies: {} files with tables, {} dwords, {} masks with high bits outside vector extent",
+            deps.files, deps.dwords, deps.masks_with_high_bits
         );
         for (tag, c) in ["ISG1", "OSG1"].into_iter().zip(sizes) {
             println!(
@@ -289,20 +345,54 @@ pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
 mod tests {
     use super::*;
     #[test]
-    fn validates_psv_semantic_indices_and_reports_opaque_tail() {
+    fn validates_psv_semantic_indices_and_returns_exact_suffix() {
         let mut psv = [0; 97];
         for (at, v) in [(32, 1), (60, 4), (64, b'X'), (68, 1), (76, 16), (88, 1)] {
             psv[at] = v;
         }
         assert_eq!(
             psv_elements(&psv, 60),
-            Some(([vec![Element::Single(key(b"x", 0))], vec![], vec![]], 1))
+            Some((
+                [vec![Element::Single(key(b"x", 0))], vec![], vec![]],
+                &psv[96..]
+            ))
         );
         psv[88] = 2;
         assert!(psv_elements(&psv, 60).is_none());
         psv[88] = 1;
         psv[80] = 4;
         assert!(psv_elements(&psv, 60).is_none());
+    }
+
+    #[test]
+    fn dependency_tail_consumes_separate_gs_stream_tables() {
+        let mut header = [0; 40];
+        header[28] = 2;
+        header[35] = 1;
+        header[36..40].copy_from_slice(&[1, 0, 9, 0]);
+        let mut bytes = [0; 49]; // 4 input components × (1 + 2) dwords.
+        bytes[3] = 0x80; // Outside the one-vector extent.
+        bytes[23] = 0x80; // Outside the nine-vector extent.
+        bytes[19] = 0x80; // Last bit of the first dword is within nine vectors.
+        let mut d = Dependencies::default();
+        assert!(d.add(&header, &bytes[..47]).is_none());
+        assert!(d.add(&header, &bytes[..49]).is_none());
+        d.add(&header, &bytes[..48]).unwrap();
+        assert_eq!(
+            d,
+            Dependencies {
+                files: 1,
+                dwords: 12,
+                masks_with_high_bits: 2
+            }
+        );
+        header[28] = 0;
+        assert!(d.add(&header, &bytes[..16]).is_some()); // Only stream 0.
+        header[28] = 13;
+        assert!(d.add(&header, &[]).is_some()); // MS has no table.
+        assert!(d.add(&header, &bytes[..16]).is_none());
+        header[29] = 1;
+        assert!(d.add(&header, &[]).is_none()); // Outside the checked profile.
     }
 
     #[test]

@@ -51,7 +51,7 @@ Every lower bound equals its upper bound in the checked corpus; the parser accep
 
 After the resources, a `u32` byte length prefixes a dword-aligned NUL-terminated string table. A `u32` entry count then prefixes that many `u32` semantic indices. Payload bytes `32`, `33` and `34` count the input, output and patch/primitive element groups. If their sum is nonzero, a `u32` stride of 16 precedes those elements. If the sum is zero, there is no stride word. An element's first two words address the string table (byte offset) and semantic-index table (row index), and byte 8 gives the number of semantic indices used. Both ranges are checked. Names can be empty here, unlike `ISG1`/`OSG1`; the remaining packing and interpolation bytes are not decoded, except that byte 15 must be zero.
 
-All 26,503 files agree on `PSV0` versus `ISG1`/`OSG1` input and output **row counts** independently; none has patch/primitive rows. 12,918 files have bytes after these tables; the scanner reports their presence but does not interpret them. The owned fixture checks scope and bounds of both references and demonstrates that tail bytes remain unparsed.
+All 26,503 files agree on `PSV0` versus `ISG1`/`OSG1` input and output **row counts** independently; none has patch/primitive rows. An owned fixture checks scope and bounds of both references and the exact start of the suffix.
 
 All 224,378 `PSV0` elements span one row in this corpus. For each named single-row element, the scanner consumes one matching signature key (ASCII case-folded name and semantic index) in the **same file and direction**. It counts ordinal disagreement separately, comparing the key at each element's original position without compacting away nameless elements. It counts and skips nameless single-row elements and multi-row elements instead of assuming a mapping for them.
 
@@ -61,3 +61,20 @@ All 224,378 `PSV0` elements span one row in this corpus. For each named single-r
 | Output | 75,115 | 0 | 20,759 | 44,111 | 0 |
 
 The named keys correspond, but a positional join does not. Neither the residual unmatched DXBC rows nor ordinal position establish an identity for individual nameless elements. This comparison does not establish type or mask equivalence, producer/consumer linkage, or hardware register layout. An owned fixture covers reordered keys, duplicate consumption, missing keys, and excluded element cases.
+
+## PSV0 input-to-output dependency tables
+
+The bytes after the signature elements are fully accounted for by the no-ViewID branch of the public [DXC PSV layout](https://github.com/microsoft/DirectXShaderCompiler/blob/main/include/dxc/DxilContainer/DxilPipelineStateValidation.h) (`PSVRuntimeInfo1`, `PSVDependencyTable`). Payload byte 29 (`UsesViewID`) is zero in all files. Byte 35 gives the input vector count, and bytes 36–39 give output vector counts per stream. Only stream 0 is used for PS, VS and CS; GS can have four separate tables, in stream order. MS has no input-to-output table in this profile. The scanner rejects out-of-profile ViewID and stage values rather than applying the rule to their suffixes.
+
+For each applicable stream with nonzero input and output vector counts, the table contains `4 × input_vectors` consecutive masks of `ceil(output_vectors / 8)` little-endian dwords each. Each mask has one bit per output component (four per output vector). The checker requires the tables to consume the suffix exactly and separately counts masks with high bits outside the output vector extent. An owned fixture covers multiple GS streams, a multi-dword mask, padding bits, truncation and trailing bytes.
+
+| Stage | Files with tables | Dependency dwords |
+|---|---:|---:|
+| PS | 10,487 | 353,880 |
+| VS | 2,236 | 18,156 |
+| GS | 195 | 1,540 |
+| CS | 0 | 0 |
+| MS | 0 | 0 |
+| Total | 12,918 | 373,576 |
+
+All 26,503 suffix extents match, with no mask bits set outside the declared vector extent. These tables describe source signature dependencies within one shader; the check does not tie those bits to native instructions, stage linkage or verified execution.
