@@ -112,12 +112,12 @@ pub(super) struct SourceInterface {
 }
 
 impl SourceInterface {
-    pub(super) fn ordinary_keys(bytes: &[u8]) -> Option<Vec<Key>> {
+    pub(super) fn ordinary_inputs(bytes: &[u8]) -> Option<Vec<(Key, usize, u32)>> {
         let (_, rows) = check(bytes)?;
         Some(
             rows.into_iter()
                 .filter(|r| ps_linkage_system(&r.key.0, r.system_code).is_none())
-                .map(|r| r.key)
+                .map(|r| (r.key, r.component_type, r.primary.count_ones()))
                 .collect(),
         )
     }

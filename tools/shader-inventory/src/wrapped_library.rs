@@ -176,7 +176,22 @@ impl VertexFields {
     }
 }
 
-fn layout_extent(blob: &[u8]) -> Option<(Vec<Key>, usize, VertexFields)> {
+// (DXBC component type, logical component count), after public DXGI conversion.
+fn vertex_format_shape(format: usize) -> Option<(usize, u32)> {
+    match format {
+        2 | 10 | 24 | 28 => Some((3, 4)),
+        6 => Some((3, 3)),
+        16 => Some((3, 2)),
+        17 => Some((1, 2)),
+        30 => Some((1, 4)),
+        41 => Some((3, 1)),
+        _ => None,
+    }
+}
+
+type Layout = (Vec<(Key, usize)>, usize, VertexFields);
+
+fn layout_extent(blob: &[u8]) -> Option<Layout> {
     let count = word(blob, 76)?;
     let mut cursor = 80usize;
     if count > blob.len().checked_sub(cursor)? / 30 {
@@ -199,10 +214,11 @@ fn layout_extent(blob: &[u8]) -> Option<(Vec<Key>, usize, VertexFields)> {
             return None;
         }
         cursor = stop.checked_add(24)?;
-        keys.push(semantic_key(name, word(blob, stop)?));
+        let format = word(blob, stop + 4)?;
+        keys.push((semantic_key(name, word(blob, stop)?), format));
         fields.observe(
             [
-                word(blob, stop + 4)?,
+                format,
                 word(blob, stop + 8)?,
                 word(blob, stop + 12)?,
                 word(blob, stop + 16)?,
@@ -359,7 +375,7 @@ pub(super) fn run(
     }
 
     let mut sources = HashMap::<SourceKey, SourceFamily>::new();
-    let mut vs_keys = HashMap::<SourceKey, Option<Vec<Key>>>::new();
+    let mut vs_keys = HashMap::<SourceKey, Option<Vec<(Key, usize, u32)>>>::new();
     let mut counts = BTreeMap::<u16, Payloads>::new();
     let (mut bytes, mut inflate) = (Vec::new(), Vec::new());
     let (mut files, mut joined_wrappers, mut work) = (0, 0, 0usize);
@@ -405,7 +421,7 @@ pub(super) fn run(
                     return Err("duplicate VS input signature".into());
                 }
                 let keys =
-                    SourceInterface::ordinary_keys(table).ok_or("invalid VS input signature")?;
+                    SourceInterface::ordinary_inputs(table).ok_or("invalid VS input signature")?;
                 let first = !vs_keys.contains_key(&(stage, key));
                 update_projection(vs_keys.entry((stage, key)).or_default(), keys, first);
             }
@@ -505,7 +521,8 @@ pub(super) fn run(
     // ever seen for the same program. Unknown slots stay in the grouping key.
     let mut graphics_rows = BTreeMap::<Vec<usize>, GraphicsCoverage>::new();
     let mut state_sizes = BTreeMap::<Vec<usize>, BTreeMap<usize, HashSet<_>>>::new();
-    let mut layouts_seen = HashMap::<_, Option<(Vec<Key>, usize, VertexFields)>>::new();
+    let mut layouts_seen = HashMap::<_, Option<Layout>>::new();
+    let mut format_matches = [0usize; 7];
     let mut vertex_fields = VertexFields::default();
     let mut vs_layout = BTreeMap::<Vec<usize>, [usize; 6]>::new();
     let mut layout_shapes = BTreeMap::<(usize, usize), usize>::new();
@@ -591,14 +608,34 @@ pub(super) fn run(
                 (_, None) => 3,
                 (_, Some(None)) => 4,
                 (Some((layout, _, _)), Some(Some(source))) => {
-                    if layout == source {
-                        0
+                    let ordered = layout.iter().map(|r| &r.0).eq(source.iter().map(|r| &r.0));
+                    let mut layout = layout.iter().collect::<Vec<_>>();
+                    let mut source = source.iter().collect::<Vec<_>>();
+                    layout.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                    source.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                    if layout.iter().map(|r| &r.0).eq(source.iter().map(|r| &r.0)) {
+                        if source.windows(2).any(|w| w[0].0 == w[1].0) {
+                            format_matches[6] += 1;
+                        } else {
+                            for ((_, format), (_, component, count)) in
+                                layout.into_iter().zip(source)
+                            {
+                                let Some((kind, width)) = vertex_format_shape(*format) else {
+                                    format_matches[5] += 1;
+                                    continue;
+                                };
+                                format_matches[usize::from(kind != *component)] += 1;
+                                let bucket = match width.cmp(count) {
+                                    std::cmp::Ordering::Equal => 2,
+                                    std::cmp::Ordering::Greater => 3,
+                                    std::cmp::Ordering::Less => 4,
+                                };
+                                format_matches[bucket] += 1;
+                            }
+                        }
+                        usize::from(!ordered)
                     } else {
-                        let mut layout = layout.iter().collect::<Vec<_>>();
-                        let mut source = source.iter().collect::<Vec<_>>();
-                        layout.sort_unstable();
-                        source.sort_unstable();
-                        if layout == source { 1 } else { 2 }
+                        2
                     }
                 }
             };
@@ -629,6 +666,9 @@ pub(super) fn run(
             "  VS ordinary input keys versus layout, slots {slots:?} [ordered equal, reordered equal, different, missing source, divergent source, unsupported extent]: {counts:?}"
         );
     }
+    println!(
+        "  Unique layout/VS key candidate format checks [type equal, type different, width equal, format more components, format fewer components, unknown format, duplicate-key PSO rows]: {format_matches:?}"
+    );
     for ((slot, multi), c) in source_links {
         let cohort = if multi {
             "Invariant multi-candidate"
@@ -790,7 +830,10 @@ mod tests {
         bytes[115..117].copy_from_slice(b"Z\0");
         assert_eq!(
             layout_extent(&bytes).map(|(keys, pad, _)| (keys, pad)),
-            Some((vec![semantic_key(b"xy", 0), semantic_key(b"z", 0)], 3))
+            Some((
+                vec![(semantic_key(b"xy", 0), 0), (semantic_key(b"z", 0), 0)],
+                3
+            ))
         );
         assert_eq!(layout_extent(&bytes[..143]), None);
         bytes[143] = 1;
