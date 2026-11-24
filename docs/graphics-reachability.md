@@ -18,11 +18,17 @@ The walk starts at stored-span offset `+40` as an explicit hypothesis. It follow
 | 5 (PS) | 12,101 | 12,091 | 10 unclassified `s_sendmsg` | 6,188 | 5,913 decode |
 | 7 (MS) | 9,282 | 0 | 9,282 `s_sendmsg` (`MSG_GS_ALLOC_REQ`) | 0 | 8,258 `MSG_GS_ALLOC_REQ`, 1,024 decode |
 
-The message classification requires the public four-byte SOPP opcode and recognized immediate fields to agree with LLVM's symbolic operands. Unrecognized cases stay grouped, with no operands printed. Only the first rejection is counted; neither the operation names nor the reported stream encoding establish how the Xbox schedules or couples stages. No message is treated as fallthrough or exit. The owned fixture also rejects noncanonical bits and a numeric-only operand presentation.
+The message classification requires the public four-byte SOPP opcode and recognized immediate fields to agree with LLVM's symbolic operands. Unrecognized cases stay grouped, with no operands printed. Only the first rejection is counted; neither the operation names nor the reported stream encoding establish how the Xbox schedules or couples stages. Strict graphs reject messages without assuming fallthrough or exit. The owned fixture also rejects noncanonical bits and a numeric-only operand presentation.
 
 None of the 158 stage-2 or 788 stage-4 first `s_swappc_b64` blockers matches the tested adjacent local `GETPC` + literal `ADD`/carry or `SUB`/borrow window with distinct ordinary source/destination register pairs, under either CPU or wave test. The same narrow literal-PC hypothesis also matches none of the 37 stage-2 first `s_setpc_b64` blockers under any decoder configuration. The classifier inspects only the immediately preceding checked fallthrough decode sequence; it does not rule out nonadjacent setup or other control-flow paths. It adds no successor and does not model a call, return, or link register.
 
-Every complete graph has at least one reachable eight-byte `exp` checked against LLVM and the public GFX10 encoding prefix. No export result is attributed to an incomplete graph. An owned fixture distinguishes reachable, branch-skipped, and seen-before-rejection exports under all four decoder configurations. This census does not establish payload coupling, message semantics, native linkage, authenticated entry, or executable Metal coverage. No title shader was executed or modified.
+Every complete strict graph has at least one reachable eight-byte `exp` checked against LLVM and the public GFX10 encoding prefix. No export result is attributed to an incomplete graph. An owned fixture distinguishes reachable, branch-skipped, and seen-before-rejection exports under all four decoder configurations. This census does not establish payload coupling, message semantics, native linkage, authenticated entry, or executable Metal coverage. No title shader was executed or modified.
+
+## Separate GS/MS message projection
+
+For GS/MS only, a second pass is run on strict first rejections at a recognized message. This pass assumes a single local fallthrough edge after each checked `s_sendmsg` in the public GS emit/cut/emit-cut, GS done/NOP, or GS allocation-request set. Other messages and control, graph extents, decoder errors, and the checked `s_endpgm` requirement are unchanged. No actual message effect, external state, invocation coupling, or guarantee of resumption is modeled.
+
+Under this hypothesis all 195 GS payloads complete in both CPU passes with no checked reachable `EXP`. All 9,282 eligible MS payloads complete with checked reachable `EXP` on `gfx1013`; all 8,258 eligible complete with `EXP` on `gfx1030`, and 1,024 rejected earlier by the strict decoder do not enter the projection. Both wave settings give the same aggregate counts. This is not part of the strict census or a substitute for checking message behavior on the title hardware.
 
 ## Native VS export projection
 

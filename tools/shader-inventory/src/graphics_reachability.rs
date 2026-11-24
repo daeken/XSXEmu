@@ -117,6 +117,14 @@ struct Exports {
 }
 
 fn checked_exports(dis: &mut Disassembler, bytes: &[u8]) -> Result<Exports, ResultClass> {
+    project_exports(dis, bytes, false)
+}
+
+fn project_exports(
+    dis: &mut Disassembler,
+    bytes: &[u8],
+    allow_checked_message_fallthrough: bool,
+) -> Result<Exports, ResultClass> {
     let mut scratch = [0; 1024];
     let mut unsupported = ResultClass::Decode;
     let mut pattern = PcPattern::default();
@@ -125,15 +133,23 @@ fn checked_exports(dis: &mut Disassembler, bytes: &[u8]) -> Result<Exports, Resu
         let (len, text) = dis.one(tail, pc * 4, &mut scratch)?;
         let name = text.split_ascii_whitespace().next()?;
         let first = word(tail, 0)? as u32;
-        let Some(flow) = control(name, first, len) else {
+        let msg = (name == "s_sendmsg").then(|| sendmsg_class(first, len, text));
+        let flow = control(name, first, len).or_else(|| {
+            (allow_checked_message_fallthrough
+                && msg
+                    .as_ref()
+                    .is_some_and(|m| *m != SendMsgClass::Unclassified))
+            .then_some(Flow::Next)
+        });
+        let Some(flow) = flow else {
             unsupported = if name == "s_swappc_b64" {
                 ResultClass::SwapPc(pattern.classify_swap(pc, len, first, bytes.len()))
             } else if name == "s_setpc_b64" {
                 ResultClass::SetPc(pattern.classify(pc, len, first, bytes.len()))
             } else if name.starts_with("s_setpc") || name.starts_with("s_swappc") {
                 ResultClass::UnmodeledPc(name.to_owned())
-            } else if name == "s_sendmsg" {
-                ResultClass::SendMsg(sendmsg_class(first, len, text))
+            } else if let Some(msg) = msg {
+                ResultClass::SendMsg(msg)
             } else {
                 ResultClass::OtherControl(name.to_owned())
             };
@@ -245,6 +261,7 @@ struct Counts {
     waves: [BTreeMap<ResultClass, usize>; 2],
     vertex_exports: [VertexExports; 2],
     different_vertex_exports: usize,
+    message_projection: [BTreeMap<ResultClass, usize>; 2],
 }
 
 pub fn run(lib: &OsStr, cpu: Cpu, root: &Path) -> Result<(), Box<dyn Error>> {
@@ -302,6 +319,19 @@ pub fn run(lib: &OsStr, cpu: Cpu, root: &Path) -> Result<(), Box<dyn Error>> {
                 }
             }
         }
+        if matches!(stage, 3 | 7) {
+            for ((outcome, dis), tally) in outcomes
+                .iter()
+                .zip(&mut waves)
+                .zip(&mut c.message_projection)
+            {
+                if matches!(outcome, Err(ResultClass::SendMsg(class)) if *class != SendMsgClass::Unclassified)
+                {
+                    let class = result_class(project_exports(dis, bytes, true));
+                    *tally.entry(class).or_default() += 1;
+                }
+            }
+        }
         let results = outcomes.map(result_class);
         c.different_wave_class += usize::from(results[0] != results[1]);
         for (result, counter) in results.into_iter().zip(&mut c.waves) {
@@ -329,6 +359,13 @@ pub fn run(lib: &OsStr, cpu: Cpu, root: &Path) -> Result<(), Box<dyn Error>> {
         );
         for (width, counts) in [64, 32].into_iter().zip(c.waves) {
             println!("  wave{width}: {counts:?}");
+        }
+        if matches!(stage, 3 | 7) {
+            for (width, counts) in [64, 32].into_iter().zip(c.message_projection) {
+                println!(
+                    "  wave{width} separate checked-message fallthrough projection: {counts:?}"
+                );
+            }
         }
         if stage == 4 {
             println!(
@@ -738,6 +775,22 @@ mod tests {
                         .flat_map(u32::to_le_bytes)
                         .collect();
                     assert_eq!(walk(&mut dis, &bytes), ResultClass::SendMsg(class));
+                    assert_eq!(
+                        result_class(project_exports(&mut dis, &bytes, true)),
+                        ResultClass::CompleteWithoutExp
+                    );
+                    assert_eq!(
+                        project_exports(&mut dis, &bytes[..4], true),
+                        Err(ResultClass::BadSuccessor)
+                    );
+                    let unknown: Vec<u8> = [msg, 0xbf90_0001, 0xbf81_0000]
+                        .into_iter()
+                        .flat_map(u32::to_le_bytes)
+                        .collect();
+                    assert_eq!(
+                        project_exports(&mut dis, &unknown, true),
+                        Err(ResultClass::SendMsg(SendMsgClass::Unclassified))
+                    );
                 }
             }
         }
