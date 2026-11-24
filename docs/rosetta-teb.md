@@ -334,6 +334,26 @@ DWORD, not a macOS thread ID. The initial guest TEB's `ClientId.UniqueThread`
 bridge preserves `LastError`; it does not add guest thread creation or handles.
 An owned PE imports it through `api-ms-win-core-processthreads-l1-1-0.dll` and
 checks the return against the TEB and verifies `LastError` across repeated calls.
+
+`CreateSemaphoreExW` uses the existing audited six-argument bridge. Read-only
+inspection of the two direct call sites targeting IAT RVA `0x6793ac8` shows
+null security and name, a caller-supplied signed initial count, maximum
+`0x7fff`, zero flags, and access `0x00100002` (`SYNCHRONIZE |
+SEMAPHORE_MODIFY_STATE`). The missing-import trace does not capture the
+live initial count; upstream static calls pass different values.
+
+The provider creates a typed guest handle owning a separate count/limit,
+with only those two explicit access bits supported. It accepts
+`0 <= initial <= maximum` and `maximum > 0`, and preserves LastError on
+success. Invalid counts or flags fail with `ERROR_INVALID_PARAMETER`;
+non-null security/name or unsupported access bits fail with
+`ERROR_NOT_SUPPORTED`. No pointer is dereferenced. Existing ordinary
+`DuplicateHandle` and `CloseHandle` share and release the object as usual;
+this change does not audit those APIs for static TLS. Named objects,
+security attributes, `ReleaseSemaphore`, and wait APIs remain unsupported.
+The owned PE tests both stack DWORDs with nonzero upper halves, distinct
+handles, and guest LastError on success and failure.
+
 `IsProcessorFeaturePresent` uses the ordinary provider's AMD64 baseline and
 runtime x86 feature detection, preserving `LastError`. It reports
 `PF_FASTFAIL_AVAILABLE` (23) as false: Windows `INT 29h` fast-fail handling is

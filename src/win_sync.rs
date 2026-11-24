@@ -97,7 +97,12 @@ pub(crate) fn lookup(dll: &[u8], name: &[u8]) -> Option<HostExport> {
         (b"kernelbase.dll" | b"kernel32.dll" | MEMORY, b"VirtualFree") => {
             export!("kernelbase.dll", "VirtualFree", native::virtual_free)
         }
-        // WaitForSingleObject needs a real waitable-handle registry.
+        (b"kernelbase.dll" | b"kernel32.dll" | SYNCH, b"CreateSemaphoreExW") => export!(
+            "kernelbase.dll",
+            "CreateSemaphoreExW",
+            crate::providers::win_io::native::create_semaphore_ex_w
+        ),
+        // Semaphore creation alone does not implement semaphore release or waits.
         _ => None,
     }
 }
@@ -136,7 +141,18 @@ mod registry_tests {
         }
         assert!(crate::providers::lookup(SYNCH, init).is_none());
         assert!(crate::providers::lookup(INTERLOCKED, b"initializeSListHead").is_none());
-        assert!(lookup(SYNCH, b"WaitForSingleObject").is_none());
+        let create = b"CreateSemaphoreExW";
+        let entry = crate::providers::lookup(SYNCH, create).unwrap();
+        assert_eq!(entry.provider, "kernelbase.dll");
+        assert_eq!(entry.symbol.as_bytes(), create);
+        for dll in [b"kernelbase.dll".as_slice(), b"kernel32.dll"] {
+            assert_eq!(Some(entry), crate::providers::lookup(dll, create));
+        }
+        assert!(crate::providers::lookup(SYNCH_12, create).is_none());
+        for name in [b"ReleaseSemaphore".as_slice(), b"WaitForSingleObject"] {
+            assert!(crate::providers::lookup(SYNCH, name).is_none());
+            assert!(crate::providers::lookup(b"kernelbase.dll", name).is_none());
+        }
         assert!(lookup(SYNCH, b"Sleep").is_none());
         assert!(lookup(SYNCH_12, b"sleep").is_none());
         assert!(!has_dll(b"api-ms-win-core-synch-l1-2-1.dll"));

@@ -306,12 +306,28 @@ pub(crate) mod native {
             self.pipe.changed.notify_all();
         }
     }
+    // SYNCHRONIZE | SEMAPHORE_MODIFY_STATE. No generic/standard rights mapping.
+    const SEMAPHORE_RIGHTS: u32 = 0x0010_0002;
+
+    fn semaphore_access(access: u32) -> Result<u32> {
+        if access & !SEMAPHORE_RIGHTS != 0 {
+            return Err(UNSUPPORTED);
+        }
+        Ok(access)
+    }
+
     enum Object {
         File(FileObject),
         #[cfg(target_os = "macos")]
         Console(Terminal),
         Pipe(PipeEnd),
         Search(Mutex<Search>),
+        // The object owns the count and limit, shared across duplicated handles.
+        #[allow(dead_code, reason = "wait and release are not implemented yet")]
+        Semaphore {
+            count: i32,
+            maximum: i32,
+        },
     }
     #[derive(Clone)]
     struct Entry {
@@ -719,6 +735,38 @@ pub(crate) mod native {
         )
     }
 
+    pub(crate) extern "win64" fn create_semaphore_ex_w(
+        security: *const c_void,
+        initial: i32,
+        maximum: i32,
+        name: *const u16,
+        flags: u32,
+        desired_access: u32,
+    ) -> usize {
+        ret(
+            (|| {
+                if initial < 0 || maximum <= 0 || initial > maximum || flags != 0 {
+                    return Err(INVALID_PARAM);
+                }
+                // No namespace, security descriptor or inheritance support.
+                // Neither pointer is dereferenced, including on failure.
+                if !name.is_null() || !security.is_null() {
+                    return Err(UNSUPPORTED);
+                }
+                let access = semaphore_access(desired_access)?;
+                lock(&STATE).insert(Entry {
+                    obj: Arc::new(Object::Semaphore {
+                        count: initial,
+                        maximum,
+                    }),
+                    access,
+                    inheritable: false,
+                })
+            })(),
+            0,
+        )
+    }
+
     pub(super) extern "win64" fn CloseHandle(h: usize) -> i32 {
         boolean((|| {
             let mut st = lock(&STATE);
@@ -768,7 +816,10 @@ pub(crate) mod native {
                 return Err(INVALID_PARAM);
             }
             if options & 2 == 0 {
-                let requested = access_mask(access)?;
+                let requested = match &*e.obj {
+                    Object::Semaphore { .. } => semaphore_access(access)?,
+                    _ => access_mask(access)?,
+                };
                 if requested & !e.access != 0 {
                     return Err(ACCESS);
                 }
@@ -781,6 +832,65 @@ pub(crate) mod native {
             }
             Ok(())
         })())
+    }
+
+    #[test]
+    fn semaphore_handles_own_typed_state_and_duplicate_without_escalation() {
+        use crate::providers::native::get_last_error;
+
+        let null = ptr::null();
+        set_last_error(0x1234);
+        let h = create_semaphore_ex_w(null, 3, 17, ptr::null(), 0, SEMAPHORE_RIGHTS);
+        assert_ne!(h, 0);
+        assert_eq!(get_last_error(), 0x1234);
+        let other = create_semaphore_ex_w(null, 0, 1, ptr::null(), 0, 2);
+        assert_ne!(other, 0);
+        assert_ne!(other, h);
+        let weak = {
+            let e = entry(h).unwrap();
+            let Object::Semaphore { count, maximum } = *e.obj else {
+                panic!("expected a semaphore object");
+            };
+            assert_eq!((count, maximum), (3, 17));
+            assert_eq!(e.access, SEMAPHORE_RIGHTS);
+            assert!(!e.inheritable);
+            Arc::downgrade(&e.obj)
+        };
+        assert_eq!(GetFileType(h), 0);
+        assert_eq!(get_last_error(), BAD_HANDLE);
+        let mut duplicate = 0;
+        unsafe {
+            assert_eq!(
+                DuplicateHandle(
+                    INVALID,
+                    other,
+                    INVALID,
+                    &mut duplicate,
+                    SEMAPHORE_RIGHTS,
+                    0,
+                    0
+                ),
+                0
+            );
+            assert_eq!(get_last_error(), ACCESS);
+            assert_eq!(
+                DuplicateHandle(INVALID, h, INVALID, &mut duplicate, 2, 0, 0),
+                1
+            );
+        }
+        assert_ne!(duplicate, h);
+        assert_eq!(entry(duplicate).unwrap().access, 2);
+        assert!(Arc::ptr_eq(
+            &entry(duplicate).unwrap().obj,
+            &weak.upgrade().unwrap()
+        ));
+        assert_eq!(CloseHandle(h), 1);
+        assert_eq!(CloseHandle(h), 0);
+        assert_eq!(get_last_error(), BAD_HANDLE);
+        assert!(weak.upgrade().is_some());
+        assert_eq!(CloseHandle(duplicate), 1);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(CloseHandle(other), 1);
     }
 
     fn std_slot(n: u32) -> Result<usize> {
@@ -1155,7 +1265,7 @@ pub(crate) mod native {
                 #[cfg(target_os = "macos")]
                 Object::Console(_) => Ok(2),
                 Object::Pipe(_) => Ok(3),
-                Object::Search(_) => Err(BAD_HANDLE),
+                Object::Search(_) | Object::Semaphore { .. } => Err(BAD_HANDLE),
             }),
             0,
         )

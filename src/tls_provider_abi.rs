@@ -172,6 +172,8 @@ audited_bridges! {
         proc::get_startup_info_w, (out: *mut proc::StartupInfoW) -> ();
     xsxemu_tls_is_processor_feature_present, is_processor_feature_present: b"kernelbase.dll", b"IsProcessorFeaturePresent",
         proc::is_processor_feature_present, (feature: u32) -> i32;
+    xsxemu_tls_create_semaphore_ex_w, create_semaphore_ex_w: b"kernelbase.dll", b"CreateSemaphoreExW",
+        io::create_semaphore_ex_w, (security: *const c_void, initial: i32, maximum: i32, name: *const u16, flags: u32, desired_access: u32) -> usize;
     xsxemu_tls_getstdhandle, getstdhandle: b"kernelbase.dll", b"GetStdHandle",
         io::GetStdHandle, (slot: u32) -> usize;
     xsxemu_tls_getfiletype, getfiletype: b"kernelbase.dll", b"GetFileType",
