@@ -10,10 +10,16 @@ enum ColorPipeline {
     Rgba,
     Green,
     AlphaBlend,
+    FragmentDepth,
 }
 
 impl ColorPipeline {
-    const ALL: [Self; 3] = [Self::Rgba, Self::Green, Self::AlphaBlend];
+    const ALL: [Self; 4] = [
+        Self::Rgba,
+        Self::Green,
+        Self::AlphaBlend,
+        Self::FragmentDepth,
+    ];
 }
 
 #[derive(Clone, Copy)]
@@ -25,7 +31,13 @@ struct Draw {
     depth_write: bool,
 }
 
-fn draws(overlay_depth_write: bool) -> [Draw; 5] {
+impl Draw {
+    fn fragment_depth(self) -> Option<u8> {
+        matches!(self.pipeline, ColorPipeline::FragmentDepth).then_some(8 - self.depth_eighths)
+    }
+}
+
+fn draws(overlay_depth_write: bool) -> [Draw; 7] {
     [
         Draw {
             x: (0, 7),
@@ -62,6 +74,20 @@ fn draws(overlay_depth_write: bool) -> [Draw; 5] {
             pipeline: ColorPipeline::AlphaBlend,
             depth_write: false,
         },
+        Draw {
+            x: (3, 4),
+            depth_eighths: 7, // Fails at raster depth, passes at fragment depth 1.
+            color: [255, 0, 255, 255],
+            pipeline: ColorPipeline::FragmentDepth,
+            depth_write: true,
+        },
+        Draw {
+            x: (3, 4),
+            depth_eighths: 2, // Rejected by the depth written by the previous fragment.
+            color: [255; 4],
+            pipeline: ColorPipeline::Rgba,
+            depth_write: true,
+        },
     ]
 }
 
@@ -72,11 +98,12 @@ fn reference(draws: &[Draw]) -> [[u8; 4]; WIDTH] {
     let mut depth = [8; WIDTH];
     for draw in draws {
         for x in draw.x.0..draw.x.1 {
-            if draw.depth_eighths >= depth[x] {
+            let z = draw.fragment_depth().unwrap_or(draw.depth_eighths);
+            if z >= depth[x] {
                 continue;
             }
             match draw.pipeline {
-                ColorPipeline::Rgba => row[x] = draw.color,
+                ColorPipeline::Rgba | ColorPipeline::FragmentDepth => row[x] = draw.color,
                 ColorPipeline::Green => row[x][1] = draw.color[1],
                 ColorPipeline::AlphaBlend => {
                     let a = u32::from(draw.color[3]);
@@ -89,7 +116,7 @@ fn reference(draws: &[Draw]) -> [[u8; 4]; WIDTH] {
                 }
             }
             if draw.depth_write {
-                depth[x] = draw.depth_eighths;
+                depth[x] = z;
             }
         }
     }
@@ -103,13 +130,14 @@ fn oracle_distinguishes_blend_mask_scissor_depth_test_and_depth_write() {
     let blended = [153, 102, 0, 153];
     let yellow = [255, 255, 0, 255];
     let blue = [0, 0, 255, 255];
+    let magenta = [255, 0, 255, 255];
     assert_eq!(
         reference(&draws(true)),
-        [red, blended, blue, blue, yellow, yellow, yellow, CLEAR]
+        [red, blended, blue, magenta, yellow, yellow, yellow, CLEAR]
     );
     assert_eq!(
         reference(&draws(false)),
-        [red, blended, blue, blue, blue, blue, yellow, CLEAR]
+        [red, blended, blue, magenta, blue, blue, yellow, CLEAR]
     );
 }
 
@@ -144,6 +172,11 @@ vertex float4 owned_vertex(uint id [[vertex_id]], constant float &z [[buffer(0)]
     return float4(corners[id], z, 1);
 }
 fragment float4 owned_fragment(constant float4 &color [[buffer(0)]]) { return color; }
+struct FragmentOutput { float4 color [[color(0)]]; float depth [[depth(any)]]; };
+fragment FragmentOutput owned_depth_fragment(constant float4 &color [[buffer(0)]],
+                                             constant float &depth [[buffer(1)]]) {
+    return FragmentOutput{color, depth};
+}
 "#;
 
     fn pipeline_descriptor(
@@ -152,7 +185,13 @@ fragment float4 owned_fragment(constant float4 &color [[buffer(0)]]) { return co
     ) -> Result<RenderPipelineDescriptor, String> {
         let desc = RenderPipelineDescriptor::new();
         let vs = lib.get_function("owned_vertex", None)?;
-        let ps = lib.get_function("owned_fragment", None)?;
+        let ps = lib.get_function(
+            match pipeline {
+                ColorPipeline::FragmentDepth => "owned_depth_fragment",
+                _ => "owned_fragment",
+            },
+            None,
+        )?;
         desc.set_vertex_function(Some(&vs));
         desc.set_fragment_function(Some(&ps));
         desc.set_raster_sample_count(1);
@@ -164,7 +203,9 @@ fragment float4 owned_fragment(constant float4 &color [[buffer(0)]]) { return co
         color.set_pixel_format(COLOR);
         color.set_blending_enabled(matches!(pipeline, ColorPipeline::AlphaBlend));
         color.set_write_mask(match pipeline {
-            ColorPipeline::Rgba | ColorPipeline::AlphaBlend => MTLColorWriteMask::All,
+            ColorPipeline::Rgba | ColorPipeline::AlphaBlend | ColorPipeline::FragmentDepth => {
+                MTLColorWriteMask::All
+            }
             ColorPipeline::Green => MTLColorWriteMask::Green,
         });
         if matches!(pipeline, ColorPipeline::AlphaBlend) {
@@ -306,6 +347,10 @@ fragment float4 owned_fragment(constant float4 &color [[buffer(0)]]) { return co
                 let rgba = draw.color.map(|v| f32::from(v) / 255.);
                 enc.set_vertex_bytes(0, 4, (&raw const z).cast());
                 enc.set_fragment_bytes(0, 16, rgba.as_ptr().cast());
+                if let Some(z) = draw.fragment_depth() {
+                    let output_z = f32::from(z) / 8.;
+                    enc.set_fragment_bytes(1, 4, (&raw const output_z).cast());
+                }
                 enc.draw_primitives(MTLPrimitiveType::Triangle, 0, 3);
             }
             enc.end_encoding();
