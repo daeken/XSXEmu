@@ -544,6 +544,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     run_alu(&dev, &queue, "ALU", &alu::FIXTURE)?;
     run_alu(&dev, &queue, "branch/literal", &alu::BRANCH_FIXTURE)?;
+    run_alu(&dev, &queue, "owned forward PC", &alu::PC_FORWARD_FIXTURE)?;
+    run_alu(&dev, &queue, "owned backward PC", &alu::PC_BACKWARD_FIXTURE)?;
     run_exec(&dev, &queue, None)?;
     run_buffer(&dev, &queue)?;
     run_exec_store(&dev, &queue, None)

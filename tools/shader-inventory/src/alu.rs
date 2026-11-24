@@ -16,12 +16,44 @@ pub const BRANCH_FIXTURE: [u32; 6] = [
     0x4a020100, 0xbf820001, 0xffffffff, 0x3a0202ff, 0xa5a5a5a5, 0xbf810000,
 ];
 
+pub const PC_FORWARD_FIXTURE: [u32; 10] = [
+    0x4a020100, 0xbe941f00, 0x8014ff14, 20, 0x82158015, 0xbe802014, 0xffffffff, 0x3a0202ff,
+    0xa5a5a5a5, 0xbf810000,
+];
+pub const PC_BACKWARD_FIXTURE: [u32; 10] = [
+    0x4a020100, 0xbf820003, 0x3a0202ff, 0xa5a5a5a5, 0xbf810000, 0xbe941f00, 0x8094ff14, 16,
+    0x82958015, 0xbe802014,
+];
+
+// Test-only fusion for the exact owned s[20:21] sequence. It has no externally
+// visible scalar state in this backend; no supported instruction reads SCC or
+// these SGPRs. The CFG checks the five dwords as a single extent, rejecting any
+// reachable edge into the middle, including jumps into the literal itself.
+fn pc_jump(words: &[u32]) -> Option<i16> {
+    let [0xbe941f00, low, literal, high, 0xbe802014, ..] = words else {
+        return None;
+    };
+    if literal % 4 != 0 {
+        return None;
+    }
+    let dwords = i64::from(literal / 4);
+    let delta = match (*low, *high) {
+        (0x8014ff14, 0x82158015) => dwords,
+        (0x8094ff14, 0x82958015) => -dwords,
+        _ => return None,
+    };
+    // GETPC returns the next dword, while Flow::Jump is relative to the end of
+    // the fused five-dword sequence.
+    i16::try_from(delta - 4).ok()
+}
+
 fn decode_one(words: &[u32]) -> Option<Instruction<Alu>> {
     let word = *words.first()?;
     let (width, flow, op) = match word {
         0x4a020100 => (1, Flow::Next, Alu::DoubleInput),
         0x3a0202c1 => (1, Flow::Next, Alu::XorOutput(u32::MAX)),
         0x3a0202ff => (2, Flow::Next, Alu::XorOutput(*words.get(1)?)),
+        0xbe941f00 => (5, Flow::Jump(pc_jump(words)?), Alu::Control),
         0xbf810000 => (1, Flow::Stop, Alu::Control),
         0xbf820000..=0xbf82ffff => (1, Flow::Jump(word as i16), Alu::Control),
         // Recognize the two edges, but do not lower conditional SCC branches yet.
@@ -134,6 +166,24 @@ mod tests {
                 .unwrap()
                 .contains("v1 = 0xa5a5a5a5u ^ v1;")
         );
+    }
+
+    #[test]
+    fn owned_pc_jump_preserves_alu_path_and_rejects_wrong_edges() {
+        let expected = cpu(&BRANCH_FIXTURE, &[3; LANES], MASK).unwrap();
+        for code in [&PC_FORWARD_FIXTURE, &PC_BACKWARD_FIXTURE] {
+            assert_eq!(cpu(code, &[3; LANES], MASK).unwrap(), expected);
+            assert_eq!(msl(code), msl(&BRANCH_FIXTURE));
+        }
+        for literal in [0, 3, 0x10000] {
+            let mut bad = PC_FORWARD_FIXTURE;
+            bad[3] = literal;
+            assert!(msl(&bad).is_err());
+            assert!(cpu(&bad, &[3; LANES], MASK).is_err());
+        }
+        let mut mixed = PC_BACKWARD_FIXTURE;
+        mixed[8] = 0x82158015;
+        assert!(msl(&mixed).is_err());
     }
 
     #[test]
