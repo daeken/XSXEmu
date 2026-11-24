@@ -66,6 +66,25 @@ For source provenance, independently walked all 26,503 extracted wrapped DXBC ch
 
 19,595 extracted wrapped files occur in at least one candidate set; no candidate joined by digest had a conflicting stage. A candidate file count is not a unique shader count. This join establishes source-family provenance only. No first-candidate rule, native FSSM variant selection, signature equivalence, or machine-code equality to wrapped-source payloads was validated.
 
+### Candidate stored-byte comparison
+
+```sh
+cargo run --locked --release --manifest-path tools/shader-inventory/Cargo.toml -- \
+  --wrapped-library "$WRAPPED_DXBC_DIR" "$EXPANDED_PIPELINE_LIBRARY"
+```
+
+The scanner repeats the stage/digest join directly against the expanded binary library and checked wrappers, with no sidecars. It compares each FSSM payload in each candidate wrapper to the corresponding entire library program span. It tests two length-sensitive equality hypotheses: the bounded FSSM window addressed by little-endian u64 start and length at `+0xc0/+0xc8`, and that same window minus its first 40 bytes. The second comparison tests the known compute prefix displacement as a byte-window hypothesis; it is **not** an executable-start rule for graphics. Neither comparison strips suffix bytes, reinterprets fields, or assumes that the two formats use the same padding.
+
+| Stage | Bounded payload/program comparisons | Equal entire stored windows | Equal after FSSM +40 |
+|---|---:|---:|---:|
+| PS | 10,020 | 0 | 0 |
+| VS | 1,419 | 0 | 0 |
+| CS | 2,689 | 0 | 0 |
+| MS | 8,666 | 0 | 0 |
+| Total | 22,794 | 0 | 0 |
+
+There were no unbounded candidate windows. The extra VS payloads are retained, not reduced to one per wrapper. The unlabelled slot-6 program is outside the join. These negative results reject direct stored-span aliasing for the two tested views, not related instruction bodies after other framing, layout fixup, or variant selection. No IDs, digests, shader bytes, or instruction listings are printed.
+
 ## Reproduce the structural census
 
 ```sh

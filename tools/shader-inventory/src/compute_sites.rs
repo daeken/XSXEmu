@@ -134,7 +134,7 @@ impl Hypothesis {
     }
 }
 
-fn graphics_items(blob: &[u8]) -> Option<&[u8]> {
+pub(crate) fn graphics_items(blob: &[u8]) -> Option<&[u8]> {
     let end = blob.len().checked_sub(32)?;
     let items = blob.get(16..end)?;
     (items.len() % 32 == 0

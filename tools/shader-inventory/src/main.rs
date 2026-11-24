@@ -7,6 +7,7 @@ mod library_index;
 mod llvm;
 mod reachable;
 mod signatures;
+mod wrapped_library;
 
 use flate2::{Decompress, FlushDecompress, Status};
 use std::{
@@ -323,6 +324,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args_os().skip(1);
     const USAGE: &str = "usage: xsx-shader-inventory [--header-only | --compute-isa <LLVM shared library> <primary CPU> <reference CPU>] <shaders.rpf> (select gfx1013 and gfx1030, in either order)";
     let first = args.next().ok_or(USAGE)?;
+    if first == "--wrapped-library" {
+        let usage = "usage: xsx-shader-inventory --wrapped-library <wrapped DXBC directory> <expanded PS/0/9 library>";
+        let wrapped = args.next().ok_or(usage)?;
+        let library = args.next().filter(|_| args.next().is_none()).ok_or(usage)?;
+        return wrapped_library::run(
+            std::path::Path::new(&wrapped),
+            std::path::Path::new(&library),
+        );
+    }
     if first == "--wrapped-signatures" {
         let path = args
             .next()

@@ -1,0 +1,222 @@
+//! Test byte-equality hypotheses inside stage/digest candidate families, not native ABI equivalence.
+use crate::{
+    ARCHIVE_LIMIT, BLOB_LIMIT, compute_sites::graphics_items, dxbc_chunks, shader_payloads,
+    stage_name, word,
+};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    error::Error,
+    fs::{self, File},
+    io::Read,
+    path::Path,
+};
+use xsxemu::{
+    compute_metadata::ComputeMetadata,
+    pipeline_library::{PipelineLibrary, ProgramId},
+};
+
+#[derive(Default)]
+struct Program {
+    wrappers: usize,
+    stored_equal: bool,
+    adjusted_equal: bool,
+}
+
+#[derive(Default)]
+struct Payloads {
+    compared: usize,
+    invalid: usize,
+}
+
+fn digest(blob: &[u8]) -> Option<[u8; 16]> {
+    let start = blob.len().checked_sub(32)?;
+    blob.get(start + 4..start + 20)?.try_into().ok()
+}
+
+// Same raw c0/c8 interpretation as the compute census, but no instruction,
+// alignment, suffix, or launch assertion is made for a graphics payload here.
+fn extent(fssm: &[u8]) -> Option<&[u8]> {
+    let read =
+        |off| usize::try_from(u64::from_le_bytes(fssm.get(off..off + 8)?.try_into().ok()?)).ok();
+    let start = read(0xc0)?;
+    let len = read(0xc8)?;
+    if start < 0x120 || len <= 40 {
+        return None;
+    }
+    fssm.get(start..start.checked_add(len)?)
+}
+
+fn bounded(path: &Path, limit: usize, bytes: &mut Vec<u8>) -> Result<(), Box<dyn Error>> {
+    bytes.clear();
+    File::open(path)?
+        .take(limit as u64 + 1)
+        .read_to_end(bytes)?;
+    if bytes.len() > limit {
+        return Err("wrapped library input exceeds bound".into());
+    }
+    Ok(())
+}
+
+pub(super) fn run(wrapped: &Path, path: &Path) -> Result<(), Box<dyn Error>> {
+    let mut library_bytes = Vec::new();
+    bounded(path, ARCHIVE_LIMIT, &mut library_bytes)?;
+    let library = PipelineLibrary::parse(&library_bytes)?;
+    let mut index = HashMap::<(u16, [u8; 16]), HashSet<ProgramId>>::new();
+    let mut programs = BTreeMap::<u16, HashMap<ProgramId, Program>>::new();
+    let mut unknown_slots = HashSet::new();
+    let mut add = |stage, program, blob: &[u8]| -> Option<()> {
+        index
+            .entry((stage, digest(blob)?))
+            .or_default()
+            .insert(program);
+        programs
+            .entry(stage)
+            .or_default()
+            .entry(program)
+            .or_default();
+        Some(())
+    };
+    let mut checked_graphics = HashSet::new();
+    for pso in library.graphics() {
+        for (slot, item) in pso.slots.into_iter().enumerate() {
+            let Some(item) = item else { continue };
+            let stage = match slot {
+                0 => 0,
+                1 => 1,
+                2 => 13,
+                _ => {
+                    unknown_slots.insert((slot, item.program));
+                    continue;
+                }
+            };
+            let id = item
+                .metadata
+                .ok_or("missing known graphics slot metadata")?;
+            if !checked_graphics.insert((stage, item.program, id)) {
+                continue;
+            }
+            let blob = library.blob(id).ok_or("missing graphics metadata span")?;
+            graphics_items(blob).ok_or("invalid graphics metadata framing")?;
+            add(stage, item.program, blob).ok_or("missing graphics metadata digest")?;
+        }
+    }
+    for pso in library.compute() {
+        ComputeMetadata::from_library(&library, pso).ok_or("invalid compute metadata framing")?;
+        add(
+            5,
+            pso.program,
+            library
+                .blob(pso.layout)
+                .ok_or("missing compute layout span")?,
+        )
+        .ok_or("missing compute layout digest")?;
+    }
+
+    let mut counts = BTreeMap::<u16, Payloads>::new();
+    let (mut bytes, mut inflate) = (Vec::new(), Vec::new());
+    let (mut files, mut joined_wrappers, mut work) = (0, 0, 0usize);
+    for entry in fs::read_dir(wrapped)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file()
+            || entry.path().extension().and_then(|s| s.to_str()) != Some("dxbc")
+        {
+            continue;
+        }
+        files += 1;
+        if files > 100_000 {
+            return Err("wrapped library file-count limit exceeded".into());
+        }
+        bounded(&entry.path(), BLOB_LIMIT, &mut bytes)?;
+        let parts = dxbc_chunks(&bytes).ok_or("invalid DXBC directory")?;
+        let dxil = crate::dxil_chunk(&bytes).ok_or("missing unique DXIL")?;
+        let stage = (word(dxil, 0).ok_or("truncated stage label")? >> 16) as u16;
+        let mut hashes = parts.iter().filter(|(tag, _)| *tag == b"HASH");
+        let (_, hash) = hashes.next().ok_or("missing HASH")?;
+        if hash.len() != 20 || hashes.next().is_some() {
+            return Err("invalid HASH framing".into());
+        }
+        let key: [u8; 16] = hash[4..].try_into()?;
+        let Some(ids) = index.get(&(stage, key)) else {
+            continue;
+        };
+        joined_wrappers += 1;
+        let candidates = programs.get_mut(&stage).ok_or("missing program stage")?;
+        let mut eligible = Vec::with_capacity(ids.len());
+        for id in ids {
+            let p = candidates
+                .get_mut(id)
+                .ok_or("missing indexed library program")?;
+            p.wrappers += 1;
+            eligible.push((
+                *id,
+                library.program(*id).ok_or("missing library program span")?,
+            ));
+        }
+        work = work
+            .checked_add(
+                eligible
+                    .len()
+                    .checked_mul(32)
+                    .ok_or("comparison overflow")?,
+            )
+            .ok_or("comparison overflow")?;
+        if work > 4_000_000 {
+            return Err("wrapped library comparison budget exceeded".into());
+        }
+        let count = counts.entry(stage).or_default();
+        let mut compare = |payload: &[u8]| {
+            let Some(raw) = extent(payload) else {
+                count.invalid += eligible.len();
+                return;
+            };
+            count.compared += eligible.len();
+            for (id, lib) in &eligible {
+                // Only length-sensitive, exact byte equality. No candidate selection.
+                let p = candidates
+                    .get_mut(id)
+                    .expect("eligible IDs came from candidates");
+                p.stored_equal |= raw == *lib;
+                p.adjusted_equal |= raw[40..] == **lib;
+            }
+        };
+        shader_payloads(&bytes, &mut inflate, None, Some(&mut compare))
+            .ok_or("invalid candidate XDAT/XBCH framing")?;
+    }
+    println!(
+        "Wrapped library identity hypotheses: {files} wrappers, {joined_wrappers} in at least one candidate family, {} distinct unlabelled slot/program pairs excluded",
+        unknown_slots.len()
+    );
+    for (stage, stage_programs) in programs {
+        let totals = counts.remove(&stage).unwrap_or_default();
+        let values = || stage_programs.values();
+        println!(
+            "{}: {} library programs, {} with candidates, {} multi-wrapper; {} bounded and {} invalid payload/program comparisons; {} exact stored, {} exact after FSSM +40",
+            stage_name(stage),
+            stage_programs.len(),
+            values().filter(|p| p.wrappers > 0).count(),
+            values().filter(|p| p.wrappers > 1).count(),
+            totals.compared,
+            totals.invalid,
+            values().filter(|p| p.stored_equal).count(),
+            values().filter(|p| p.adjusted_equal).count()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn raw_extent_supports_two_exact_distinct_windows_and_rejects_bounds() {
+        let mut b = [0; 0x160];
+        b[0xc0..0xc8].copy_from_slice(&0x120u64.to_le_bytes());
+        b[0xc8..0xd0].copy_from_slice(&0x38u64.to_le_bytes());
+        let w = extent(&b).unwrap();
+        assert!(std::ptr::eq(w, &b[0x120..0x158]));
+        assert!(std::ptr::eq(&w[40..], &b[0x148..0x158]));
+        assert!(extent(&b[..0x157]).is_none());
+        b[0xc8..0xd0].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(extent(&b).is_none());
+    }
+}
