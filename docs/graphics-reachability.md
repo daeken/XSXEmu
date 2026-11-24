@@ -26,6 +26,23 @@ Every complete graph has at least one reachable eight-byte `exp` checked against
 
 The stage-4 check cross-validates the six-bit public target field for `POS0`–`POS4` and `PARAM0`–`PARAM31` against the LLVM mnemonic and symbolic operand. Under both wave tests every complete `gfx1013` stage-4 graph (1,448) and every complete `gfx1030` stage-4 graph (1,242) contains `POS0` with raw `EN=15` and a nonempty dense set of enabled `PARAM` ordinals starting at zero. Neither pass observes a zero-enable `PARAM` or an export outside `POS`/`PARAM` in a complete stage-4 graph. In each pass 20 payloads also have `POS1`, none has `POS2`–`POS4`. Both wave settings agree on the per-payload projection. These are reachable target and enable-field observations only; they do not correlate parameter ordinals with source declarations, physical interpolation slots, or an individual executed path.
 
+## Same-wrapper VS output comparison
+
+```sh
+cargo run --locked --release --manifest-path tools/shader-inventory/Cargo.toml -- \
+  --wrapped-vs-exports "$TRUSTED_LLVM_21_DYLIB" gfx1013 "$WRAPPED_DXBC_DIRECTORY"
+# Repeat with gfx1030.
+```
+
+All 2,236 VS wrappers join their checked `OSG1` to the unique raw stage-4 FSSM payload in the same wrapper. The 195 additional raw stage-2 companion payloads are not included in the comparison. Source rows with public `SV_Position`, `SV_ClipDistance`, or `SV_CullDistance` name/enum pairs are counted separately from ordinary output registers. There are no other system outputs in the complete cases. In both decoder passes, `SV_Position` presence agrees with `POS0` in every complete graph and all 20 cases with `POS1` have a clip-or-cull declaration, with neither direction of disagreement. This is a presence correlation, not a packing or lane assignment.
+
+| CPU (either wave test) | Complete | Native PARAM count lower than ordinary source registers | Equal count | Higher count | Exact unshifted ordinal set |
+|---|---:|---:|---:|---:|---:|
+| `gfx1013` | 1,448 | 434 | 878 | 136 | 5 |
+| `gfx1030` | 1,242 | 394 | 712 | 136 | 5 |
+
+The ordinary projection counts distinct source register numbers, including shared registers once. The native projection counts distinct reachable nonzero-enable `PARAM` ordinals. Neither direct ordinal equality nor a uniform one-to-one compaction explains the corpus. No native linkage or stage-pair placement is inferred.
+
 ## Same-wrapper PS target comparison
 
 ```sh

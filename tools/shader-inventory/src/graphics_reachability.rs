@@ -386,11 +386,55 @@ impl PsComparison {
     }
 }
 
-pub fn run_wrapped_ps(lib: &OsStr, cpu: Cpu, root: &Path) -> Result<(), Box<dyn Error>> {
+#[derive(Debug, Default)]
+struct VsComparison {
+    complete: usize,
+    rejected: usize,
+    ordinary_count_native_lower_equal_higher: [usize; 3],
+    unshifted_exact: usize,
+    position_presence_equal: usize,
+    clip_or_cull_vs_pos1: [[usize; 2]; 2],
+    other_system: usize,
+}
+
+impl VsComparison {
+    fn add(
+        &mut self,
+        source: crate::signatures::VsOutputProjection,
+        result: Result<Exports, ResultClass>,
+    ) {
+        let Ok(native) = result else {
+            self.rejected += 1;
+            return;
+        };
+        self.complete += 1;
+        use std::cmp::Ordering::*;
+        let bucket = match native
+            .active_parameters
+            .count_ones()
+            .cmp(&source.ordinary.count_ones())
+        {
+            Less => 0,
+            Equal => 1,
+            Greater => 2,
+        };
+        self.ordinary_count_native_lower_equal_higher[bucket] += 1;
+        self.unshifted_exact += usize::from(source.ordinary == native.active_parameters);
+        self.position_presence_equal += usize::from(source.position == (native.positions[0] != 0));
+        self.clip_or_cull_vs_pos1[usize::from(source.clip_or_cull)]
+            [usize::from(native.positions[1] != 0)] += 1;
+        self.other_system += usize::from(source.other_system);
+    }
+}
+
+pub fn run_wrapped(lib: &OsStr, cpu: Cpu, root: &Path, vertex: bool) -> Result<(), Box<dyn Error>> {
     let llvm = Llvm::load(lib)?;
     let mut waves = [llvm.context(cpu, false)?, llvm.context(cpu, true)?];
     let mut totals: [PsComparison; 2] = Default::default();
-    let (mut files, mut pixel, mut invalid, mut differences) = (0, 0, 0, 0);
+    let mut vs_totals: [VsComparison; 2] = Default::default();
+    let stage = u16::from(vertex);
+    let native_stage = if vertex { 4 } else { 5 };
+    let (mut files, mut matched, mut invalid, mut differences) = (0, 0, 0, 0);
     let (mut wrapper, mut inflated) = (Vec::new(), Vec::new());
     for entry in fs::read_dir(root)? {
         let entry = entry?;
@@ -399,66 +443,88 @@ pub fn run_wrapped_ps(lib: &OsStr, cpu: Cpu, root: &Path) -> Result<(), Box<dyn 
         }
         files += 1;
         if files > FILE_LIMIT {
-            return Err("wrapped PS file-count limit exceeded".into());
+            return Err("wrapped export file-count limit exceeded".into());
         }
         wrapper.clear();
         File::open(entry.path())?
             .take(BLOB_LIMIT as u64 + 1)
             .read_to_end(&mut wrapper)?;
         if wrapper.len() > BLOB_LIMIT {
-            return Err("wrapped PS input exceeds size limit".into());
+            return Err("wrapped export input exceeds size limit".into());
         }
         let dxil = crate::dxil_chunk(&wrapper).ok_or("missing unique DXIL")?;
-        if word(dxil, 0).ok_or("missing DXIL stage")? >> 16 != 0 {
+        if word(dxil, 0).ok_or("missing DXIL stage")? >> 16 != usize::from(stage) {
             continue;
         }
-        pixel += 1;
+        matched += 1;
         let parts = crate::dxbc_chunks(&wrapper).ok_or("invalid DXBC directory")?;
         let mut os = parts.iter().filter(|(tag, _)| *tag == b"OSG1");
-        let (_, signature) = os.next().ok_or("missing PS output signature")?;
+        let (_, signature) = os.next().ok_or("missing output signature")?;
         if os.next().is_some() {
-            return Err("duplicate PS output signature".into());
+            return Err("duplicate output signature".into());
         }
-        let Some(source) = crate::signatures::color_targets(signature) else {
+        let colors = (!vertex)
+            .then(|| crate::signatures::color_targets(signature))
+            .flatten();
+        let outputs = vertex
+            .then(|| crate::signatures::vs_outputs(signature))
+            .flatten();
+        if colors.is_none() && outputs.is_none() {
             invalid += 1;
             continue;
-        };
+        }
         let mut psv = parts.iter().filter(|(tag, _)| *tag == b"PSV0");
         let depth = psv
             .next()
             .filter(|_| psv.next().is_none())
             .and_then(|(_, bytes)| crate::signatures::ps_depth_declared(bytes));
-        let mut result = None;
+        let (mut result, mut native_count) = (None, 0);
         let mut capture = |payload: &[u8]| {
-            if payload.get(0x100) == Some(&5)
-                && let Some((bytes, _)) = code(payload)
-            {
-                result = Some(waves.each_mut().map(|dis| checked_exports(dis, bytes)));
+            if payload.get(0x100) == Some(&native_stage) {
+                native_count += 1;
+                if let Some((bytes, _)) = code(payload) {
+                    result = Some(waves.each_mut().map(|dis| checked_exports(dis, bytes)));
+                }
             }
         };
-        let Some((0, _, 1)) =
-            crate::shader_payloads(&wrapper, &mut inflated, Some(0), Some(&mut capture))
+        let Some((_, _, n)) =
+            crate::shader_payloads(&wrapper, &mut inflated, Some(stage), Some(&mut capture))
         else {
             invalid += 1;
             continue;
         };
+        if native_count != 1 || (!vertex && n != 1) {
+            invalid += 1;
+            continue;
+        }
         let Some(result) = result else {
             invalid += 1;
             continue;
         };
         differences += usize::from(result[0] != result[1]);
-        for (outcome, total) in result.into_iter().zip(&mut totals) {
-            total.add(source, depth, outcome);
+        for (i, outcome) in result.into_iter().enumerate() {
+            match (outputs, colors) {
+                (Some(source), _) => vs_totals[i].add(source, outcome),
+                (_, Some(source)) => totals[i].add(source, depth, outcome),
+                _ => unreachable!(),
+            }
         }
     }
-    if pixel == 0 {
-        return Err("no pixel wrappers".into());
+    if matched == 0 {
+        return Err("no matching wrapped stages".into());
     }
+    let stage_name = if vertex { "VS" } else { "PS" };
     println!(
-        "{} LLVM {:?}; {files} wrappers, {pixel} PS, {invalid} unsupported same-wrapper joins; {differences} different wave results",
+        "{} LLVM {:?}; {files} wrappers, {matched} {stage_name}, {invalid} unsupported same-wrapper joins; {differences} different wave results",
         cpu.name(),
         llvm.version
     );
+    if vertex {
+        for (wave, t) in [64, 32].into_iter().zip(vs_totals) {
+            println!("  wave{wave}: {t:?}");
+        }
+        return Ok(());
+    }
     for (wave, t) in [64, 32].into_iter().zip(totals) {
         println!(
             "  wave{wave}: {} complete, {} rejected; complete target sets: {} exact, {} with only extra source targets, {} with only extra native targets, {} with both",
@@ -530,6 +596,36 @@ mod tests {
             ),
             (1, 1, 0, 1, 1, 1, 1)
         );
+    }
+
+    #[test]
+    fn vs_projection_keeps_register_sets_distinct_from_cardinality() {
+        let mut comparison = VsComparison::default();
+        let source = crate::signatures::VsOutputProjection {
+            ordinary: 6,
+            position: true,
+            clip_or_cull: true,
+            other_system: false,
+        };
+        for params in [1, 3, 7] {
+            comparison.add(
+                source,
+                Ok(Exports {
+                    active_parameters: params,
+                    positions: [1 << 15, 1 << 1, 0, 0, 0],
+                    ..Default::default()
+                }),
+            );
+        }
+        comparison.add(source, Err(ResultClass::Decode));
+        assert_eq!(
+            comparison.ordinary_count_native_lower_equal_higher,
+            [1, 1, 1]
+        );
+        assert_eq!(comparison.unshifted_exact, 0);
+        assert_eq!(comparison.rejected, 1);
+        assert_eq!(comparison.position_presence_equal, 3);
+        assert_eq!(comparison.clip_or_cull_vs_pos1, [[0, 0], [0, 3]]);
     }
 
     #[test]

@@ -117,6 +117,33 @@ pub(super) fn color_targets(bytes: &[u8]) -> Option<u8> {
     Some(mask)
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct VsOutputProjection {
+    pub ordinary: u32,
+    pub position: bool,
+    pub clip_or_cull: bool,
+    pub other_system: bool,
+}
+
+pub(super) fn vs_outputs(osg: &[u8]) -> Option<VsOutputProjection> {
+    let (_, rows) = check(osg)?;
+    let mut projection = VsOutputProjection {
+        ordinary: 0,
+        position: false,
+        clip_or_cull: false,
+        other_system: false,
+    };
+    for row in rows {
+        match ps_linkage_system(&row.key.0, row.system_code) {
+            None => projection.ordinary |= 1u32.checked_shl(row.register.try_into().ok()?)?,
+            Some(0) => projection.position = true,
+            Some(1 | 2) => projection.clip_or_cull = true,
+            _ => projection.other_system = true,
+        }
+    }
+    Some(projection)
+}
+
 /// Source declaration flag only; no assumption about native export channels.
 pub(super) fn ps_depth_declared(psv: &[u8]) -> Option<bool> {
     resource_rows(psv, 0)?;
