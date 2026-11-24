@@ -2200,12 +2200,13 @@ fn xmem_bridge_owns_exact_boot_reservations_and_cpu_mapping() {
     }
 }
 
-const THREAD_ID_CODE_CAPACITY: usize = 0x100;
+const THREAD_ID_CODE_CAPACITY: usize = 0x180;
 
 #[repr(C)]
 struct ThreadIdFixture {
     entry: u32,
     process_entry: u32,
+    priority_boost_entry: u32,
     code: [u8; THREAD_ID_CODE_CAPACITY],
 }
 
@@ -2226,7 +2227,11 @@ fn thread_id_bridge_matches_guest_teb_and_preserves_last_error() {
     }
     let scratch = Scratch::new();
     let entry = unsafe { static_tls_thread_id_fixture.entry };
-    let exe = thread_api_image(entry, b"GetCurrentThreadId\0");
+    let exe = thread_api_image(
+        entry,
+        b"api-ms-win-core-processthreads-l1-1-0.dll\0",
+        b"GetCurrentThreadId\0",
+    );
     let path = scratch.write("thread-id.exe", &exe);
     expect(run(&path, &[OPT]), 1, "incomplete dependency graph");
     let output = launcher(&path, &[OPT, "--rust-providers"])
@@ -2244,7 +2249,7 @@ fn thread_id_bridge_matches_guest_teb_and_preserves_last_error() {
     expect(output, 48, "Guest entry returned 48");
 }
 
-fn thread_api_image(entry: u32, symbol: &[u8]) -> Vec<u8> {
+fn thread_api_image(entry: u32, contract: &[u8], symbol: &[u8]) -> Vec<u8> {
     let fixture = unsafe { &static_tls_thread_id_fixture };
     let mut exe = image(Kind::Solo);
     // Keep the existing PE layout; replace only this fixture's .text and
@@ -2253,11 +2258,7 @@ fn thread_api_image(entry: u32, symbol: &[u8]) -> Vec<u8> {
     put(&mut exe, file(TEXT), &fixture.code);
     w32(&mut exe, OP + 16, TEXT + entry as usize);
     w64(&mut exe, file(ARRAY), PREFERRED + TEXT);
-    dir_import_one(
-        &mut exe,
-        b"api-ms-win-core-processthreads-l1-1-0.dll\0",
-        symbol,
-    );
+    dir_import_one(&mut exe, contract, symbol);
     exe
 }
 
@@ -2268,13 +2269,39 @@ fn get_current_process_bridge_preserves_last_error_and_returns_full_width_pseudo
     }
     let scratch = Scratch::new();
     let entry = unsafe { static_tls_thread_id_fixture.process_entry };
-    let exe = thread_api_image(entry, b"GetCurrentProcess\0");
+    let exe = thread_api_image(
+        entry,
+        b"api-ms-win-core-processthreads-l1-1-0.dll\0",
+        b"GetCurrentProcess\0",
+    );
     let path = scratch.write("current-process.exe", &exe);
     expect(
         run(&path, &[OPT, "--rust-providers"]),
         48,
         "Guest entry returned 48",
     );
+}
+
+#[test]
+fn process_priority_boost_bridge_reports_unsupported_and_invalid_handle() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let entry = unsafe { static_tls_thread_id_fixture.priority_boost_entry };
+    let exe = thread_api_image(
+        entry,
+        b"api-ms-win-core-processthreads-l1-1-2.dll\0",
+        b"SetProcessPriorityBoost\0",
+    );
+    let path = scratch.write("process-boost.exe", &exe);
+    let output = run(&path, &[OPT, "--rust-providers"]);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(
+            "SetProcessPriorityBoost: dynamic boost changes are unsupported (disable=true)"
+        )
+    );
+    expect(output, 48, "Guest entry returned 48");
 }
 
 const SEMAPHORE_CODE_CAPACITY: usize = 0x300;

@@ -16,6 +16,7 @@ const THREADS: &[u8] = b"api-ms-win-core-processthreads-l1-1-0.dll";
 #[cfg(target_os = "macos")]
 const TOPOLOGY: &[u8] = b"api-ms-win-core-processtopology-l1-1-0.dll";
 const FEATURES: &[u8] = b"api-ms-win-core-processthreads-l1-1-1.dll";
+const BOOST: &[u8] = b"api-ms-win-core-processthreads-l1-1-2.dll";
 const ENV: &[u8] = b"api-ms-win-core-processenvironment-l1-1-0.dll";
 const DEBUG: &[u8] = b"api-ms-win-core-debug-l1-1-0.dll";
 const ERROR: &[u8] = b"api-ms-win-core-errorhandling-l1-1-0.dll";
@@ -26,7 +27,7 @@ const UTIL: &[u8] = b"api-ms-win-core-util-l1-1-0.dll";
 pub(crate) fn has_dll(dll: &[u8]) -> bool {
     matches!(
         dll,
-        BASE | K32 | THREADS | FEATURES | ENV | DEBUG | ERROR | INFO | PROFILE | UTIL
+        BASE | K32 | THREADS | FEATURES | BOOST | ENV | DEBUG | ERROR | INFO | PROFILE | UTIL
     ) || {
         #[cfg(target_os = "macos")]
         {
@@ -58,6 +59,11 @@ pub(crate) fn lookup(dll: &[u8], name: &[u8]) -> Option<HostExport> {
             "kernelbase.dll",
             "SetThreadGroupAffinity",
             native::set_thread_group_affinity
+        ),
+        (BASE | K32 | BOOST, b"SetProcessPriorityBoost") => export!(
+            "kernelbase.dll",
+            "SetProcessPriorityBoost",
+            native::set_process_priority_boost
         ),
         (BASE | K32 | THREADS, b"GetCurrentProcess") => export!(
             "kernelbase.dll",
@@ -214,6 +220,17 @@ pub(crate) mod native {
 
     pub(crate) extern "win64" fn get_current_process() -> usize {
         CURRENT_PROCESS
+    }
+
+    pub(crate) extern "win64" fn set_process_priority_boost(process: usize, disable: i32) -> i32 {
+        if kernel_handle(process) != CURRENT_PROCESS {
+            return fail(ERROR_INVALID_HANDLE);
+        }
+        eprintln!(
+            "xsxemu: SetProcessPriorityBoost: dynamic boost changes are unsupported (disable={})",
+            disable != 0
+        );
+        fail(ERROR_NOT_SUPPORTED)
     }
 
     pub(super) extern "win64" fn get_current_thread() -> usize {

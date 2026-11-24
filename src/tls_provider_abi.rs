@@ -150,6 +150,8 @@ audited_bridges! {
         crate::xbox_xmem::virtual_alloc, (base: usize, size: usize, flags: u32, attributes: u32, protect: u32) -> usize;
     xsxemu_tls_get_current_process, get_current_process: b"kernelbase.dll", b"GetCurrentProcess",
         proc::get_current_process, () -> usize;
+    xsxemu_tls_set_process_priority_boost, set_process_priority_boost: b"kernelbase.dll", b"SetProcessPriorityBoost",
+        proc::set_process_priority_boost, (process: usize, disable: i32) -> i32;
     xsxemu_tls_get_current_thread_id, get_current_thread_id: b"kernelbase.dll", b"GetCurrentThreadId",
         native::current_thread_id, () -> u32;
     xsxemu_tls_get_last_error, get_error: b"kernelbase.dll", b"GetLastError",
