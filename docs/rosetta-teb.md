@@ -306,7 +306,13 @@ in the single-thread model, and process attach/detach still run.
 runtime x86 feature detection, preserving `LastError`. It reports
 `PF_FASTFAIL_AVAILABLE` (23) as false: Windows `INT 29h` fast-fail handling is
 not implemented by this launcher.
-`GetProcAddress` and `FreeLibrary` aren't bridged. Unbridged
+The audited `GetProcAddress` bridge accepts exact mapped image bases and
+case-sensitive names for direct PE exports whose RVAs were already admitted
+by the image's GuardCF metadata at mapping time. It never adds CFG targets,
+resolves forwarders or ordinals, or returns a Rust provider address. Success
+preserves `LastError`; an invalid handle gives `ERROR_INVALID_HANDLE` and an
+unavailable export gives `ERROR_PROC_NOT_FOUND`.
+`FreeLibrary` isn't bridged. Unbridged
 providers fail before entry unless `--trace-missing-imports` is enabled,
 which treats well-formed unavailable or unbridged slots as callable, not
 as data: PE import records don't distinguish the two.
@@ -321,7 +327,7 @@ signatures are supported, with up to eight argument slots. The guest DWORD at `G
 initially zero and authoritative: the adapters transfer it to/from the
 ordinary provider's thread-local cell as needed and restore the previous
 host value. The guest signal mask remains in place throughout. There are
-no nested guest calls, dynamic lookup, unwind, or additional guest threads
+no nested guest calls, dynamic loading, unwind, or additional guest threads
 in this bridge lane.
 
 `cargo test --target x86_64-apple-darwin --test static_tls_lane` runs an
@@ -330,6 +336,12 @@ audited providers. The callback uses direct calls and the entry uses both
 GuardCF thunks. The fixture checks last-error coherence through detach,
 Win64 nonvolatile register sentinels, and six- and eight-argument text
 conversions. It does not execute a game or UCRT.
+A separate generated PE pair tests named lookup and GuardCF dispatch into
+an owned synchronization DLL. Its wake export has no waiters in this
+single-thread test model; its sleep export returns `ERROR_TIMEOUT` for a
+zero-duration poll and traps on unsupported blocking waits. This is a test
+fixture, not a production condition-variable implementation or an API-set
+substitution.
 
 The trace thunks are sealed RX before guest entry. GuardCF admits the exact
 bound thunk addresses, not their interior, common assembly gate or reporter.

@@ -30,8 +30,9 @@ macro_rules! target_for_child {
 
 // These rows are limited to fixed integer/pointer arguments and one scalar
 // return (or void). A function pointer may only be an opaque registration
-// token (FlsAlloc). Do not invoke callbacks, re-enter guest code, return
-// function pointers, unwind, or add aggregate, floating-point or variadic ABIs.
+// token (FlsAlloc). GetProcAddress may return only a direct mapped PE export
+// already admitted by GuardCF. Do not return host function pointers, invoke
+// callbacks, re-enter guest code, unwind, or add aggregate, float or varargs.
 macro_rules! audited_bridges {
     ($($entry:ident, $adapter:ident : $dll:literal, $symbol:literal,
         $target:path $(=> $restricted:path)?, ($($arg:ident: $ty:ty),*) -> $ret:ty;)*) => {
@@ -117,6 +118,8 @@ audited_bridges! {
         native::heap_free, (heap: *mut c_void, flags: u32, block: *mut c_void) -> i32;
     xsxemu_tls_get_module_handle_w, get_module_handle_w: b"kernelbase.dll", b"GetModuleHandleW",
         loader::get_module_handle_w, (name: *const u16) -> usize;
+    xsxemu_tls_get_proc_address, get_proc_address: b"kernelbase.dll", b"GetProcAddress",
+        loader::get_proc_address => loader::tls_child_get_proc_address, (module: usize, symbol: usize) -> usize;
     xsxemu_tls_get_module_file_name_w, get_module_file_name_w: b"kernelbase.dll", b"GetModuleFileNameW",
         loader::get_module_file_name_w, (module: usize, buffer: *mut u16, capacity: u32) -> u32;
     xsxemu_tls_load_library_ex_w, load_library_ex_w: b"kernelbase.dll", b"LoadLibraryExW",

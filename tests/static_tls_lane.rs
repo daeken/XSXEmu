@@ -55,6 +55,9 @@ struct Fixture {
     module_handle_dll_main: u32,
     module_handle_entry: u32,
     processor_feature_entry: u32,
+    sync_entry: u32,
+    sync_sleep: u32,
+    sync_wake: u32,
     code: [u8; RAW],
 }
 global_asm!(include_str!("fixtures/static_tls_lane.S"),
@@ -1502,6 +1505,108 @@ fn processor_feature_bridge_preserves_last_error_and_reports_fastfail_unavailabl
 }
 
 #[test]
+fn mapped_sync_facade_exports_must_already_be_callable_cfg_entries() {
+    if !rosetta() {
+        return;
+    }
+    const DLL: &str = "owned-sync.dll";
+    const SLEEP: &[u8] = b"SleepConditionVariableCS\0";
+    const WAKE: &[u8] = b"WakeAllConditionVariable\0";
+    let f = unsafe { &static_tls_fixture };
+    let sleep = TEXT + f.sync_sleep as usize;
+    let wake = TEXT + f.sync_wake as usize;
+    let scratch = Scratch::new();
+    let flags = [OPT, "--rust-providers"];
+    let mut exe = image(Kind::Guarded);
+    w32(&mut exe, OP + 16, TEXT + f.sync_entry as usize);
+    // Libraryloader and critical-section bridges plus one static PE import
+    // to root the facade. No special API-set lookup rule.
+    dir(&mut exe, 1, LINK, 80);
+    for (i, (lookup, dll, iat, names)) in [
+        (
+            0x50,
+            &b"api-ms-win-core-libraryloader-l1-2-0.dll\0"[..],
+            IAT,
+            &[&b"GetModuleHandleW\0"[..], b"GetProcAddress\0"][..],
+        ),
+        (
+            0x68,
+            &b"kernel32.dll\0"[..],
+            IAT + 24,
+            &[
+                &b"InitializeCriticalSectionAndSpinCount\0"[..],
+                b"EnterCriticalSection\0",
+                b"LeaveCriticalSection\0",
+                b"DeleteCriticalSection\0",
+            ][..],
+        ),
+        (0x90, DLL.as_bytes(), IAT + 64, &[WAKE][..]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let at = file(LINK) + 20 * i;
+        let dll_name = LINK + 0xa0 + 0x30 * i;
+        w32(&mut exe, at, LINK + lookup);
+        w32(&mut exe, at + 12, dll_name);
+        w32(&mut exe, at + 16, iat);
+        put(&mut exe, file(dll_name), dll);
+        for (j, name) in names.iter().enumerate() {
+            let hint_name = LINK + 0x140 + 0xc0 * i + 0x30 * j;
+            w64(&mut exe, file(LINK) + lookup + 8 * j, hint_name);
+            put(&mut exe, file(hint_name) + 2, name);
+        }
+    }
+
+    let mut dll = image(Kind::Guarded);
+    w16(&mut dll, 0x96, 0x2022);
+    w32(&mut dll, OP + 16, 0); // No entry or TLS callback required.
+    dir(&mut dll, 9, 0, 0);
+    w64(&mut dll, file(LOAD) + 0x88, 2);
+    w32(&mut dll, file(GFIDS), sleep);
+    w32(&mut dll, file(GFIDS) + 4, wake);
+    dir(&mut dll, 0, LINK, 0x100);
+    for (off, val) in [
+        (12, LINK + 0x50),
+        (16, 1),
+        (20, 2),
+        (24, 2),
+        (28, LINK + 0x30),
+        (32, LINK + 0x38),
+        (36, LINK + 0x40),
+    ] {
+        w32(&mut dll, file(LINK) + off, val);
+    }
+    w32(&mut dll, file(LINK) + 0x30, sleep);
+    w32(&mut dll, file(LINK) + 0x34, wake);
+    w32(&mut dll, file(LINK) + 0x38, LINK + 0x80);
+    w32(&mut dll, file(LINK) + 0x3c, LINK + 0xa0);
+    w16(&mut dll, file(LINK) + 0x42, 1);
+    put(&mut dll, file(LINK) + 0x50, DLL.as_bytes());
+    put(&mut dll, file(LINK) + 0x80, SLEEP);
+    put(&mut dll, file(LINK) + 0xa0, WAKE);
+    scratch.write(DLL, &dll);
+    let exe_path = scratch.write("sync-facade.exe", &exe);
+    expect(run(&exe_path, &flags), 46, "Guest entry returned 46");
+
+    w32(&mut exe, file(MODE), 2);
+    scratch.write("sync-facade.exe", &exe);
+    expect(run(&exe_path, &flags), 1, "child terminated by signal 4");
+
+    w32(&mut exe, file(MODE), 1);
+    scratch.write("sync-facade.exe", &exe);
+    // Sleep points at executable code, but its exact RVA is no longer CFG-approved.
+    w64(&mut dll, file(LOAD) + 0x88, 1);
+    w32(&mut dll, file(GFIDS), wake);
+    scratch.write(DLL, &dll);
+    expect(run(&exe_path, &flags), 47, "Guest entry returned 47");
+    // A data export also cannot escape through the child look-up adapter.
+    w32(&mut dll, file(LINK) + 0x30, MODE);
+    scratch.write(DLL, &dll);
+    expect(run(&exe_path, &flags), 47, "Guest entry returned 47");
+}
+
+#[test]
 fn module_filename_bridge_uses_mapped_paths_and_teb_last_error() {
     if !rosetta() {
         return;
@@ -1705,19 +1810,10 @@ fn unaudited_exports_and_raw_address_aliases_are_refused_before_entry() {
         "no enabled audited bridge for kernelbase.dll!SetErrorMode",
     );
 
-    let mut dynamic = image(Kind::Bridge);
-    put(&mut dynamic, file(LINK) + 0x112, b"GetProcAddress\0");
-    let exe = dir.write("dynamic.exe", &dynamic);
-    expect(
-        run(&exe, &flags),
-        1,
-        "no enabled audited bridge for kernelbase.dll!GetProcAddress",
-    );
-
     expect(
         run(&exe, &[OPT, "--rust-providers", "--trace-missing-imports"]),
         1,
-        "symbol=\"GetProcAddress\" IAT RVA=",
+        "symbol=\"SetErrorMode\" IAT RVA=",
     );
     expect(
         run(&exe, &[OPT, "--rust-providers", "--trace-missing-imports"]),

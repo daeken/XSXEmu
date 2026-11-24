@@ -12,6 +12,7 @@ _static_tls_fixture:
     .long Lmodule_filename_dll_main-Ltext
     .long Lmodule_handle_dll_main-Ltext, Lmodule_handle_entry-Ltext
     .long Lprocessor_feature_entry-Ltext
+    .long Lsync_entry-Ltext, Lsync_sleep-Ltext, Lsync_wake-Ltext
 Ltext:
 .macro tls index
     leaq Ltext(%rip), %r11
@@ -928,5 +929,115 @@ Lmodule_handle_name:
     .short 'O', 'w', 'N', 'e', 'D', 0  /* Case-insensitive, implicit .dll. */
 Lmodule_handle_missing:
     .short 'k', 'e', 'r', 'n', 'e', 'l', '3', '2', '.', 'd', 'l', 'l', 0
+/* Fixture only: the owned caller supplies an initialized condition variable
+ * and an exclusively held critical section. There are no possible peers, so
+ * releasing and reacquiring on a zero-timeout poll has no observable effect. */
+Lsync_sleep:
+    testl %r9d, %r9d
+    jne Lbad                             /* A blocking wait is unsupported. */
+    movl $1460, %gs:0x68                 /* ERROR_TIMEOUT */
+    xorl %eax, %eax
+    retq
+Lsync_wake:
+    retq                                 /* No waiter can coexist. */
+Lsync_entry:
+    tls 0
+    phase 1, 2
+    pushq %rbx
+    subq $80, %rsp
+    xorl %ecx, %ecx
+    callq *{iat_delta}(%r11)
+    leaq Ltext(%rip), %r11
+    leaq -{text_rva}(%r11), %rcx
+    cmpq %rcx, %rax
+    jne Lbad
+    cmpw $0x5a4d, (%rax)
+    jne Lbad
+    movslq 0x3c(%rax), %rcx
+    cmpl $0x4550, (%rax,%rcx)
+    jne Lbad
+    leaq Lsync_module(%rip), %rcx
+    callq *{iat_delta}(%r11)
+    testq %rax, %rax
+    je Lbad
+    movq %rax, %rbx
+    cmpw $0x5a4d, (%rax)
+    jne Lbad
+    leaq Ltext(%rip), %r11
+    movq $0, 32(%rsp)                    /* CONDITION_VARIABLE_INIT */
+    leaq 40(%rsp), %rcx                   /* CRITICAL_SECTION (40 bytes) */
+    xorl %edx, %edx
+    callq *{iat_delta}+24(%r11)          /* InitializeCriticalSectionAndSpinCount */
+    testl %eax, %eax
+    je Lbad
+    leaq Ltext(%rip), %r11
+    leaq 40(%rsp), %rcx
+    callq *{iat_delta}+32(%r11)          /* EnterCriticalSection */
+    leaq Ltext(%rip), %r11
+    movq %rbx, %rcx
+    leaq Lsync_wake_name(%rip), %rdx
+    movl $0x23456789, %gs:0x68
+    callq *{iat_delta}+8(%r11)
+    leaq {text_rva}+Lsync_wake-Ltext(%rbx), %rcx
+    cmpq %rcx, %rax
+    jne Lbad
+    cmpl $0x23456789, %gs:0x68
+    jne Lbad
+    leaq Ltext(%rip), %r11
+    leaq 32(%rsp), %rcx
+    callq *{dispatch_delta}(%r11)
+    cmpl $0x23456789, %gs:0x68
+    jne Lbad
+    leaq Ltext(%rip), %r11
+    movq %rbx, %rcx
+    leaq Lsync_sleep_name(%rip), %rdx
+    callq *{iat_delta}+8(%r11)
+    leaq Ltext(%rip), %r11
+    cmpl $1, {mode_delta}(%r11)
+    je Lsync_refused
+    leaq {text_rva}+Lsync_sleep-Ltext(%rbx), %rcx
+    cmpq %rcx, %rax
+    jne Lbad
+    cmpl $0x23456789, %gs:0x68
+    jne Lbad
+    leaq 32(%rsp), %rcx
+    leaq 40(%rsp), %rdx
+    movl {mode_delta}(%r11), %r9d         /* mode 0 = poll, 2 = wait */
+    callq *{dispatch_delta}(%r11)
+    testl %eax, %eax
+    jne Lbad
+    cmpl $1460, %gs:0x68
+    jne Lbad
+    jmp Lsync_return
+Lsync_refused:
+    testq %rax, %rax
+    jne Lbad
+    cmpl $127, %gs:0x68                  /* ERROR_PROC_NOT_FOUND */
+    jne Lbad
+Lsync_return:
+    movl %gs:0x68, %ebx
+    leaq Ltext(%rip), %r11
+    leaq 40(%rsp), %rcx
+    callq *{iat_delta}+40(%r11)          /* LeaveCriticalSection */
+    leaq Ltext(%rip), %r11
+    leaq 40(%rsp), %rcx
+    callq *{iat_delta}+48(%r11)          /* DeleteCriticalSection */
+    cmpl %ebx, %gs:0x68
+    jne Lbad
+    xorl %eax, %eax
+    leaq Ltext(%rip), %r11
+    cmpl $1, {mode_delta}(%r11)
+    sete %al
+    addl $46, %eax
+    addq $80, %rsp
+    popq %rbx
+    retq
+Lsync_sleep_name:
+    .asciz "SleepConditionVariableCS"
+Lsync_wake_name:
+    .asciz "WakeAllConditionVariable"
+.p2align 1
+Lsync_module:
+    .short 'o','w','n','e','d','-','s','y','n','c','.','d','l','l',0
 Lend:
     .org Ltext + {capacity}, 0xcc

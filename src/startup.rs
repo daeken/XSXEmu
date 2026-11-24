@@ -478,11 +478,15 @@ mod native {
         // Install the mapped image graph before either execution lane can run
         // an attach callback, and keep it alive until after detach.
         let _loader = win_loader::register(
-            images
-                .iter()
-                .zip(&pes)
-                .zip(&memories)
-                .map(|(((path, _), pe), mem)| (*path, pe, mem.base())),
+            images.iter().zip(&pes).zip(&memories).zip(&cfgs).map(
+                |((((path, _), pe), mem), cfg)| {
+                    let tls_cfg = match cfg {
+                        CfgProfile::Guarded(cfg) if static_tls => Some(cfg),
+                        _ => None,
+                    };
+                    (*path, pe, mem.base(), tls_cfg)
+                },
+            ),
             api_set,
             rust_providers,
         )?;
@@ -491,7 +495,7 @@ mod native {
                 win_proc::init_process(images[0].0)?;
             }
             // Registration remains exact-address, including bounded legacy root
-            // callbacks in trusted offline mode. No unwind or dynamic lookup.
+            // callbacks in trusted offline mode. Export lookup never adds targets.
             let _cfg_registration = targets.map(Targets::install).transpose()?;
             let outcome = tls_runtime::run(&tls, images, &pes, &memories, attach_order);
             win_fls::native::finish_initial_thread()?;

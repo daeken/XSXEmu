@@ -152,7 +152,10 @@ pub(crate) mod native {
     const MAX_EXPORT_NAME: usize = 65_536;
 
     enum Target {
-        Rva(u32),
+        Rva {
+            rva: u32,
+            tls_callable: bool,
+        },
         Forwarder {
             dll: Vec<u8>,
             routed: Vec<u8>,
@@ -252,7 +255,7 @@ pub(crate) mod native {
                     Query::Ordinal(ordinal) => image.ordinals.get(&ordinal),
                 }?;
                 match image.targets.get(index)? {
-                    Target::Rva(rva) => {
+                    Target::Rva { rva, .. } => {
                         return image
                             .base
                             .checked_add(*rva as usize)
@@ -304,6 +307,7 @@ pub(crate) mod native {
             Result,
             apiset::ApiSet,
             pe::{ExportTarget, Pe},
+            win_cfg::{CfgMetadata, ExportSuppression},
         };
         use std::marker::PhantomData;
 
@@ -355,12 +359,12 @@ pub(crate) mod native {
         /// The first tuple describes the process EXE. Supply the actual source
         /// path and mapped base. PE exports are read only from checked file bytes.
         pub(crate) fn register<'a, 'pe: 'a>(
-            inputs: impl IntoIterator<Item = (&'a str, &'a Pe<'pe>, u64)>,
+            inputs: impl IntoIterator<Item = (&'a str, &'a Pe<'pe>, u64, Option<&'a CfgMetadata<'pe>>)>,
             api_set: Option<&ApiSet>,
             rust_providers: bool,
         ) -> Result<Registration> {
             let mut images: Vec<Image> = Vec::new();
-            for (path, pe, base) in inputs {
+            for (path, pe, base, tls_cfg) in inputs {
                 let base = usize::try_from(base)?;
                 let end = base
                     .checked_add(pe.size_of_image as usize)
@@ -402,7 +406,12 @@ pub(crate) mod native {
                 };
                 for export in pe.exports()? {
                     let target = match export.target {
-                        ExportTarget::Rva(rva) => Target::Rva(rva),
+                        ExportTarget::Rva(rva) => Target::Rva {
+                            rva,
+                            tls_callable: tls_cfg.is_some_and(|cfg| {
+                                cfg.permits_rva(rva, ExportSuppression::Enabled)
+                            }),
+                        },
                         ExportTarget::Forwarder(value) => {
                             forwarder(value, basename(path).as_bytes(), api_set)
                                 .unwrap_or(Target::Unresolved)
@@ -444,6 +453,20 @@ pub(crate) mod native {
         use std::ptr;
 
         const MAIN: usize = 0x1_0000_0000;
+        fn register<'a, 'pe: 'a>(
+            inputs: impl IntoIterator<Item = (&'a str, &'a Pe<'pe>, u64)>,
+            api_set: Option<&crate::apiset::ApiSet>,
+            rust_providers: bool,
+        ) -> crate::Result<super::registration::Registration> {
+            super::register(
+                inputs
+                    .into_iter()
+                    .map(|(path, pe, base)| (path, pe, base, None)),
+                api_set,
+                rust_providers,
+            )
+        }
+
         const DLL: usize = MAIN + 0x2000;
         const FWD: usize = DLL + 0x2000;
         const CYCLE: usize = FWD + 0x2000;
@@ -933,7 +956,7 @@ pub(crate) mod native {
         })
     }
 
-    pub(super) unsafe extern "win64" fn get_proc_address(module: usize, symbol: usize) -> usize {
+    pub(crate) unsafe extern "win64" fn get_proc_address(module: usize, symbol: usize) -> usize {
         graph(|g| {
             let Some(g) = g else {
                 return fail(ERROR_INVALID_HANDLE);
@@ -952,6 +975,35 @@ pub(crate) mod native {
             };
             g.resolve(image, query)
                 .unwrap_or_else(|| fail(ERROR_PROC_NOT_FOUND))
+        })
+    }
+
+    // Direct, named exports only. Admission is derived from the same guarded
+    // image metadata as the sealed CFG table, never from a lookup or IAT slot.
+    #[cfg(target_os = "macos")]
+    pub(crate) unsafe extern "win64" fn tls_child_get_proc_address(
+        module: usize,
+        symbol: usize,
+    ) -> usize {
+        graph(|g| {
+            let Some(image) = g.and_then(|g| g.by_handle(module)) else {
+                return fail(ERROR_INVALID_HANDLE);
+            };
+            if symbol <= u16::MAX as usize {
+                return fail(ERROR_PROC_NOT_FOUND);
+            }
+            let name = symbol as *const u8;
+            let Some(len) = (unsafe { terminated(name, MAX_EXPORT_NAME) }) else {
+                return fail(ERROR_INVALID_PARAMETER);
+            };
+            let name = unsafe { std::slice::from_raw_parts(name, len) };
+            match image.names.get(name).and_then(|&i| image.targets.get(i)) {
+                Some(Target::Rva {
+                    rva,
+                    tls_callable: true,
+                }) => image.base + *rva as usize,
+                _ => fail(ERROR_PROC_NOT_FOUND),
+            }
         })
     }
 
