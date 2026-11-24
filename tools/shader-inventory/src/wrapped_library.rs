@@ -124,10 +124,16 @@ impl GraphicsCoverage {
 // Observed size baselines, not verified serialized section boundaries.
 fn state_base(slots: &[usize]) -> Option<usize> {
     match slots {
-        [0, 1] | [0, 1, 6] => Some(380),
-        [0, 2] => Some(464),
+        [1] | [0, 1] | [0, 1, 6] => Some(380),
+        [2] | [0, 2] => Some(464),
         _ => None,
     }
+}
+
+fn state_window(blob: &[u8], base: usize) -> Option<(&[u8], &[u8])> {
+    let start = base.checked_sub(44)?;
+    let before_base = blob.get(start..base)?;
+    Some(before_base.split_at(32))
 }
 
 // Public DXGI_FORMAT byte widths, limited to the observed candidate subset.
@@ -539,6 +545,7 @@ pub(super) fn run(
         ),
     >::new();
     let mut state_sizes = BTreeMap::<Vec<usize>, BTreeMap<usize, HashSet<_>>>::new();
+    let mut state_bases = HashMap::<_, HashSet<_>>::new();
     let mut layouts_seen = HashMap::<_, Option<Layout>>::new();
     let mut format_matches = [0usize; 7];
     let mut vertex_fields = VertexFields::default();
@@ -604,6 +611,10 @@ pub(super) fn run(
             .entry(state.len())
             .or_default()
             .insert(pso.state);
+        state_bases
+            .entry(pso.state)
+            .or_default()
+            .insert(state_base(&slots));
         if let Some(pixel) = pso.slots[0] {
             let size = state.len();
             state_sizes_by_ps
@@ -685,6 +696,35 @@ pub(super) fn run(
             c.complete_unique, c.complete_multi, c.missing, c.missing_and_multi, c.no_known_slots,
         );
     }
+    let mut windows = HashSet::new();
+    let mut zero_shapes = BTreeMap::<[bool; 8], usize>::new();
+    let (mut contexts, mut multiple_bases, mut unprofiled, mut short, mut unaligned, mut zero_tail) =
+        (0, 0, 0, 0, 0, 0);
+    for (&id, bases) in &state_bases {
+        contexts += bases.len();
+        multiple_bases += usize::from(bases.iter().filter(|b| b.is_some()).count() > 1);
+        let blob = library.blob(id).ok_or("missing graphics state span")?;
+        for &base in bases {
+            let Some(base) = base else {
+                unprofiled += 1;
+                continue;
+            };
+            let Some((window, following)) = state_window(blob, base) else {
+                short += 1;
+                continue;
+            };
+            unaligned += usize::from((blob.len() - base) % 8 != 0);
+            windows.insert(window);
+            let zero_shape = std::array::from_fn(|i| window[i * 4..i * 4 + 4] == [0; 4]);
+            *zero_shapes.entry(zero_shape).or_default() += 1;
+            zero_tail += usize::from(following == [0; 12]);
+        }
+    }
+    println!(
+        "  Graphics state pre-base window: {} distinct IDs, {contexts} ID/base contexts ({multiple_bases} multi-base IDs, {unprofiled} unknown-base, {short} short, {unaligned} non-eight-byte residual); {} distinct windows, zero-dword shapes: {zero_shapes:?}; {zero_tail} with 12 subsequent zero bytes",
+        state_bases.len(),
+        windows.len(),
+    );
     for (slots, by_size) in state_sizes {
         let counts: Vec<_> = by_size
             .into_iter()
@@ -945,6 +985,23 @@ pub(super) fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn state_window_checks_full_coverage_at_each_base() {
+        let blob: Vec<_> = (0..=127).collect::<Vec<u8>>();
+        assert_eq!(
+            state_window(&blob, 80),
+            Some((&blob[36..68], &blob[68..80]))
+        );
+        assert_eq!(
+            state_window(&blob, 100),
+            Some((&blob[56..88], &blob[88..100]))
+        );
+        assert_eq!(state_window(&blob[..79], 80), None);
+        assert_eq!(state_window(&blob, 43), None);
+        assert_eq!(state_base(&[0, 1, 2]), None);
+    }
+
     #[test]
     fn source_family_does_not_recover_invariance_after_a_disagreement() {
         // One checked ordinary row, followed by its owned semantic string.
