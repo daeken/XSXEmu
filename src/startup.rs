@@ -21,8 +21,12 @@ mod native {
     const PROCESS_DETACH: u32 = 0;
     const MAX_MAPPED_TOTAL: usize = 1024 * 1024 * 1024;
     const AMD64_DEFAULT_COOKIE: u64 = 0x0000_2b99_2ddf_a232;
+    const DLL_FORCE_INTEGRITY: u16 = 0x0080;
 
     fn validate_profile<'a>(pe: &Pe<'a>, name: &str, static_tls: bool) -> Result<CfgProfile<'a>> {
+        if pe.dll_characteristics & DLL_FORCE_INTEGRITY != 0 {
+            return Err(format!("{name}: FORCE_INTEGRITY requires Windows signature verification, which this loader does not provide").into());
+        }
         if !static_tls && pe.tls()?.is_some() {
             return Err(format!("{name}: static TLS requires a Windows TEB and is not supported by this startup profile").into());
         }

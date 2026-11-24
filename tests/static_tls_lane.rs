@@ -357,6 +357,24 @@ fn launcher(path: &Path, opts: &[&str]) -> Command {
     cmd.arg("run").arg(path).args(opts);
     cmd
 }
+#[test]
+fn force_integrity_is_refused_in_both_execution_profiles() {
+    if !rosetta() {
+        return;
+    }
+    let dir = Scratch::new();
+    let mut bytes = image(Kind::Solo);
+    w16(&mut bytes, OP + 70, 0x0080);
+    let exe = dir.write("requires-signature.exe", &bytes);
+    for flags in [&[][..], &[OPT][..]] {
+        expect(
+            run(&exe, flags),
+            1,
+            "FORCE_INTEGRITY requires Windows signature verification",
+        );
+    }
+}
+
 fn run(path: &Path, opts: &[&str]) -> Output {
     launcher(path, opts).output().unwrap()
 }
