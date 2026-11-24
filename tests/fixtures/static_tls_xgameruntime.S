@@ -199,17 +199,21 @@ Lxgr_entry:
     jmp Lxgr_bad
 Lxgr_cleanup:
     movq queue_a(%rsp), %rdx
-    movl $1, %r8d
+    movabsq $0xfedcba9876543201, %r8 /* only R8B is defined for wait */
     xorq %r9, %r9
     leaq Lxgr_callback(%rip), %rax
-    movq %rax, 32(%rsp)             /* never invoke the supplied guest callback */
+    movq $0, 24(%rsp)
+    movq %rax, 32(%rsp)             /* callee [rsp+0x28]; must reject callback */
+    movq $0, 40(%rsp)
     meth 22
     check 0x80004001
     movq object_b(%rsp), %rcx
     movq queue_a(%rsp), %rdx
-    movl $1, %r8d
+    movabsq $0xfedcba9876543201, %r8
     xorq %r9, %r9
+    movq $-1, 24(%rsp)              /* poison adjacent offsets */
     movq $0, 32(%rsp)
+    movq $-1, 40(%rsp)
     meth 22
     check 0
     movq object_b(%rsp), %rcx
@@ -241,7 +245,14 @@ Lxgr_cleanup:
     cmpq queue_a(%rsp), %rax
     je Lxgr_bad
     movq %rax, queue_a(%rsp)
-    exp uninit                     /* reclaim this outstanding queue */
+    movq object_b(%rsp), %rcx
+    movq %rax, %rdx
+    movabsq $0xfedcba9876543200, %r8 /* also exercise wait=false */
+    xorq %r9, %r9
+    movq $0, 32(%rsp)
+    meth 22
+    check 0
+    exp uninit                     /* terminate did not close this queue */
     query_impl Lxgr_guid, Lxgr_guid
     check 0x800401f0
     check_null object_out

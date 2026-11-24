@@ -2723,6 +2723,7 @@ fn built_in_xgameruntime_exercises_owned_win64_startup_and_refuses_unsupported_c
         "queue terminate wait=1",
         "queue poll port=1 mode=1 terminated=true",
         "queue close",
+        "queue terminate wait=0",
         "uninitialize queues=1",
         "DLL process detach queues=0 live_interfaces=0",
     ] {
