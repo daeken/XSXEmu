@@ -103,6 +103,20 @@ fn check(bytes: &[u8]) -> Option<(Count, Vec<SignatureRow>)> {
     Some((count, keys))
 }
 
+// This is source declaration presence, not an attachment binding or write mask.
+pub(super) fn color_targets(bytes: &[u8]) -> Option<u8> {
+    let (_, rows) = check(bytes)?;
+    let mut mask = 0;
+    for row in rows {
+        match (row.key.0.as_slice(), row.system_code) {
+            (b"sv_target", 64) if row.key.1 < 8 => mask |= 1 << row.key.1,
+            (b"sv_target", _) | (_, 64) => return None,
+            _ => (),
+        }
+    }
+    Some(mask)
+}
+
 // Equality is over only this ordinary-row projection and the number of
 // excluded system rows, not all signature fields or all system semantics.
 #[derive(Default, PartialEq, Eq)]

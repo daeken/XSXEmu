@@ -73,6 +73,7 @@ struct SourceFamily {
     count: usize,
     invariant: Option<SourceInterface>,
     system_invariant: Option<SystemInterface>,
+    targets: Option<Option<u8>>,
 }
 
 impl SourceFamily {
@@ -134,6 +135,18 @@ fn state_window(blob: &[u8], base: usize) -> Option<(&[u8], &[u8])> {
     let start = base.checked_sub(44)?;
     let before_base = blob.get(start..base)?;
     Some(before_base.split_at(32))
+}
+
+// Compare raw nonzero occupancy at the tested stride only; this is not a record decoder.
+fn residual_occupancy(bytes: &[u8]) -> Option<(usize, u8)> {
+    let (chunks, remainder) = bytes.as_chunks::<8>();
+    if !remainder.is_empty() || chunks.len() > 8 {
+        return None;
+    }
+    let mask = chunks.iter().enumerate().fold(0, |mask, (i, chunk)| {
+        mask | (u8::from(*chunk != [0; 8]) << i)
+    });
+    Some((chunks.len(), mask))
 }
 
 // Public DXGI_FORMAT byte widths, limited to the observed candidate subset.
@@ -429,6 +442,21 @@ pub(super) fn run(
             let interface =
                 SourceInterface::parse(table).ok_or("invalid graphics source signature")?;
             sources.entry((stage, key)).or_default().add(interface);
+            if stage == 0 {
+                let family = sources
+                    .get_mut(&(stage, key))
+                    .ok_or("missing source family")?;
+                let mut outputs = parts.iter().filter(|(t, _)| *t == b"OSG1");
+                let (_, table) = outputs.next().ok_or("missing PS output signature")?;
+                if outputs.next().is_some() {
+                    return Err("duplicate PS output signature".into());
+                }
+                update_projection(
+                    &mut family.targets,
+                    crate::signatures::color_targets(table),
+                    family.count == 1,
+                );
+            }
             if stage == 1 {
                 let mut inputs = parts.iter().filter(|(t, _)| *t == b"ISG1");
                 let (_, table) = inputs.next().ok_or("missing VS input signature")?;
@@ -546,6 +574,7 @@ pub(super) fn run(
     >::new();
     let mut state_sizes = BTreeMap::<Vec<usize>, BTreeMap<usize, HashSet<_>>>::new();
     let mut state_bases = HashMap::<_, HashSet<_>>::new();
+    let mut target_positions = BTreeMap::<_, [usize; 8]>::new();
     let mut layouts_seen = HashMap::<_, Option<Layout>>::new();
     let mut format_matches = [0usize; 7];
     let mut vertex_fields = VertexFields::default();
@@ -616,6 +645,26 @@ pub(super) fn run(
             .or_default()
             .insert(state_base(&slots));
         if let Some(pixel) = pso.slots[0] {
+            let counts = target_positions.entry(slots.clone()).or_default();
+            match (families[0], state_base(&slots)) {
+                (_, None) => counts[0] += 1,
+                (None, _) => counts[1] += 1,
+                (Some(f), _) if f.targets.is_none() => counts[2] += 1,
+                (Some(f), Some(base)) => {
+                    if let Some(Some(targets)) = f.targets {
+                        if let Some((n, occupied)) = state.get(base..).and_then(residual_occupancy)
+                        {
+                            counts[5] += 1;
+                            counts[6] += usize::from(n == targets.count_ones() as usize);
+                            counts[7] += usize::from(occupied == targets);
+                        } else {
+                            counts[4] += 1;
+                        }
+                    } else {
+                        counts[3] += 1;
+                    }
+                }
+            }
             let size = state.len();
             state_sizes_by_ps
                 .entry(pixel.program)
@@ -746,6 +795,11 @@ pub(super) fn run(
         });
         println!(
             "  State bytes 45 / 46 before baselines [VS distinct, MS distinct, shared distinct, VS includes zero, MS includes zero]: {profiles:?}"
+        );
+    }
+    for (slots, totals) in target_positions {
+        println!(
+            "  PS color target vs eight-byte state residual, slots {slots:?} [unknown base, missing source, divergent, unsupported signature, invalid residual, compared, equal count, equal occupancy]: {totals:?}"
         );
     }
     for (slots, by_size) in state_sizes {
@@ -1024,6 +1078,40 @@ mod tests {
         assert_eq!(state_window(&blob[..79], 80), None);
         assert_eq!(state_window(&blob, 43), None);
         assert_eq!(state_base(&[0, 1, 2]), None);
+    }
+
+    #[test]
+    fn residual_occupancy_preserves_zero_chunk_positions_and_rejects_overflow() {
+        let mut residual = [0; 24];
+        residual[23] = 1;
+        assert_eq!(residual_occupancy(&residual), Some((3, 0b100)));
+        assert_eq!(residual_occupancy(&[]), Some((0, 0)));
+        assert_eq!(residual_occupancy(&residual[..23]), None);
+        assert_eq!(residual_occupancy(&[0; 72]), None);
+    }
+
+    #[test]
+    fn color_targets_use_source_name_and_enum_without_using_register() {
+        let mut table = [0u8; 50];
+        for (at, value) in [
+            (0, 1u32),
+            (4, 8),
+            (12, 40),
+            (16, 3),
+            (20, 64),
+            (24, 3),
+            (28, 6),
+            (32, 1),
+        ] {
+            table[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        table[40..].copy_from_slice(b"SV_Target\0");
+        assert_eq!(crate::signatures::color_targets(&table), Some(0b1000));
+        table[16] = 8;
+        assert_eq!(crate::signatures::color_targets(&table), None);
+        table[16] = 3;
+        table[20] = 0;
+        assert_eq!(crate::signatures::color_targets(&table), None);
     }
 
     #[test]
