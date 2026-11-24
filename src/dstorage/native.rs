@@ -1,6 +1,6 @@
 //! Host-side state for the original guest facade. Staging is CPU-only and is
 //! never exposed to the guest; its sole observable operation is configuration.
-use std::{io::Write, sync::Mutex};
+use std::{fs::File, io::Write, sync::Mutex};
 
 type Hr = i32;
 const E_NOINTERFACE: Hr = 0x8000_4002u32 as Hr;
@@ -13,6 +13,39 @@ const IUNKNOWN: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0xc0, 0, 0, 0, 0, 0, 0, 0x46
 const FACTORY: [u8; 16] = [
     0x11, 0x9d, 0x95, 0x62, 0x5f, 0xd4, 0x84, 0x48, 0xa0, 0xa3, 0xf7, 0x86, 0x2e, 0xa2, 0x43, 0xae,
 ];
+
+// 43704f9f-27c6-4a9f-8815-d16527894df4, in Win64 GUID byte order.
+const FILE_IID: [u8; 16] = [
+    0x9f, 0x4f, 0x70, 0x43, 0xc6, 0x27, 0x9f, 0x4a, 0x88, 0x15, 0xd1, 0x65, 0x27, 0x89, 0x4d, 0xf4,
+];
+const FILE_LIMIT: usize = 64;
+
+struct StorageFile {
+    prefix: Box<usize>,
+    refs: u32,
+    _backing: File, // Private owned descriptor, released with the COM object.
+}
+
+impl StorageFile {
+    fn address(&self) -> usize {
+        std::ptr::from_ref(self.prefix.as_ref()).addr()
+    }
+}
+
+static FILES: Mutex<Vec<StorageFile>> = Mutex::new(Vec::new());
+
+fn files() -> std::sync::MutexGuard<'static, Vec<StorageFile>> {
+    FILES
+        .lock()
+        .unwrap_or_else(|_| stop(format_args!("file state unavailable")))
+}
+
+fn file_index(files: &[StorageFile], this: usize) -> usize {
+    files
+        .iter()
+        .position(|f| f.address() == this)
+        .unwrap_or_else(|| stop(format_args!("invalid file instance")))
+}
 
 struct Factory {
     // Only this word is guest-visible. It points into the relocated PE, not
@@ -143,6 +176,88 @@ pub(crate) extern "win64" fn set_staging_size(this: usize, bytes: u32) -> Hr {
     0
 }
 
+fn win32_hr(code: u32) -> Hr {
+    (0x8007_0000 | (code & 0xffff)) as Hr
+}
+
+pub(crate) unsafe extern "win64" fn open_file(
+    this: usize,
+    path: *const u16,
+    iid: *const [u8; 16],
+    out: *mut usize,
+) -> Hr {
+    match unsafe { requested(iid, out) } {
+        Ok(FILE_IID) => {}
+        Ok(_) => return E_NOINTERFACE,
+        Err(hr) => return hr,
+    }
+    if path.is_null() {
+        return E_POINTER;
+    }
+    // The vtables are immutable, adjacent tables in the same admitted PE.
+    let vtable = *instance(&mut state(), this).prefix + super::FILE_VTABLE_OFFSET;
+    let path = match unsafe { crate::providers::win_io::native::wide(path) } {
+        Ok(path) => path,
+        Err(error) => return win32_hr(error),
+    };
+    let mut files = files();
+    if files.len() >= FILE_LIMIT {
+        return win32_hr(4); // ERROR_TOO_MANY_OPEN_FILES
+    }
+    if files.try_reserve(1).is_err() {
+        return E_OUTOFMEMORY;
+    }
+    let backing = match crate::title_data::open_regular(&path) {
+        Ok(file) => file,
+        Err(error) => return win32_hr(error),
+    };
+    let file = StorageFile {
+        prefix: Box::new(vtable),
+        refs: 1,
+        _backing: backing,
+    };
+    let address = file.address();
+    files.push(file);
+    unsafe { out.write_unaligned(address) };
+    0
+}
+
+pub(crate) unsafe extern "win64" fn file_query(
+    this: usize,
+    iid: *const [u8; 16],
+    out: *mut usize,
+) -> Hr {
+    match unsafe { requested(iid, out) } {
+        Ok(IUNKNOWN | FILE_IID) => {}
+        Ok(_) => return E_NOINTERFACE,
+        Err(hr) => return hr,
+    }
+    file_add_ref(this);
+    unsafe { out.write_unaligned(this) };
+    0
+}
+
+pub(crate) extern "win64" fn file_add_ref(this: usize) -> u32 {
+    let mut files = files();
+    let index = file_index(&files, this);
+    let refs = &mut files[index].refs;
+    *refs = refs
+        .checked_add(1)
+        .unwrap_or_else(|| stop(format_args!("file reference count overflow")));
+    *refs
+}
+
+pub(crate) extern "win64" fn file_release(this: usize) -> u32 {
+    let mut files = files();
+    let index = file_index(&files, this);
+    files[index].refs -= 1;
+    let refs = files[index].refs;
+    if refs == 0 {
+        files.swap_remove(index);
+    }
+    refs
+}
+
 fn stop(args: std::fmt::Arguments<'_>) -> ! {
     let _ = writeln!(
         std::io::stderr().lock(),
@@ -155,6 +270,10 @@ fn stop(args: std::fmt::Arguments<'_>) -> ! {
 }
 
 pub(crate) extern "win64" fn unsupported(slot: u32) -> ! {
+    if slot as usize >= super::FACTORY_SLOTS {
+        let slot = slot as usize - super::FACTORY_SLOTS;
+        stop(format_args!("unsupported file vtable slot {slot}"));
+    }
     stop(format_args!("unsupported factory vtable slot {slot}"))
 }
 
@@ -163,7 +282,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn staging_has_real_bounded_backing_owned_by_factory() {
+    fn factory_and_files_own_bounded_real_backing() {
         let mut object = 0;
         assert_eq!(unsafe { get_factory(&FACTORY, &mut object, 1) }, 0);
         assert!(state().as_ref().unwrap().staging.is_none());
@@ -191,5 +310,49 @@ mod tests {
         assert_eq!(unsafe { get_factory(&FACTORY, &mut object, 1) }, 0);
         assert!(state().as_ref().unwrap().staging.is_none());
         assert_eq!(release(object), 0);
+
+        let root = std::env::temp_dir().join(format!("xsxemu-ds-owned-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let payload = b"original DirectStorage payload";
+        std::fs::write(root.join("owned.dat"), payload).unwrap();
+        crate::title_data::mount(&root).unwrap();
+        assert_eq!(unsafe { get_factory(&FACTORY, &mut object, 1) }, 0);
+        let path: Vec<u16> = r"G:\owned.dat".encode_utf16().chain([0]).collect();
+        let mut objects = [0; FILE_LIMIT];
+        for out in &mut objects {
+            assert_eq!(
+                unsafe { open_file(object, path.as_ptr(), &FILE_IID, out) },
+                0
+            );
+        }
+        let mut out = usize::MAX;
+        assert_eq!(
+            unsafe { open_file(object, path.as_ptr(), &FILE_IID, &mut out) },
+            win32_hr(4)
+        );
+        assert_eq!(out, 0);
+        use std::os::unix::fs::FileExt;
+        let mut bytes = [0; 30];
+        {
+            let files = files();
+            assert_eq!(files.len(), FILE_LIMIT);
+            let first = &files[file_index(&files, objects[0])];
+            assert_eq!(
+                first._backing.read_at(&mut bytes, 0).unwrap(),
+                payload.len()
+            );
+        }
+        assert_eq!(&bytes[..payload.len()], payload);
+        assert_eq!(file_release(objects[0]), 0);
+        assert_eq!(
+            unsafe { open_file(object, path.as_ptr(), &FILE_IID, &mut objects[0]) },
+            0
+        );
+        assert_eq!(release(object), 0);
+        for file in objects {
+            assert_eq!(file_release(file), 0);
+        }
+        assert!(files().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

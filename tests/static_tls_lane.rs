@@ -3215,11 +3215,13 @@ fn gameinput_root_ordinal_exposes_guarded_no_device_service() {
     );
 }
 
-const DSTORAGE_CAPACITY: usize = 0x800;
+const DSTORAGE_CAPACITY: usize = 0x1000;
 #[repr(C)]
 struct DStorageFixture {
     entry: u32,
     unsupported: u32,
+    open: u32,
+    file_unsupported: u32,
     code: [u8; DSTORAGE_CAPACITY],
 }
 
@@ -3234,7 +3236,7 @@ unsafe extern "C" {
 }
 
 #[test]
-fn dstorage_exact_root_factory_supports_only_owned_cpu_staging() {
+fn dstorage_exact_root_factory_stages_and_opens_confined_owned_files() {
     if !rosetta() {
         return;
     }
@@ -3292,6 +3294,25 @@ fn dstorage_exact_root_factory_supports_only_owned_cpu_staging() {
     set_entry(&mut exe, fixture.unsupported);
     let path = scratch.write("dstorage-unsupported.exe", &exe);
     expect(run(&path, &args), 87, "unsupported factory vtable slot 10");
+    let mount = scratch.0.join("data");
+    std::fs::create_dir(&mount).unwrap();
+    std::fs::write(mount.join("owned.dat"), b"owned payload").unwrap();
+    std::os::unix::fs::symlink(mount.join("owned.dat"), mount.join("link")).unwrap();
+    let mounted = [
+        OPT,
+        TRUSTED,
+        "--rust-providers",
+        opt,
+        "--title-data",
+        mount.to_str().unwrap(),
+    ];
+    set_entry(&mut exe, fixture.open);
+    let path = scratch.write("dstorage-open.exe", &exe);
+    expect(run(&path, &args), 56, "Guest entry returned 56");
+    expect(run(&path, &mounted), 55, "Guest entry returned 55");
+    set_entry(&mut exe, fixture.file_unsupported);
+    let path = scratch.write("dstorage-file-unsupported.exe", &exe);
+    expect(run(&path, &mounted), 87, "unsupported file vtable slot 3");
 }
 
 const WINSOCK_INIT_CAPACITY: usize = 0x400;

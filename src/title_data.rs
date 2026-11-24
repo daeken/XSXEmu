@@ -37,7 +37,6 @@ pub(crate) fn open(name: &str) -> Result<File, u32> {
 
 /// Open a confined, owned, read-only regular file for an archive consumer.
 /// Directory handles are accepted by attribute lookup, but not by this API.
-#[allow(dead_code)] // DirectStorage OpenFile is a separate follow-up.
 pub(crate) fn open_regular(name: &str) -> Result<File, u32> {
     open_regular_under(ROOT.get(), name)
 }

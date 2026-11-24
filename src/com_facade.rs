@@ -30,7 +30,10 @@ pub(crate) fn image(
     methods: &[(usize, &str)],
     entry_arg: EntryArg,
 ) -> Vec<u8> {
-    assert!(slots <= 22 && methods.len() <= slots);
+    // Vtables end at relocation metadata; the IAT ends at the vtables and
+    // also needs entries for creation and the terminal bridge.
+    assert!(slots <= 32 && methods.len() <= slots);
+    assert!((methods.len() + 2) * 8 <= (VTABLE - IAT) as usize);
     const OP: usize = 0x98;
     const CODE: usize = 0x200;
     const RO: usize = 0x600;

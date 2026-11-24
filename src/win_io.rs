@@ -611,7 +611,7 @@ pub(crate) mod native {
     }
 
     // Caller must provide readable initialized units through the terminating NUL.
-    unsafe fn wide(p: *const u16) -> Result<String> {
+    pub(crate) unsafe fn wide(p: *const u16) -> Result<String> {
         if p.is_null() {
             return Err(INVALID_PARAM);
         }

@@ -114,6 +114,14 @@ audited_bridges! {
         ds::add_ref, (this: usize) -> u32;
     xsxemu_tls_ds_release, ds_release: b"xcrdapi.dll", b"Release",
         ds::release, (this: usize) -> u32;
+    xsxemu_tls_ds_open, ds_open: b"xcrdapi.dll", b"OpenFile",
+        ds::open_file, (this: usize, path: *const u16, iid: *const [u8; 16], out: *mut usize) -> i32;
+    xsxemu_tls_ds_file_query, ds_file_query: b"xcrdapi.dll", b"File.QueryInterface",
+        ds::file_query, (this: usize, iid: *const [u8; 16], out: *mut usize) -> i32;
+    xsxemu_tls_ds_file_retain, ds_file_retain: b"xcrdapi.dll", b"File.AddRef",
+        ds::file_add_ref, (this: usize) -> u32;
+    xsxemu_tls_ds_file_release, ds_file_release: b"xcrdapi.dll", b"File.Release",
+        ds::file_release, (this: usize) -> u32;
     xsxemu_tls_ds_staging, ds_staging: b"xcrdapi.dll", b"SetStagingBufferSize",
         ds::set_staging_size, (this: usize, bytes: u32) -> i32;
     xsxemu_tls_ds_unsupported, ds_unsupported: b"xcrdapi.dll", b"unsupported-vtable-slot",

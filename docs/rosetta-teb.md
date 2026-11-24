@@ -465,8 +465,16 @@ and `IUnknown` via `QueryInterface`. The active factory has a real reference
 count. Slot 8 accepts only 32 MiB, allocates that much zero-initialized private
 CPU storage on success, and reuses it on repeat calls. Allocation failure is
 reported, and final `Release` frees the backing. There is no guest mapping of
-that buffer, GPU/DMA support, queue, file service, or decompression. Every
-other entry in the known Xbox factory table terminates with its slot number.
+that buffer, GPU/DMA support, queue submission, or decompression.
+
+The first run with the `G:` mount reached factory slot 4 at guest return RVA
+`0x28c8c21`. `OpenFile(this, path, iid, out)` accepts the Xbox file IID
+`43704f9f-27c6-4a9f-8815-d16527894df4` and opens a regular file read-only through
+the same descriptor-confined `--title-data DIR` mount as the attributes
+precheck. No other drive or path namespace is admitted. The private file
+object holds the descriptor until its final COM release; at most 64 objects
+may be open. Only the file's IUnknown prefix is implemented, and no file
+descriptor is exposed to the guest. Unmodeled factory/file slots are terminal.
 The owned Win64 fixture exercises the import gate, rebasing, CFG, IID/output
 handling, size checks and lifetime; a host test verifies the actual buffer.
 
@@ -475,7 +483,8 @@ unchecked) followed by slot 10 (`+0x50`, newer queue IID and a `0x20`-byte
 queue descriptor, negative HRESULT asserts). Separate helpers use slot 4
 (`+0x20`) for file open. They return/store null if it fails. On success they
 retain the DirectStorage object in a wrapper that separately opens and reads
-file metadata via ordinary Win32 I/O. That is not a fallback for a missing
+file metadata via ordinary Win32 I/O. This DirectStorage change does not
+expand the Win32 mount operation set. That is not a fallback for a missing
 factory or failed DirectStorage open. The inspected consumers also use queue
 slot 3 to enqueue a request, queue slot 8 to close, and status-array slot 2
 to release. These downstream interfaces remain unimplemented.
