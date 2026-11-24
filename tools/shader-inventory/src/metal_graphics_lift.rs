@@ -5,6 +5,10 @@ mod graphics_decode;
 mod graphics_lift;
 #[cfg(target_os = "macos")]
 mod metal_artifact;
+#[cfg(any(test, target_os = "macos"))]
+#[allow(dead_code)]
+// The graphics probe uses the shared framing, not the compute key or unbounded reader.
+mod metal_cache;
 #[cfg(target_os = "macos")]
 mod owned_graphics_artifact;
 #[cfg(any(test, target_os = "macos"))]
@@ -31,6 +35,7 @@ mod gpu {
         Source,
         Load(&'a Path, bool),
         Archive(&'a Path, &'a Path, bool, bool, [u8; 32]),
+        ExpectStrictMiss(&'a Path, &'a Path),
     }
 
     fn strict(
@@ -61,16 +66,17 @@ mod gpu {
                 return Ok(());
             }
             [mode, lib] if mode == "--load-metallib" || mode == "--load-mutated-metallib" => Mode::Load(Path::new(lib), mode == "--load-mutated-metallib"),
+            [mode, lib, archive] if mode == "--expect-owned-metal-miss" => Mode::ExpectStrictMiss(Path::new(lib), Path::new(archive)),
             [mode, lib, archive, compiler] if mode == "--bake-archive" || mode == "--replay-archive" || mode == "--replay-mutated-archive" => Mode::Archive(Path::new(lib), Path::new(archive), mode == "--bake-archive", mode == "--replay-mutated-archive", owned_graphics_artifact::compiler_profile(compiler)?),
-            _ => return Err("usage: shader-metal-graphics-lift [--emit-msl | --emit-mutated-msl | --load-metallib LIB | --load-mutated-metallib LIB | {--bake-archive|--replay-archive|--replay-mutated-archive} LIB ARCHIVE COMPILER_SHA256]".into()),
+            _ => return Err("usage: shader-metal-graphics-lift [--emit-msl | --emit-mutated-msl | --load-metallib LIB | --load-mutated-metallib LIB | {--bake-archive|--replay-archive|--replay-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-owned-metal-miss MUTATED_LIB ARCHIVE]".into()),
         };
+        if matches!(mode, Mode::Archive(..) | Mode::ExpectStrictMiss(..))
+            && std::env::var_os("MTL_SHADER_VALIDATION").is_some()
+        {
+            return Err("translated archive fixture requires MTL_SHADER_VALIDATION unset".into());
+        }
         let dev = Device::system_default().ok_or("no Metal device")?;
         let admitted = if let Mode::Archive(lib, path, bake, mutated, compiler) = mode {
-            if std::env::var_os("MTL_SHADER_VALIDATION").is_some() {
-                return Err(
-                    "translated archive fixture requires MTL_SHADER_VALIDATION unset".into(),
-                );
-            }
             let profile = owned_graphics_artifact::device_profile(&dev)?;
             let job = owned_graphics_job::ready(mutated, compiler, profile)?;
             let lib = owned_graphics_artifact::artifact_digest(lib)?;
@@ -92,7 +98,9 @@ mod gpu {
                 options.set_fast_math_enabled(false);
                 dev.new_library_with_source(&msl, &options)?
             }
-            Mode::Load(path, _) | Mode::Archive(path, _, _, _, _) => {
+            Mode::Load(path, _)
+            | Mode::Archive(path, _, _, _, _)
+            | Mode::ExpectStrictMiss(path, _) => {
                 metal_artifact::file_url(path, false).map_err(|e| e.to_string())?;
                 dev.new_library_with_file(path)?
             }
@@ -119,6 +127,26 @@ mod gpu {
         color_attachment.set_pixel_format(format);
         color_attachment.set_write_mask(MTLColorWriteMask::All);
         color_attachment.set_blending_enabled(false);
+        // Independent owned negative control. No sidecar is read or written;
+        // success is possible only for the specific Metal archive-miss error.
+        if let Mode::ExpectStrictMiss(_, path) = mode {
+            let url = metal_artifact::file_url(path, false).map_err(|e| e.to_string())?;
+            let descriptor = BinaryArchiveDescriptor::new();
+            descriptor.set_url(&url);
+            let archive = dev.new_binary_archive_with_descriptor(&descriptor)?;
+            desc.set_binary_archives(&[&archive]);
+            return match strict(&dev, &desc) {
+                Err(err)
+                    if err.contains("Unable to find function \"translated_ps\"")
+                        && err.contains("in binary archives") =>
+                {
+                    println!("independent Metal strict miss: {err}");
+                    Ok(())
+                }
+                Err(err) => Err(format!("unexpected Metal strict-probe error: {err}")),
+                Ok(_) => Err("unexpected Metal strict hit for owned negative control".into()),
+            };
+        }
         let pipeline = match mode {
             Mode::Archive(_, path, bake, _, _) => {
                 let url = metal_artifact::file_url(path, bake).map_err(|e| e.to_string())?;

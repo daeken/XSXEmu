@@ -55,5 +55,8 @@ if "$p" --replay-archive "$d/owned.metallib" "$d/owned.metalar" "$compiler" > "$
 fi
 grep -F 'expected a bounded regular owned artifact' "$d/miss.log"
 mv "$d/original.identity" "$d/owned.metalar.identity"
+# Independent Metal negative control: the copied archive has no sidecar.
+cp "$d/owned.metalar" "$d/diagnostic.metalar"
+"$p" --expect-owned-metal-miss "$d/mutated.metallib" "$d/diagnostic.metalar"
 printf x >> "$d/owned.metalar"
 expect_mismatch --replay-archive "$d/owned.metallib" "$d/owned.metalar" "$compiler"

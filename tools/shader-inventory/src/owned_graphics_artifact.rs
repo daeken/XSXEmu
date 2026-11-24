@@ -1,5 +1,8 @@
 //! Bounded trusted-local file binding for the owned graphics smoke.
-use crate::owned_graphics_job::{IDENTITY_SIZE, digest, identity};
+use crate::{
+    metal_cache::MANIFEST_SIZE,
+    owned_graphics_job::{digest, identity},
+};
 use std::{
     fs,
     io::{Read, Write},
@@ -70,7 +73,7 @@ fn manifest(path: &Path) -> PathBuf {
 }
 
 pub(crate) fn verify(job: &ReadyJob, lib: Digest, archive: &Path) -> Result<(), String> {
-    let bytes = read(&manifest(archive), IDENTITY_SIZE)?;
+    let bytes = read(&manifest(archive), MANIFEST_SIZE)?;
     let expected = identity(job, lib, artifact_digest(archive)?);
     if bytes != expected {
         return Err("owned graphics artifact identity mismatch".into());

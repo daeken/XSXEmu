@@ -1,13 +1,15 @@
-//! Versioned local identity for the owned offline compute probe only.
+//! Versioned local identity for the owned offline Metal probes.
 use sha2::{Digest, Sha256};
 
 pub(crate) struct Key(Sha256);
 
 impl Key {
     pub(crate) fn new() -> Self {
-        Self(Sha256::new_with_prefix(
-            b"XSXEmu owned compute archive key v1\0",
-        ))
+        Self::with_domain(b"XSXEmu owned compute archive key v1\0")
+    }
+
+    pub(crate) fn with_domain(domain: &[u8]) -> Self {
+        Self(Sha256::new_with_prefix(domain))
     }
 
     pub(crate) fn field(&mut self, name: &str, bytes: &[u8]) -> &mut Self {
@@ -25,8 +27,10 @@ impl Key {
 
 /// Separate archive identity detects accidental replacement or partial output.
 /// Fixed binary framing allows exact comparison without accepting unknown versions.
-pub(crate) fn manifest(key: [u8; 32], archive: [u8; 32]) -> [u8; 72] {
-    let mut bytes = [0; 72];
+pub(crate) const MANIFEST_SIZE: usize = 72;
+
+pub(crate) fn manifest(key: [u8; 32], archive: [u8; 32]) -> [u8; MANIFEST_SIZE] {
+    let mut bytes = [0; MANIFEST_SIZE];
     bytes[..8].copy_from_slice(b"XSXMCA1\0");
     bytes[8..40].copy_from_slice(&key);
     bytes[40..].copy_from_slice(&archive);

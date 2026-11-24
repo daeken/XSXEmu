@@ -50,16 +50,15 @@ pub(crate) fn ready(mutated: bool, compiler: Digest, device: Digest) -> Result<R
     }.ready().map_err(|e| format!("owned ready job rejected: {e:?}"))
 }
 
-const MAGIC: &[u8; 8] = b"XSXOGA1\0";
-pub(crate) const IDENTITY_SIZE: usize = 8 + 3 * 32;
-
-pub(crate) fn identity(job: &ReadyJob, lib: Digest, archive: Digest) -> [u8; IDENTITY_SIZE] {
-    let mut bytes = [0; IDENTITY_SIZE];
-    bytes[..8].copy_from_slice(MAGIC);
-    bytes[8..40].copy_from_slice(&job.key().bytes());
-    bytes[40..72].copy_from_slice(&lib);
-    bytes[72..].copy_from_slice(&archive);
-    bytes
+pub(crate) fn identity(
+    job: &ReadyJob,
+    lib: Digest,
+    archive: Digest,
+) -> [u8; crate::metal_cache::MANIFEST_SIZE] {
+    let mut key = crate::metal_cache::Key::with_domain(b"XSXEmu owned graphics archive key v1\0");
+    key.field("ready-job", &job.key().bytes())
+        .field("metallib", &lib);
+    crate::metal_cache::manifest(key.finish(), archive)
 }
 
 #[cfg(test)]
