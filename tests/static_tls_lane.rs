@@ -338,15 +338,17 @@ fn image(kind: Kind) -> Vec<u8> {
 
         let heap = imports + 100;
         w32(&mut b, file(heap), LINK + 0x720);
-        w32(&mut b, file(heap) + 12, LINK + 0x730);
+        w32(&mut b, file(heap) + 12, LINK + 0x738);
         w32(&mut b, file(heap) + 16, IAT + 248);
-        w64(&mut b, file(LINK) + 0x720, LINK + 0x750);
+        w64(&mut b, file(LINK) + 0x720, LINK + 0x758);
+        w64(&mut b, file(LINK) + 0x728, LINK + 0x768);
         put(
             &mut b,
-            file(LINK) + 0x730,
+            file(LINK) + 0x738,
             b"api-ms-win-core-heap-l1-1-0.dll\0",
         );
-        put(&mut b, file(LINK) + 0x752, b"HeapSize\0");
+        put(&mut b, file(LINK) + 0x75a, b"HeapSize\0");
+        put(&mut b, file(LINK) + 0x76a, b"HeapReAlloc\0");
     }
     b
 }

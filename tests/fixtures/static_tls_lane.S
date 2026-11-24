@@ -264,6 +264,7 @@ Lbridge_entry:
     cmpq $0, (%rax)
     jne Lbad
     movq $0x12345678, (%rax)
+    movb $0xab, 31(%rax)
     movq %rax, 56(%rsp)
     cmpl $0xfedcba98, %gs:0x68   /* heap success preserves last error */
     jne Lbad
@@ -289,6 +290,57 @@ Lbridge_entry:
     cmpq $-1, %rax
     jne Lbad
     cmpl $0x87654321, %gs:0x68
+    jne Lbad
+
+    /* Grow via exact CFG dispatch with a Win64 fourth argument (R9).
+     * Use the full pointer returned in RAX for subsequent heap operations. */
+    movq 48(%rsp), %rcx
+    movl $8, %edx               /* HEAP_ZERO_MEMORY */
+    movq 56(%rsp), %r8
+    movq $64, %r9
+    leaq Ltext(%rip), %r11
+    movq {iat_delta}+256(%r11), %rax
+    callq *{dispatch_delta}(%r11) /* HeapReAlloc via the heap API set */
+    testq %rax, %rax
+    je Lbad
+    cmpq $0x12345678, (%rax)
+    jne Lbad
+    cmpb $0xab, 31(%rax)
+    jne Lbad
+    .irp off,32,40,48,56
+        cmpq $0, \off(%rax)
+        jne Lbad
+    .endr
+    movq %rax, 56(%rsp)
+    cmpl $0x87654321, %gs:0x68
+    jne Lbad
+
+    /* A grow with IN_PLACE_ONLY fails deterministically without allocating.
+     * The low 32 bits are zero to catch a truncated SIZE_T argument. */
+    movq 48(%rsp), %rcx
+    movl $0x10, %edx            /* HEAP_REALLOC_IN_PLACE_ONLY */
+    movq 56(%rsp), %r8
+    movabsq $0x100000000, %r9
+    leaq Ltext(%rip), %r11
+    movq {iat_delta}+256(%r11), %rax
+    callq *{dispatch_delta}(%r11)
+    testq %rax, %rax
+    jne Lbad
+    cmpl $0x87654321, %gs:0x68
+    jne Lbad
+
+    /* Failure leaves the original allocation live, sized and intact. */
+    movq 48(%rsp), %rcx
+    xorl %edx, %edx
+    movq 56(%rsp), %r8
+    leaq Ltext(%rip), %r11
+    callq *{iat_delta}+248(%r11) /* HeapSize */
+    cmpq $64, %rax
+    jne Lbad
+    movq 56(%rsp), %rax
+    cmpq $0x12345678, (%rax)
+    jne Lbad
+    cmpb $0xab, 31(%rax)
     jne Lbad
 
     xorq %rcx, %rcx             /* wrong heap for HeapFree */

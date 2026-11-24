@@ -435,7 +435,7 @@ pub(crate) mod native {
             .map_or(usize::MAX, |b| b.size)
     }
 
-    pub(super) extern "win64" fn heap_re_alloc(
+    pub(crate) extern "win64" fn heap_re_alloc(
         heap: *mut c_void,
         flags: u32,
         ptr: *mut c_void,
