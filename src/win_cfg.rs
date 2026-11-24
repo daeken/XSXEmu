@@ -138,13 +138,24 @@ pub const DORMANT_CALLABLE: usize = 5;
 const DORMANT_FIELDS: [usize; DORMANT_CALLABLE + 1] = [CHECK, DISPATCH, 0x118, 0x120, 0x128, 0x130];
 const DORMANT_SIZE: usize = 0x138;
 const INSTRUMENTED_CATALOG_OFFSET: u32 = 0xbed20;
+// The two 0x8000 bits have not been independently interpreted.
 const INSTRUMENTED_VOLATILE_VERSION: u32 = 0x8002_8002;
+const SUPPORTED_VOLATILE_VERSION: u32 = 0x0001_0001;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DormantLayout {
+    Legacy,
+    InstrumentedNoPolicy,
+    BinkInspection,
+}
 
 #[derive(Debug)]
 pub struct DormantSlots {
     slots: [u32; DORMANT_FIELDS.len()],
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
     config: Range<u32>,
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    zero_fill_cast: bool,
 }
 
 impl DormantSlots {
@@ -158,20 +169,51 @@ impl DormantSlots {
     }
 
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-    pub fn readonly_ranges(&self) -> [Range<usize>; DORMANT_FIELDS.len() + 1] {
-        std::array::from_fn(|i| match self.slots.get(i) {
-            Some(&rva) => rva as usize..rva as usize + 8,
-            None => self.config.start as usize..self.config.end as usize,
-        })
+    pub fn readonly_ranges(&self) -> Vec<Range<usize>> {
+        let count = if self.zero_fill_cast {
+            DORMANT_CALLABLE
+        } else {
+            self.slots.len()
+        };
+        // The RW CastGuard cell is excluded from loader writes, not sealed.
+        self.slots[..count]
+            .iter()
+            .map(|&rva| rva as usize..rva as usize + 8)
+            .chain(std::iter::once(
+                self.config.start as usize..self.config.end as usize,
+            ))
+            .collect()
     }
 
-    fn parse(pe: &Pe<'_>, rva: u32, raw: &[u8], size: usize) -> Result<Self> {
-        let (slots, config) = validate_dormant(pe, rva, raw, size, false)?;
+    fn parse(pe: &Pe<'_>, rva: u32, raw: &[u8], size: usize, profile: Profile) -> Result<Self> {
+        let instrumented = u32_at(raw, GUARD_FLAGS) == CF_INSTRUMENTED;
+        // This decision never calls the Bink classifier. In particular, a
+        // nonzero CodeIntegrity tuple is not authorized by a structural match.
+        let layout = if instrumented {
+            if nonzero(&raw[CFG_END..raw.len().min(CODE_INTEGRITY_END)]) {
+                return Err(PeError::Unsupported(
+                    "CodeIntegrity on instrumented dormant image",
+                ));
+            }
+            match profile {
+                #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+                Profile::TlsChild => DormantLayout::InstrumentedNoPolicy,
+                _ => DormantLayout::Legacy,
+            }
+        } else {
+            DormantLayout::Legacy
+        };
+        let (slots, config) = validate_dormant(pe, rva, raw, size, layout)?;
+        if layout == DormantLayout::InstrumentedNoPolicy {
+            validate_castguard_write_exclusion(pe, slots[DORMANT_CALLABLE])?;
+        }
         let _ = &config;
         Ok(Self {
             slots,
             #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
             config,
+            #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+            zero_fill_cast: instrumented,
         })
     }
 }
@@ -192,8 +234,19 @@ pub fn inspect_instrumented_slots(pe: &Pe<'_>) -> Result<Option<[u32; DORMANT_FI
     if u32_at(raw, GUARD_FLAGS) != CF_INSTRUMENTED {
         return Ok(None);
     }
-    let (slots, _) = validate_dormant(pe, dir.rva, raw, u32_at(raw, 0) as usize, true)?;
-    let cast = range(slots[DORMANT_CALLABLE], 8)?;
+    let (slots, _) = validate_dormant(
+        pe,
+        dir.rva,
+        raw,
+        u32_at(raw, 0) as usize,
+        DormantLayout::BinkInspection,
+    )?;
+    validate_castguard_write_exclusion(pe, slots[DORMANT_CALLABLE])?;
+    Ok(Some(slots))
+}
+
+fn validate_castguard_write_exclusion(pe: &Pe<'_>, cast: u32) -> Result<()> {
+    let cast = range(cast, 8)?;
     if let Some(rva) = pe.security_cookie_rva()?
         && overlaps(&cast, &range(rva, 8)?)
     {
@@ -211,7 +264,7 @@ pub fn inspect_instrumented_slots(pe: &Pe<'_>) -> Result<Option<[u32; DORMANT_FI
     {
         return Err(PeError::Invalid("TLS index overlaps CastGuard cell"));
     }
-    Ok(Some(slots))
+    Ok(())
 }
 
 fn validate_dormant(
@@ -219,31 +272,33 @@ fn validate_dormant(
     rva: u32,
     raw: &[u8],
     size: usize,
-    instrumented: bool,
+    layout: DormantLayout,
 ) -> Result<([u32; DORMANT_FIELDS.len()], Range<u32>)> {
-    let flags = u32_at(raw, GUARD_FLAGS);
+    let instrumented = layout != DormantLayout::Legacy;
+    let volatile_version = match layout {
+        DormantLayout::Legacy => None,
+        DormantLayout::InstrumentedNoPolicy => Some(SUPPORTED_VOLATILE_VERSION),
+        DormantLayout::BinkInspection => Some(INSTRUMENTED_VOLATILE_VERSION),
+    };
     let expected_flags = if instrumented { CF_INSTRUMENTED } else { 0 };
-    // Neither form advertises GUARD_CF or carries any guard tables.
-    // CodeIntegrity is matched only as descriptive metadata; its offset
-    // is never followed and this does not admit signed images here.
-    let catalog_offset = if instrumented {
-        INSTRUMENTED_CATALOG_OFFSET
-    } else {
-        0
+    let (ci_flags_catalog, catalog_offset) = match layout {
+        DormantLayout::Legacy => (1, 0), // existing profile, unchanged
+        DormantLayout::InstrumentedNoPolicy => (0, 0),
+        DormantLayout::BinkInspection => (1, INSTRUMENTED_CATALOG_OFFSET),
     };
     if size != DORMANT_SIZE
-            || raw.len() != size
-            || nonzero(&raw[4..0x58])
-            || (instrumented && u64_at(raw, 0x58) == 0)
-            || nonzero(&raw[0x60..CHECK])
-            || nonzero(&raw[FUNCTION_TABLE..GUARD_FLAGS])
-            || (flags != expected_flags)
-            || u32_at(raw, 0x94) != 1 // CodeIntegrity.Flags and Catalog
-            || u32_at(raw, 0x98) != catalog_offset
-            || nonzero(&raw[0x9c..VOLATILE_METADATA])
-            || nonzero(&raw[EH_TABLE..EH_END])
-            || (u64_at(raw, VOLATILE_METADATA) != 0) != instrumented
-            || pe.directory(4).is_some()
+        || raw.len() != size
+        || nonzero(&raw[4..0x58])
+        || (instrumented && u64_at(raw, 0x58) == 0)
+        || nonzero(&raw[0x60..CHECK])
+        || nonzero(&raw[FUNCTION_TABLE..GUARD_FLAGS])
+        || u32_at(raw, GUARD_FLAGS) != expected_flags
+        || u32_at(raw, CFG_END) != ci_flags_catalog
+        || u32_at(raw, CFG_END + 4) != catalog_offset
+        || nonzero(&raw[CFG_END + 8..VOLATILE_METADATA])
+        || nonzero(&raw[EH_TABLE..EH_END])
+        || (u64_at(raw, VOLATILE_METADATA) != 0) != volatile_version.is_some()
+        || pe.directory(4).is_some()
     {
         return Err(PeError::Invalid(
             "CFG metadata without GUARD_CF characteristic (not dormant linker layout)",
@@ -300,7 +355,7 @@ fn validate_dormant(
 
     // All VA words must rebase exactly once. No DIR64 may change the
     // validated opcodes, other metadata, or the null CastGuard cell.
-    // For the instrumented form this is 13 DIR64s: six guard fields,
+    // The instrumented forms require 13 DIR64s: six guard fields,
     // five callable slots, one security cookie VA and one volatile VA.
     let mut remaining = DORMANT_FIELDS.map(|offset| rva + offset as u32).to_vec();
     remaining.extend(&slots[..DORMANT_CALLABLE]);
@@ -308,16 +363,11 @@ fn validate_dormant(
         remaining.push(rva + 0x58);
     }
     let mut metadata = vec![config.clone()];
-    if instrumented {
+    if let Some(version) = volatile_version {
         for &slot in &slots {
             metadata.push(range(slot, 8)?);
         }
-        validate_volatile(
-            pe,
-            u64_at(raw, VOLATILE_METADATA),
-            INSTRUMENTED_VOLATILE_VERSION,
-            &mut metadata,
-        )?;
+        validate_volatile(pe, u64_at(raw, VOLATILE_METADATA), version, &mut metadata)?;
         remaining.push(rva + VOLATILE_METADATA as u32);
     }
     for fix in pe.relocations()? {
@@ -629,7 +679,7 @@ impl<'a> CfgProfile<'a> {
             return no_cfg(advertised);
         }
         if !advertised {
-            return DormantSlots::parse(pe, dir.rva, raw, size).map(Self::Dormant);
+            return DormantSlots::parse(pe, dir.rva, raw, size, profile).map(Self::Dormant);
         }
         CfgMetadata::parse_guarded(pe, dir.rva, raw, size, profile).map(Self::Guarded)
     }
@@ -1028,7 +1078,12 @@ fn validate_auxiliary(
         if volatile_field.len() != 8 {
             return Err(PeError::Invalid("truncated volatile metadata pointer"));
         }
-        validate_volatile(pe, u64_at(volatile_field, 0), 0x0001_0001, ranges)?;
+        validate_volatile(
+            pe,
+            u64_at(volatile_field, 0),
+            SUPPORTED_VOLATILE_VERSION,
+            ranges,
+        )?;
         va_fixups[1] = Some(config_rva + VOLATILE_METADATA as u32);
     }
 

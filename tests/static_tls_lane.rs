@@ -531,7 +531,13 @@ fn dormant_profile_rejects_metadata_slot_and_relocation_near_misses() {
         (file(LOAD) + 4, 1, "not dormant linker layout"),
         (file(LOAD) + 0x80, 1, "not dormant linker layout"), // GFID VA
         (file(LOAD) + 0x88, 1, "not dormant linker layout"), // GFID count
-        (file(LOAD) + 0x91, 1, "not dormant linker layout"), // GuardFlags
+        // Exact CF_INSTRUMENTED is a different form; the legacy CI tuple
+        // still cannot authorize that form.
+        (
+            file(LOAD) + 0x91,
+            1,
+            "CodeIntegrity on instrumented dormant image",
+        ),
         (file(LOAD) + 0x94, 0, "not dormant linker layout"),
         (file(LOAD) + 0x98, 1, "not dormant linker layout"), // CatalogOffset
         (file(LOAD) + 0x104, 1, "not dormant linker layout"), // Volatile metadata
@@ -594,12 +600,121 @@ fn instrumented_terminal_profile_is_parse_only() {
     }
     let scratch = Scratch::new();
     let mut b = instrumented_terminal_image(Kind::Solo);
+    // Like Bink, no TLS directory, so both lanes reach load-config validation.
+    dir(&mut b, 9, 0, 0);
     let exe = scratch.write("terminal.exe", &b);
     expect(inspect(&exe), 0, PARSE_ONLY);
-    expect(run(&exe, &[OPT]), 1, "not dormant linker layout");
-    dir(&mut b, 9, 0, 0); // avoid the earlier default TLS refusal
+    for args in [&[][..], &[OPT][..]] {
+        expect(
+            run(&exe, args),
+            1,
+            "CodeIntegrity on instrumented dormant image",
+        );
+    }
+}
+
+// Original runtime fixture: zero CodeIntegrity, and only the already-supported
+// volatile version. It is not a classifier match for the observed Bink tuple.
+fn instrumented_no_policy_image(kind: Kind) -> Vec<u8> {
+    let mut b = instrumented_terminal_image(kind);
+    b[file(LOAD) + 0x94..file(LOAD) + 0xa0].fill(0);
+    w32(&mut b, file(TERMINAL_VOLATILE) + 4, 0x0001_0001);
+    b
+}
+
+#[test]
+fn instrumented_no_policy_slots_are_opt_in_and_all_five_trap() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let original = instrumented_no_policy_image(Kind::Solo);
+    let exe = scratch.write("terminal.exe", &original);
+    expect(run(&exe, &[OPT]), 43, "Guest entry returned 43");
+    let mut b = original.clone();
+    dir(&mut b, 9, 0, 0);
     scratch.write("terminal.exe", &b);
     expect(run(&exe, &[]), 1, "not dormant linker layout");
+
+    for (i, name) in [
+        "CFG check",
+        "CFG dispatch",
+        "XFG check",
+        "XFG dispatch",
+        "XFG table dispatch",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut b = original.clone();
+        dormant_call(&mut b, CHECK + 8 * i);
+        scratch.write("terminal.exe", &b);
+        expect(
+            run(&exe, &[OPT]),
+            86,
+            &format!("called dormant linker guard slot: {name}"),
+        );
+    }
+
+    // Same preferred base, so a module must rebase before installation.
+    let root = scratch.write("root.exe", &image(Kind::Exe));
+    let mut dll = instrumented_no_policy_image(Kind::Dll);
+    scratch.write("owned.dll", &dll);
+    expect(run(&root, &[OPT]), 42, "Guest entry returned 42");
+    dormant_call(&mut dll, CHECK + 8);
+    scratch.write("owned.dll", &dll);
+    expect(
+        run(&root, &[OPT]),
+        86,
+        "called dormant linker guard slot: CFG dispatch",
+    );
+}
+
+#[test]
+fn instrumented_no_policy_runtime_rejects_ci_and_volatile_near_misses() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let original = instrumented_no_policy_image(Kind::Solo);
+    for (at, value, diagnostic) in [
+        (
+            file(LOAD) + 0x94,
+            1,
+            "CodeIntegrity on instrumented dormant image",
+        ),
+        (
+            file(LOAD) + 0x98,
+            0xbed20,
+            "CodeIntegrity on instrumented dormant image",
+        ),
+        (
+            file(TERMINAL_VOLATILE) + 4,
+            0x8002_8002,
+            "volatile metadata layout or version",
+        ),
+        (file(TERMINAL_VOLATILE) + 24, 0, "volatile access rows"),
+        (
+            file(TERMINAL_VOLATILE) + 32,
+            0,
+            "volatile range order or bounds",
+        ),
+        (file(LOAD) + 0xa0, 1, "not dormant linker layout"),
+        (file(LOAD) + 0x90, 0x0200_0100, "not dormant linker layout"),
+    ] {
+        let mut b = original.clone();
+        w32(&mut b, at, value);
+        let exe = scratch.write("terminal.exe", &b);
+        expect(run(&exe, &[OPT]), 1, diagnostic);
+    }
+    let mut b = original;
+    w64(&mut b, file(LOAD) + 0x58, PREFERRED + TERMINAL_CAST);
+    let exe = scratch.write("terminal.exe", &b);
+    expect(
+        run(&exe, &[OPT]),
+        1,
+        "security cookie overlaps CastGuard cell",
+    );
 }
 
 #[test]

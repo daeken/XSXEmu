@@ -501,8 +501,15 @@ Only this classifier accepts the exact word `0x80028002`. [LIEF's decoder][lief-
 prints the two halves as minimum and maximum versions masked with `0x7fff`,
 but that does not establish the semantics of either high bit or rule out
 further requirements. Both execution lanes still reject the image pending
-that clarification and CodeIntegrity review. There are no runtime slot
-patches, signature admission changes, or CFG allowlist additions.
+that clarification and independent interpretation of CodeIntegrity `Flags=1`.
+
+A separate TLS-child-only form, tested with owned fixtures, requires all-zero
+CodeIntegrity, no security directory, and the already-supported volatile
+version `0x00010001`. It retains the exact slot, table and relocation checks.
+It replaces all five callable slots with terminal gates (exit 86) and leaves
+the null CastGuard cell RW and excluded from loader writes. It does not admit
+Bink's version or CodeIntegrity tuple, change signature admission, or add CFG
+targets.
 
 [lief-volatile]: https://github.com/lief-project/LIEF/blob/main/src/PE/LoadConfigurations/VolatileMetadata.cpp
 
