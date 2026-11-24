@@ -6,7 +6,7 @@ mod guest;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 mod import_traps;
 mod link;
-mod pe;
+use xsxemu::pe;
 mod providers;
 mod startup;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]

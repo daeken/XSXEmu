@@ -1,6 +1,7 @@
 //! Counts only; never exports assets or interprets the RPF9 TOC.
 mod cfg;
 mod coverage;
+mod embedded;
 mod library_index;
 mod llvm;
 mod reachable;
@@ -311,6 +312,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args_os().skip(1);
     const USAGE: &str = "usage: xsx-shader-inventory [--header-only | --compute-isa <LLVM shared library> <primary CPU> <reference CPU>] <shaders.rpf> (select gfx1013 and gfx1030, in either order)";
     let first = args.next().ok_or(USAGE)?;
+    if first == "--embedded-shaders" {
+        let path = args
+            .next()
+            .filter(|_| args.next().is_none())
+            .ok_or("usage: xsx-shader-inventory --embedded-shaders <local PE32+ image>")?;
+        return embedded::run(std::path::Path::new(&path));
+    }
     if first == "--pipeline-index" || first == "--compute-blobs" {
         let path = args
             .next()

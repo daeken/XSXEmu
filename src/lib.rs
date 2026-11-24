@@ -2,6 +2,7 @@
 
 pub mod compute_capture;
 pub mod compute_metadata;
+pub mod pe;
 pub mod pipeline_library;
 pub mod root_signature;
 pub mod rpf9;

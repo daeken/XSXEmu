@@ -4,7 +4,7 @@
 
 ## Goal 1: document the title's shader and pipeline formats
 
-Start with an evidence ledger, not a single unified format. The local extraction contains **26,503 wrapped DXBC records**, **26,698 native FSSM payloads**, and **21,522 compiled-library programs**; these are separate denominators, not a count of unique shaders. The current [native compute census](compute-reachability.md) validates 2,689 compute spans. DLL-embedded shaders and runtime-created inputs are separate inventories, not covered by those numbers.
+Start with an evidence ledger, not a single unified format. The local extraction contains **26,503 wrapped DXBC records**, **26,698 native FSSM payloads**, and **21,522 compiled-library programs**; these are separate denominators, not a count of unique shaders. The current [native compute census](compute-reachability.md) validates 2,689 compute spans. The [PE section census](embedded-shaders.md) adds a separate denominator of 91 structural containers across the package EXE and DLLs. Runtime-created inputs are not covered by any of those counts.
 
 | Surface | What to document and verify |
 |---|---|

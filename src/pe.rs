@@ -298,7 +298,7 @@ impl<'a> Pe<'a> {
     /// Validate the narrow layout used by the offline catalog inspection
     /// profile: a single WIN_CERTIFICATE at the aligned end of the image file.
     /// This checks the record header and bounds, not its opaque payload.
-    pub(crate) fn embedded_certificate_envelope(&self) -> Result<DataDirectory> {
+    pub fn embedded_certificate_envelope(&self) -> Result<DataDirectory> {
         let dir = self.directory(4).ok_or(PeError::Invalid(
             "missing embedded attribute certificate directory",
         ))?;
