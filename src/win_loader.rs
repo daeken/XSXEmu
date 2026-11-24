@@ -157,7 +157,11 @@ mod native {
     }
 
     fn path_key(path: &str) -> String {
-        path.replace('\\', "/").to_lowercase()
+        let mut key = path.replace('\\', "/").to_lowercase();
+        if key.starts_with('/') && !key.starts_with("//") {
+            key.insert_str(0, "c:");
+        }
+        key
     }
 
     impl Graph {
@@ -316,11 +320,24 @@ mod native {
                         format!("{path}: invalid or overlapping mapped module range").into(),
                     );
                 }
+                // Use the same guest path as GetCommandLineW and win_io's
+                // C: drive mapping. Do not reinterpret literal Unix backslashes.
+                let guest_path = if path.starts_with('/') {
+                    if path.contains('\\') {
+                        return Err(format!(
+                            "{path}: host module path contains a literal backslash"
+                        )
+                        .into());
+                    }
+                    format!("C:{}", path.replace('/', "\\"))
+                } else {
+                    path.to_owned()
+                };
                 let mut image = Image {
                     base,
                     end,
-                    filename: path.encode_utf16().collect(),
-                    path_key: path_key(path),
+                    filename: guest_path.encode_utf16().collect(),
+                    path_key: path_key(&guest_path),
                     link_name: basename(path).to_owned(),
                     names: Default::default(),
                     ordinals: Default::default(),
@@ -485,15 +502,16 @@ mod native {
                 assert_eq!(get_module_handle_ex_w(PIN, ptr::null(), &mut out), 1);
                 assert_eq!(out, MAIN);
 
-                let expected = wide("/known/Example.exe");
+                let expected = wide(r"C:\known\Example.exe");
                 let mut path = vec![0xffff; expected.len()];
                 assert_eq!(
                     get_module_file_name_w(0, path.as_mut_ptr(), path.len() as u32),
                     (path.len() - 1) as u32
                 );
                 assert_eq!(path, expected);
+                assert_eq!(get_module_handle_w(path.as_ptr()), MAIN);
                 assert_eq!(get_module_file_name_w(DLL, path.as_mut_ptr(), 4), 4);
-                assert_eq!(&path[..4], &wide("/kn"));
+                assert_eq!(&path[..4], &wide(r"C:\"));
                 assert_eq!(last_error(), ERROR_INSUFFICIENT_BUFFER);
 
                 assert_eq!(
