@@ -1119,7 +1119,7 @@ Lconfigure_d3d12_vm_entry:
     movl $44, %eax
     addq $72, %rsp
     retq
-/* Original ABI exercise: no loads/stores to the resulting reservations. */
+/* Original ABI exercise: touches only the ends of the RW mappings. */
 .macro xmem attr, prot, flags=0x20402000
     xorl %ecx, %ecx
     movq %rbx, %rdx
@@ -1129,6 +1129,32 @@ Lconfigure_d3d12_vm_entry:
     movl $0xfeedface, 36(%rsp)
     leaq Ltext(%rip), %r11
     callq *{iat_delta}(%r11)
+.endm
+.macro xmem_cpu size, attr, prot, error
+    movl $\size, %ebx
+    xmem \attr, \prot, 0x20003000
+    testq %rax, %rax
+    jz Lbad
+    testl $0x1fffff, %eax
+    jnz Lbad
+    cmpl $\error, %gs:0x68
+    jne Lbad
+    leaq -1(%rax,%rbx), %rdx
+    cmpb $0, (%rax)
+    jne Lbad
+    cmpb $0, (%rdx)
+    jne Lbad
+    movb $0x55, (%rax)
+    movb $0xaa, (%rdx)
+    cmpb $0x55, (%rax)
+    jne Lbad
+    cmpb $0xaa, (%rdx)
+    jne Lbad
+    xmem \attr, \prot, 0x20003000
+    testq %rax, %rax
+    jnz Lbad
+    cmpl $8, %gs:0x68
+    jne Lbad
 .endm
 Lxmem_entry:
     tls 0
@@ -1167,29 +1193,14 @@ Lxmem_entry:
     jnz Lbad
     cmpl $50, %gs:0x68
     jne Lbad
+    xmem_cpu 0x49400000, 0x183, 0x22004, 50
+    xmem_cpu 0x89700000, 0x283, 0x2404, 8
+    /* Unobserved pair swapping size but keeping second flags still fails. */
     movl $0x49400000, %ebx
-    xmem 0x183, 0x22004, 0x20003000
+    xmem 0x283, 0x2404, 0x20003000
     testq %rax, %rax
-    jz Lbad
-    testl $0x1fffff, %eax
     jnz Lbad
     cmpl $50, %gs:0x68
-    jne Lbad
-    leaq -1(%rax,%rbx), %rdx
-    cmpb $0, (%rax)
-    jne Lbad
-    cmpb $0, (%rdx)
-    jne Lbad
-    movb $0x55, (%rax)
-    movb $0xaa, (%rdx)
-    cmpb $0x55, (%rax)
-    jne Lbad
-    cmpb $0xaa, (%rdx)
-    jne Lbad
-    xmem 0x183, 0x22004, 0x20003000
-    testq %rax, %rax
-    jnz Lbad
-    cmpl $8, %gs:0x68
     jne Lbad
     movl $45, %eax
     addq $48, %rsp

@@ -12,6 +12,7 @@ const ALIGN: usize = 0x1_0000;
 const S16: usize = 16 * GIB;
 const S24: usize = 24 * GIB;
 const COMMIT_SIZE: usize = 0x4940_0000;
+const SECOND_COMMIT_SIZE: usize = 0x8970_0000;
 const COMMIT_ALIGN: usize = 2 * 1024 * 1024;
 const ANYWHERE: i32 = 1;
 const INHERIT_NONE: i32 = 2;
@@ -22,8 +23,9 @@ const ERROR_NOT_SUPPORTED: u32 = 50;
 
 // No supported XMem release operation. Each slot owns its mapping until this
 // disposable static-TLS child exits. At most 48 GiB of inaccessible VA plus
-// one COMMIT_SIZE demand-zero CPU mapping. No host page wiring or eager touch.
-static MAPPINGS: Mutex<[Option<Reservation>; 3]> = Mutex::new([None, None, None]);
+// exactly one mapping per accepted CPU commit shape (at most 3,371 MiB
+// combined). No host page wiring or eager touch.
+static MAPPINGS: Mutex<[Option<Reservation>; 4]> = Mutex::new([None, None, None, None]);
 
 #[derive(Clone, Copy)]
 enum Mode {
@@ -42,6 +44,7 @@ impl Mode {
 
 unsafe extern "C" {
     static mach_task_self_: u32;
+    fn getpagesize() -> i32;
     fn mach_vm_map(
         task: u32,
         address: *mut u64,
@@ -70,6 +73,7 @@ enum Failure {
     TupleAlreadyReserved,
     Mach(i32),
     UnexpectedMapping,
+    InvalidHostExtent,
 }
 
 impl std::fmt::Display for Failure {
@@ -81,6 +85,9 @@ impl std::fmt::Display for Failure {
             }
             Self::Mach(code) => write!(f, "mach_vm_map status={code}"),
             Self::UnexpectedMapping => f.write_str("unexpected host VA range"),
+            Self::InvalidHostExtent => {
+                f.write_str("extent is not an exact multiple of the host page size")
+            }
         }
     }
 }
@@ -88,7 +95,12 @@ impl std::fmt::Display for Failure {
 impl Reservation {
     fn new(size: usize, mode: Mode) -> Result<Self, Failure> {
         let (alignment, protection) = mode.properties();
-        debug_assert!(size != 0 && size.is_multiple_of(alignment));
+        // SAFETY: libSystem provides the host page size. Only the base needs
+        // the stronger VA alignment; ensure the length won't be rounded.
+        let page = unsafe { getpagesize() };
+        if page <= 0 || size == 0 || !size.is_multiple_of(page as usize) {
+            return Err(Failure::InvalidHostExtent);
+        }
         let mut base = 0;
         let len = size as u64;
         // SAFETY: libSystem provides the task-self port. We supply a valid
@@ -144,6 +156,7 @@ fn reserve(
         (0, S16 | S24, 0x2040_2000, 0x21, 4) => (0, Mode::Reserve),
         (0, S16 | S24, 0x2040_2000, 3, 0x801) => (1, Mode::Reserve),
         (0, COMMIT_SIZE, 0x2000_3000, 0x183, 0x22004) => (2, Mode::CpuCommit),
+        (0, SECOND_COMMIT_SIZE, 0x2000_3000, 0x283, 0x2404) => (3, Mode::CpuCommit),
         _ => return Err(Failure::UnsupportedTuple),
     };
     let mut slots = MAPPINGS.lock().unwrap_or_else(|_| std::process::abort());
@@ -271,21 +284,33 @@ mod tests {
             check(&a);
             check(&b);
             let c = Reservation::new(COMMIT_SIZE, Mode::CpuCommit).unwrap();
-            assert!(c.base.is_multiple_of(COMMIT_ALIGN as u64));
-            for reserve in [&a, &b] {
-                assert!(c.base + c.len <= reserve.base || reserve.base + reserve.len <= c.base);
-                check(reserve);
-            }
-            // Mach may split a large anonymous RW mapping into multiple
-            // entries (observed 128 MiB). Require exact, gapless RW coverage.
-            let mut cursor = c.base;
-            let end = c.base + c.len;
-            while cursor < end {
-                let (base, len, prot, max_prot) = region(c.task, cursor).unwrap();
-                assert_eq!((base, prot, max_prot), (cursor, PROT_RW, PROT_RW));
-                assert!(len != 0 && len <= end - cursor);
-                cursor += len;
-            }
+            let d = Reservation::new(SECOND_COMMIT_SIZE, Mode::CpuCommit).unwrap();
+            let disjoint = |first: &Reservation, second: &Reservation| {
+                first.base + first.len <= second.base || second.base + second.len <= first.base
+            };
+            let check_rw = |r: &Reservation, expected: usize| {
+                assert_eq!(r.len, expected as u64);
+                assert!(r.base.is_multiple_of(COMMIT_ALIGN as u64));
+                for reserve in [&a, &b] {
+                    assert!(disjoint(r, reserve));
+                    check(reserve);
+                }
+                // Mach may split a large anonymous RW mapping into multiple
+                // entries. Require exact, gapless RW coverage.
+                let mut cursor = r.base;
+                let end = r.base + r.len;
+                while cursor < end {
+                    let (base, len, prot, max_prot) = region(r.task, cursor).unwrap();
+                    assert_eq!((base, prot, max_prot), (cursor, PROT_RW, PROT_RW));
+                    assert!(len != 0 && len <= end - cursor);
+                    cursor += len;
+                }
+            };
+            assert!(disjoint(&c, &d));
+            check_rw(&c, COMMIT_SIZE);
+            check_rw(&d, SECOND_COMMIT_SIZE);
+            release(d);
+            check_rw(&c, COMMIT_SIZE);
             release(c);
             check(&a);
             check(&b);
