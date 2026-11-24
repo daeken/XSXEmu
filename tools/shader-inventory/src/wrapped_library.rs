@@ -41,6 +41,7 @@ struct Program {
     equal_window_agreeing_profile: bool,
     equal_window_disagreeing_profile: bool,
     graph_complete: bool,
+    indirect_hypothesis_closed: bool,
     graph_failures: HashSet<&'static str>,
     graph_unchecked: bool,
 }
@@ -538,9 +539,10 @@ pub(super) fn run(
                         if let Some((body, _)) =
                             code(payload).filter(|(body, _)| Some(*body) == fssm_cut)
                         {
-                            let result = *walked.get_or_insert_with(|| {
+                            let (result, indirect_closed) = *walked.get_or_insert_with(|| {
                                 reference_walk_result(&mut dis[usize::from(profile.1)], body)
                             });
+                            p.indirect_hypothesis_closed |= indirect_closed;
                             if result == "complete" {
                                 p.graph_complete = true;
                             } else {
@@ -1049,6 +1051,10 @@ pub(super) fn run(
                 values().filter(|p| p.graph_complete).count(),
                 values().filter(|p| !p.graph_failures.is_empty()).count(),
                 values().filter(|p| p.graph_unchecked).count()
+            );
+            println!(
+                "  Conditional compute indirect closure: {} programs with a closed reference hypothesis (separate from strict CFG)",
+                values().filter(|p| p.indirect_hypothesis_closed).count()
             );
             let mut failures = BTreeMap::<_, usize>::new();
             for reason in values().flat_map(|p| &p.graph_failures) {

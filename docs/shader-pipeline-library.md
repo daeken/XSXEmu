@@ -166,6 +166,8 @@ For compute, the scanner also compares the FSSM XYZ and wave-width bit to every 
 
 Append a trusted LLVM 21 library path and `gfx1013` or `gfx1030` to `--wrapped-library` to walk the matching compute windows under one explicit reference profile. The walker requires profile agreement and independently checks that the FSSM window matches the existing FSSM compute-span parser. It starts at byte zero of the equal window and follows supported direct control, requiring a reachable decoded end instruction. LLVM 21.1.6 completed 43 of 51 on `gfx1013` and 14 of 51 on `gfx1030`; `gfx1013` reports eight first blockers at indirect PC transfers; `gfx1030` reports eight indirect PC blockers and 29 decode blockers. All 51 passed the FSSM span prerequisite. These are conditional static CFG results, not evidence that either reference CPU is the console ISA or that the library actually enters at that offset.
 
+The [indirect closure check](compute-reachability.md) runs separately on these matched windows when the strict reference walker first stops at an indirect transfer. All eight such `gfx1013` library programs have a closed reference hypothesis with a reachable end instruction; none of the eight `gfx1030` programs does. The counts remain separate from the 43 and 14 strict walks and provide no additional evidence of an observed library entry or dispatch.
+
 ## Reproduce the structural census
 
 ```sh

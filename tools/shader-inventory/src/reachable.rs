@@ -340,8 +340,8 @@ fn analyze(dis: &mut Disassembler, bytes: &[u8]) -> Result<ProgramCounts, Blocke
     Ok(counts)
 }
 
-pub(crate) fn reference_walk_result(dis: &mut Disassembler, bytes: &[u8]) -> &'static str {
-    match analyze(dis, bytes) {
+pub(crate) fn reference_walk_result(dis: &mut Disassembler, bytes: &[u8]) -> (&'static str, bool) {
+    let strict = match analyze(dis, bytes) {
         Ok(_) => "complete",
         Err(Blocker::IndirectPc(_)) => "indirect PC",
         Err(Blocker::Control(_)) => "other control",
@@ -350,7 +350,15 @@ pub(crate) fn reference_walk_result(dis: &mut Disassembler, bytes: &[u8]) -> &'s
         Err(Blocker::InvalidWidth) => "invalid width",
         Err(Blocker::Overlap) => "overlap",
         Err(Blocker::NoExit) => "no exit",
+    };
+    let mut frontier = IndirectFrontier::default();
+    if strict == "indirect PC" {
+        frontier.add(dis, bytes);
     }
+    (
+        strict,
+        frontier.closure.contains_key("closed hypothesis with exit"),
+    )
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
