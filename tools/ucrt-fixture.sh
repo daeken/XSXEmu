@@ -3,27 +3,32 @@
 set -eu
 
 usage() {
-    echo 'Usage: sh tools/ucrt-fixture.sh [--static-tls] [--run]'
+    echo 'Usage: sh tools/ucrt-fixture.sh [--static-tls] [--run] [--rand-s]'
     echo 'Default: build and audit only. --static-tls: build the PE static TLS variant.'
+    echo '--rand-s: exercise real rand_s entropy; requires --static-tls --run.'
     echo '--run: also run the trusted fixture (not sandboxed), requiring an x86-64 macOS'
     echo 'XSXEmu build. Running the static TLS variant requires Rosetta.'
 }
 
 mode=audit
 variant=original
+probe=heap
 case "$#:${1-}" in
     1:--help|1:-h) usage; exit 0 ;;
 esac
 for arg do
-    case "$arg:$mode:$variant" in
+    case "$arg:$mode:$variant:$probe" in
+        --rand-s:*:*:heap) probe=rand_s ;;
         --run:audit:*) mode=run ;;
-        --static-tls:*:original) variant=static-tls ;;
+        --static-tls:*:original:*) variant=static-tls ;;
         *) usage >&2; exit 2 ;;
     esac
 done
 
 fail() { echo "ucrt-fixture: $*" >&2; exit 1; }
 sha256() { shasum -a 256 < "$1" | cut -d ' ' -f 1; }
+[ "$probe" != rand_s ] || [ "$variant:$mode" = static-tls:run ] ||
+    fail '--rand-s requires --static-tls --run'
 
 cd "$(dirname "$0")/.."
 ucrt=/Volumes/External2/windlls/ucrtbase.dll
@@ -48,6 +53,9 @@ EXPORTS
     malloc
     free
 EOF
+if [ "$probe" = rand_s ]; then
+    printf '    rand_s\n' >> "$tmp/ucrt.def"
+fi
 "$lld" -flavor link /lib /machine:x64 "/def:$tmp/ucrt.def" "/out:$tmp/ucrt.lib"
 set --
 name=ucrt-fixture.exe
@@ -56,6 +64,9 @@ if [ "$variant" = static-tls ]; then
     set -- --cfg fixture_static_tls
     name=ucrt-static-tls-fixture.exe
     label='Static TLS fixture'
+fi
+if [ "$probe" = rand_s ]; then
+    set -- "$@" --cfg fixture_rand_s
 fi
 rustc --edition 2024 --target x86_64-pc-windows-gnullvm \
     -C panic=abort -C opt-level=2 -C force-unwind-tables=yes \
@@ -97,7 +108,7 @@ status=0
 cat "$tmp/audit.log"
 grep -Fq "$tmp/providers/ucrtbase.dll (134 IAT slots)" "$tmp/audit.log" ||
     fail 'audit did not reach the exact UCRT and its 134 IAT slots'
-if grep -Eq '^  (ucrt-fixture|ucrt-static-tls-fixture)\.exe:.*ucrtbase\.dll!(malloc|free) → ' "$tmp/audit.log"; then
+if grep -Eq '^  (ucrt-fixture|ucrt-static-tls-fixture)\.exe:.*ucrtbase\.dll!(malloc|free|rand_s) → ' "$tmp/audit.log"; then
     fail 'fixture imports did not bind to the UCRT'
 fi
 case "$status" in
@@ -115,13 +126,20 @@ set --
 if [ "$variant" = static-tls ]; then
     set -- --experimental-static-tls
 fi
+if [ "$probe" = rand_s ]; then
+    set -- "$@" --trusted-offline --guest-entropy
+fi
 status=0
-"$emu" run "$fixture" --dll-dir "$tmp/providers" --api-set "$schema" \
+XSXEMU_TRACE_STARTUP=1 "$emu" run "$fixture" --dll-dir "$tmp/providers" --api-set "$schema" \
     --rust-providers --trace-missing-imports "$@" > "$tmp/run.log" 2>&1 || status=$?
 cat "$tmp/run.log"
 [ "$status" -eq 42 ] && grep -Fxq 'Guest entry returned 42' "$tmp/run.log" ||
     fail "expected guest return 42 after UCRT process attach; got exit status $status"
-if [ "$variant" = static-tls ]; then
+if [ "$probe" = rand_s ]; then
+    grep -Fq 'bridge dispatch api-ms-win-security-systemfunctions-l1-1-0.dll!SystemFunction036' "$tmp/run.log" ||
+        fail 'rand_s did not call the entropy bridge'
+    echo 'Guest returned 42 after pinned UCRT rand_s, real entropy bridge dispatch, and CRT detach.'
+elif [ "$variant" = static-tls ]; then
     echo 'Guest verified the static TLS index, GS vector, relocated template and zero-fill state across malloc/free; returned 42.'
 else
     echo 'Guest returned 42 after UCRT process attach and a malloc/free round trip.'

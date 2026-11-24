@@ -103,6 +103,8 @@ macro_rules! audited_bridges {
 }
 
 audited_bridges! {
+    xsxemu_tls_system_function_036, system_function_036: b"api-ms-win-security-systemfunctions-l1-1-0.dll", b"SystemFunction036",
+        crate::guest_entropy::system_function_036, (buffer: *mut u8, len: u32) -> u8;
     xsxemu_tls_configure_d3d12_vm, configure_d3d12_vm: b"d3d12_xs.dll", b"D3D12ConfigureVirtualMemoryX",
         crate::xbox_d3d12_vm::configure, (config: *const u8) -> i32;
     xsxemu_tls_xmem_virtual_alloc, xmem_virtual_alloc: b"xmem.dll", b"XMemVirtualAlloc",
@@ -137,6 +139,8 @@ audited_bridges! {
         loader::get_module_file_name_w, (module: usize, buffer: *mut u16, capacity: u32) -> u32;
     xsxemu_tls_load_library_ex_w, load_library_ex_w: b"kernelbase.dll", b"LoadLibraryExW",
         loader::load_library_ex_w => loader::tls_child_load_library_ex_w, (name: *const u16, file: usize, flags: u32) -> usize;
+    xsxemu_tls_free_library, free_library: b"kernelbase.dll", b"FreeLibrary",
+        loader::free_library => loader::tls_child_free_library, (module: usize) -> i32;
     xsxemu_tls_disable_thread_library_calls, disable_thread_library_calls: b"kernelbase.dll", b"DisableThreadLibraryCalls",
         loader::disable_thread_library_calls, (module: usize) -> i32;
     xsxemu_tls_rtl_pc_to_file_header, rtl_pc_to_file_header: b"ntdll.dll", b"RtlPcToFileHeader",

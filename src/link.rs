@@ -396,6 +396,7 @@ pub struct Options<'a> {
     pub api_set: Option<&'a ApiSet>,
     pub rust_providers: bool,
     pub trace_missing_imports: bool,
+    pub guest_entropy: bool,
     pub map_extra_dll: Option<&'a Path>,
     pub trusted_offline: bool,
 }
@@ -614,6 +615,41 @@ impl Builder<'_> {
                 ));
             }
             self.plan.modules.push(extra);
+        }
+        if self.options.guest_entropy {
+            use crate::guest_entropy::{self, BASENAME, BRIDGE_SLOT, GUEST_PATH};
+            let path = Path::new(GUEST_PATH);
+            let error = |why| LinkError::new(path, "map guest entropy DLL", why);
+            let image = guest_entropy::image();
+            if !self.options.trusted_offline || !self.options.rust_providers {
+                return Err(error("requires trusted offline and Rust providers"));
+            }
+            if self.plan.modules.len() >= self.max_images || image.len() > self.remaining_bytes {
+                return Err(error("graph limit reached"));
+            }
+            if self
+                .plan
+                .modules
+                .iter()
+                .any(|m| m.name.eq_ignore_ascii_case(BASENAME.as_bytes()))
+            {
+                return Err(error("duplicate mapped module basename"));
+            }
+            let export = providers::GUEST_ENTROPY;
+            // A private IAT slot, bound only here after the static graph closes.
+            self.plan.modules.push(ModulePlan {
+                path: path.to_owned(),
+                name: BASENAME.as_bytes().to_vec(),
+                image,
+                dependencies: Vec::new(),
+                iat: vec![IatBinding {
+                    iat_rva: BRIDGE_SLOT,
+                    dll: export.provider.as_bytes().to_vec(),
+                    symbol: Symbol::Name(export.symbol.as_bytes().to_vec()),
+                    target: Ok(BindingTarget::Rust(export)),
+                }],
+                unresolved_dependencies: Vec::new(),
+            });
         }
         Ok(self.plan)
     }

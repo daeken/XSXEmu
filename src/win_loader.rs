@@ -191,6 +191,8 @@ pub(crate) mod native {
     struct Graph {
         images: Vec<Image>,
         rust_providers: bool,
+        #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+        entropy_module: Option<usize>,
     }
 
     thread_local! {
@@ -371,6 +373,7 @@ pub(crate) mod native {
             inputs: impl IntoIterator<Item = (&'a str, &'a Pe<'pe>, u64, Option<&'a CfgMetadata<'pe>>)>,
             api_set: Option<&ApiSet>,
             rust_providers: bool,
+            entropy_module: Option<usize>,
         ) -> Result<Registration> {
             let mut images: Vec<Image> = Vec::new();
             for (path, pe, base, tls_cfg) in inputs {
@@ -446,6 +449,7 @@ pub(crate) mod native {
                 *slot = Some(Graph {
                     images,
                     rust_providers,
+                    entropy_module,
                 });
                 Ok(Registration(PhantomData))
             })
@@ -473,6 +477,7 @@ pub(crate) mod native {
                     .map(|(path, pe, base)| (path, pe, base, None)),
                 api_set,
                 rust_providers,
+                None,
             )
         }
 
@@ -536,6 +541,58 @@ pub(crate) mod native {
             let get: extern "win64" fn() -> u32 =
                 unsafe { std::mem::transmute(export.address().unwrap()) };
             get()
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn child_entropy_loader_requires_opt_in_and_exact_system32_contract() {
+            use crate::guest_entropy::{BASENAME, GUEST_PATH};
+            let exe_bytes = image(None);
+            let dll_bytes = crate::guest_entropy::image();
+            let exe = Pe::parse(&exe_bytes).unwrap();
+            let dll = Pe::parse(&dll_bytes).unwrap();
+            let inputs = [
+                ("/Example.exe", &exe, MAIN as u64, None),
+                (GUEST_PATH, &dll, DLL as u64, None),
+            ];
+            let load = |name: &str, file, flags| unsafe {
+                tls_child_load_library_ex_w(wide(name).as_ptr(), file, flags)
+            };
+            let scope = super::register(inputs, None, true, None).unwrap();
+            assert_eq!(load(BASENAME, 0, 0x800), 0);
+            assert_eq!(last_error(), ERROR_MOD_NOT_FOUND);
+            drop(scope);
+            let _scope = super::register(inputs, None, true, Some(1)).unwrap();
+            for (name, file, flags, error) in [
+                (BASENAME, 0, 0, ERROR_MOD_NOT_FOUND),
+                (BASENAME, 0, 4, ERROR_NOT_SUPPORTED),
+                (BASENAME, 1, 0x800, ERROR_INVALID_PARAMETER),
+                (GUEST_PATH, 0, 0x800, ERROR_NOT_SUPPORTED),
+                ("advapi32", 0, 0x800, ERROR_MOD_NOT_FOUND),
+                ("kernelbase", 0, 0x800, ERROR_MOD_NOT_FOUND),
+                (
+                    "api-ms-win-core-synch-l1-2-0",
+                    0,
+                    0x800,
+                    ERROR_MOD_NOT_FOUND,
+                ),
+            ] {
+                assert_eq!(load(name, file, flags), 0);
+                assert_eq!(last_error(), error);
+            }
+            assert_eq!(load(BASENAME.trim_end_matches(".dll"), 0, 0x800), DLL);
+            assert_eq!(last_error(), ERROR_MOD_NOT_FOUND); // Success leaves it unchanged.
+            assert_eq!(load(&BASENAME.to_ascii_uppercase(), 0, 0x800), DLL);
+            for query in [1, c"NotSystemFunction036".as_ptr() as usize] {
+                assert_eq!(unsafe { tls_child_get_proc_address(DLL, query) }, 0);
+                assert_eq!(last_error(), ERROR_PROC_NOT_FOUND);
+            }
+            assert_eq!(tls_child_free_library(MAIN), 0);
+            assert_eq!(tls_child_free_library(DLL), 1);
+            assert_eq!(tls_child_free_library(DLL), 1);
+            assert_eq!(tls_child_free_library(DLL), 0);
+            assert_eq!(last_error(), ERROR_INVALID_HANDLE);
+            assert_eq!(unsafe { get_module_handle_w(wide(BASENAME).as_ptr()) }, DLL);
         }
 
         #[test]
@@ -829,18 +886,32 @@ pub(crate) mod native {
             .ok_or(ERROR_INVALID_PARAMETER)
     }
 
-    // The TLS child may inspect mapped image ranges but cannot acquire module
-    // handles. Preserve validation and always report a miss for valid loads.
+    #[cfg(target_os = "macos")]
+    fn entropy_image(graph: Option<&Graph>) -> Option<&Image> {
+        let g = graph?;
+        g.images.get(g.entropy_module?)
+    }
+
+    // No loading: only an exact SYSTEM32 request for the explicitly enabled
+    // built-in image may acquire a reference. Startup owns its mapped lifetime.
     #[cfg(target_os = "macos")]
     pub(crate) unsafe extern "win64" fn tls_child_load_library_ex_w(
         name: *const u16,
         file: usize,
         flags: u32,
     ) -> usize {
-        let error = unsafe { load_key(name, file, flags) }
-            .err()
-            .unwrap_or(ERROR_MOD_NOT_FOUND);
-        fail(error)
+        let key = match unsafe { load_key(name, file, flags) } {
+            Ok(key) => key,
+            Err(error) => return fail(error),
+        };
+        if flags != LOAD_LIBRARY_SEARCH_SYSTEM32 || key != crate::guest_entropy::BASENAME {
+            return fail(ERROR_MOD_NOT_FOUND);
+        }
+        graph(|g| {
+            let image = entropy_image(g);
+            image.ok_or(ERROR_MOD_NOT_FOUND).and_then(Image::acquire)
+        })
+        .unwrap_or_else(fail)
     }
 
     pub(crate) unsafe extern "win64" fn load_library_ex_w(
@@ -883,16 +954,27 @@ pub(crate) mod native {
         })
     }
 
-    pub(super) extern "win64" fn free_library(module: usize) -> i32 {
+    fn release(image: &Image) -> i32 {
+        let Some(next) = image.references.get().checked_sub(1) else {
+            return fail(ERROR_INVALID_HANDLE);
+        };
+        image.references.set(next);
+        1
+    }
+
+    pub(crate) extern "win64" fn free_library(module: usize) -> i32 {
         graph(|g| {
-            let Some(image) = g.and_then(|g| g.by_handle(module)) else {
-                return fail(ERROR_INVALID_HANDLE);
-            };
-            let Some(next) = image.references.get().checked_sub(1) else {
-                return fail(ERROR_INVALID_HANDLE);
-            };
-            image.references.set(next);
-            1
+            g.and_then(|g| g.by_handle(module))
+                .map_or_else(|| fail(ERROR_INVALID_HANDLE), release)
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) extern "win64" fn tls_child_free_library(module: usize) -> i32 {
+        graph(|g| {
+            entropy_image(g)
+                .filter(|m| m.base == module)
+                .map_or_else(|| fail(ERROR_INVALID_HANDLE), release)
         })
     }
 

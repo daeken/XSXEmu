@@ -29,6 +29,11 @@ pub const XMEM_VIRTUAL_ALLOC: HostExport = HostExport {
     symbol: "XMemVirtualAlloc",
     address: None,
 };
+pub const GUEST_ENTROPY: HostExport = HostExport {
+    provider: crate::guest_entropy::BASENAME,
+    symbol: "SystemFunction036",
+    address: None,
+};
 const KERNELBASE: &str = "kernelbase.dll";
 const NTDLL: &str = "ntdll.dll";
 const ERROR_HANDLING: &[u8] = b"api-ms-win-core-errorhandling-l1-1-0.dll";

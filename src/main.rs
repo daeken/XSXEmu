@@ -3,6 +3,7 @@ mod apiset;
 mod darwin_guest_mask;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 mod guest;
+mod guest_entropy;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 mod import_traps;
 mod link;
@@ -48,6 +49,7 @@ const USAGE: &str = "Usage: xsxemu <inspect|map|audit|run> <image.exe> [options]
     run option: --trusted-offline  Ignore opaque CodeIntegrity and volatile hints (requires --experimental-static-tls)\n\
     run option: --no-guest-cfg  Disable guest CFG enforcement (trusted-offline static TLS only)\n\
     run option: --map-extra-dll PATH  Map an extra PE DLL (trusted-offline static TLS only)\n\
+    run option: --guest-entropy  Map the built-in entropy DLL (trusted-offline static TLS with Rust providers)\n\
     audit/run options: --api-set SCHEMA.dll, --rust-providers";
 
 fn main() -> ExitCode {
@@ -85,6 +87,7 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
     let mut trusted_offline = false;
     let mut no_guest_cfg = false;
     let mut map_extra_dll = None;
+    let mut guest_entropy = false;
     let mut startup_profile = None;
     let mut options = args.iter();
     while let Some(arg) = options.next() {
@@ -118,6 +121,7 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
             ("run", Some("--trace-missing-imports")) => trace_missing_imports = true,
             ("run", Some("--experimental-static-tls")) => experimental_tls = true,
             ("run", Some("--trusted-offline")) => trusted_offline = true,
+            ("run", Some("--guest-entropy")) => guest_entropy = true,
             ("run", Some("--no-guest-cfg")) => no_guest_cfg = true,
             ("run", Some("--map-extra-dll")) if map_extra_dll.is_none() => {
                 map_extra_dll = Some(PathBuf::from(
@@ -131,6 +135,9 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
             }
             _ => return Err(format!("unexpected option {arg:?}\n{USAGE}").into()),
         }
+    }
+    if guest_entropy && !(trusted_offline && experimental_tls && rust_providers) {
+        return Err("--guest-entropy requires --trusted-offline, --experimental-static-tls and --rust-providers".into());
     }
     if map_extra_dll.is_some() && !(trusted_offline && experimental_tls) {
         return Err(
@@ -191,6 +198,7 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
                     rust_providers,
                     trace_missing_imports,
                     map_extra_dll: map_extra_dll.as_deref(),
+                    guest_entropy,
                     trusted_offline: trusted_offline
                         || matches!(
                             startup_profile,
@@ -502,11 +510,20 @@ fn resolve(
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
     {
         let tls_child = startup_profile.is_some();
-        let paths: Vec<_> = plan
-            .modules
-            .iter()
-            .map(|m| fs::canonicalize(&m.path))
-            .collect::<std::io::Result<_>>()?;
+        let paths: Vec<_> =
+            plan.modules
+                .iter()
+                .map(|m| {
+                    if m.iat.iter().any(|b| {
+                        b.target == Ok(link::BindingTarget::Rust(providers::GUEST_ENTROPY))
+                    }) {
+                        // The built-in image has a guest-visible path, no host file.
+                        Ok(m.path.clone())
+                    } else {
+                        fs::canonicalize(&m.path)
+                    }
+                })
+                .collect::<std::io::Result<_>>()?;
         let path_names: Vec<_> = paths.iter().map(|path| path.to_string_lossy()).collect();
         let images: Vec<_> = plan
             .modules

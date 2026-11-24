@@ -320,9 +320,22 @@ mod native {
     ) -> Result<u32> {
         use crate::tls_runtime;
         let static_tls = profile.uses_static_tls();
-        for &(importer, _, target) in bindings {
+        let mut entropy_module = None;
+        for &(importer, slot, target) in bindings {
             if let BindingTarget::Rust(export) = target {
-                use crate::providers::{D3D12_VM_CONFIGURE, XMEM_VIRTUAL_ALLOC};
+                use crate::providers::{D3D12_VM_CONFIGURE, GUEST_ENTROPY, XMEM_VIRTUAL_ALLOC};
+                if export == GUEST_ENTROPY {
+                    use crate::guest_entropy::{BRIDGE_SLOT, GUEST_PATH};
+                    if !matches!(profile, Profile::TrustedOfflineTlsChild)
+                        || !rust_providers
+                        || importer == 0
+                        || slot != BRIDGE_SLOT
+                        || images[importer].0 != GUEST_PATH
+                        || entropy_module.replace(importer).is_some()
+                    {
+                        return Err("entropy bridge requires the built-in guest entropy DLL".into());
+                    }
+                }
                 if [D3D12_VM_CONFIGURE, XMEM_VIRTUAL_ALLOC].contains(&export)
                     && (!matches!(profile, Profile::TrustedOfflineTlsChild)
                         || (export == XMEM_VIRTUAL_ALLOC && importer != 0))
@@ -524,6 +537,7 @@ mod native {
             ),
             api_set,
             rust_providers,
+            entropy_module,
         )?;
         if let Some(tls) = tls {
             if rust_providers {

@@ -7,6 +7,8 @@ use core::{ffi::c_void, panic::PanicInfo, ptr};
 unsafe extern "C" {
     fn malloc(size: usize) -> *mut c_void;
     fn free(memory: *mut c_void);
+    #[cfg(fixture_rand_s)]
+    fn rand_s(output: *mut u32) -> i32;
 }
 
 // Keep a DIR64 relocation so the EXE can map away from its preferred base.
@@ -141,7 +143,17 @@ fn heap_probe() -> u32 {
         ptr::write_volatile(memory, MARKER);
         let observed = ptr::read_volatile(memory);
         free(memory.cast());
-        if observed == MARKER { 42 } else { 2 }
+        if observed != MARKER {
+            return 2;
+        }
+        #[cfg(fixture_rand_s)]
+        {
+            let mut output = 0;
+            if rand_s(&mut output) != 0 {
+                return 8;
+            }
+        }
+        42
     }
 }
 
