@@ -228,6 +228,8 @@ fn resolve(
     options: link::Options<'_>,
 ) -> Result<ExitCode> {
     use std::collections::BTreeMap;
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    let startup_options = (options.api_set, options.rust_providers);
     let plan = link::build_configured(image, roots, options)?;
     for module in &plan.modules {
         println!(
@@ -285,16 +287,17 @@ fn resolve(
     return Err("execution requires an x86-64 macOS build (Rosetta on Apple Silicon)".into());
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
     {
-        let names: Vec<_> = plan
+        let paths: Vec<_> = plan
             .modules
             .iter()
-            .map(|m| String::from_utf8_lossy(&m.name))
-            .collect();
+            .map(|m| fs::canonicalize(&m.path))
+            .collect::<std::io::Result<_>>()?;
+        let path_names: Vec<_> = paths.iter().map(|path| path.to_string_lossy()).collect();
         let images: Vec<_> = plan
             .modules
             .iter()
-            .zip(&names)
-            .map(|(m, n)| (n.as_ref(), m.image.as_slice()))
+            .zip(&path_names)
+            .map(|(m, path)| (path.as_ref(), m.image.as_slice()))
             .collect();
         let mut bindings = Vec::new();
         for (i, module) in plan.modules.iter().enumerate() {
@@ -304,7 +307,13 @@ fn resolve(
             }
         }
         let order = attach_order(&plan)?;
-        let status = startup::run(&images, &bindings, &order)?;
+        let status = startup::run(
+            &images,
+            &bindings,
+            &order,
+            startup_options.0,
+            startup_options.1,
+        )?;
         println!("Guest entry returned {status}");
         Ok(ExitCode::from(status as u8))
     }

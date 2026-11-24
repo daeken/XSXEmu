@@ -30,12 +30,6 @@ pub(crate) fn has_dll(dll: &[u8]) -> bool {
 
 pub(crate) fn lookup(dll: &[u8], name: &[u8]) -> Option<HostExport> {
     match (dll, name) {
-        (BASE | K32 | THREADS, b"CreateProcessW") => {
-            export!("kernelbase.dll", "CreateProcessW", native::create_process_w)
-        }
-        (BASE | K32 | THREADS, b"CreateThread") => {
-            export!("kernelbase.dll", "CreateThread", native::create_thread)
-        }
         (BASE | K32 | THREADS, b"GetCurrentProcess") => export!(
             "kernelbase.dll",
             "GetCurrentProcess",
@@ -56,9 +50,6 @@ pub(crate) fn lookup(dll: &[u8], name: &[u8]) -> Option<HostExport> {
             "GetStartupInfoW",
             native::get_startup_info_w
         ),
-        (BASE | K32 | THREADS, b"ResumeThread") => {
-            export!("kernelbase.dll", "ResumeThread", native::resume_thread)
-        }
         (BASE | K32 | FEATURES, b"IsProcessorFeaturePresent") => export!(
             "kernelbase.dll",
             "IsProcessorFeaturePresent",
@@ -168,7 +159,6 @@ mod native {
     const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
     const ERROR_NOT_SUPPORTED: u32 = 50;
     const ERROR_INVALID_PARAMETER: u32 = 87;
-    const ERROR_CALL_NOT_IMPLEMENTED: u32 = 120;
     const ERROR_ENVVAR_NOT_FOUND: u32 = 203;
     const ERROR_FILENAME_EXCED_RANGE: u32 = 206;
     const CURRENT_PROCESS: usize = usize::MAX;
@@ -248,43 +238,6 @@ mod native {
 
     // No child process or guest thread scheduler. Never launch a host command,
     // start an unmanaged host thread, or claim to have produced either handle.
-    pub(super) extern "win64" fn create_process_w(
-        _application: *const u16,
-        _command: *mut u16,
-        _process_attrs: *const c_void,
-        _thread_attrs: *const c_void,
-        _inherit: i32,
-        _flags: u32,
-        _env: *const c_void,
-        _cwd: *const u16,
-        _startup: *const StartupInfoW,
-        _out: *mut c_void,
-    ) -> i32 {
-        fail(ERROR_CALL_NOT_IMPLEMENTED)
-    }
-
-    pub(super) extern "win64" fn create_thread(
-        _attrs: *const c_void,
-        _stack_size: usize,
-        _start: *const c_void,
-        _param: *mut c_void,
-        _flags: u32,
-        _id: *mut u32,
-    ) -> usize {
-        fail(ERROR_CALL_NOT_IMPLEMENTED);
-        0
-    }
-
-    pub(super) extern "win64" fn resume_thread(thread: usize) -> u32 {
-        // The only recognized thread is already running and is not suspendable.
-        set_last_error(if kernel_handle(thread) == CURRENT_THREAD {
-            ERROR_NOT_SUPPORTED
-        } else {
-            ERROR_INVALID_HANDLE
-        });
-        u32::MAX
-    }
-
     fn diagnostic(args: std::fmt::Arguments<'_>) {
         // A lost/redirected diagnostic stream is not an ABI panic.
         let _ = std::io::stderr().lock().write_fmt(args);
@@ -697,18 +650,6 @@ mod native {
                 assert_eq!(get_exit_code_process(get_current_thread(), &mut code), 0);
                 assert_eq!(get_exit_code_process(u32::MAX as usize, &mut code), 1);
             }
-            assert_eq!(resume_thread(get_current_thread()), u32::MAX);
-            assert_eq!(
-                create_thread(
-                    ptr::null(),
-                    0,
-                    ptr::null(),
-                    ptr::null_mut(),
-                    0,
-                    ptr::null_mut()
-                ),
-                0
-            );
         }
 
         #[test]

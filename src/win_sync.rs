@@ -723,7 +723,7 @@ mod native {
             Ok(start)
         }
 
-        pub(in crate::win_sync) extern "win64" fn virtual_alloc(
+        pub(in crate::providers::win_sync) extern "win64" fn virtual_alloc(
             addr: *mut c_void,
             size: usize,
             kind: u32,
@@ -761,7 +761,7 @@ mod native {
             Ok(previous)
         }
 
-        pub(in crate::win_sync) unsafe extern "win64" fn virtual_protect(
+        pub(in crate::providers::win_sync) unsafe extern "win64" fn virtual_protect(
             addr: *mut c_void,
             size: usize,
             code: u32,
@@ -785,7 +785,7 @@ mod native {
         }
 
         #[repr(C)]
-        pub(in crate::win_sync) struct MemoryBasicInformation {
+        pub(in crate::providers::win_sync) struct MemoryBasicInformation {
             base_address: usize,
             allocation_base: usize,
             allocation_protect: u32,
@@ -826,7 +826,7 @@ mod native {
             })
         }
 
-        pub(in crate::win_sync) unsafe extern "win64" fn virtual_query(
+        pub(in crate::providers::win_sync) unsafe extern "win64" fn virtual_query(
             addr: *const c_void,
             out: *mut MemoryBasicInformation,
             len: usize,
@@ -978,7 +978,7 @@ mod native {
             }
         }
 
-        pub(in crate::win_sync) extern "win64" fn virtual_free(
+        pub(in crate::providers::win_sync) extern "win64" fn virtual_free(
             addr: *mut c_void,
             size: usize,
             kind: u32,

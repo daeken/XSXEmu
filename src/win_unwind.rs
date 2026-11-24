@@ -11,23 +11,25 @@
 
 use crate::providers::HostExport;
 
+const RTL_SUPPORT: &[u8] = b"api-ms-win-core-rtlsupport-l1-1-0.dll";
+
 pub(crate) fn has_dll(dll: &[u8]) -> bool {
-    dll == b"ntdll.dll"
+    matches!(dll, b"ntdll.dll" | RTL_SUPPORT)
 }
 
 pub(crate) fn lookup(dll: &[u8], name: &[u8]) -> Option<HostExport> {
     match (dll, name) {
-        (b"ntdll.dll", b"RtlLookupFunctionEntry") => {
+        (b"ntdll.dll" | RTL_SUPPORT, b"RtlLookupFunctionEntry") => {
             export!(
                 "ntdll.dll",
                 "RtlLookupFunctionEntry",
                 native::lookup_function_entry
             )
         }
-        (b"ntdll.dll", b"RtlVirtualUnwind") => {
+        (b"ntdll.dll" | RTL_SUPPORT, b"RtlVirtualUnwind") => {
             export!("ntdll.dll", "RtlVirtualUnwind", native::virtual_unwind)
         }
-        (b"ntdll.dll", b"RtlCaptureContext") => {
+        (b"ntdll.dll" | RTL_SUPPORT, b"RtlCaptureContext") => {
             export!("ntdll.dll", "RtlCaptureContext", native::capture_context)
         }
         _ => None,

@@ -22,7 +22,6 @@ const ERROR_HANDLING: &[u8] = b"api-ms-win-core-errorhandling-l1-1-0.dll";
 const PROCESS_THREADS: &[u8] = b"api-ms-win-core-processthreads-l1-1-0.dll";
 const HEAP: &[u8] = b"api-ms-win-core-heap-l1-1-0.dll";
 
-#[allow(unused_macros)] // Used by the provider submodules as they are enabled.
 macro_rules! export {
     ($provider:expr, $symbol:literal, $function:path) => {{
         #[cfg(target_arch = "x86_64")]
@@ -37,6 +36,19 @@ macro_rules! export {
     }};
 }
 
+#[path = "win_io.rs"]
+mod win_io;
+#[path = "win_loader.rs"]
+pub(crate) mod win_loader;
+#[path = "win_proc.rs"]
+pub(crate) mod win_proc;
+#[path = "win_sync.rs"]
+mod win_sync;
+#[path = "win_text.rs"]
+mod win_text;
+#[path = "win_unwind.rs"]
+pub(crate) mod win_unwind;
+
 #[cfg(target_arch = "x86_64")]
 pub(crate) use native::set_last_error;
 
@@ -50,7 +62,12 @@ pub fn has_dll(dll: &[u8]) -> bool {
             | ERROR_HANDLING
             | PROCESS_THREADS
             | HEAP
-    )
+    ) || win_loader::has_dll(dll)
+        || win_proc::has_dll(dll)
+        || win_sync::has_dll(dll)
+        || win_unwind::has_dll(dll)
+        || win_io::has_dll(dll)
+        || win_text::has_dll(dll)
 }
 
 /// Resolve exact symbol bytes in a lowercase DLL name. API-set rows are exact
@@ -129,7 +146,12 @@ pub fn lookup(dll: &[u8], name: &[u8]) -> Option<HostExport> {
         (b"kernelbase.dll" | b"kernel32.dll" | HEAP, b"HeapWalk") => {
             export!(KERNELBASE, "HeapWalk", heap_walk)
         }
-        _ => None,
+        _ => win_loader::lookup(dll, name)
+            .or_else(|| win_proc::lookup(dll, name))
+            .or_else(|| win_sync::lookup(dll, name))
+            .or_else(|| win_unwind::lookup(dll, name))
+            .or_else(|| win_io::lookup(dll, name))
+            .or_else(|| win_text::lookup(dll, name)),
     }
 }
 

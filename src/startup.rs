@@ -6,9 +6,11 @@
 mod native {
     use crate::{
         MAX_IMAGE, Result,
+        apiset::ApiSet,
         guest::{GuestMemory, Region},
         link::BindingTarget,
         pe::Pe,
+        providers::{win_loader, win_proc, win_unwind},
     };
     use std::{fs::File, io::Read};
 
@@ -74,6 +76,8 @@ mod native {
         images: &[(&str, &[u8])],
         bindings: &[(usize, u32, BindingTarget)],
         attach_order: &[usize],
+        api_set: Option<&ApiSet>,
+        rust_providers: bool,
     ) -> Result<u32> {
         let pes = images
             .iter()
@@ -140,6 +144,49 @@ mod native {
             if pe.entry_rva != 0 {
                 mem.validate_target(pe.entry_rva as usize)?;
             }
+        }
+        let _loader = win_loader::register(
+            images
+                .iter()
+                .zip(&pes)
+                .zip(&memories)
+                .map(|(((path, _), pe), mem)| (*path, pe, mem.base())),
+            api_set,
+            rust_providers,
+        )?;
+        let mut unwind_registrations = Vec::<win_unwind::Registration>::new();
+        for (pe, mem) in pes.iter().zip(&memories) {
+            let (rva, size) = if let Some(dir) = pe.directory(3) {
+                let end = dir
+                    .rva
+                    .checked_add(dir.size)
+                    .ok_or("exception directory overflow")?;
+                if !pe.sections.iter().any(|s| {
+                    s.readable()
+                        && !s.writable()
+                        && dir.rva >= s.virtual_address
+                        && end - s.virtual_address <= s.virtual_size.max(s.raw_size)
+                }) {
+                    return Err(
+                        "exception directory must be in a readable, immutable section".into(),
+                    );
+                }
+                (dir.rva, dir.size)
+            } else {
+                (0, 0)
+            };
+            // SAFETY: the mappings and immutable tables outlive the registrations.
+            unwind_registrations.push(unsafe {
+                win_unwind::register_image(
+                    mem.base() as *const u8,
+                    pe.size_of_image as usize,
+                    rva,
+                    size,
+                )
+            }?);
+        }
+        if rust_providers {
+            win_proc::init_process(images[0].0)?;
         }
         let mut attached: Vec<usize> = Vec::new();
         let mut outcome = Ok(0);
