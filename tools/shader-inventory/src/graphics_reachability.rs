@@ -407,7 +407,7 @@ fn export_shape(first: u32, len: usize, text: &str) -> Option<ExportShape> {
 fn nearest_form(name: &str, w: u32, len: usize, text: &str) -> String {
     let source = w & 0x1ff;
     match name {
-        "v_mov_b32_e32" | "v_cvt_pkrtz_f16_f32_e32" => {
+        "v_mov_b32_e32" | "v_cvt_pkrtz_f16_f32_e32" | "v_cmp_ne_u32_e32" | "v_cndmask_b32_e32" => {
             if (256..=511).contains(&source) {
                 format!("{name}/VGPR/{len}B")
             } else if source <= 105 {
@@ -542,6 +542,8 @@ impl LiftGaps {
                         | Op::FinalPackedRg0 { .. }
                         | Op::FinalPixelDepth { .. } => name == "exp",
                         Op::PackHalfRtz { .. } => name == "v_cvt_pkrtz_f16_f32_e32",
+                        Op::CompareNonzero { .. } => name == "v_cmp_ne_u32_e32",
+                        Op::SelectBits { .. } => name == "v_cndmask_b32_e32",
                         Op::End => name == "s_endpgm",
                     }
             });

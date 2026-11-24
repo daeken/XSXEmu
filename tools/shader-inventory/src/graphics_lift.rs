@@ -137,6 +137,7 @@ fn lift(stage: Stage, words: &[u32]) -> Result<Vec<Op>, Reject> {
     let mut ops = Vec::new();
     let mut pc = 0;
     let mut exported = 0;
+    let mut has_vcc = false;
     while pc < words.len() {
         let (width, op) = decode(words, pc).map_err(|err| match err {
             DecodeError::Unsupported(pc) => Reject::Unsupported(pc),
@@ -153,6 +154,20 @@ fn lift(stage: Stage, words: &[u32]) -> Result<Vec<Op>, Reject> {
         match op {
             Op::Move { dst, src } | Op::AddF32Literal { dst, src, .. } => {
                 require(src)?;
+                live[usize::from(dst.0)] = true;
+            }
+            Op::CompareNonzero { src } => {
+                if matches!(stage, Stage::Vertex | Stage::MultiVertex) {
+                    return Err(Reject::Unsupported(pc));
+                }
+                require(src)?;
+                has_vcc = true;
+            }
+            Op::SelectBits { dst, when_true, .. } => {
+                if !has_vcc {
+                    return Err(Reject::Unsupported(pc));
+                }
+                require(when_true)?;
                 live[usize::from(dst.0)] = true;
             }
             Op::MoveBits { dst, .. } => live[usize::from(dst.0)] = true,
@@ -241,6 +256,10 @@ fn body(out: &mut String, ops: &[Op]) {
 }
 
 fn emit_body(out: &mut String, ops: &[Op], packed_color_lvalue: &str, multi: bool) {
+    // Only the active lane's VCC bit is observable in this straight-line profile.
+    if ops.iter().any(|op| matches!(op, Op::CompareNonzero { .. })) {
+        out.push_str("  bool lane_vcc;\n");
+    }
     for op in ops {
         match *op {
             Op::Move {
@@ -248,6 +267,20 @@ fn emit_body(out: &mut String, ops: &[Op], packed_color_lvalue: &str, multi: boo
                 src: Vgpr(src),
             } => {
                 writeln!(out, "  r[{dst}] = r[{src}];").unwrap();
+            }
+            Op::CompareNonzero { src: Vgpr(r) } => {
+                writeln!(out, "  lane_vcc = r[{r}] != 0u;").unwrap();
+            }
+            Op::SelectBits {
+                dst: Vgpr(dst),
+                when_false,
+                when_true: Vgpr(src),
+            } => {
+                writeln!(
+                    out,
+                    "  r[{dst}] = lane_vcc ? r[{src}] : 0x{when_false:08x}u;"
+                )
+                .unwrap();
             }
             Op::MoveBits {
                 dst: Vgpr(dst),
@@ -361,6 +394,15 @@ const EDGE_LITERAL: &[u32] = &[0x0e06_02ff, 0x3e80_0000]; // v_mul_legacy_f32_e3
 const EDGE_FMAC: &[u32] = &[0x5608_0300]; // v_fmac_f32_e32 v4, v0, v1
 const EDGE_RTZ: &[u32] = &[0x5e0a_0300]; // v_cvt_pkrtz_f16_f32_e32 v5, v0, v1
 
+const EDGE_SELECT: &[u32] = &[
+    0x7d8a_0080,
+    0x0214_02ff,
+    0x7fc1_2345,
+    0x7d8a_0280,
+    0x0216_00ff,
+    0x8000_0000,
+];
+
 const EDGE_MOV_HINTS: &[u32] = &[
     0xbfa0_0003,
     0x7e0c_0280,
@@ -401,7 +443,10 @@ pub fn translate_legacy_edge_fixture() -> Result<String, DecodeError> {
         body(&mut msl, &[op]);
         pc += width;
     }
-    msl.push_str("  out[2 * id] = uint4(r[2], r[3], r[4], r[5]);\n  out[2 * id + 1] = uint4(r[6], r[7], r[8], r[9]);\n}\n");
+    let select = lift(Stage::PackedPixel, &[EDGE_SELECT, PACKED_PS].concat())
+        .map_err(|_| DecodeError::Unsupported(0))?;
+    body(&mut msl, &select[..4]);
+    msl.push_str("  out[3 * id] = uint4(r[2], r[3], r[4], r[5]);\n  out[3 * id + 1] = uint4(r[6], r[7], r[8], r[9]);\n  out[3 * id + 2] = uint4(r[10], r[11], 0u, 0u);\n}\n");
     Ok(msl)
 }
 
@@ -539,7 +584,7 @@ mod tests {
             io::Write,
             process::{Command, Stdio},
         };
-        let asm = "v_mov_b32_e32 v8, v4\nexp param0 v8, v5, v6, v7\nexp pos0 v0, v1, v2, v3 done\ns_endpgm\nv_add_f32_e32 v4, 0.25, v0\nv_fma_f32 v5, v1, v2, v3\nv_mul_legacy_f32_e32 v6, v5, v4\nv_mul_legacy_f32_e32 v6, 0.5, v6\nv_mul_legacy_f32_e32 v7, 0, v3\nexp mrt0 v4, v5, v6, v7 done\ns_endpgm\nv_mul_legacy_f32_e32 v2, v0, v1\nv_mul_legacy_f32_e32 v3, 0.25, v1\nv_fmac_f32_e32 v4, v0, v1\nv_cvt_pkrtz_f16_f32_e32 v5, v0, v1\ns_inst_prefetch 3\nv_mov_b32_e32 v6, 0\ns_nop 0\nv_mov_b32_e32 v7, 0.5\nv_mov_b32_e32 v8, 1.0\nv_mov_b32_e32 v9, 0x7fc12345\nexp mrt0 v1, v1, v0, v0 done compr vm\ns_endpgm\nexp mrt0 v1, v1, off, off done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrtz v2, off, off, off done vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrt1 v0, v0, v1, v1 done compr vm\ns_endpgm\n";
+        let asm = "v_mov_b32_e32 v8, v4\nexp param0 v8, v5, v6, v7\nexp pos0 v0, v1, v2, v3 done\ns_endpgm\nv_add_f32_e32 v4, 0.25, v0\nv_fma_f32 v5, v1, v2, v3\nv_mul_legacy_f32_e32 v6, v5, v4\nv_mul_legacy_f32_e32 v6, 0.5, v6\nv_mul_legacy_f32_e32 v7, 0, v3\nexp mrt0 v4, v5, v6, v7 done\ns_endpgm\nv_mul_legacy_f32_e32 v2, v0, v1\nv_mul_legacy_f32_e32 v3, 0.25, v1\nv_fmac_f32_e32 v4, v0, v1\nv_cvt_pkrtz_f16_f32_e32 v5, v0, v1\ns_inst_prefetch 3\nv_mov_b32_e32 v6, 0\ns_nop 0\nv_mov_b32_e32 v7, 0.5\nv_mov_b32_e32 v8, 1.0\nv_mov_b32_e32 v9, 0x7fc12345\nv_cmp_ne_u32_e32 vcc_lo, 0, v0\nv_cndmask_b32_e32 v10, 0x7fc12345, v1, vcc_lo\nv_cmp_ne_u32_e32 vcc_lo, 0, v1\nv_cndmask_b32_e32 v11, 0x80000000, v0, vcc_lo\nexp mrt0 v1, v1, v0, v0 done compr vm\ns_endpgm\nexp mrt0 v1, v1, off, off done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrtz v2, off, off, off done vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrt1 v0, v0, v1, v1 done compr vm\ns_endpgm\n";
         let mut asm = asm.to_owned();
         for n in 0..7 {
             let r = 4 + 4 * n;
@@ -554,6 +599,7 @@ mod tests {
             .chain(EDGE_FMAC)
             .chain(EDGE_RTZ)
             .chain(EDGE_MOV_HINTS)
+            .chain(EDGE_SELECT)
             .chain(PACKED_PS)
             .chain(PACKED_RG_PS)
             .chain(DEPTH_PS)
@@ -643,6 +689,25 @@ mod tests {
             decode(&[DUAL_PS[2], 0x10100], 0),
             Err(DecodeError::Unsupported(0))
         );
+    }
+
+    #[test]
+    fn select_requires_local_predicate_and_live_source() {
+        assert_eq!(
+            lift(Stage::PackedPixel, &EDGE_SELECT[1..3]),
+            Err(Reject::Unsupported(0))
+        );
+        assert_eq!(
+            lift(Stage::PackedPixel, &[EDGE_SELECT[0], 0x0214_08ff, 0]),
+            Err(Reject::Uninitialized(1, 4))
+        );
+        assert_eq!(
+            decode(&EDGE_SELECT[1..2], 0),
+            Err(DecodeError::Truncated(0))
+        );
+        for word in [0x7d8a_0180, 0x7d8a_0181, 0x7d8a_0100, 0x0214_0300] {
+            assert_eq!(decode(&[word, 0], 0), Err(DecodeError::Unsupported(0)));
+        }
     }
 
     #[test]

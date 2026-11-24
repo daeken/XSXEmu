@@ -95,16 +95,18 @@ mod gpu {
             ([0x3e80_0000, P0], 0x0000_3400),
         ];
         inputs.extend(rtz.iter().map(|([a, b], _)| [*a, *b, 0, 0]));
+        let nan_zero_row = inputs.len();
+        inputs.push([NAN, P0, 0, 0]);
         let bytes = std::mem::size_of_val(inputs.as_slice());
         let usage = MTLResourceOptions::StorageModeShared;
         let input = dev.new_buffer_with_data(inputs.as_ptr().cast(), bytes as u64, usage);
-        let output = dev.new_buffer(2 * bytes as u64, usage);
+        let output = dev.new_buffer(3 * bytes as u64, usage);
         let out = output.contents().cast::<[u32; 4]>();
         if out.is_null() {
             return Err("unmapped readback".into());
         }
         // Shared buffer is owned here; no CPU access during execution.
-        unsafe { out.write_bytes(0xa5, 2 * inputs.len()) };
+        unsafe { out.write_bytes(0xa5, 3 * inputs.len()) };
         let queue = dev.new_command_queue();
         let cmd = queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
@@ -123,7 +125,7 @@ mod gpu {
         }
         for (i, (_, expected)) in cases.into_iter().enumerate() {
             // Exact dispatched extent, completed writes, owned allocation still live.
-            let actual = unsafe { out.add(2 * i).read() };
+            let actual = unsafe { out.add(3 * i).read() };
             if actual[..2] != expected {
                 return Err(
                     format!("edge row {i}: got {actual:08x?}, expected {expected:08x?}").into(),
@@ -135,28 +137,45 @@ mod gpu {
         assert_eq!(4097_i64 * 4097 - 16785408, 1);
         assert_eq!(4097_f32 * 4097. - 16785408., 0.);
         for i in cases.len()..rtz_start {
-            let got = unsafe { out.add(2 * i).read() }[2];
+            let got = unsafe { out.add(3 * i).read() }[2];
             if got != 1_f32.to_bits() {
                 return Err(format!("FMAC row {i} returned {got:08x}").into());
             }
         }
         for (i, (_, expected)) in rtz.into_iter().enumerate() {
-            let got = unsafe { out.add(2 * (rtz_start + i)).read() }[3];
+            let got = unsafe { out.add(3 * (rtz_start + i)).read() }[3];
             if got != expected {
                 return Err(format!("RTZ row {i}: got {got:08x}, expected {expected:08x}").into());
             }
         }
         let mov_oracle = [0, 0.5_f32.to_bits(), 1_f32.to_bits(), 0x7fc1_2345];
         for i in 0..inputs.len() {
-            let got = unsafe { out.add(2 * i + 1).read() };
+            let got = unsafe { out.add(3 * i + 1).read() };
             if got != mov_oracle {
                 return Err(
                     format!("MOV row {i}: got {got:08x?}, expected {mov_oracle:08x?}").into(),
                 );
             }
         }
+        // Literal result rows for (+0,-Inf), (NaN,+0), (-0,+Inf), and (+3,-2).
+        // The '-0' input is nonzero as an unsigned integer, and the second
+        // comparison must overwrite the first predicate (rather than OR it).
+        for (i, expected) in [
+            (2, [NAN, P0]),
+            (nan_zero_row, [P0, N0]),
+            (0, [INF, N0]),
+            (6, [N2, P3]),
+        ] {
+            let got = unsafe { out.add(3 * i + 2).read() };
+            if got[..2] != expected {
+                return Err(format!(
+                    "conditional row {i}: got {got:08x?}, expected {expected:08x?}"
+                )
+                .into());
+            }
+        }
         println!(
-            "{}: strict arithmetic archive, 16/16 legacy words, 2/2 FMAC words 3/3 packed RTZ words and {mov_words}/{mov_words} raw MOV words",
+            "{}: strict arithmetic archive, 16/16 legacy words, 2/2 FMAC words, 3/3 packed RTZ words, {mov_words}/{mov_words} raw MOV words and 8/8 select words",
             dev.name(),
             mov_words = 4 * inputs.len()
         );

@@ -64,6 +64,14 @@ pub(crate) enum Op {
         dst: Vgpr,
         src: [Vgpr; 2],
     },
+    CompareNonzero {
+        src: Vgpr,
+    },
+    SelectBits {
+        dst: Vgpr,
+        when_false: u32,
+        when_true: Vgpr,
+    },
     End,
 }
 
@@ -83,6 +91,26 @@ pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeErro
         0xbf80_0000 => return Ok((1, Op::NopOneCycle)),
         0xbfa0_0003 => return Ok((1, Op::PrefetchThreeLines)),
         _ => {}
+    }
+    // VOPC NE_U32 with inline integer zero and one ordinary VGPR.
+    if w & !0x1fe00 == 0x7d8a_0080 {
+        return Ok((
+            1,
+            Op::CompareNonzero {
+                src: Vgpr((w >> 9) as u8),
+            },
+        ));
+    }
+    // VOP2 CNDMASK reads implicit VCC, with raw literal S0 and VGPR S1.
+    if w & 0xfe00_01ff == 0x0200_00ff {
+        return Ok((
+            2,
+            Op::SelectBits {
+                dst: Vgpr((w >> 17) as u8),
+                when_false: ext()?,
+                when_true: Vgpr((w >> 9) as u8),
+            },
+        ));
     }
     // The MOV literal is a raw word, never an arithmetic float operand.
     if w & 0xfe01_fe00 == 0x7e00_0200 {
