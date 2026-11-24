@@ -61,6 +61,39 @@ struct Payloads {
     unsupported_compute_profiles: usize,
 }
 
+const GRAPHICS_STAGES: [u16; 3] = [0, 1, 13];
+type SourceKey = (u16, [u8; 16]);
+
+#[derive(Default)]
+struct GraphicsCoverage {
+    complete_unique: usize,
+    complete_multi: usize,
+    missing: usize,
+    missing_and_multi: usize,
+    no_known_slots: usize,
+}
+
+impl GraphicsCoverage {
+    fn add(&mut self, known_slots: impl IntoIterator<Item = usize>) {
+        let mut iter = known_slots.into_iter().peekable();
+        if iter.peek().is_none() {
+            self.no_known_slots += 1;
+            return;
+        }
+        let (mut missing, mut multi) = (false, false);
+        for count in iter {
+            missing |= count == 0;
+            multi |= count > 1;
+        }
+        match (missing, multi) {
+            (false, false) => self.complete_unique += 1,
+            (false, true) => self.complete_multi += 1,
+            (true, false) => self.missing += 1,
+            (true, true) => self.missing_and_multi += 1,
+        }
+    }
+}
+
 fn digest(blob: &[u8]) -> Option<[u8; 16]> {
     let start = blob.len().checked_sub(32)?;
     blob.get(start + 4..start + 20)?.try_into().ok()
@@ -129,7 +162,7 @@ pub(super) fn run(
     let mut library_bytes = Vec::new();
     bounded(path, ARCHIVE_LIMIT, &mut library_bytes)?;
     let library = PipelineLibrary::parse(&library_bytes)?;
-    let mut index = HashMap::<(u16, [u8; 16]), HashSet<ProgramId>>::new();
+    let mut index = HashMap::<SourceKey, HashSet<ProgramId>>::new();
     let mut programs = BTreeMap::<u16, HashMap<ProgramId, Program>>::new();
     let mut unknown_slots = HashSet::new();
     let mut add = |stage, program, blob: &[u8]| -> Option<()> {
@@ -145,17 +178,13 @@ pub(super) fn run(
         Some(())
     };
     let mut checked_graphics = HashSet::new();
+    let mut graphics_keys = HashMap::new();
     for pso in library.graphics() {
         for (slot, item) in pso.slots.into_iter().enumerate() {
             let Some(item) = item else { continue };
-            let stage = match slot {
-                0 => 0,
-                1 => 1,
-                2 => 13,
-                _ => {
-                    unknown_slots.insert((slot, item.program));
-                    continue;
-                }
+            let Some(&stage) = GRAPHICS_STAGES.get(slot) else {
+                unknown_slots.insert((slot, item.program));
+                continue;
             };
             let id = item
                 .metadata
@@ -165,6 +194,11 @@ pub(super) fn run(
             }
             let blob = library.blob(id).ok_or("missing graphics metadata span")?;
             graphics_items(blob).ok_or("invalid graphics metadata framing")?;
+            let key = (
+                stage,
+                digest(blob).ok_or("missing graphics metadata digest")?,
+            );
+            graphics_keys.insert((slot, id), key);
             add(stage, item.program, blob).ok_or("missing graphics metadata digest")?;
         }
     }
@@ -199,6 +233,7 @@ pub(super) fn run(
         p.nonzero_site_word = site_programs.contains(&id);
     }
 
+    let mut source_counts = HashMap::<SourceKey, usize>::new();
     let mut counts = BTreeMap::<u16, Payloads>::new();
     let (mut bytes, mut inflate) = (Vec::new(), Vec::new());
     let (mut files, mut joined_wrappers, mut work) = (0, 0, 0usize);
@@ -227,6 +262,7 @@ pub(super) fn run(
             continue;
         };
         joined_wrappers += 1;
+        *source_counts.entry((stage, key)).or_default() += 1;
         let candidates = programs.get_mut(&stage).ok_or("missing program stage")?;
         let mut eligible = Vec::with_capacity(ids.len());
         for id in ids {
@@ -318,6 +354,33 @@ pub(super) fn run(
         "Wrapped library identity hypotheses: {files} wrappers, {joined_wrappers} in at least one candidate family, {} distinct unlabelled slot/program pairs excluded",
         unknown_slots.len()
     );
+    // A row uses the digest on its exact metadata reference, not all digests
+    // ever seen for the same program. Unknown slots stay in the grouping key.
+    let mut graphics_rows = BTreeMap::<Vec<usize>, GraphicsCoverage>::new();
+    for pso in library.graphics() {
+        let mut slots = Vec::new();
+        let mut candidates = Vec::new();
+        for (slot, item) in pso.slots.into_iter().enumerate() {
+            let Some(item) = item else { continue };
+            slots.push(slot);
+            if GRAPHICS_STAGES.get(slot).is_some() {
+                let id = item
+                    .metadata
+                    .ok_or("missing known graphics slot metadata")?;
+                let key = graphics_keys
+                    .get(&(slot, id))
+                    .ok_or("missing checked stage key")?;
+                candidates.push(source_counts.get(key).copied().unwrap_or(0));
+            }
+        }
+        graphics_rows.entry(slots).or_default().add(candidates);
+    }
+    for (slots, c) in graphics_rows {
+        println!(
+            "  Graphics rows with present slots {slots:?}: known slots {} all unique, {} all found with ambiguity, {} missing without ambiguity, {} missing with ambiguity, {} no known slots",
+            c.complete_unique, c.complete_multi, c.missing, c.missing_and_multi, c.no_known_slots,
+        );
+    }
     for (stage, stage_programs) in programs {
         let totals = counts.remove(&stage).unwrap_or_default();
         let values = || stage_programs.values();
@@ -399,6 +462,25 @@ pub(super) fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn graphics_coverage_does_not_hide_missing_or_ambiguous_slots() {
+        let mut c = GraphicsCoverage::default();
+        c.add([1, 1]);
+        c.add([1, 2]);
+        c.add([0, 1]);
+        c.add([0, 2]);
+        c.add([]);
+        assert_eq!(c.no_known_slots, 1);
+        assert_eq!(
+            (
+                c.complete_unique,
+                c.complete_multi,
+                c.missing,
+                c.missing_and_multi
+            ),
+            (1, 1, 1, 1)
+        );
+    }
     #[test]
     fn agreeing_dispatch_reference_does_not_hide_a_disagreeing_one() {
         let a = ([1, 2, 3], true);

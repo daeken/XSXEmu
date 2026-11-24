@@ -85,6 +85,20 @@ The scanner repeats the stage/digest join directly against the expanded binary l
 
 There were no unbounded candidate windows. The extra VS payloads are retained, not reduced to one per wrapper. The unlabelled slot-6 program is outside the join. These negative results reject direct stored-span aliasing for the two tested views, not related instruction bodies after other framing, layout fixup, or variant selection. No IDs, digests, shader bytes, or instruction listings are printed.
 
+### Per-row graphics source candidate coverage
+
+The scanner also joins each **present, stage-labelled slot in each PSO row** to wrapped sources by `(stage, digest)`, using the footer on that slot's exact metadata reference. It does not substitute candidates attached to another reference to the same program. Counts are by PSO row, not by unique tuple or program; a slot with more than one wrapper is ambiguous even if the wrappers may be equivalent. Unknown slots remain in the row grouping but have no stage/digest classification.
+
+| Present slot roles | All known slots unique | All known slots found, some ambiguous | Missing known slot, no ambiguity | Missing and ambiguous known slots |
+|---|---:|---:|---:|---:|
+| PS + VS | 13,284 | 80 | 19 | 0 |
+| PS + VS + slot 6 | 0 | 0 | 2 | 0 |
+| PS + MS | 8,775 | 1,951 | 0 | 0 |
+| VS only | 24 | 0 | 0 | 0 |
+| MS only | 1,241 | 95 | 0 | 0 |
+
+The unique two-stage cohorts are the starting point for source interface comparisons. The counts do not prove that a wrapper contains the native variant used by a PSO, that two source interfaces are compatible, or that any PSO is reconstructible. In particular, the two rows with slot 6 have both an unidentified stage reference and a missing wrapped source among the known slots.
+
 ### Conditional marker-bounded equality
 
 The same scanner separately tests a narrower byte window. On the FSSM side it begins at `start + 40`, removes only trailing `0xbf9f0000` words, and requires the resulting aligned bytes to end in `0xbf810000`. On the library side it looks for the last aligned `0xbf810000` in the final 512 stored bytes and compares through that word from each explicit hypothesis (`+0`, `+24`, `+36`). A raw marker can be a literal or data; it is not a verified instruction or proof of entry/exit.
