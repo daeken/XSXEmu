@@ -31,6 +31,8 @@ LLVM **21.1.6**; **26,698** native inputs, **2,689** compute, no read/header/spa
 | First blocker: LLVM instruction reject | 0 | 1,471 |
 | First blocker: unmodeled `s_setpc_b64` | 13 | 12 |
 
+All 13 `gfx1013` and 12 `gfx1030` indirect first blockers have a checked local fallthrough pattern: PC materialization into an ordinary SGPR pair, an unsigned literal addition to the low word, carry into the high word with zero as the other addend, and `s_setpc_b64` on the same pair. The recognizer permits intervening checked `s_waitcnt` only; it uses the selected LLVM mnemonics and checks GFX10 opcodes, widths, and same-pair operands independently. Under the reference arithmetic, the resulting candidate offset is dword-aligned and lies inside the selected span in every case. No address or literal is emitted. This checks the preceding visited path only, not dominance, independent destination boundaries, observed dispatch, or the Xbox dialect. The CFG still stops on the transfer; the number of complete graphs is unchanged.
+
 The earlier archive linear `gfx1013` walk completed 1,680 spans. The paired counters here compare each *complete* graph to a linear walk of the same extracted payload, locating the first linear reject either outside the graph or inside a reachable instruction's extension. They exclude graphs that already stopped at reachable blockers. Skipped words are not all necessarily data; the paired comparison shows precisely which linear rejects do not block the reachable graph. The `gfx1030` run is an independent reference, not a fallback and not a candidate to merge into the `gfx1013` report.
 
 ## What to translate first

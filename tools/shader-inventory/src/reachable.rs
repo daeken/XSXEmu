@@ -135,9 +135,127 @@ fn compare_linear(
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum IndirectShape {
+    Unmatched,
+    RelativeLiteralUnaligned,
+    RelativeLiteralOutsideSpan,
+    RelativeLiteralInSpan,
+}
+
+#[derive(Clone, Copy, Default)]
+enum PcStep {
+    #[default]
+    None,
+    Get {
+        pair: u32,
+        base: usize,
+    },
+    Low {
+        pair: u32,
+        base: usize,
+        literal: usize,
+    },
+    High {
+        pair: u32,
+        base: usize,
+        literal: usize,
+    },
+}
+
+// Observe only the immediately preceding fallthrough path already visited by
+// the reference walker. A matching window does not prove it dominates SETPC
+// or that a second path cannot enter its middle.
+#[derive(Default)]
+struct PcPattern {
+    next: Option<usize>,
+    step: PcStep,
+}
+
+impl PcPattern {
+    fn observe(&mut self, pc: usize, size: usize, name: &str, first: u32, tail: &[u8], flow: Flow) {
+        let prior = if self.next == Some(pc) {
+            self.step
+        } else {
+            PcStep::None
+        };
+        self.next = (flow == Flow::Next).then_some(pc + size / 4);
+        let dst = (first >> 16) & 127;
+        let src = first & 0xffff;
+        self.step = match (flow, prior, name, size) {
+            (Flow::Next, _, "s_getpc_b64", 4)
+                if first & 0xff80_ffff == 0xbe80_1f00 && dst.is_multiple_of(2) && dst <= 100 =>
+            {
+                PcStep::Get {
+                    pair: dst,
+                    base: (pc + 1) * 4,
+                }
+            }
+            (Flow::Next, PcStep::Get { pair, base }, "s_add_u32", 8)
+                if first >> 23 == 0x100 && dst == pair && matches_pair(src, pair, 255) =>
+            {
+                word(tail, 4).map_or(PcStep::None, |literal| PcStep::Low {
+                    pair,
+                    base,
+                    literal,
+                })
+            }
+            (
+                Flow::Next,
+                PcStep::Low {
+                    pair,
+                    base,
+                    literal,
+                },
+                "s_addc_u32",
+                4,
+            ) if first >> 23 == 0x104 && dst == pair + 1 && matches_pair(src, pair + 1, 128) => {
+                PcStep::High {
+                    pair,
+                    base,
+                    literal,
+                }
+            }
+            (Flow::Next, _, "s_waitcnt", 4) if first >> 16 == 0xbf8c => prior,
+            _ => PcStep::None,
+        };
+    }
+
+    fn classify(&self, pc: usize, size: usize, first: u32, extent: usize) -> IndirectShape {
+        let PcStep::High {
+            pair,
+            base,
+            literal,
+        } = self.step
+        else {
+            return IndirectShape::Unmatched;
+        };
+        if self.next != Some(pc) || size != 4 || first != 0xbe80_2000 | pair {
+            return IndirectShape::Unmatched;
+        }
+        // Public reference arithmetic: a literal low word plus a carry into
+        // a zero-addend high word, not a sign-extended 32-bit displacement.
+        if !literal.is_multiple_of(4) {
+            IndirectShape::RelativeLiteralUnaligned
+        } else if base
+            .checked_add(literal)
+            .is_some_and(|target| target < extent)
+        {
+            IndirectShape::RelativeLiteralInSpan
+        } else {
+            IndirectShape::RelativeLiteralOutsideSpan
+        }
+    }
+}
+
+fn matches_pair(src: u32, reg: u32, other: u32) -> bool {
+    src == reg | (other << 8) || src == other | (reg << 8)
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Blocker {
     Decode,
     Control(String),
+    IndirectPc(IndirectShape),
     OutsideSpan,
     InvalidWidth,
     Overlap,
@@ -148,15 +266,21 @@ fn analyze(dis: &mut Disassembler, bytes: &[u8]) -> Result<ProgramCounts, Blocke
     let mut scratch = [0; 1024];
     let mut counts = ProgramCounts::default();
     let mut blocker = Blocker::Decode;
+    let mut pc_pattern = PcPattern::default();
     let graph = cfg::walk_extent(bytes.len() / 4, |dword| {
         let tail = &bytes[dword * 4..];
         let (size, line) = dis.one(tail, dword * 4, &mut scratch)?;
         let first = u32::from_le_bytes(tail[..4].try_into().unwrap());
         let name = line.split_ascii_whitespace().next().unwrap();
         let Some(flow) = control(name, first, size) else {
-            blocker = Blocker::Control(name.to_owned());
+            blocker = if name == "s_setpc_b64" {
+                Blocker::IndirectPc(pc_pattern.classify(dword, size, first, bytes.len()))
+            } else {
+                Blocker::Control(name.to_owned())
+            };
             return None;
         };
+        pc_pattern.observe(dword, size, name, first, tail, flow);
         if let Some(n) = counts.ops.get_mut(name) {
             *n += 1;
         } else {
@@ -201,7 +325,7 @@ fn analyze(dis: &mut Disassembler, bytes: &[u8]) -> Result<ProgramCounts, Blocke
 pub(crate) fn reference_walk_result(dis: &mut Disassembler, bytes: &[u8]) -> &'static str {
     match analyze(dis, bytes) {
         Ok(_) => "complete",
-        Err(Blocker::Control(name)) if name == "s_setpc_b64" => "indirect PC",
+        Err(Blocker::IndirectPc(_)) => "indirect PC",
         Err(Blocker::Control(_)) => "other control",
         Err(Blocker::Decode) => "decode",
         Err(Blocker::OutsideSpan) => "outside span",
@@ -526,6 +650,34 @@ mod tests {
         ] {
             assert_eq!(control(name, first, size), None);
         }
+    }
+
+    #[test]
+    fn local_pc_pattern_checks_literal_bounds_alignment_and_continuity() {
+        let materialize = |literal: u32| {
+            let mut p = PcPattern::default();
+            p.observe(1, 4, "s_getpc_b64", 0xbe94_1f00, &[], Flow::Next);
+            let tail = [0x8014_ff14, literal].map(u32::to_le_bytes).concat();
+            p.observe(2, 8, "s_add_u32", 0x8014_ff14, &tail, Flow::Next);
+            p.observe(4, 4, "s_waitcnt", 0xbf8c_0000, &[], Flow::Next);
+            p.observe(5, 4, "s_addc_u32", 0x8215_8015, &[], Flow::Next);
+            p
+        };
+        let p = materialize(20);
+        assert_eq!(
+            p.classify(6, 4, 0xbe80_2014, 32),
+            IndirectShape::RelativeLiteralInSpan
+        );
+        assert_eq!(
+            p.classify(6, 4, 0xbe80_2014, 28),
+            IndirectShape::RelativeLiteralOutsideSpan
+        );
+        assert_eq!(p.classify(7, 4, 0xbe80_2014, 32), IndirectShape::Unmatched);
+        assert_eq!(p.classify(6, 4, 0xbe80_2016, 32), IndirectShape::Unmatched);
+        assert_eq!(
+            materialize(19).classify(6, 4, 0xbe80_2014, 32),
+            IndirectShape::RelativeLiteralUnaligned
+        );
     }
 
     #[test]
