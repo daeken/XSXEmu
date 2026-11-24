@@ -11,6 +11,7 @@ _static_tls_fixture:
     .long Ltrace_entry-Ltext, Ldisable_calls_dll_main-Ltext
     .long Lmodule_filename_dll_main-Ltext
     .long Lmodule_handle_dll_main-Ltext, Lmodule_handle_entry-Ltext
+    .long Lprocessor_feature_entry-Ltext
 Ltext:
 .macro tls index
     leaq Ltext(%rip), %r11
@@ -895,6 +896,27 @@ Lmodule_handle_entry:
     leaq Ltext(%rip), %r11
     leaq -{text_rva}(%r11), %rdx
     cmpq %rdx, %rax
+    jne Lbad
+    cmpl $0x87654321, %gs:0x68
+    jne Lbad
+    addq $40, %rsp
+    movl $43, %eax
+    retq
+Lprocessor_feature_entry:
+    tls 0
+    phase 1, 2
+    subq $40, %rsp
+    movl $0x87654321, %gs:0x68
+    movabsq $0x876543210000000a, %rcx  /* PF_XMMI64_INSTRUCTIONS_AVAILABLE; high bits ignored. */
+    callq *{iat_delta}(%r11)
+    cmpl $1, %eax
+    jne Lbad
+    cmpl $0x87654321, %gs:0x68
+    jne Lbad
+    leaq Ltext(%rip), %r11
+    movl $23, %ecx                    /* PF_FASTFAIL_AVAILABLE; don't advertise INT 29h. */
+    callq *{iat_delta}(%r11)
+    testl %eax, %eax
     jne Lbad
     cmpl $0x87654321, %gs:0x68
     jne Lbad

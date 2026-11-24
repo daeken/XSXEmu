@@ -159,6 +159,8 @@ audited_bridges! {
         proc::decode_pointer, (value: *mut c_void) -> *mut c_void;
     xsxemu_tls_get_startup_info_w, get_startup_info_w: b"kernelbase.dll", b"GetStartupInfoW",
         proc::get_startup_info_w, (out: *mut proc::StartupInfoW) -> ();
+    xsxemu_tls_is_processor_feature_present, is_processor_feature_present: b"kernelbase.dll", b"IsProcessorFeaturePresent",
+        proc::is_processor_feature_present, (feature: u32) -> i32;
     xsxemu_tls_getstdhandle, getstdhandle: b"kernelbase.dll", b"GetStdHandle",
         io::GetStdHandle, (slot: u32) -> usize;
     xsxemu_tls_getfiletype, getfiletype: b"kernelbase.dll", b"GetFileType",

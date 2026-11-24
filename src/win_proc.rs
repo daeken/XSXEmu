@@ -559,7 +559,7 @@ pub(crate) mod native {
         unsafe { out.write(info) };
     }
 
-    pub(super) extern "win64" fn is_processor_feature_present(feature: u32) -> i32 {
+    pub(crate) extern "win64" fn is_processor_feature_present(feature: u32) -> i32 {
         // Report the baseline and detectable usable instruction-set extensions;
         // do not advertise Windows kernel features such as FASTFAIL_AVAILABLE.
         use std::arch::is_x86_feature_detected as detect;

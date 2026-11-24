@@ -302,6 +302,10 @@ provider uses `ERROR_INVALID_HANDLE` for non-DLL handles and
 `ERROR_INVALID_PARAMETER` for a DLL with static TLS. Success preserves
 LastError. There are no guest thread attach/detach notifications to suppress
 in the single-thread model, and process attach/detach still run.
+`IsProcessorFeaturePresent` uses the ordinary provider's AMD64 baseline and
+runtime x86 feature detection, preserving `LastError`. It reports
+`PF_FASTFAIL_AVAILABLE` (23) as false: Windows `INT 29h` fast-fail handling is
+not implemented by this launcher.
 `GetProcAddress` and `FreeLibrary` aren't bridged. Unbridged
 providers fail before entry unless `--trace-missing-imports` is enabled,
 which treats well-formed unavailable or unbridged slots as callable, not

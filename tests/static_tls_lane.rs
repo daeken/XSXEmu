@@ -54,6 +54,7 @@ struct Fixture {
     module_filename_dll_main: u32,
     module_handle_dll_main: u32,
     module_handle_entry: u32,
+    processor_feature_entry: u32,
     code: [u8; RAW],
 }
 global_asm!(include_str!("fixtures/static_tls_lane.S"),
@@ -1467,6 +1468,32 @@ fn module_handle_bridge_returns_borrowed_mapped_bases_and_sets_teb_error_on_miss
     );
     dir_import_one(&mut dll, API_SET, SYMBOL);
     scratch.write("owned.dll", &dll);
+    expect(
+        run(&exe, &[OPT, "--rust-providers"]),
+        43,
+        "Guest entry returned 43",
+    );
+}
+
+#[test]
+fn processor_feature_bridge_preserves_last_error_and_reports_fastfail_unavailable() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let mut exe = image(Kind::Solo);
+    w32(
+        &mut exe,
+        OP + 16,
+        TEXT + unsafe { static_tls_fixture.processor_feature_entry } as usize,
+    );
+    dir_import_one(
+        &mut exe,
+        b"api-ms-win-core-processthreads-l1-1-1.dll\0",
+        b"IsProcessorFeaturePresent\0",
+    );
+    let exe = scratch.write("processor-feature.exe", &exe);
+    expect(run(&exe, &[OPT]), 1, "incomplete dependency graph");
     expect(
         run(&exe, &[OPT, "--rust-providers"]),
         43,
