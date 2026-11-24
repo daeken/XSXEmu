@@ -376,6 +376,8 @@ struct IndirectFrontier {
     incomplete: BTreeMap<&'static str, usize>,
     unmatched: usize,
     windows: BTreeMap<(bool, TargetOverlap), usize>,
+    windows_with_candidate_interior_entry: usize,
+    candidate_targets_to_cuts: [usize; 2],
 }
 
 impl IndirectFrontier {
@@ -430,11 +432,24 @@ impl IndirectFrontier {
         // out external straightline predecessors to its interior, so collect
         // both kinds of branch successor once across the checked graph.
         let entries = branch_entries(&graph);
+        let candidate_entries: BTreeSet<_> = graph
+            .values()
+            .filter_map(|node| node.op.flatten().map(|(_, target)| target))
+            .collect();
         for (&pc, node) in &graph {
             match node.op {
                 None => (),
                 Some(None) => self.unmatched += 1,
                 Some(Some((start, target))) => {
+                    self.windows_with_candidate_interior_entry += usize::from(
+                        candidate_entries
+                            .range((Excluded(start), Included(pc)))
+                            .next()
+                            .is_some(),
+                    );
+                    if let Some(cut) = graph.get(&target).and_then(|op| op.op) {
+                        self.candidate_targets_to_cuts[usize::from(cut.is_some())] += 1;
+                    }
                     *self
                         .windows
                         .entry((
@@ -641,6 +656,11 @@ impl Report {
             self.indirect_frontier.incomplete,
             self.indirect_frontier.unmatched,
             self.indirect_frontier.windows
+        );
+        println!(
+            "Indirect-cut candidate cross-check: windows with interior candidate entry={}; sources landing on a cut [unmatched, matched]={:?}",
+            self.indirect_frontier.windows_with_candidate_interior_entry,
+            self.indirect_frontier.candidate_targets_to_cuts
         );
         println!(
             "Backend triage (not translated): small-wave32-filter={} with-execz-and-uint-gt-cmpx={} with-scc-branch={} single-raw-store-1x1x1={} smallest-single-store-nodes={:?}",
