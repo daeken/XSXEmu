@@ -3605,6 +3605,77 @@ fn unsupported_guardcf_policy_and_guard_tls_overlap_fail_preentry() {
     );
 }
 
+const THREAD_CONTROL_CODE: usize = 0x200;
+#[repr(C)]
+struct ThreadControlsFixture {
+    entry: u32,
+    bytes: [u8; THREAD_CONTROL_CODE],
+}
+global_asm!(include_str!("fixtures/static_tls_thread_controls.S"),
+    capacity = const THREAD_CONTROL_CODE,
+    iat = const IAT - TEXT,
+    options(att_syntax),
+);
+unsafe extern "C" {
+    static static_tls_thread_controls_fixture: ThreadControlsFixture;
+}
+
+#[test]
+fn offline_thread_controls_report_virtual_group_and_reject_setters() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let mut exe = image(Kind::Solo);
+    let fixture = unsafe { &static_tls_thread_controls_fixture };
+    exe[file(TEXT)..file(TEXT) + RAW].fill(0xcc);
+    put(&mut exe, file(TEXT), &fixture.bytes);
+    w32(&mut exe, OP + 16, TEXT + fixture.entry as usize);
+    w64(&mut exe, file(ARRAY), PREFERRED + TEXT);
+    dir(&mut exe, 1, LINK, 4 * 20);
+    let groups: &[(&[u8], &[&[u8]], usize)] = &[
+        (
+            b"api-ms-win-core-processthreads-l1-1-0.dll\0",
+            &[b"CreateThread\0", b"SetThreadPriority\0", b"ResumeThread\0"],
+            0,
+        ),
+        (
+            b"api-ms-win-core-processtopology-l1-1-0.dll\0",
+            &[b"GetThreadGroupAffinity\0", b"SetThreadGroupAffinity\0"],
+            4,
+        ),
+        (
+            b"api-ms-win-core-sysinfo-l1-1-0.dll\0",
+            &[b"GetLogicalProcessorInformation\0"],
+            7,
+        ),
+    ];
+    for (i, &(module, symbols, iat_index)) in groups.iter().enumerate() {
+        let row = file(LINK) + 20 * i;
+        let lookup = LINK + 0x80 + 0x28 * i;
+        let name = LINK + 0x160 + 0x40 * i;
+        w32(&mut exe, row, lookup);
+        w32(&mut exe, row + 12, name);
+        w32(&mut exe, row + 16, IAT + 8 * iat_index);
+        put(&mut exe, file(name), module);
+        for (j, symbol) in symbols.iter().enumerate() {
+            let entry = LINK + 0x300 + 0x100 * i + 0x30 * j;
+            w64(&mut exe, file(lookup) + 8 * j, entry);
+            put(&mut exe, file(entry) + 2, symbol);
+        }
+    }
+    let path = scratch.write("thread-controls.exe", &exe);
+    let output = run(&path, &[OPT, TRUSTED, "--rust-providers"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for api in ["SetThreadPriority", "SetThreadGroupAffinity"] {
+        assert!(
+            stderr.contains(&format!("xsxemu: {api}: offline")),
+            "{stderr}"
+        );
+    }
+    expect(output, 58, "Guest entry returned 58");
+}
+
 const THREAD_CODE: usize = 0x1000;
 #[repr(C)]
 struct ThreadFixture {

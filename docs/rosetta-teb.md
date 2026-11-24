@@ -309,6 +309,22 @@ launcher may still terminate the child). The title's thread-creation
 failure path calls `Sleep(250)` before retrying; bridging the delay does
 not make a failed `CreateThread` succeed.
 
+In the explicit trusted-offline static TLS lane, the guest sees 16
+virtual logical processors in one group (`0xffff`), independent of host
+CPU count. `SystemInfo`, legacy logical-processor records, and thread group
+affinity share this topology. The legacy records expose one bit per virtual
+processor with no SMT or host core relationships inferred. Other execution
+profiles retain their previous topology.
+
+The suspended-worker continuation requests normal priority and changes the
+queried group's mask to `0x1f00` before resuming. The audited affinity query
+requires an owned thread handle with query access and writes all 16 bytes
+(mask, group zero, reserved zero). The priority and affinity setters do not
+change host scheduling or guest state: with a valid request handle and
+required access, they log the offline limitation and return `FALSE` with
+`ERROR_NOT_SUPPORTED`. Affinity rejection leaves the previous-state output
+untouched. No mask is remapped or used to pin a host thread.
+
 `GetTickCount64` models guest uptime with the macOS raw monotonic clock,
 including host sleep. It returns whole milliseconds as an unsigned 64-bit
 value and preserves `LastError`. Its epoch is independent of the guest's

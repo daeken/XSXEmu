@@ -13,6 +13,8 @@ use crate::providers::HostExport;
 const BASE: &[u8] = b"kernelbase.dll";
 const K32: &[u8] = b"kernel32.dll";
 const THREADS: &[u8] = b"api-ms-win-core-processthreads-l1-1-0.dll";
+#[cfg(target_os = "macos")]
+const TOPOLOGY: &[u8] = b"api-ms-win-core-processtopology-l1-1-0.dll";
 const FEATURES: &[u8] = b"api-ms-win-core-processthreads-l1-1-1.dll";
 const ENV: &[u8] = b"api-ms-win-core-processenvironment-l1-1-0.dll";
 const DEBUG: &[u8] = b"api-ms-win-core-debug-l1-1-0.dll";
@@ -25,11 +27,38 @@ pub(crate) fn has_dll(dll: &[u8]) -> bool {
     matches!(
         dll,
         BASE | K32 | THREADS | FEATURES | ENV | DEBUG | ERROR | INFO | PROFILE | UTIL
-    )
+    ) || {
+        #[cfg(target_os = "macos")]
+        {
+            dll == TOPOLOGY
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
 }
 
 pub(crate) fn lookup(dll: &[u8], name: &[u8]) -> Option<HostExport> {
     match (dll, name) {
+        #[cfg(target_os = "macos")]
+        (BASE | K32 | THREADS, b"SetThreadPriority") => export!(
+            "kernelbase.dll",
+            "SetThreadPriority",
+            native::set_thread_priority
+        ),
+        #[cfg(target_os = "macos")]
+        (BASE | K32 | TOPOLOGY, b"GetThreadGroupAffinity") => export!(
+            "kernelbase.dll",
+            "GetThreadGroupAffinity",
+            native::get_thread_group_affinity
+        ),
+        #[cfg(target_os = "macos")]
+        (BASE | K32 | TOPOLOGY, b"SetThreadGroupAffinity") => export!(
+            "kernelbase.dll",
+            "SetThreadGroupAffinity",
+            native::set_thread_group_affinity
+        ),
         (BASE | K32 | THREADS, b"GetCurrentProcess") => export!(
             "kernelbase.dll",
             "GetCurrentProcess",
@@ -259,11 +288,15 @@ pub(crate) mod native {
         wide: Box<[u16]>,
         ansi: Box<[u8]>,
         pointer_key: usize,
+        virtual_topology: bool,
     }
 
     static COMMAND: OnceLock<CommandLine> = OnceLock::new();
 
-    pub(crate) fn init_process(image_path: &str) -> Result<(), &'static str> {
+    pub(crate) fn init_process(
+        image_path: &str,
+        virtual_topology: bool,
+    ) -> Result<(), &'static str> {
         // Only argv[0] is available in this launcher. It has distinct CRT
         // quoting rules: enclose in quotes and do not escape backslashes.
         if image_path.is_empty() || image_path.contains(['"', '\0']) {
@@ -294,6 +327,7 @@ pub(crate) mod native {
                 wide,
                 ansi,
                 pointer_key,
+                virtual_topology,
             })
             .map_err(|_| "guest process already initialized")
     }
@@ -550,6 +584,12 @@ pub(crate) mod native {
     }
 
     fn guest_processor_count() -> usize {
+        if COMMAND
+            .get()
+            .is_some_and(|process| process.virtual_topology)
+        {
+            return 16;
+        }
         // Keep the one-group guest profile stable across the size probe and
         // fill, and use exactly the same count for SYSTEM_INFO.
         static COUNT: OnceLock<usize> = OnceLock::new();
@@ -558,6 +598,80 @@ pub(crate) mod native {
                 .map_or(1, |n| n.get())
                 .min(u64::BITS as usize)
         })
+    }
+
+    fn guest_active_processor_mask() -> usize {
+        usize::MAX >> (usize::BITS as usize - guest_processor_count())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[repr(C)]
+    pub(crate) struct GroupAffinity {
+        mask: usize,
+        group: u16,
+        reserved: [u16; 3],
+    }
+
+    #[cfg(target_os = "macos")]
+    const _: () = {
+        assert!(size_of::<GroupAffinity>() == 16);
+        assert!(std::mem::offset_of!(GroupAffinity, group) == 8);
+        assert!(std::mem::offset_of!(GroupAffinity, reserved) == 10);
+    };
+
+    #[cfg(target_os = "macos")]
+    pub(crate) unsafe extern "win64" fn get_thread_group_affinity(
+        h: usize,
+        out: *mut GroupAffinity,
+    ) -> i32 {
+        use crate::providers::win_io::native::{
+            THREAD_QUERY_LIMITED_INFORMATION, require_owned_thread,
+        };
+        if let Err(error) = require_owned_thread(h, THREAD_QUERY_LIMITED_INFORMATION) {
+            return fail(error);
+        }
+        if out.is_null() {
+            return fail(ERROR_INVALID_PARAMETER);
+        }
+        // SAFETY: caller provides a writable 16-byte Win64 GROUP_AFFINITY.
+        unsafe {
+            out.write_unaligned(GroupAffinity {
+                mask: guest_active_processor_mask(),
+                group: 0,
+                reserved: [0; 3],
+            })
+        };
+        1
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) extern "win64" fn set_thread_group_affinity(
+        h: usize,
+        requested: *const GroupAffinity,
+        _previous: *mut GroupAffinity,
+    ) -> i32 {
+        use crate::providers::win_io::native::{THREAD_SET_INFORMATION, require_owned_thread};
+        if let Err(error) = require_owned_thread(h, THREAD_SET_INFORMATION) {
+            return fail(error);
+        }
+        if requested.is_null() {
+            return fail(ERROR_INVALID_PARAMETER);
+        }
+        // Do not read the request or write previous affinity when refusing.
+        eprintln!(
+            "xsxemu: SetThreadGroupAffinity: offline thread affinity changes are unsupported"
+        );
+        fail(ERROR_NOT_SUPPORTED)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) extern "win64" fn set_thread_priority(h: usize, _priority: i32) -> i32 {
+        use crate::providers::win_io::native::{THREAD_SET_RIGHTS, require_owned_thread};
+        if let Err(error) = require_owned_thread(h, THREAD_SET_RIGHTS) {
+            return fail(error);
+        }
+        eprintln!("xsxemu: SetThreadPriority: offline thread priority changes are unsupported");
+        fail(ERROR_NOT_SUPPORTED)
     }
 
     #[repr(C)]
@@ -618,7 +732,7 @@ pub(crate) mod native {
             page_size: 4096,
             minimum_application_address: 0x1_0000,
             maximum_application_address: 0x7fff_fffe_ffff,
-            active_processor_mask: usize::MAX >> (usize::BITS as usize - threads),
+            active_processor_mask: guest_active_processor_mask(),
             number_of_processors: threads as u32,
             processor_type: 8664,
             allocation_granularity: 65536,
@@ -738,8 +852,8 @@ pub(crate) mod native {
 
         #[test]
         fn command_line_uses_guest_image_and_pointer_codec_roundtrips() {
-            assert!(init_process("bad\"name").is_err());
-            super::super::init_process("/owned dir/café.exe").unwrap();
+            assert!(init_process("bad\"name", false).is_err());
+            super::super::init_process("/owned dir/café.exe", false).unwrap();
             let expected = wide("\"C:\\owned dir\\café.exe\"");
             let ansi = b"\"C:\\owned dir\\caf\xe9.exe\"\0";
             unsafe {
@@ -752,7 +866,7 @@ pub(crate) mod native {
                     ansi
                 );
             }
-            assert!(init_process("other.exe").is_err());
+            assert!(init_process("other.exe", false).is_err());
             let mut value = 42u32;
             let value = ptr::from_mut(&mut value).cast();
             let encoded = encode_pointer(value);

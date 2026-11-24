@@ -228,6 +228,12 @@ audited_bridges! {
         proc::get_startup_info_w, (out: *mut proc::StartupInfoW) -> ();
     xsxemu_tls_get_logical_processor_information, get_logical_processor_information: b"kernelbase.dll", b"GetLogicalProcessorInformation",
         proc::get_logical_processor_information, (out: *mut proc::LogicalProcessorInformation, length: *mut u32) -> i32;
+    xsxemu_tls_get_thread_group_affinity, get_thread_group_affinity: b"kernelbase.dll", b"GetThreadGroupAffinity",
+        proc::get_thread_group_affinity, (handle: usize, out: *mut proc::GroupAffinity) -> i32;
+    xsxemu_tls_set_thread_group_affinity, set_thread_group_affinity: b"kernelbase.dll", b"SetThreadGroupAffinity",
+        proc::set_thread_group_affinity, (handle: usize, requested: *const proc::GroupAffinity, previous: *mut proc::GroupAffinity) -> i32;
+    xsxemu_tls_set_thread_priority, set_thread_priority: b"kernelbase.dll", b"SetThreadPriority",
+        proc::set_thread_priority, (handle: usize, priority: i32) -> i32;
     xsxemu_tls_is_processor_feature_present, is_processor_feature_present: b"kernelbase.dll", b"IsProcessorFeaturePresent",
         proc::is_processor_feature_present, (feature: u32) -> i32;
     // The start address is an opaque integer here. Only the new host lane

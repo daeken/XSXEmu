@@ -334,7 +334,26 @@ pub(crate) mod native {
     #[cfg(target_os = "macos")]
     const THREAD_SUSPEND_RESUME: u32 = 2;
     #[cfg(target_os = "macos")]
-    const THREAD_RIGHTS: u32 = SYNCHRONIZE | THREAD_SUSPEND_RESUME;
+    pub(crate) const THREAD_QUERY_LIMITED_INFORMATION: u32 = 0x0800;
+    #[cfg(target_os = "macos")]
+    pub(crate) const THREAD_SET_INFORMATION: u32 = 0x0020;
+    #[cfg(target_os = "macos")]
+    pub(crate) const THREAD_SET_RIGHTS: u32 = THREAD_SET_INFORMATION | 0x0400;
+    #[cfg(target_os = "macos")]
+    const THREAD_RIGHTS: u32 =
+        SYNCHRONIZE | THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION | THREAD_SET_RIGHTS;
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn require_owned_thread(h: usize, any_access: u32) -> Result<()> {
+        let e = entry(h)?;
+        if !matches!(&*e.obj, Object::Thread(_)) {
+            return Err(BAD_HANDLE);
+        }
+        if e.access & any_access == 0 {
+            return Err(ACCESS);
+        }
+        Ok(())
+    }
 
     #[cfg(target_os = "macos")]
     pub(crate) struct ThreadCompletion {

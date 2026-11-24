@@ -593,7 +593,10 @@ mod native {
         )?;
         if let Some(tls) = tls {
             if rust_providers {
-                win_proc::init_process(images[0].0)?;
+                win_proc::init_process(
+                    images[0].0,
+                    matches!(profile, Profile::TrustedOfflineTlsChild),
+                )?;
             }
             // Registration remains exact-address, including bounded legacy root
             // callbacks in trusted offline mode. Export lookup never adds targets.
@@ -640,7 +643,7 @@ mod native {
             }?);
         }
         if rust_providers {
-            win_proc::init_process(images[0].0)?;
+            win_proc::init_process(images[0].0, false)?;
         }
         // Keep the sealed policy active through DLL detach, and withdraw it
         // before any of the tracked image mappings are released.
