@@ -16,7 +16,7 @@ const OPT: &str = "--experimental-static-tls";
 const TRUSTED: &str = "--trusted-offline";
 const WARNING: &str = "neither signature nor catalog is verified; Xbox policy is not evaluated";
 const PAGE: usize = 0x4000;
-const RAW: usize = 0x2a00; // Includes the shared fixture's bridge code.
+const RAW: usize = 0x2c00; // Includes the shared fixture's bridge code.
 const TEXT: usize = PAGE;
 const RO: usize = 2 * PAGE;
 const DATA: usize = 3 * PAGE;
@@ -2006,7 +2006,7 @@ fn xmem_bridge_owns_exact_boot_reservations_and_cpu_mapping() {
             stderr
                 .matches("mapped anonymous demand-zero CPU RW")
                 .count(),
-            4,
+            5,
             "{stderr}"
         );
         assert!(

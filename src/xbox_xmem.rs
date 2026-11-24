@@ -15,6 +15,7 @@ const COMMIT_SIZE: usize = 0x4940_0000;
 const SECOND_COMMIT_SIZE: usize = 0x8970_0000;
 const THIRD_COMMIT_SIZE: usize = 0x2330_0000;
 const FOURTH_COMMIT_SIZE: usize = 0x2540_0000;
+const SMALL_COMMIT_SIZE: usize = 0x0140_0000;
 const COMMIT_ALIGN: usize = 2 * 1024 * 1024;
 const ANYWHERE: i32 = 1;
 const INHERIT_NONE: i32 = 2;
@@ -25,14 +26,15 @@ const ERROR_NOT_SUPPORTED: u32 = 50;
 
 // No supported XMem release operation. Each slot owns its mapping until this
 // disposable static-TLS child exits. At most 48 GiB of inaccessible VA plus
-// exactly one mapping per accepted CPU commit shape (at most 4,530 MiB
+// exactly one mapping per accepted CPU commit shape (at most 4,550 MiB
 // combined). No host page wiring or eager touch.
-static MAPPINGS: Mutex<[Option<Reservation>; 6]> = Mutex::new([const { None }; 6]);
+static MAPPINGS: Mutex<[Option<Reservation>; 7]> = Mutex::new([const { None }; 7]);
 
 #[derive(Clone, Copy)]
 enum Mode {
     Reserve,
     CpuCommit,
+    CpuCommit64KiB,
 }
 
 impl Mode {
@@ -40,6 +42,7 @@ impl Mode {
         match self {
             Self::Reserve => (ALIGN, PROT_NONE),
             Self::CpuCommit => (COMMIT_ALIGN, PROT_RW),
+            Self::CpuCommit64KiB => (ALIGN, PROT_RW),
         }
     }
 }
@@ -161,6 +164,7 @@ fn reserve(
         (0, SECOND_COMMIT_SIZE, 0x2000_3000, 0x283, 0x2404) => (3, Mode::CpuCommit),
         (0, THIRD_COMMIT_SIZE, 0x2000_3000, 0x183, 0x22004) => (4, Mode::CpuCommit),
         (0, FOURTH_COMMIT_SIZE, 0x2000_3000, 0x183, 0x22004) => (5, Mode::CpuCommit),
+        (0, SMALL_COMMIT_SIZE, 0x2040_3000, 0x181, 4) => (6, Mode::CpuCommit64KiB),
         _ => return Err(Failure::UnsupportedTuple),
     };
     let mut slots = MAPPINGS.lock().unwrap_or_else(|_| std::process::abort());
@@ -195,7 +199,7 @@ pub(crate) extern "win64" fn virtual_alloc(
             );
             address
         }
-        Ok((address, Mode::CpuCommit)) => {
+        Ok((address, Mode::CpuCommit | Mode::CpuCommit64KiB)) => {
             let _ = writeln!(
                 stderr,
                 "mapped anonymous demand-zero CPU RW at {address:#x}; skipped Xbox protection/cache, physical page and GPU mapping semantics"
@@ -291,12 +295,13 @@ mod tests {
             let d = Reservation::new(SECOND_COMMIT_SIZE, Mode::CpuCommit).unwrap();
             let e = Reservation::new(THIRD_COMMIT_SIZE, Mode::CpuCommit).unwrap();
             let f = Reservation::new(FOURTH_COMMIT_SIZE, Mode::CpuCommit).unwrap();
+            let g = Reservation::new(SMALL_COMMIT_SIZE, Mode::CpuCommit64KiB).unwrap();
             let disjoint = |first: &Reservation, second: &Reservation| {
                 first.base + first.len <= second.base || second.base + second.len <= first.base
             };
-            let check_rw = |r: &Reservation, expected: usize| {
+            let check_rw = |r: &Reservation, expected: usize, align: usize| {
                 assert_eq!(r.len, expected as u64);
-                assert!(r.base.is_multiple_of(COMMIT_ALIGN as u64));
+                assert!(r.base.is_multiple_of(align as u64));
                 for reserve in [&a, &b] {
                     assert!(disjoint(r, reserve));
                     check(reserve);
@@ -313,21 +318,29 @@ mod tests {
                 }
             };
             assert!(disjoint(&c, &d));
-            check_rw(&c, COMMIT_SIZE);
-            check_rw(&d, SECOND_COMMIT_SIZE);
+            check_rw(&c, COMMIT_SIZE, COMMIT_ALIGN);
+            check_rw(&d, SECOND_COMMIT_SIZE, COMMIT_ALIGN);
             assert!(disjoint(&c, &e) && disjoint(&d, &e));
-            check_rw(&e, THIRD_COMMIT_SIZE);
+            check_rw(&e, THIRD_COMMIT_SIZE, COMMIT_ALIGN);
             assert!([&c, &d, &e].into_iter().all(|prior| disjoint(prior, &f)));
-            check_rw(&f, FOURTH_COMMIT_SIZE);
+            check_rw(&f, FOURTH_COMMIT_SIZE, COMMIT_ALIGN);
+            assert!(
+                [&c, &d, &e, &f]
+                    .into_iter()
+                    .all(|prior| disjoint(prior, &g))
+            );
+            check_rw(&g, SMALL_COMMIT_SIZE, ALIGN);
+            release(g);
+            check_rw(&f, FOURTH_COMMIT_SIZE, COMMIT_ALIGN);
             release(f);
-            check_rw(&c, COMMIT_SIZE);
-            check_rw(&d, SECOND_COMMIT_SIZE);
-            check_rw(&e, THIRD_COMMIT_SIZE);
+            check_rw(&c, COMMIT_SIZE, COMMIT_ALIGN);
+            check_rw(&d, SECOND_COMMIT_SIZE, COMMIT_ALIGN);
+            check_rw(&e, THIRD_COMMIT_SIZE, COMMIT_ALIGN);
             release(e);
-            check_rw(&c, COMMIT_SIZE);
-            check_rw(&d, SECOND_COMMIT_SIZE);
+            check_rw(&c, COMMIT_SIZE, COMMIT_ALIGN);
+            check_rw(&d, SECOND_COMMIT_SIZE, COMMIT_ALIGN);
             release(d);
-            check_rw(&c, COMMIT_SIZE);
+            check_rw(&c, COMMIT_SIZE, COMMIT_ALIGN);
             release(c);
             check(&a);
             check(&b);

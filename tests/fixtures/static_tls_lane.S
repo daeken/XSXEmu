@@ -1177,12 +1177,12 @@ Lconfigure_d3d12_vm_entry:
     leaq Ltext(%rip), %r11
     callq *{iat_delta}(%r11)
 .endm
-.macro xmem_cpu size, attr, prot, error
+.macro xmem_cpu size, attr, prot, error, flags=0x20003000, mask=0x1fffff
     movl $\size, %ebx
-    xmem \attr, \prot, 0x20003000
+    xmem \attr, \prot, \flags
     testq %rax, %rax
     jz Lbad
-    testl $0x1fffff, %eax
+    testl $\mask, %eax
     jnz Lbad
     cmpl $\error, %gs:0x68
     jne Lbad
@@ -1197,7 +1197,7 @@ Lconfigure_d3d12_vm_entry:
     jne Lbad
     cmpb $0xaa, (%rdx)
     jne Lbad
-    xmem \attr, \prot, 0x20003000
+    xmem \attr, \prot, \flags
     testq %rax, %rax
     jnz Lbad
     cmpl $8, %gs:0x68
@@ -1244,6 +1244,7 @@ Lxmem_entry:
     xmem_cpu 0x89700000, 0x283, 0x2404, 8
     xmem_cpu 0x23300000, 0x183, 0x22004, 8
     xmem_cpu 0x25400000, 0x183, 0x22004, 8
+    xmem_cpu 0x1400000, 0x181, 4, 8, 0x20403000, 0xffff
     /* Unobserved pair swapping size but keeping second flags still fails. */
     movl $0x49400000, %ebx
     xmem 0x283, 0x2404, 0x20003000
