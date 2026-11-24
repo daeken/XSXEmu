@@ -198,8 +198,17 @@ fn analyze(dis: &mut Disassembler, bytes: &[u8]) -> Result<ProgramCounts, Blocke
     Ok(counts)
 }
 
-pub(crate) fn complete_reference_walk(dis: &mut Disassembler, bytes: &[u8]) -> bool {
-    analyze(dis, bytes).is_ok()
+pub(crate) fn reference_walk_result(dis: &mut Disassembler, bytes: &[u8]) -> &'static str {
+    match analyze(dis, bytes) {
+        Ok(_) => "complete",
+        Err(Blocker::Control(name)) if name == "s_setpc_b64" => "indirect PC",
+        Err(Blocker::Control(_)) => "other control",
+        Err(Blocker::Decode) => "decode",
+        Err(Blocker::OutsideSpan) => "outside span",
+        Err(Blocker::InvalidWidth) => "invalid width",
+        Err(Blocker::Overlap) => "overlap",
+        Err(Blocker::NoExit) => "no exit",
+    }
 }
 
 // Deliberately only a triage filter. Does not validate operands, ABI bindings,

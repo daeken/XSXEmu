@@ -6,7 +6,7 @@ use crate::{
     coverage::code,
     dxbc_chunks,
     llvm::{Cpu, Llvm},
-    reachable::complete_reference_walk,
+    reachable::reference_walk_result,
     shader_payloads, stage_name, word,
 };
 use std::{
@@ -35,7 +35,7 @@ struct Program {
     equal_window_agreeing_profile: bool,
     equal_window_disagreeing_profile: bool,
     graph_complete: bool,
-    graph_failed: bool,
+    graph_failures: HashSet<&'static str>,
     graph_unchecked: bool,
 }
 
@@ -287,11 +287,14 @@ pub(super) fn run(
                         if let Some((body, _)) =
                             code(payload).filter(|(body, _)| Some(*body) == fssm_cut)
                         {
-                            let complete = *walked.get_or_insert_with(|| {
-                                complete_reference_walk(&mut dis[usize::from(profile.1)], body)
+                            let result = *walked.get_or_insert_with(|| {
+                                reference_walk_result(&mut dis[usize::from(profile.1)], body)
                             });
-                            p.graph_complete |= complete;
-                            p.graph_failed |= !complete;
+                            if result == "complete" {
+                                p.graph_complete = true;
+                            } else {
+                                p.graph_failures.insert(result);
+                            }
                         } else {
                             p.graph_unchecked = true;
                         }
@@ -352,9 +355,14 @@ pub(super) fn run(
             println!(
                 "  Conditional compute reference CFG: {} programs with a complete walk, {} with a failed walk, {} matching-profile programs with unvalidated FSSM span",
                 values().filter(|p| p.graph_complete).count(),
-                values().filter(|p| p.graph_failed).count(),
+                values().filter(|p| !p.graph_failures.is_empty()).count(),
                 values().filter(|p| p.graph_unchecked).count()
             );
+            let mut failures = BTreeMap::<_, usize>::new();
+            for reason in values().flat_map(|p| &p.graph_failures) {
+                *failures.entry(reason).or_default() += 1;
+            }
+            println!("  Programs per reference CFG failure class: {failures:?}");
         }
     }
     Ok(())
