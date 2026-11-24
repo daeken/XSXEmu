@@ -1,0 +1,50 @@
+# Shader archive inventory and Metal bring-up
+
+This work is independent of PE boot. The archive was opened read-only. No title code or retail shader was executed, and no assets were written out. The tool prints aggregates only.
+
+## What is readable
+
+The local 411,695,600-byte file starts with `9FPR` (RPF9). The public data start is `0x8640`; header word `+0x0c` is `0xa0`. Following the documented trailer convention, the inspected data interval ends at `0x1889f950`. `SGD5` is visible at `0x9000`. Leonida's `docs/rpf.md` reports that the TOC is encrypted/packed; this reader seeks past the opaque region and does not establish the cipher, decode the TOC, or try keys. No authorized TOC data/reader was provided; original paths and a complete entry listing are unavailable. Plaintext payloads can be read independently of the TOC. Unmatched regions are not classified as encrypted or plaintext by this reader.
+
+The local reader validates raw DEFLATE records with the observed `_Wrapped` marker, two matching stored-length fields and an exact inflated length. In all accepted records the stored span includes 12 opaque bytes after the DEFLATE stream. Within the DXBC envelope the nominal DXIL bitcode position points to `NOBC`, **not desktop LLVM/DXIL bitcode**. The DXIL-labelled chunk also contains an XDAT directory. The reader checks each tag `0x0d` extent and its `XBCH` v3 zlib stream for exact consumption/length and `FSSM` v0x101 magic/version. It preserves the number of payloads per envelope, without claiming to parse the FSSM code or metadata. All stage/model values come from the DXIL-shaped program header, not the plaintext suffix.
+
+| Stage (all SM 6.6) | DXBC envelopes | XBCH / FSSM payloads |
+|---|---:|---:|
+| Pixel | 12,101 | 12,101 |
+| Mesh | 9,282 | 9,282 |
+| Compute | 2,689 | 2,689 |
+| Vertex | 2,236 | 2,431 |
+| Geometry | 195 | 195 |
+| **Total** | **26,503** | **26,698** |
+
+Zero `_Wrapped` candidates were rejected. The 195 extra native payloads are in vertex-labelled envelopes; this count does not determine their individual ABI or stage. The observed DXBC chunk set is `SFI0 ISG1 OSG1 PSV0 HASH DXIL PRIV`. No claim that this is an exhaustive RPF listing.
+
+A separate `PS 00 09`-magic library at `0x10579000` comprises 4,205 zlib streams (275,540,780 inflated bytes, five bytes before the proposed archive trailer after stream end). The header declares 25,471 graphics pipelines, 2,693 compute pipelines, 54,576 blobs and 21,522 programs. The reader verifies the aggregate section arithmetic and actual stream boundaries and sizes; it does **not** walk each pipeline/blob/program table entry. Leonida's `docs/shader_library.md` independently reports that the library contains separately compiled RDNA programs linked by digest, not byte-identical duplicates of the source FSSM programs; inventorying the two forms does not prove interchangeability. Its library-stage counts are 9,996 PS, 7,498 MS, 2,684 CS, 1,343 VS and one unidentified program (reported, not re-measured here).
+
+The Rust tool is a bounded layout-specific scanner, not a general unpacker. It caps archive size at 512 MiB, individual inflated blobs at 8 MiB, and library streams at 64 KiB. It buffers the data region but does not concatenate the library; the local release run took ~2.8 seconds and ~414 MB peak resident memory. Original synthetic tests cover duplicate XBCH entries, corrupt lengths/offsets, truncation, trailer bounds and multi-stream library stitching.
+
+```sh
+M=tools/shader-inventory/Cargo.toml
+cargo test --locked --manifest-path "$M" --all-features
+cargo run --locked --release --manifest-path "$M" -- /path/to/shaders.rpf
+cargo run --locked --release --manifest-path "$M" --features metal-probe --bin shader-metal-probe
+```
+
+## First GPU milestone: owned GFX10.3 fixture
+
+Homebrew LLVM 21.1.6 `llvm-mc -triple=amdgcn -mcpu=gfx1030 -show-encoding tools/shader-inventory/fixture.s` assembled the two ALU instructions and terminator. `llvm-mc -triple=amdgcn -mcpu=gfx1030 -disassemble` decoded the same bytes (`00 01 02 4a / c1 02 02 3a / 00 00 81 bf`). Exact words only are accepted: the tiny lifter verifies operands/termination, then interprets or emits MSL. The host supplies the synthetic VGPR input/output and initial EXEC, so there is no guest resource mapping or memory instruction yet.
+
+On Apple M4, the generated MSL compiled with Metal and dispatched one 32-lane SIMD group. Sparse (including bit 31), all-active, and all-inactive masks compared **96/96 words** against Rust readback expectations, including wraparound inputs and preservation of the inactive-lane sentinel. Non-32-lane hardware is rejected. This is a single fixture using a host-provided static mask, not evidence of dynamic EXEC, wave64, or retail shader compatibility. SDK/runtime compilation, capability checking, buffer setup, dispatch and readback are real.
+
+## Where the decoder ends and the Xbox ABI starts
+
+* **Standard GFX10.3:** Use AMD's [public machine-readable ISA](https://gpuopen.com/machine-readable-isa/) and its RDNA 2 ISA reference for instruction lengths, operands, modifiers and semantics. Use LLVM AMDGPU `gfx1030` assembly/disassembly differentially for standard encodings, not as a semantic oracle. Separately consult Mesa [ACO `aco_opcodes.py`](https://gitlab.freedesktop.org/mesa/mesa/-/blob/main/src/amd/compiler/aco_opcodes.py), [`aco_ir.h`](https://gitlab.freedesktop.org/mesa/mesa/-/blob/main/src/amd/compiler/aco_ir.h) and [`gfx103.json`](https://gitlab.freedesktop.org/mesa/mesa/-/blob/main/src/amd/registers/gfx103.json) / [`gfx10-rsrc.json`](https://gitlab.freedesktop.org/mesa/mesa/-/blob/main/src/amd/registers/gfx10-rsrc.json) for instruction classes, special registers, compute/stage state and descriptor field definitions. The Mesa mirror's ACO opcode and IR sources carry MIT notices; the register JSONs were consulted as references, not licensed for reuse by inference. No upstream code/tables were copied; check each file's provenance/license before any future reuse.
+* **Xbox encoding profile:** XCL (`91f9a5e`) `crates/xcl/src/gpu/rdna2.rs` identifies encodings and handles extension words (literal, DPP, SDWA, NSA); `rdna2_spec.rs` is generated from AMD's public ISA XML; `rdna2_xbox.rs` documents compatibility deltas including non-fused multiply-add forms retained from GFX10.1. Leonida `docs/fssm_crosscheck.md` reports better `gfx1013` decoding of this corpus than `gfx1030`, not that Xbox is fully identical to GFX10.1. Example reproduced on LLVM 21: `gfx1013` assembles `v_mad_legacy_f32 v1, v0, v0, v0` to `01 00 40 d5 00 01 02 04`, which `gfx1030` disassembles as `v_fma_legacy_f32`. Decoding success alone can silently select different arithmetic. Keep an explicit Xbox profile with evidence per override, never fall through by choosing whichever target decoded more words.
+* **Xbox dispatch/stage ABI:** FSSM in XDAT/XBCH, pipeline-library programs and FSPX may share machine instructions but require different metadata parsing. Leonida `docs/embedded_shaders.md` reports DLL-only FSPX/ACCC and mixed genuine DXIL/native containers; do not apply this archive's `NOBC` rule to every Xbox image. XCL `crates/xcl/src/gpu/recomp/` and `docs/wave64-on-wave32.md` show which wave/descriptor/export dependencies a practical recompiler has to model, not code for XSXEmu. XCL and Leonida were used as behavioral/factual GPL references only. Alkyhol (MIT) `docs/shaders.md` demonstrates host resource mapping and DXIL → SPIR-V → MSL for eligible desktop bitcode, **not** the `NOBC` corpus. Treat actual desktop DXIL as a separately validated path, not a fallback for this archive.
+
+## Next gated milestones
+
+1. **Measure before expanding.** Before selecting a first native CS from the 2,689 envelopes, build a local-only coverage report: metadata completeness, wave32/64 and thread-group distribution, reachable instructions/operand variants and blockers (branch targets, LDS/barriers, memory spaces, images, lane transfers). Keep pipeline-library programs separate and distinguish parser/decode, semantic, and backend failures. Leonida `docs/isa_coverage.md` is prior-art evidence for corpus reach (e.g. 40 CS use `image_bvh_intersect_ray`), not a substitute for selecting a small local workload. `docs/shader_validation.md` shows why compilation or `spirv-val` does not prove semantics.
+2. **Wave and EXEC.** Add owned fixtures for SALU state (SGPR/SCC), VGPR writes and `EXEC`/`VCC`/compare/branch masks, including inactive lanes and partial last waves. Validate variable-length decode and control-flow instruction boundaries; never stop at the first `s_endpgm` if branches reach later code. Compare a Rust ISA model, generated Metal readback and, where available, native AMD oracle results. Gate the initial backend to a measured matching wave width; refuse wave64 until cross-half ballot/lane reads and reconvergence are tested. If emulating one wave64 with two SIMD groups, budget shared memory and use only proven uniform group barriers; don't assume GPU forward progress across SIMD groups.
+3. **Descriptors and memory.** Next owned dispatch: checked console root/user-data SGPR bindings and one raw buffer load/store with overflow and out-of-bounds probes. Separate guest V#/T#/S# descriptors and console GPU addresses from Metal resource objects/indices; validate lengths, format, swizzle, alignment and aliasing. Then cover LDS, scratch, atomics, ordering (`waitcnt`, coherent accesses, barriers) and Metal device limits. Don't approximate unknown ordering/cache flags by silently dropping them. Host resource metadata and limits become part of the pipeline cache key along with decoder profile, shader variant and wave size.
+4. **Graphics later.** Establish VS/PS signature linkage, interpolation and position/depth/color exports (channel masks, compressed pairs, kill/helper lanes) on owned render/readback. Mesh/NGG, geometry expansion and ray operations need separate capability gates and output validation, not stage renaming. A future SPIR-V/MSL backend would need the same feature and differential checks; a syntactically valid module is insufficient.

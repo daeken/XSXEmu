@@ -1,0 +1,21 @@
+[package]
+name = "xsx-shader-inventory"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+default-run = "xsx-shader-inventory"
+
+[dependencies]
+flate2 = "1.1"
+
+[features]
+metal-probe = ["dep:metal"]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = { version = "0.33", optional = true }
+
+[[bin]]
+name = "shader-metal-probe"
+path = "src/metal_probe.rs"
+required-features = ["metal-probe"]
