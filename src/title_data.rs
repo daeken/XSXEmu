@@ -35,6 +35,25 @@ pub(crate) fn open(name: &str) -> Result<File, u32> {
     open_under(ROOT.get(), name)
 }
 
+/// Open a confined, owned, read-only regular file for an archive consumer.
+/// Directory handles are accepted by attribute lookup, but not by this API.
+#[allow(dead_code)] // DirectStorage OpenFile is a separate follow-up.
+pub(crate) fn open_regular(name: &str) -> Result<File, u32> {
+    open_regular_under(ROOT.get(), name)
+}
+
+fn open_regular_under(root: Option<&File>, name: &str) -> Result<File, u32> {
+    let file = open_under(root, name)?;
+    if !file
+        .metadata()
+        .map_err(crate::providers::win_io::native::win_err)?
+        .is_file()
+    {
+        return Err(5); // ERROR_ACCESS_DENIED
+    }
+    Ok(file)
+}
+
 fn open_under(root: Option<&File>, name: &str) -> Result<File, u32> {
     let root = root.ok_or(15u32)?; // ERROR_INVALID_DRIVE
     let tail = name
@@ -95,4 +114,38 @@ fn open_under(root: Option<&File>, name: &str) -> Result<File, u32> {
         parent = Some(file);
     }
     unreachable!("nonempty mount path has a component")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    #[test]
+    fn regular_open_returns_owned_read_only_file_not_directory() {
+        let path =
+            std::env::temp_dir().join(format!("xsxemu-title-data-unit-{}", std::process::id()));
+        std::fs::create_dir(&path).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(path.clone());
+        std::fs::write(path.join("owned.rpf"), b"owned").unwrap();
+        let root = File::open(&path).unwrap();
+        assert_eq!(open_regular_under(None, "G:\\owned.rpf").unwrap_err(), 15);
+        assert_eq!(open_regular_under(Some(&root), "G:\\").unwrap_err(), 5);
+        assert_eq!(
+            open_regular_under(Some(&root), "G:\\missing.rpf").unwrap_err(),
+            2
+        );
+        let mut file = open_regular_under(Some(&root), "G:\\owned.rpf").unwrap();
+        drop(root);
+        assert!(file.write_all(b"no").is_err());
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"owned");
+    }
 }
