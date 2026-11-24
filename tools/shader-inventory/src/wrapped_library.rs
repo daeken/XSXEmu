@@ -121,13 +121,70 @@ impl GraphicsCoverage {
     }
 }
 
-fn layout_extent(blob: &[u8]) -> Option<(Vec<Key>, usize)> {
+// Public DXGI_FORMAT byte widths, limited to the observed candidate subset.
+fn vertex_width(format: usize) -> Option<usize> {
+    match format {
+        2 => Some(16),
+        6 => Some(12),
+        10 | 16 | 17 => Some(8),
+        24 | 28 | 30 | 41 => Some(4),
+        _ => None,
+    }
+}
+
+#[derive(Default, PartialEq, Eq, Debug)]
+struct VertexFields {
+    nonzero_class_or_step: usize,
+    unsupported_width: usize,
+    out_of_range_slot: usize,
+    first_nonzero: usize,
+    contiguous: usize,
+    gaps: usize,
+    overlaps: usize,
+}
+
+impl VertexFields {
+    fn observe(&mut self, words: [usize; 5], ends: &mut [Option<usize>; 32]) {
+        let [format, slot, offset, class, step] = words;
+        self.nonzero_class_or_step += usize::from(class != 0 || step != 0);
+        let Some(prior) = ends.get_mut(slot) else {
+            self.out_of_range_slot += 1;
+            return;
+        };
+        self.first_nonzero += usize::from(prior.is_none() && offset != 0);
+        let Some(end) = vertex_width(format).and_then(|width| offset.checked_add(width)) else {
+            self.unsupported_width += 1;
+            *prior = None;
+            return;
+        };
+        match offset.cmp(&prior.unwrap_or(0)) {
+            std::cmp::Ordering::Equal => self.contiguous += 1,
+            std::cmp::Ordering::Greater => self.gaps += 1,
+            std::cmp::Ordering::Less => self.overlaps += 1,
+        }
+        *prior = Some(prior.unwrap_or(0).max(end));
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.nonzero_class_or_step += other.nonzero_class_or_step;
+        self.unsupported_width += other.unsupported_width;
+        self.out_of_range_slot += other.out_of_range_slot;
+        self.first_nonzero += other.first_nonzero;
+        self.contiguous += other.contiguous;
+        self.gaps += other.gaps;
+        self.overlaps += other.overlaps;
+    }
+}
+
+fn layout_extent(blob: &[u8]) -> Option<(Vec<Key>, usize, VertexFields)> {
     let count = word(blob, 76)?;
     let mut cursor = 80usize;
     if count > blob.len().checked_sub(cursor)? / 30 {
         return None;
     }
     let mut keys = Vec::with_capacity(count);
+    let mut fields = VertexFields::default();
+    let mut ends = [None; 32];
     for _ in 0..count {
         let n = word(blob, cursor)?;
         if !(2..=256).contains(&n) {
@@ -143,10 +200,23 @@ fn layout_extent(blob: &[u8]) -> Option<(Vec<Key>, usize)> {
         }
         cursor = stop.checked_add(24)?;
         keys.push(semantic_key(name, word(blob, stop)?));
+        fields.observe(
+            [
+                word(blob, stop + 4)?,
+                word(blob, stop + 8)?,
+                word(blob, stop + 12)?,
+                word(blob, stop + 16)?,
+                word(blob, stop + 20)?,
+            ],
+            &mut ends,
+        );
     }
     let rest = blob.get(cursor..)?;
-    (rest.len() == (4 - cursor % 4) % 4 && rest.iter().all(|&b| b == 0))
-        .then_some((keys, rest.len()))
+    (rest.len() == (4 - cursor % 4) % 4 && rest.iter().all(|&b| b == 0)).then_some((
+        keys,
+        rest.len(),
+        fields,
+    ))
 }
 
 fn digest(blob: &[u8]) -> Option<[u8; 16]> {
@@ -435,7 +505,8 @@ pub(super) fn run(
     // ever seen for the same program. Unknown slots stay in the grouping key.
     let mut graphics_rows = BTreeMap::<Vec<usize>, GraphicsCoverage>::new();
     let mut state_sizes = BTreeMap::<Vec<usize>, BTreeMap<usize, HashSet<_>>>::new();
-    let mut layouts_seen = HashMap::<_, Option<(Vec<Key>, usize)>>::new();
+    let mut layouts_seen = HashMap::<_, Option<(Vec<Key>, usize, VertexFields)>>::new();
+    let mut vertex_fields = VertexFields::default();
     let mut vs_layout = BTreeMap::<Vec<usize>, [usize; 6]>::new();
     let mut layout_shapes = BTreeMap::<(usize, usize), usize>::new();
     let mut layout_other = 0;
@@ -505,8 +576,9 @@ pub(super) fn run(
                     .blob(pso.input_layout)
                     .ok_or("missing graphics layout span")?;
                 let shape = layout_extent(layout);
-                if let Some((keys, pad)) = &shape {
+                if let Some((keys, pad, fields)) = &shape {
                     *layout_shapes.entry((keys.len(), *pad)).or_default() += 1;
+                    vertex_fields.merge(fields);
                 } else {
                     layout_other += 1;
                 }
@@ -518,7 +590,7 @@ pub(super) fn run(
                 (None, _) => 5,
                 (_, None) => 3,
                 (_, Some(None)) => 4,
-                (Some((layout, _)), Some(Some(source))) => {
+                (Some((layout, _, _)), Some(Some(source))) => {
                     if layout == source {
                         0
                     } else {
@@ -551,6 +623,7 @@ pub(super) fn run(
         "  Graphics layout blobs: {} distinct; unsupported extent: {layout_other}; (count, zero suffix bytes) histogram: {layout_shapes:?}",
         layouts_seen.len()
     );
+    println!("  Graphics layout D3D12 input-element field hypothesis: {vertex_fields:?}");
     for (slots, counts) in vs_layout {
         println!(
             "  VS ordinary input keys versus layout, slots {slots:?} [ordered equal, reordered equal, different, missing source, divergent source, unsupported extent]: {counts:?}"
@@ -690,6 +763,24 @@ mod tests {
     }
 
     #[test]
+    fn layout_field_hypothesis_checks_widths_per_slot() {
+        let mut fields = VertexFields::default();
+        let mut ends = [None; 32];
+        fields.observe([6, 0, 0, 0, 0], &mut ends);
+        fields.observe([28, 1, 0, 0, 0], &mut ends);
+        fields.observe([28, 0, 8, 0, 0], &mut ends);
+        fields.observe([28, 0, 16, 0, 0], &mut ends);
+        fields.observe([0, 1, 4, 0, 0], &mut ends);
+        fields.observe([28, 32, 0, 1, 1], &mut ends);
+        assert_eq!(fields.contiguous, 2);
+        assert_eq!(fields.gaps, 1);
+        assert_eq!(fields.overlaps, 1);
+        assert_eq!(fields.unsupported_width, 1);
+        assert_eq!(fields.out_of_range_slot, 1);
+        assert_eq!(fields.nonzero_class_or_step, 1);
+    }
+
+    #[test]
     fn layout_extent_uses_dense_variable_records_and_exact_zero_padding() {
         let mut bytes = [0u8; 144];
         bytes[76..80].copy_from_slice(&2u32.to_le_bytes());
@@ -698,7 +789,7 @@ mod tests {
         bytes[111..115].copy_from_slice(&2u32.to_le_bytes());
         bytes[115..117].copy_from_slice(b"Z\0");
         assert_eq!(
-            layout_extent(&bytes),
+            layout_extent(&bytes).map(|(keys, pad, _)| (keys, pad)),
             Some((vec![semantic_key(b"xy", 0), semantic_key(b"z", 0)], 3))
         );
         assert_eq!(layout_extent(&bytes[..143]), None);
