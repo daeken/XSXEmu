@@ -139,6 +139,51 @@ fn pointer(thread: &Thread<'_>, index: usize) -> u64 {
 }
 
 #[test]
+fn loader_check_failure_keeps_every_index_unmodified() {
+    let exe = fixture(false, true);
+    let dll = fixture(true, true);
+    let exe = Pe::parse(&exe).unwrap();
+    let dll = Pe::parse(&dll).unwrap();
+    let mut root = mapped(&exe);
+    let mut dep = mapped(&dll);
+    let error = || Error::Invalid(ImageId::Dll(0), "external fixup overlap");
+    assert_eq!(
+        Plan::prepare_checked(
+            Some(Image {
+                pe: &exe,
+                mapped: &mut root
+            }),
+            &mut [Image {
+                pe: &dll,
+                mapped: &mut dep
+            }],
+            Limits::default(),
+            |id, image, sites| {
+                assert_eq!(*sites.index, INDEX as u32..INDEX as u32 + 4);
+                assert_eq!(*sites.directory, TLS as u32..TLS as u32 + 40);
+                assert_eq!(
+                    sites.template,
+                    Some(&(TEMPLATE as u32..TEMPLATE as u32 + 12))
+                );
+                assert_eq!(
+                    sites.callback_array,
+                    Some(&(ARRAY as u32..ARRAY as u32 + 24))
+                );
+                assert_eq!(index(image.mapped), SENTINEL);
+                match id {
+                    ImageId::Root => Ok(()),
+                    _ => Err(error()),
+                }
+            },
+        )
+        .unwrap_err(),
+        error()
+    );
+    assert_eq!(index(&root), SENTINEL);
+    assert_eq!(index(&dep), SENTINEL);
+}
+
+#[test]
 fn root_ga_dense_indices_and_independent_aligned_threads() {
     let root = fixture(false, true);
     let no_tls = fixture(true, false);

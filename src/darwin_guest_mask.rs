@@ -1,4 +1,5 @@
-//! Fail-closed signal policy for disposable Darwin GS probe children only.
+//! Fail-closed signal policy for disposable Darwin guest GS children only.
+
 use std::ffi::c_int;
 use std::ptr::null;
 

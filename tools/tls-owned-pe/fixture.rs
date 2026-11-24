@@ -14,7 +14,7 @@ mod image;
 #[path = "../../src/pe.rs"]
 #[allow(dead_code)]
 mod pe;
-#[path = "../darwin-probe-mask.rs"]
+#[path = "../../src/darwin_guest_mask.rs"]
 mod probe_mask;
 #[path = "../../src/static_tls.rs"]
 #[allow(dead_code)]

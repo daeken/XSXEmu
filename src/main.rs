@@ -1,5 +1,7 @@
 mod apiset;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+mod darwin_guest_mask;
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 mod guest;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 mod import_traps;
@@ -7,6 +9,11 @@ mod link;
 mod pe;
 mod providers;
 mod startup;
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+#[allow(dead_code)] // The portable planner is also exercised by standalone fixtures.
+mod static_tls;
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+mod tls_runtime;
 mod win_cfg;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 mod win_cfg_runtime;
@@ -30,6 +37,7 @@ const USAGE: &str = "Usage: xsxemu <inspect|map|audit|run> <image.exe> [options]
     audit [--dll-dir DIR] [--symbols]  Resolve the static import graph without executing\n\
     run [--dll-dir DIR]    Start a trusted image (x86-64 macOS/Rosetta only; not sandboxed)\n\
     run option: --trace-missing-imports  Trap on calls to missing static imports instead of refusing startup\n\
+    run option: --experimental-static-tls  Trusted PE-only startup in a disposable Rosetta child\n\
     audit/run options: --api-set SCHEMA.dll, --rust-providers";
 
 fn main() -> ExitCode {
@@ -42,6 +50,8 @@ fn main() -> ExitCode {
     }
 }
 
+const TLS_CHILD: &str = "__static-tls-child";
+
 fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
     let command = args.next().ok_or(USAGE)?;
     if command == "--help" || command == "-h" {
@@ -50,35 +60,64 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
     }
     let image = PathBuf::from(args.next().ok_or(USAGE)?);
     let command = command.to_str().ok_or(USAGE)?;
+    let tls_child = command == TLS_CHILD;
+    let command = if tls_child { "run" } else { command };
+    let args: Vec<_> = args.collect();
     let mut roots = Vec::new();
     let mut symbols = false;
     let mut base = None;
     let mut schema = None;
     let mut rust_providers = false;
     let mut trace_missing_imports = false;
-    while let Some(arg) = args.next() {
+    let mut experimental_tls = false;
+    let mut options = args.iter();
+    while let Some(arg) = options.next() {
         match (command, arg.to_str()) {
             ("inspect" | "audit", Some("--symbols")) => symbols = true,
             ("audit" | "run", Some("--dll-dir")) => roots.push(PathBuf::from(
-                args.next().ok_or("--dll-dir requires a path")?,
+                options.next().ok_or("--dll-dir requires a path")?,
             )),
             ("audit" | "run", Some("--api-set")) if schema.is_none() => {
-                let path = PathBuf::from(args.next().ok_or("--api-set requires a path")?);
-                schema = Some(
-                    apiset::ApiSet::parse(&read_image(&path)?)
-                        .map_err(|e| format!("{}: {e}", path.display()))?,
-                );
+                schema = Some(PathBuf::from(
+                    options.next().ok_or("--api-set requires a path")?,
+                ));
             }
             ("audit" | "run", Some("--rust-providers")) => rust_providers = true,
             ("run", Some("--trace-missing-imports")) => trace_missing_imports = true,
+            ("run", Some("--experimental-static-tls")) => experimental_tls = true,
             ("map", Some("--base")) if base.is_none() => {
                 base = Some(parse_base(
-                    &args.next().ok_or("--base requires an address")?,
+                    options.next().ok_or("--base requires an address")?,
                 )?)
             }
             _ => return Err(format!("unexpected option {arg:?}\n{USAGE}").into()),
         }
     }
+    if tls_child && !experimental_tls {
+        return Err("static TLS child requires --experimental-static-tls".into());
+    }
+    if experimental_tls {
+        if rust_providers || trace_missing_imports {
+            return Err(
+                "experimental static TLS does not support Rust providers or trace thunks".into(),
+            );
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+        return Err("experimental static TLS requires an x86-64 macOS build under Rosetta".into());
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        {
+            tls_runtime::require_rosetta()?;
+            if !tls_child {
+                return tls_runtime::spawn_child(&image, &args);
+            }
+        }
+    }
+    let schema = schema
+        .map(|path| -> Result<_> {
+            apiset::ApiSet::parse(&read_image(&path)?)
+                .map_err(|e| format!("{}: {e}", path.display()).into())
+        })
+        .transpose()?;
     match command {
         "inspect" => inspect(&image, symbols)?,
         "map" => map(&image, base)?,
@@ -93,6 +132,7 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
                     rust_providers,
                     trace_missing_imports,
                 },
+                tls_child,
             );
         }
         _ => return Err(USAGE.into()),
@@ -263,6 +303,11 @@ fn resolve(
     launch: bool,
     symbols: bool,
     options: link::Options<'_>,
+    #[cfg_attr(
+        not(all(target_os = "macos", target_arch = "x86_64")),
+        allow(unused_variables)
+    )]
+    tls_child: bool,
 ) -> Result<ExitCode> {
     use std::collections::BTreeMap;
     let trace = launch && options.trace_missing_imports;
@@ -357,14 +402,18 @@ fn resolve(
             }
         }
         let order = attach_order(&plan)?;
-        let status = startup::run(
-            &images,
-            &bindings,
-            &traps,
-            &order,
-            startup_options.0,
-            startup_options.1,
-        )?;
+        let status = if tls_child {
+            startup::run_tls_child(&images, &bindings, &order)?
+        } else {
+            startup::run(
+                &images,
+                &bindings,
+                &traps,
+                &order,
+                startup_options.0,
+                startup_options.1,
+            )?
+        };
         println!("Guest entry returned {status}");
         Ok(ExitCode::from(status as u8))
     }

@@ -6,7 +6,7 @@ use std::mem::{offset_of, size_of};
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[path = "../darwin-probe-mask.rs"]
+#[path = "../../src/darwin_guest_mask.rs"]
 mod probe_mask;
 mod signal_policy;
 

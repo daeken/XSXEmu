@@ -22,8 +22,12 @@ mod native {
     const MAX_MAPPED_TOTAL: usize = 1024 * 1024 * 1024;
     const AMD64_DEFAULT_COOKIE: u64 = 0x0000_2b99_2ddf_a232;
 
-    fn validate_profile<'a>(pe: &Pe<'a>, name: &str) -> Result<Option<CfgMetadata<'a>>> {
-        if pe.tls()?.is_some() {
+    fn validate_profile<'a>(
+        pe: &Pe<'a>,
+        name: &str,
+        static_tls: bool,
+    ) -> Result<Option<CfgMetadata<'a>>> {
+        if !static_tls && pe.tls()?.is_some() {
             return Err(format!("{name}: static TLS requires a Windows TEB and is not supported by this startup profile").into());
         }
         for (dir, label) in [
@@ -39,6 +43,12 @@ mod native {
             }
         }
         let cfg = CfgMetadata::parse(pe).map_err(|e| format!("{name}: {e}"))?;
+        if static_tls && cfg.is_some() {
+            return Err(format!(
+                "{name}: experimental static TLS does not support GuardCF host thunks"
+            )
+            .into());
+        }
         if cfg.is_none()
             && let Some(dir) = pe.directory(10)
         {
@@ -139,6 +149,35 @@ mod native {
         api_set: Option<&ApiSet>,
         rust_providers: bool,
     ) -> Result<u32> {
+        run_impl(
+            images,
+            bindings,
+            missing,
+            attach_order,
+            api_set,
+            rust_providers,
+            false,
+        )
+    }
+
+    pub fn run_tls_child(
+        images: &[(&str, &[u8])],
+        bindings: &[(usize, u32, BindingTarget)],
+        attach_order: &[usize],
+    ) -> Result<u32> {
+        run_impl(images, bindings, &[], attach_order, None, false, true)
+    }
+
+    fn run_impl(
+        images: &[(&str, &[u8])],
+        bindings: &[(usize, u32, BindingTarget)],
+        missing: &[MissingImport<'_>],
+        attach_order: &[usize],
+        api_set: Option<&ApiSet>,
+        rust_providers: bool,
+        static_tls: bool,
+    ) -> Result<u32> {
+        use crate::tls_runtime;
         let (pes, cfgs): (Vec<_>, Vec<_>) = images
             .iter()
             .enumerate()
@@ -148,12 +187,15 @@ mod native {
                 if dll != (index != 0) {
                     return Err(format!("{name}: wrong image kind for startup").into());
                 }
-                let cfg = validate_profile(&pe, name)?;
+                let cfg = validate_profile(&pe, name, static_tls)?;
                 Ok((pe, cfg))
             })
             .collect::<Result<Vec<_>>>()?
             .into_iter()
             .unzip();
+        let tls_writes = static_tls
+            .then(|| tls_runtime::PatchWrites::validate(&pes, bindings))
+            .transpose()?;
         validate_trap_slots(&pes, bindings, missing)?;
         let mut targets = cfgs.iter().any(Option::is_some).then(Targets::default);
         let mut total = 0usize;
@@ -192,6 +234,9 @@ mod native {
             };
             patch(&mut memories[importer], iat, addr)?;
         }
+        let tls = tls_writes
+            .map(|writes| writes.prepare(&pes, &mut memories))
+            .transpose()?;
         let traps = Traps::new(missing)?;
         if let Some(traps) = &traps {
             for (import, addr) in traps.bindings() {
@@ -241,6 +286,11 @@ mod native {
             if pe.entry_rva != 0 {
                 mem.validate_target(pe.entry_rva as usize)?;
             }
+        }
+        if let Some(tls) = tls {
+            // Neither the host loader, the unwind provider, nor CFG is installed
+            // on this path. No thunk can lead from guest GS into host Rust.
+            return tls_runtime::run(&tls, images, &pes, &memories, attach_order);
         }
         let _loader = win_loader::register(
             images
@@ -325,4 +375,4 @@ mod native {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-pub use native::run;
+pub use native::{run, run_tls_child};

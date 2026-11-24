@@ -109,6 +109,14 @@ pub struct Plan {
     allocation: usize,
 }
 
+/// TLS ranges known before the planner modifies any index slot.
+pub struct PatchSites<'a> {
+    pub index: &'a Range<u32>,
+    pub directory: &'a Range<u32>,
+    pub callback_array: Option<&'a Range<u32>>,
+    pub template: Option<&'a Range<u32>>,
+}
+
 impl Plan {
     /// Prepare from the final pre-TLS-patch bytes (apply relocations and any
     /// intended template fixups first). The caller pairs each PE with its own
@@ -120,9 +128,20 @@ impl Plan {
     /// index slots. This only validates TLS-local targets; the caller must avoid
     /// conflicts with other loader writes (e.g. IAT or security-cookie slots).
     pub fn prepare(
+        root: Option<Image<'_, '_>>,
+        dlls: &mut [Image<'_, '_>],
+        limits: Limits,
+    ) -> Result<Self> {
+        Self::prepare_checked(root, dlls, limits, |_, _, _| Ok(()))
+    }
+
+    /// As `prepare`, with an additional read-only check before committing any
+    /// index writes. Use this to validate loader writes against TLS ranges.
+    pub fn prepare_checked(
         mut root: Option<Image<'_, '_>>,
         dlls: &mut [Image<'_, '_>],
         limits: Limits,
+        mut check: impl FnMut(ImageId, &Image<'_, '_>, PatchSites<'_>) -> Result<()>,
     ) -> Result<Self> {
         let count = add(usize::from(root.is_some()), dlls.len())?;
         if count > limits.images {
@@ -173,7 +192,9 @@ impl Plan {
                 || !section_for(pe, index_rva, 4)
                     .is_some_and(|s| s.writable() && s.readable() && !s.executable())
                 || overlaps(&index_range, &table_range)
-                || callback_array.is_some_and(|array| overlaps(&index_range, &array))
+                || callback_array
+                    .as_ref()
+                    .is_some_and(|array| overlaps(&index_range, array))
                 || tls
                     .template
                     .as_ref()
@@ -188,6 +209,16 @@ impl Plan {
             {
                 return Err(invalid("callback target (not executable)"));
             }
+            check(
+                id,
+                image,
+                PatchSites {
+                    index: &index_range,
+                    directory: &table_range,
+                    callback_array: callback_array.as_ref(),
+                    template: tls.template.as_ref(),
+                },
+            )?;
             if (tls.characteristics >> 20) & 15 == 15 {
                 return Err(invalid("reserved alignment encoding"));
             }
