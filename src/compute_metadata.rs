@@ -81,6 +81,48 @@ impl ComputeMetadata {
 mod tests {
     use super::*;
     #[test]
+    fn wraps_checked_references_without_blessing_opaque_content() {
+        const PSO: usize = 128;
+        const BLOBS: usize = PSO + 24;
+        const PROGRAMS: usize = BLOBS + 24;
+        const DATA: usize = PROGRAMS + 8;
+        let mut bytes = [0u8; DATA + 104 + 4];
+        bytes[..4].copy_from_slice(b"PS\0\x09");
+        for (at, value) in [
+            (0x54, 1u32),
+            (0x58, 3),
+            (0x5c, 1),
+            (0x60, 104),
+            (0x64, 4),
+            (PSO + 8, 1),
+            (PSO + 20, 2),
+            (BLOBS + 4, 20),
+            (BLOBS + 8, 20),
+            (BLOBS + 12, 28),
+            (BLOBS + 16, 48),
+            (BLOBS + 20, 56),
+            (PROGRAMS + 4, 4),
+            (DATA + 20 + 12, 0x10020),
+            (DATA + 20 + 16, 0x100001),
+            (DATA + 48, 0x403),
+            (DATA + 68, 0x12340),
+            (DATA + 72, 0x43),
+        ] {
+            bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        let library = PipelineLibrary::parse(&bytes).unwrap();
+        let pso = library.compute().next().unwrap();
+        let metadata = ComputeMetadata::from_library(&library, pso).unwrap();
+        assert_eq!(metadata.dispatch.xyz, [32, 1, 1]);
+        assert_eq!(metadata.layout_item_counts, [0, 0]);
+        bytes[DATA + 103] = 1;
+        let library = PipelineLibrary::parse(&bytes).unwrap();
+        assert!(
+            ComputeMetadata::from_library(&library, library.compute().next().unwrap()).is_none()
+        );
+    }
+
+    #[test]
     fn bounded_dispatch_words_and_tagged_layout() {
         let mut d = [0; 28];
         d[12..20].copy_from_slice(&[32, 0, 1, 0, 1, 0, 16, 0]);
