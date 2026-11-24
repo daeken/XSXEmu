@@ -1,4 +1,7 @@
 //! Local, count-only reachability with one explicit LLVM profile, not an Xbox decoder.
+#[path = "provenance.rs"]
+mod provenance;
+
 use crate::{
     BLOB_LIMIT,
     cfg::{self, Flow, Instruction},
@@ -260,6 +263,7 @@ struct Report {
     exec_branch_and_cmpx_gt: usize,
     shortlist_scc_branch: usize,
     small_single_raw_store: usize,
+    raw_store_provenance: BTreeMap<provenance::ResultClass, usize>,
     smallest_store_steps: Option<usize>,
     small_launch_fields: BTreeMap<(usize, usize, usize), usize>,
     raw_store_launch_fields: BTreeMap<(usize, usize, usize), usize>,
@@ -318,6 +322,8 @@ impl Report {
                         .any(|(name, _)| name.starts_with("buffer_store_dword"));
                     if meta.group == [1, 1, 1] && stores == 1 && raw {
                         self.small_single_raw_store += 1;
+                        let origin = provenance::classify(&mut waves[1], bytes, p.steps, launch.0);
+                        *self.raw_store_provenance.entry(origin).or_default() += 1;
                         *self.raw_store_launch_fields.entry(launch).or_default() += 1;
                         if self.smallest_store_steps.is_none_or(|n| p.steps < n) {
                             self.smallest_store_steps = Some(p.steps);
@@ -379,6 +385,9 @@ impl Report {
                     "{class} launch fields: user_sgprs={user_sgprs} tgid_xyz_mask={tgid_mask} tidig_comp={tidig_comp} payloads={n}"
                 );
             }
+        }
+        for (origin, n) in self.raw_store_provenance {
+            println!("single-raw-store descriptor provenance {origin:?}: payloads={n}");
         }
         print_histogram(self.smallest_store_features, "smallest raw-store feature");
         print_histogram(self.features, "feature");
