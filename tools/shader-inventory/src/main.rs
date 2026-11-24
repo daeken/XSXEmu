@@ -39,15 +39,36 @@ fn inflate(input: &[u8], wrapped: bool, limit: usize, out: &mut Vec<u8>) -> Opti
     }
 }
 
-fn public_data(data: &[u8], archive_len: usize) -> Option<Range<usize>> {
-    if !data.starts_with(b"9FPR") {
-        return None;
+#[derive(Debug, PartialEq, Eq)]
+struct PublicHeader {
+    data_start: usize,
+    word_08: usize,
+    word_0c: usize,
+}
+
+impl PublicHeader {
+    const PREFIX_LEN: usize = 16;
+
+    fn parse(prefix: &[u8], file_len: usize) -> Option<Self> {
+        if !prefix.starts_with(b"9FPR") {
+            return None;
+        }
+        let data_start = word(prefix, 4)?;
+        if !(Self::PREFIX_LEN..file_len).contains(&data_start) {
+            return None;
+        }
+        Some(Self {
+            data_start,
+            word_08: word(prefix, 8)?,
+            word_0c: word(prefix, 12)?,
+        })
     }
-    let start = word(data, 4)?;
-    // The shader archive matches the documented trailer hypothesis. Never decode it.
-    let trailer = word(data, 12)?;
-    let end = archive_len.checked_sub(trailer)?;
-    (start >= 16 && start < end && trailer % 16 == 0).then_some(start..end)
+
+    /// The survey's trailer convention is a scan policy, not a decoded TOC boundary.
+    fn shader_data_window(&self, file_len: usize) -> Option<Range<usize>> {
+        let end = file_len.checked_sub(self.word_0c)?;
+        (self.data_start < end && self.word_0c % 16 == 0).then_some(self.data_start..end)
+    }
 }
 
 fn dxil_chunk(data: &[u8]) -> Option<&[u8]> {
@@ -253,19 +274,37 @@ fn stage_name(stage: u16) -> &'static str {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let mut args = std::env::args_os().skip(1);
+    let mut args = std::env::args_os().skip(1).peekable();
+    let header_only = args.next_if(|arg| arg == "--header-only").is_some();
     let path = args
         .next()
         .filter(|_| args.next().is_none())
-        .ok_or("usage: xsx-shader-inventory <shaders.rpf>")?;
+        .ok_or("usage: xsx-shader-inventory [--header-only] <shaders.rpf>")?;
     let mut file = File::open(path)?;
     let len = usize::try_from(file.metadata()?.len())?;
-    if len > ARCHIVE_LIMIT {
+    if !header_only && len > ARCHIVE_LIMIT {
         return Err("archive exceeds 512 MiB tool limit".into());
     }
-    let mut header = [0; 16];
-    file.read_exact(&mut header)?;
-    let area = public_data(&header, len).ok_or("invalid RPF9 data bounds")?;
+    let mut prefix = [0; PublicHeader::PREFIX_LEN];
+    file.read_exact(&mut prefix)?;
+    let header = PublicHeader::parse(&prefix, len).ok_or("invalid RPF9 public header")?;
+    let window = header.shader_data_window(len);
+    if header_only {
+        println!(
+            "RPF9: {len} bytes ({len:#x}); data start {:#x}; +0x08 {:#x} (unknown); +0x0c {:#x}",
+            header.data_start, header.word_08, header.word_0c
+        );
+        match window {
+            Some(area) => println!(
+                "Shader scan window under trailer convention: {:#x}..{:#x} (not TOC-derived)",
+                area.start, area.end
+            ),
+            None => println!("No shader scan window under trailer convention"),
+        }
+        println!("Read fixed prefix only; TOC not read/decoded");
+        return Ok(());
+    }
+    let area = window.ok_or("invalid RPF9 shader data bounds under trailer convention")?;
     file.seek(SeekFrom::Start(area.start as u64))?;
     let mut archive = vec![0; area.len()];
     file.read_exact(&mut archive)?;

@@ -93,17 +93,49 @@ fn verifies_inflated_len_and_record_suffix_size() {
 }
 
 #[test]
-fn fails_closed_on_bad_header_and_library_sizes() {
-    let mut header = [0; 16];
-    header[..4].copy_from_slice(b"9FPR");
-    put(&mut header, 4, 32);
-    put(&mut header, 12, 16);
-    assert_eq!(public_data(&header, 64), Some(32..48));
-    assert_eq!(public_data(&header, 45), None);
-    assert_eq!(public_data(&header[..15], 64), None);
-    put(&mut header, 12, 15);
-    assert_eq!(public_data(&header, 64), None);
+fn parses_only_the_public_prefix_and_checks_data_start() {
+    let mut prefix = *b"9FPR\x20\x01\0\0\x78\x56\x34\x12\x10\0\0\0";
+    assert_eq!(
+        PublicHeader::parse(&prefix, 0x200),
+        Some(PublicHeader {
+            data_start: 0x120,
+            word_08: 0x12345678,
+            word_0c: 16,
+        }),
+    );
+    for len in 0..prefix.len() {
+        assert!(PublicHeader::parse(&prefix[..len], 0x200).is_none());
+    }
+    assert!(PublicHeader::parse(&prefix, 0x120).is_none());
+    for start in [0, 15, 0x201, u32::MAX as usize] {
+        put(&mut prefix, 4, start);
+        assert!(PublicHeader::parse(&prefix, 0x200).is_none());
+    }
+    put(&mut prefix, 4, 16);
+    assert!(PublicHeader::parse(&prefix, 64).is_some());
+    for magic in [b"2FPR", b"7FPR", b"RPF9"] {
+        prefix[..4].copy_from_slice(magic);
+        assert!(PublicHeader::parse(&prefix, 64).is_none());
+    }
+}
 
+#[test]
+fn trailer_convention_is_separate_from_public_header_validity() {
+    let mut prefix = *b"9FPR\x20\0\0\0\0\0\0\0\x10\0\0\0";
+    let header = PublicHeader::parse(&prefix, 64).unwrap();
+    assert_eq!(header.shader_data_window(64), Some(32..48));
+    assert_eq!(header.shader_data_window(49), Some(32..33));
+    for len in [15, 45, 48] {
+        assert_eq!(header.shader_data_window(len), None);
+    }
+    put(&mut prefix, 12, 15);
+    let header = PublicHeader::parse(&prefix, 64).unwrap();
+    assert_eq!(header.word_0c, 15);
+    assert_eq!(header.shader_data_window(64), None);
+}
+
+#[test]
+fn checks_multistream_library_sizes() {
     let mut first = vec![0; LIB_BLOCK];
     first[..4].copy_from_slice(b"PS\0\x09");
     put(&mut first, 0x64, LIB_BLOCK - 0x80 + 5);
