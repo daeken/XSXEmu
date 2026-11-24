@@ -112,6 +112,10 @@ pub(crate) fn lookup(dll: &[u8], name: &[u8]) -> Option<HostExport> {
             "GetFileInformationByHandle",
             native::GetFileInformationByHandle
         ),
+        #[cfg(target_os = "macos")]
+        (b"kernelbase.dll" | b"kernel32.dll" | FILE, b"GetFileTime") => {
+            export!("kernelbase.dll", "GetFileTime", native::get_title_file_time)
+        }
         (b"kernelbase.dll" | b"kernel32.dll" | FILE, b"SetFileTime") => {
             export!("kernelbase.dll", "SetFileTime", native::SetFileTime)
         }
@@ -269,6 +273,8 @@ pub(crate) mod native {
         share: u32,
         key: Option<FileKey>,
         kind: u32,
+        #[cfg(target_os = "macos")]
+        title_data: bool,
     }
     struct Region {
         start: u64,
@@ -576,6 +582,20 @@ pub(crate) mod native {
     fn entry(h: usize) -> Result<Entry> {
         lock(&STATE).handles.get(&h).cloned().ok_or(BAD_HANDLE)
     }
+    impl FileObject {
+        fn new(f: File, open_access: u32, share: u32, key: Option<FileKey>, kind: u32) -> Self {
+            Self {
+                file: Mutex::new(f),
+                regions: Mutex::new(Vec::new()),
+                open_access,
+                share,
+                key,
+                kind,
+                #[cfg(target_os = "macos")]
+                title_data: false,
+            }
+        }
+    }
     fn open_file(
         f: File,
         open_access: u32,
@@ -583,14 +603,13 @@ pub(crate) mod native {
         key: Option<FileKey>,
         kind: u32,
     ) -> Arc<Object> {
-        Arc::new(Object::File(FileObject {
-            file: Mutex::new(f),
-            regions: Mutex::new(Vec::new()),
+        Arc::new(Object::File(FileObject::new(
+            f,
             open_access,
             share,
             key,
             kind,
-        }))
+        )))
     }
     fn kind(m: &Metadata) -> u32 {
         #[cfg(unix)]
@@ -958,7 +977,10 @@ pub(crate) mod native {
                 let mut st = lock(&STATE);
                 st.shares(&key, access, share)?;
                 let handle = st.insert(Entry {
-                    obj: open_file(file, access, share, Some(key), 1),
+                    obj: Arc::new(Object::File(FileObject {
+                        title_data: true,
+                        ..FileObject::new(file, access, share, Some(key), 1)
+                    })),
                     access,
                     inheritable: false,
                 })?;
@@ -2138,6 +2160,41 @@ pub(crate) mod native {
             };
             Ok(Some(t.ok_or(INVALID_PARAM)?))
         }
+    }
+    // The archive asks only for last-write time. Do not admit arbitrary
+    // handles or silently synthesize the other timestamps in this lane.
+    #[cfg(target_os = "macos")]
+    pub(crate) unsafe extern "win64" fn get_title_file_time(
+        h: usize,
+        created: *mut c_void,
+        accessed: *mut c_void,
+        written: *mut c_void,
+    ) -> i32 {
+        boolean((|| {
+            if !created.is_null() || !accessed.is_null() {
+                return Err(UNSUPPORTED);
+            }
+            if written.is_null() {
+                return Err(INVALID_PARAM);
+            }
+            let e = entry(h)?;
+            let Object::File(file) = &*e.obj else {
+                return Err(BAD_HANDLE);
+            };
+            if !file.title_data || e.access & R == 0 {
+                return Err(ACCESS);
+            }
+            let time = lock(&file.file)
+                .metadata()
+                .and_then(|m| m.modified())
+                .map_err(win_err)?;
+            unsafe {
+                written
+                    .cast::<FileTime>()
+                    .write_unaligned(FileTime::from_host(Ok(time)))
+            };
+            Ok(())
+        })())
     }
     #[repr(C)]
     struct AttrData {

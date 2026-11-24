@@ -673,7 +673,14 @@ existing regular file through the same confined mount and returns a guest file
 handle that can be closed with `CloseHandle`. It logs that host cache and
 alignment behavior for `FILE_FLAG_NO_BUFFERING` is not modeled. Success
 preserves guest LastError; failure sets it and returns `INVALID_HANDLE_VALUE`.
-This bridge does not add audited seek or read calls.
+The immediate helper calls `GetFileTime` (IAT RVA `0x6793960`) with null creation
+and access outputs and a last-write `FILETIME` output. The bridge accepts only
+that shape on a confined title-data handle, returning the host descriptor's
+modification time in 100 ns ticks since 1601 UTC. The caller uses zero if the
+query fails. It then attempts a synchronous 4 KiB header `ReadFile` (IAT RVA
+`0x6793970`) with a byte-count output and null `OVERLAPPED`. A separate fallback
+queries file size through `GetFileSizeEx` (IAT RVA `0x6793958`). Neither read nor
+size is added to the audited lane here.
 
 **Scarlett XGameRuntime startup.** The trace at `8eb79ce` reaches
 `GetFileAttributesW`, `LoadLibraryExW`, and `ReleaseSRWLockExclusive`, then

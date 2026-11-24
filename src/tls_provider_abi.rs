@@ -310,6 +310,8 @@ audited_bridges! {
         io::GetStdHandle, (slot: u32) -> usize;
     xsxemu_tls_create_file_w, create_file_w: b"kernelbase.dll", b"CreateFileW",
         io::CreateFileW => io::tls_child_create_file_w, (name: *const u16, desired: u32, share: u32, security: *const c_void, disposition: u32, flags: u32, template: usize) -> usize;
+    xsxemu_tls_get_file_time, get_file_time: b"kernelbase.dll", b"GetFileTime",
+        io::get_title_file_time, (handle: usize, created: *mut c_void, accessed: *mut c_void, written: *mut c_void) -> i32;
     xsxemu_tls_get_file_attributes_w, get_file_attributes_w: b"kernelbase.dll", b"GetFileAttributesW",
         io::GetFileAttributesW, (name: *const u16) -> u32;
     xsxemu_tls_getfiletype, getfiletype: b"kernelbase.dll", b"GetFileType",

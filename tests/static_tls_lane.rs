@@ -1855,7 +1855,12 @@ fn title_data_create_file_returns_closable_handle_and_refuses_other_opens() {
     let scratch = Scratch::new();
     let root = scratch.0.join("mounted");
     fs::create_dir(&root).unwrap();
-    fs::write(root.join("archive.rpf"), b"owned archive").unwrap();
+    let host_archive = root.join("archive.rpf");
+    fs::write(&host_archive, b"owned archive").unwrap();
+    fs::File::open(host_archive)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_millis(1234))
+        .unwrap();
     let outside = scratch.write("outside.rpf", b"not mounted");
     std::os::unix::fs::symlink(outside, root.join("link.rpf")).unwrap();
     let mut exe = image(Kind::Solo);
@@ -1880,17 +1885,22 @@ fn title_data_create_file_returns_closable_handle_and_refuses_other_opens() {
     .enumerate()
     {
         let row = file(imports) + 20 * i;
-        let lookup = imports + 0x50 + i * 0x10;
+        let lookup = imports + 0x40 + i * 0x20;
         let name = imports + 0x80 + i * 0x30;
         let hint_name = imports + 0xe0 + i * 0x20;
         w32(&mut exe, row, lookup);
         w32(&mut exe, row + 12, name);
-        w32(&mut exe, row + 16, IAT + i * 16);
+        w32(&mut exe, row + 16, IAT + i * 24);
         w64(&mut exe, file(lookup), hint_name);
         put(&mut exe, file(name), dll);
         put(&mut exe, file(hint_name) + 2, symbol);
+        if i == 0 {
+            let time_hint = imports + 0x120;
+            w64(&mut exe, file(lookup) + 8, time_hint);
+            put(&mut exe, file(time_hint) + 2, b"GetFileTime\0");
+        }
     }
-    let write = |name: &str, args: [usize; 3]| {
+    let write = |name: &str, args: [usize; 4]| {
         let mut exe = exe.clone();
         for (i, unit) in name.encode_utf16().chain(Some(0)).enumerate() {
             w16(&mut exe, file(MODULE_PATHS) + 2 * i, usize::from(unit));
@@ -1900,7 +1910,7 @@ fn title_data_create_file_returns_closable_handle_and_refuses_other_opens() {
         }
         scratch.write("title-create.exe", &exe)
     };
-    let exact = [3, 0x2000_0000, 0];
+    let exact = [3, 0x2000_0000, 0, 0x8000_0000];
     let archive = r"G:\archive.rpf";
     let p = write(archive, exact);
     expect(
@@ -1927,9 +1937,10 @@ fn title_data_create_file_returns_closable_handle_and_refuses_other_opens() {
         (r"G:\", exact, 5),
         (r"G:\..\outside.rpf", exact, 123),
         (r"C:\archive.rpf", exact, 123),
-        (archive, [2, exact[1], 0], 50), // CREATE_ALWAYS
-        (archive, [3, 0, 0], 50),
-        (archive, [3, exact[1], 1], 50),
+        (archive, [2, exact[1], 0, exact[3]], 50), // CREATE_ALWAYS
+        (archive, [3, 0, 0, exact[3]], 50),
+        (archive, [3, exact[1], 1, exact[3]], 50),
+        (archive, [3, exact[1], 0, 0x4000_0000], 50), // GENERIC_WRITE
     ] {
         expect(
             run(&write(name, args), &flags),
