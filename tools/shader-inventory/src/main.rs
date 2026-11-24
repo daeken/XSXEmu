@@ -3,6 +3,7 @@ mod cfg;
 mod compute_sites;
 mod coverage;
 mod embedded;
+mod graphics_reachability;
 mod library_index;
 mod llvm;
 mod reachable;
@@ -368,6 +369,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .filter(|_| args.next().is_none())
             .ok_or("usage: xsx-shader-inventory <--pipeline-index|--compute-blobs> <expanded PS/0/9 library>")?;
         return library_index::run(&path, first == "--compute-blobs");
+    }
+    if first == "--reachable-graphics" {
+        let usage = "usage: xsx-shader-inventory --reachable-graphics <trusted LLVM 21 shared library> <gfx1013|gfx1030> <native FSSM directory>";
+        let lib = args.next().ok_or(usage)?;
+        let cpu = llvm::Cpu::parse(&args.next().ok_or(usage)?).ok_or(usage)?;
+        let path = args.next().filter(|_| args.next().is_none()).ok_or(usage)?;
+        return graphics_reachability::run(&lib, cpu, std::path::Path::new(&path));
     }
     if first == "--reachable-compute" || first == "--compute-source-join" {
         const REACHABLE_USAGE: &str = "usage: xsx-shader-inventory --reachable-compute <trusted LLVM 21 shared library> <gfx1013|gfx1030> <native FSSM directory>";
