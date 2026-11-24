@@ -3650,7 +3650,11 @@ fn created_guest_thread_has_own_teb_and_tls_and_joins_before_process_detach() {
     let groups: &[(&[u8], &[&[u8]])] = &[
         (
             b"api-ms-win-core-processthreads-l1-1-0.dll\0",
-            &[b"CreateThread\0", b"GetCurrentThreadId\0"],
+            &[
+                b"CreateThread\0",
+                b"GetCurrentThreadId\0",
+                b"ResumeThread\0",
+            ],
         ),
         (
             b"api-ms-win-core-synch-l1-1-0.dll\0",
@@ -3674,7 +3678,7 @@ fn created_guest_thread_has_own_teb_and_tls_and_joins_before_process_detach() {
     ];
     // Every descriptor needs its own terminating IAT entry, even when the
     // adjacent lookup table has its own terminator as well.
-    let iat_offsets = [0, 3, 7, 9, 11];
+    let iat_offsets = [0, 4, 8, 10, 12];
     for (i, &(module, imports)) in groups.iter().enumerate() {
         let rec = file(LINK) + 20 * i;
         let lookup = LINK + 0x80 + 0x28 * i;
@@ -3690,16 +3694,19 @@ fn created_guest_thread_has_own_teb_and_tls_and_joins_before_process_detach() {
         }
     }
     let flags = [OPT, "--rust-providers"];
-    for mode in 0..=5 {
+    for mode in 0..=7 {
         w32(&mut exe, file(MODE), mode);
         let path = scratch.write(&format!("threads-{mode}.exe"), &exe);
         let output = launcher(&path, &flags)
             .env("XSXEMU_TRACE_STARTUP", "1")
             .output()
             .unwrap();
-        if mode == 1 {
+        if matches!(mode, 1 | 7) {
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(!stderr.contains("phase=tls-detach"), "{stderr}");
+            if mode == 7 {
+                assert!(!stderr.contains("begin phase=thread-entry"), "{stderr}");
+            }
             expect(
                 output,
                 86,

@@ -22,6 +22,7 @@ use std::{
 const HOST_STACK_SLACK: usize = 1024 * 1024;
 const MAX_GUEST_STACK: usize = 16 * 1024 * 1024;
 const MAX_THREADS: usize = 32;
+const CREATE_SUSPENDED: u32 = 4;
 const DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
 thread_local! {
@@ -159,6 +160,7 @@ impl Workers {
         stack: usize,
         start: u64,
         parameter: u64,
+        suspended: bool,
         id: *mut u32,
     ) -> std::result::Result<usize, u32> {
         // The active policy, if any, outlives all workers. CreateThread
@@ -174,7 +176,7 @@ impl Workers {
         if slots.len() == MAX_THREADS {
             return Err(8);
         }
-        let (handle, completion) = io::new_thread_handle()?;
+        let (handle, completion) = io::new_thread_handle(suspended)?;
         let (ready, report) = mpsc::sync_channel(0);
         let workers = self.clone();
         let job = thread::Builder::new()
@@ -191,6 +193,10 @@ impl Workers {
                         // Only return success after the worker really owns its
                         // stack, TLS, TEB, ID and checked host GS context.
                         ready.send(tid).unwrap();
+                        // The producer's unlock publishes its guest parameter
+                        // writes. Don't deliver even TLS notifications until
+                        // the startup gate is open; never hold the lock on GS.
+                        completion.await_start();
                         if workers.trace {
                             startup_trace(format_args!(
                                 "begin phase=thread-entry id={tid} target={start:#x}"
@@ -270,14 +276,17 @@ pub(crate) unsafe extern "win64" fn create_thread(
 ) -> usize {
     let result = if stack > MAX_GUEST_STACK || start == 0 {
         Err(87)
-    } else if !security.is_null() || flags != 0 {
-        Err(50) // no attributes, suspended creation or reservation flags
+    } else if !security.is_null() || flags & !CREATE_SUSPENDED != 0 {
+        Err(50) // no attributes or reservation flags
     } else {
         WORKERS.with_borrow(|workers| {
-            workers
-                .as_ref()
-                .ok_or(50u32)?
-                .spawn(stack, start, parameter, id)
+            workers.as_ref().ok_or(50u32)?.spawn(
+                stack,
+                start,
+                parameter,
+                flags == CREATE_SUSPENDED,
+                id,
+            )
         })
     };
     result.unwrap_or_else(|err| {

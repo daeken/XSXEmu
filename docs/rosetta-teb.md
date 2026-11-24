@@ -468,8 +468,8 @@ first semaphore, and releases the second on its work-loop completion path.
 The first wait and release are `WaitForSingleObject` and `ReleaseSemaphore`
 from `api-ms-win-core-synch-l1-1-0.dll`.
 
-The audited six-scalar `CreateThread` bridge accepts only flags zero and
-null security, from the EXE entry or an existing worker start routine. It
+The audited six-scalar `CreateThread` bridge accepts only flags zero or
+`CREATE_SUSPENDED` and null security, from the EXE entry or an existing worker start routine. It
 validates the start against sealed executable PE contents and any active
 CFG policy. It creates a genuine host thread (up to 32 concurrent workers),
 with guarded stack space at least as large as the request plus host bridge
@@ -496,8 +496,21 @@ handle does not stop the worker. Its object signals after thread detach,
 while separate host join ownership ensures workers are gone before process
 detach and mapping/CFG teardown. If the EXE returns and any workers fail to
 finish within 500 ms, the child exits with a diagnostic without running
-process detach. No suspended creation, `ExitThread`, forced termination,
+process detach. No `SuspendThread`, `ExitThread`, forced termination,
 alertable/multiple waits, or Windows exception unwinding is added.
+
+The second observed `CreateThread` call (return PC `0x141ad1076`) requests
+`CREATE_SUSPENDED`, a `0x57800`-byte stack, and entry RVA `0x2215ea0`. The
+caller stores the returned handle in its parameter record, then invokes
+`SetThreadPriority`, `GetThreadGroupAffinity`, `SetThreadGroupAffinity`, and
+`ResumeThread`. The guest entry reads that published handle before invoking
+its inner routine. The startup gate parks the real worker before thread
+notifications and entry; the typed `ResumeThread` bridge requires
+`THREAD_SUSPEND_RESUME` and returns the previous count (one at first release,
+zero if already unsuspended), preserving LastError on success. Closing the
+handle neither resumes nor kills the worker. An unresumed worker at teardown
+is covered by the same bounded fail-closed drain. This does not implement
+priority or affinity APIs, or suspension after launch.
 
 `CreateEventA` uses a four-argument bridge. The direct calls and tail thunk
 referencing IAT RVA `0x6793ab0` pass null security and name, manual-reset

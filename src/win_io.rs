@@ -332,14 +332,38 @@ pub(crate) mod native {
     }
 
     #[cfg(target_os = "macos")]
-    #[derive(Default)]
+    const THREAD_SUSPEND_RESUME: u32 = 2;
+    #[cfg(target_os = "macos")]
+    const THREAD_RIGHTS: u32 = SYNCHRONIZE | THREAD_SUSPEND_RESUME;
+
+    #[cfg(target_os = "macos")]
     pub(crate) struct ThreadCompletion {
+        suspended: Mutex<bool>,
+        resumed: Condvar,
         exit_code: Mutex<Option<u32>>,
         exited: Condvar,
     }
 
     #[cfg(target_os = "macos")]
     impl ThreadCompletion {
+        pub(crate) fn await_start(&self) {
+            drop(
+                self.resumed
+                    .wait_while(lock(&self.suspended), |s| *s)
+                    .unwrap_or_else(|_| std::process::abort()),
+            );
+        }
+
+        fn resume(&self) -> u32 {
+            let mut suspended = lock(&self.suspended);
+            if std::mem::replace(&mut *suspended, false) {
+                self.resumed.notify_one();
+                1
+            } else {
+                0
+            }
+        }
+
         pub(crate) fn finish(&self, code: u32) {
             *lock(&self.exit_code) = Some(code);
             self.exited.notify_all();
@@ -371,14 +395,36 @@ pub(crate) mod native {
     }
 
     #[cfg(target_os = "macos")]
-    pub(crate) fn new_thread_handle() -> Result<(usize, Arc<ThreadCompletion>)> {
-        let completion = Arc::new(ThreadCompletion::default());
+    pub(crate) fn new_thread_handle(suspended: bool) -> Result<(usize, Arc<ThreadCompletion>)> {
+        let completion = Arc::new(ThreadCompletion {
+            suspended: Mutex::new(suspended),
+            resumed: Condvar::new(),
+            exit_code: Mutex::new(None),
+            exited: Condvar::new(),
+        });
         let handle = lock(&STATE).insert(Entry {
             obj: Arc::new(Object::Thread(completion.clone())),
-            access: SYNCHRONIZE,
+            access: THREAD_RIGHTS,
             inheritable: false,
         })?;
         Ok((handle, completion))
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) extern "win64" fn resume_thread(handle: usize) -> u32 {
+        ret(
+            (|| {
+                let e = entry(handle)?;
+                let Object::Thread(thread) = &*e.obj else {
+                    return Err(BAD_HANDLE);
+                };
+                if e.access & THREAD_SUSPEND_RESUME == 0 {
+                    return Err(ACCESS);
+                }
+                Ok(thread.resume())
+            })(),
+            u32::MAX,
+        )
     }
 
     enum Object {
@@ -1063,7 +1109,7 @@ pub(crate) mod native {
                 let requested = match &*e.obj {
                     Object::Semaphore { .. } => sync_access(access, SEMAPHORE_ALL_ACCESS)?,
                     #[cfg(target_os = "macos")]
-                    Object::Thread(_) => sync_access(access, SYNCHRONIZE)?,
+                    Object::Thread(_) => sync_access(access, THREAD_RIGHTS)?,
                     Object::Event { .. } => sync_access(access, EVENT_ALL_ACCESS)?,
                     Object::Mutex { .. } => sync_access(access, MUTEX_ALL_ACCESS)?,
                     _ => access_mask(access)?,
@@ -1080,6 +1126,45 @@ pub(crate) mod native {
             }
             Ok(())
         })())
+    }
+
+    #[cfg(all(target_os = "macos", test))]
+    #[test]
+    fn resume_is_typed_and_needs_suspend_resume_rights() {
+        use crate::providers::native::get_last_error;
+
+        let (original, thread) = new_thread_handle(true).unwrap();
+        let mut wait_only = 0;
+        let mut resume_only = 0;
+        for (out, rights) in [
+            (&mut wait_only, SYNCHRONIZE),
+            (&mut resume_only, THREAD_SUSPEND_RESUME),
+        ] {
+            assert_eq!(
+                unsafe { DuplicateHandle(INVALID, original, INVALID, out, rights, 0, 0) },
+                1
+            );
+        }
+        assert_eq!(resume_thread(wait_only), u32::MAX);
+        assert_eq!(get_last_error(), ACCESS);
+        let sem = create_semaphore_w(ptr::null(), 0, 1, ptr::null());
+        assert_ne!(sem, 0);
+        assert_eq!(resume_thread(sem), u32::MAX);
+        assert_eq!(get_last_error(), BAD_HANDLE);
+        assert_eq!(CloseHandle(original), 1);
+        set_last_error(0x1234);
+        assert_eq!(resume_thread(resume_only), 1);
+        thread.await_start();
+        assert_eq!(resume_thread(resume_only), 0);
+        assert_eq!(get_last_error(), 0x1234);
+        assert_eq!(wait_for_single_object(resume_only, 0), WAIT_FAILED);
+        assert_eq!(get_last_error(), ACCESS);
+        assert_eq!(wait_for_single_object(wait_only, 0), WAIT_TIMEOUT);
+        thread.finish(0);
+        assert_eq!(wait_for_single_object(wait_only, 0), WAIT_OBJECT_0);
+        for h in [sem, wait_only, resume_only] {
+            assert_eq!(CloseHandle(h), 1);
+        }
     }
 
     #[test]

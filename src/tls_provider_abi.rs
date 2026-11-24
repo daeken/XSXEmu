@@ -234,6 +234,8 @@ audited_bridges! {
     // may enter it, via the checked SysV -> Win64 boundary.
     xsxemu_tls_create_thread, create_thread: b"kernelbase.dll", b"CreateThread",
         super::create_thread, (security: *const c_void, stack: usize, start: u64, parameter: u64, flags: u32, id: *mut u32) -> usize;
+    xsxemu_tls_resume_thread, resume_thread: b"kernelbase.dll", b"ResumeThread",
+        io::resume_thread, (handle: usize) -> u32;
     xsxemu_tls_close_handle, close_handle: b"kernelbase.dll", b"CloseHandle",
         io::CloseHandle, (handle: usize) -> i32;
     xsxemu_tls_create_semaphore_ex_w, create_semaphore_ex_w: b"kernelbase.dll", b"CreateSemaphoreExW",
