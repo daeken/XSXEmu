@@ -515,6 +515,45 @@ the stored handle. This proves a queue handle has lifecycle obligations;
 it does not establish that cleanup or other queue work executes before
 device creation. No owned or real runtime was run for this ABI audit.
 
+Public GDK semantics bound an original implementation of that path:
+
+- [Dispatch modes][gdk-queue-mode] are 32-bit: Manual=0, ThreadPool=1,
+  SerializedThreadPool=2, Immediate=3. The observed `1, 1` requests
+  automatic thread-pool dispatch for both ports, **not** manual dispatch.
+  Manual mode requires an explicit pump. [Dispatch][gdk-queue-dispatch]
+  can service any mode on its calling thread; timeout zero does not wait,
+  and the boolean result is false if nothing was dispatched or the queue
+  is terminated.
+- [Create][gdk-queue-create] returns an HRESULT and a reference-counted
+  opaque queue handle on success (one 64-bit guest output slot here).
+  This ownership is independent of the interface reference balanced by
+  [COM Release][com-release]. [Close][gdk-queue-close] drops the queue
+  reference but does not cancel pending callbacks. [Terminate][gdk-queue-stop]
+  drains with canceled callbacks, rejects new submissions with `E_ABORT`
+  as each port shuts down, and does not close the handle. The public
+  Create page does not specify exact invalid-argument HRESULTs or the
+  failure output value.
+- [The time-sensitive assertion][gdk-thread-assert] only breaks into an
+  attached debugger on a thread marked time-sensitive. With no debugger
+  it has no externally visible effect. The interface slot takes `this`
+  but no explicit arguments.
+
+A startup-only profile can implement real local initialized state,
+interface references, and empty queue ownership with both requested modes
+recorded. It must not claim full queue support: without a guest callback
+execution path, reject unsupported submission rather than accepting work
+and losing it. Non-null init options, additional classes and slots, queue
+callbacks/cancellation with pending work, and guest thread-pool execution
+remain outside this call-site proof.
+
+[gdk-queue-mode]: https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xtaskqueue/enums/xtaskqueuedispatchmode
+[gdk-queue-dispatch]: https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xtaskqueue/functions/xtaskqueuedispatch
+[gdk-queue-create]: https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xtaskqueue/functions/xtaskqueuecreate
+[gdk-queue-close]: https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xtaskqueue/functions/xtaskqueueclosehandle
+[gdk-queue-stop]: https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xtaskqueue/functions/xtaskqueueterminate
+[gdk-thread-assert]: https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xthread/functions/xthreadassertnottimesensitive
+[com-release]: https://learn.microsoft.com/en-us/windows/win32/api/unknwn/nf-unknwn-iunknown-release
+
 Local input inventory was limited to loose files in the title directory,
 its `win11-arm64-reference` tree, the standalone `windlls` tree, and a
 bounded filename search in nearby projects, downloads, ISO and VM
