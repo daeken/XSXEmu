@@ -228,7 +228,7 @@ pub(crate) mod native {
     fn boolean(r: Result<()>) -> i32 {
         ret(r.map(|()| 1), 0)
     }
-    pub(in crate::providers) fn win_err(e: io::Error) -> u32 {
+    pub(crate) fn win_err(e: io::Error) -> u32 {
         use io::ErrorKind::*;
         match e.kind() {
             NotFound => FILE_NOT_FOUND,
@@ -2132,7 +2132,16 @@ pub(crate) mod native {
         }
     }
     unsafe fn attribute_metadata(name: *const u16) -> Result<Metadata> {
-        let p = unsafe { path(name)? };
+        let name = unsafe { wide(name)? };
+        #[cfg(target_os = "macos")]
+        if name
+            .as_bytes()
+            .get(..2)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"G:"))
+        {
+            return crate::title_data::open(&name).and_then(|f| f.metadata().map_err(win_err));
+        }
+        let p = resolve(&name, false)?;
         fs::symlink_metadata(&p).map_err(|e| path_err(e, &p))
     }
     pub(crate) unsafe extern "win64" fn GetFileAttributesW(name: *const u16) -> u32 {

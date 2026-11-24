@@ -1,0 +1,98 @@
+//! Explicit read-only guest G: mount. Each lookup is relative to a pinned
+//! directory descriptor and never follows links inside the mounted tree.
+use std::{
+    ffi::CString,
+    fs::{File, OpenOptions},
+    io,
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::fs::OpenOptionsExt,
+    },
+    path::Path,
+    sync::OnceLock,
+};
+
+// Darwin <sys/fcntl.h>; O_RDONLY is zero.
+const O_NONBLOCK: i32 = 0x4;
+const O_NOFOLLOW: i32 = 0x100;
+const O_DIRECTORY: i32 = 0x10_0000;
+const O_CLOEXEC: i32 = 0x100_0000;
+const FLAGS: i32 = O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC;
+static ROOT: OnceLock<File> = OnceLock::new();
+
+pub(crate) fn mount(path: &Path) -> crate::Result<()> {
+    let root = OpenOptions::new()
+        .read(true)
+        .custom_flags(FLAGS | O_DIRECTORY)
+        .open(path)
+        .map_err(|e| format!("cannot mount --title-data {}: {e}", path.display()))?;
+    ROOT.set(root)
+        .map_err(|_| "title-data root already mounted")?;
+    Ok(())
+}
+
+pub(crate) fn open(name: &str) -> Result<File, u32> {
+    open_under(ROOT.get(), name)
+}
+
+fn open_under(root: Option<&File>, name: &str) -> Result<File, u32> {
+    let root = root.ok_or(15u32)?; // ERROR_INVALID_DRIVE
+    let tail = name
+        .get(2..)
+        .filter(|_| {
+            name.as_bytes()
+                .get(..2)
+                .is_some_and(|p| p.eq_ignore_ascii_case(b"G:"))
+        })
+        .and_then(|s| s.strip_prefix(['\\', '/']))
+        .ok_or(123u32)?;
+    if tail.is_empty() {
+        return root
+            .try_clone()
+            .map_err(crate::providers::win_io::native::win_err);
+    }
+    let mut components = tail.split(['\\', '/']).peekable();
+    let mut parent: Option<File> = None;
+    while let Some(component) = components.next() {
+        if component.is_empty()
+            || component.ends_with(['.', ' '])
+            || component.contains(|c: char| c.is_control() || "<>:\"|*?".contains(c))
+        {
+            return Err(123); // ERROR_INVALID_NAME, including '.' and '..'
+        }
+        let leaf = components.peek().is_none();
+        let component = CString::new(component).map_err(|_| 123u32)?;
+        unsafe extern "C" {
+            fn openat(fd: i32, path: *const std::ffi::c_char, flags: i32, ...) -> i32;
+        }
+        let fd = unsafe {
+            openat(
+                parent.as_ref().unwrap_or(root).as_raw_fd(),
+                component.as_ptr(),
+                FLAGS | if leaf { 0 } else { O_DIRECTORY },
+            )
+        };
+        if fd < 0 {
+            let e = io::Error::last_os_error();
+            return Err(match e.raw_os_error() {
+                Some(62) => 5, // Darwin ELOOP: link refused
+                Some(20) => 3, // Darwin ENOTDIR
+                Some(2) if !leaf => 3,
+                _ => crate::providers::win_io::native::win_err(e),
+            });
+        }
+        let file = unsafe { File::from_raw_fd(fd) };
+        if leaf {
+            let m = file
+                .metadata()
+                .map_err(crate::providers::win_io::native::win_err)?;
+            return if m.is_file() || m.is_dir() {
+                Ok(file)
+            } else {
+                Err(5)
+            };
+        }
+        parent = Some(file);
+    }
+    unreachable!("nonempty mount path has a component")
+}

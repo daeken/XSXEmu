@@ -11,6 +11,8 @@ mod guest_entropy;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 mod import_traps;
 mod link;
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+mod title_data;
 use xsxemu::pe;
 mod providers;
 mod startup;
@@ -57,6 +59,7 @@ const USAGE: &str = "Usage: xsxemu <inspect|map|audit|run> <image.exe> [options]
     run option: --map-extra-dll PATH  Map an extra PE DLL (trusted-offline static TLS only)\n\
     run option: --xgameruntime-compat  Model pinned XGameRuntime startup (trusted-offline static TLS with Rust providers)\n\
     run option: --xgameruntime-dll PATH  Admit an explicit xgameruntime.dll (trusted-offline static TLS with Rust providers)\n\
+    run option: --title-data DIR  Mount read-only guest G: for title data (trusted-offline static TLS with Rust providers)\n\
     run option: --dstorage-factory  Enable the root Xbox DirectStorage CPU staging foundation (trusted-offline static TLS with Rust providers)\n\
     run option: --gameinput-no-devices  Model the root GameInput #1 import with no devices (trusted-offline static TLS with Rust providers)\n\
     run option: --guest-entropy  Map the built-in entropy DLL (trusted-offline static TLS with Rust providers)\n\
@@ -100,6 +103,7 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
     let mut xgameruntime_dll = None;
     let mut xgameruntime_compat = false;
     let mut dstorage_factory = false;
+    let mut title_data: Option<PathBuf> = None;
     let mut gameinput_no_devices = false;
     let mut guest_entropy = false;
     let mut startup_profile = None;
@@ -135,6 +139,11 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
             ("run", Some("--trace-missing-imports")) => trace_missing_imports = true,
             ("run", Some("--experimental-static-tls")) => experimental_tls = true,
             ("run", Some("--trusted-offline")) => trusted_offline = true,
+            ("run", Some("--title-data")) if title_data.is_none() => {
+                title_data = Some(PathBuf::from(
+                    options.next().ok_or("--title-data requires a directory")?,
+                ));
+            }
             ("run", Some("--dstorage-factory")) => dstorage_factory = true,
             ("run", Some("--gameinput-no-devices")) => gameinput_no_devices = true,
             ("run", Some("--guest-entropy")) => guest_entropy = true,
@@ -159,6 +168,9 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
             }
             _ => return Err(format!("unexpected option {arg:?}\n{USAGE}").into()),
         }
+    }
+    if title_data.is_some() && !(trusted_offline && experimental_tls && rust_providers) {
+        return Err("--title-data requires --trusted-offline, --experimental-static-tls and --rust-providers".into());
     }
     if dstorage_factory && !(trusted_offline && experimental_tls && rust_providers) {
         return Err("--dstorage-factory requires --trusted-offline, --experimental-static-tls and --rust-providers".into());
@@ -204,6 +216,10 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
                 return tls_runtime::spawn_child(&image, &args);
             }
         }
+    }
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    if let Some(path) = title_data.as_deref() {
+        title_data::mount(path)?;
     }
     let schema = schema
         .map(|path| -> Result<_> {

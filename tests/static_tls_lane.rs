@@ -1765,6 +1765,67 @@ fn sleep_bridge_delays_and_preserves_guest_last_error() {
     expect(output, 57, "Guest entry returned 57");
 }
 
+#[test]
+fn title_data_mount_is_explicit_and_confines_guest_attributes() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let root = scratch.0.join("mounted");
+    fs::create_dir_all(root.join("nested")).unwrap();
+    fs::write(root.join("nested/archive.rpf"), b"owned fixture").unwrap();
+    let outside = scratch.write("outside.rpf", b"not mounted");
+    std::os::unix::fs::symlink(&outside, root.join("link.rpf")).unwrap();
+    std::os::unix::fs::symlink(&scratch.0, root.join("escape")).unwrap();
+    let root = root.to_str().unwrap();
+    let mut exe = image(Kind::Solo);
+    exe[file(TEXT)..file(TEXT) + RAW].fill(0xcc);
+    // ret (TLS callback); sub rsp,40; lea rcx,[rip+path];
+    // call [rip+IAT]; test sign -> return 0 on found, 1 on invalid attrs.
+    let mut code = vec![0xc3, 0x48, 0x83, 0xec, 0x28, 0x48, 0x8d, 0x0d];
+    code.extend_from_slice(&((MODULE_PATHS - TEXT - 12) as i32).to_le_bytes());
+    code.extend_from_slice(&[0xff, 0x15]);
+    code.extend_from_slice(&((IAT - TEXT - 18) as i32).to_le_bytes());
+    code.extend_from_slice(&[0xc1, 0xe8, 0x1f, 0x48, 0x83, 0xc4, 0x28, 0xc3]);
+    put(&mut exe, file(TEXT), &code);
+    w32(&mut exe, OP + 16, TEXT + 1);
+    w64(&mut exe, file(ARRAY), PREFERRED + TEXT);
+    dir_import_one(
+        &mut exe,
+        b"api-ms-win-core-file-l1-1-0.dll\0",
+        b"GetFileAttributesW\0",
+    );
+    let write = |name: &str| {
+        let mut exe = exe.clone();
+        for (i, unit) in name.encode_utf16().chain(Some(0)).enumerate() {
+            w16(&mut exe, file(MODULE_PATHS) + 2 * i, usize::from(unit));
+        }
+        scratch.write("title-data.exe", &exe)
+    };
+    let p = write(r"g:\nested\archive.rpf");
+    expect(
+        run(&p, &[OPT, TRUSTED, "--rust-providers"]),
+        1,
+        "Guest entry returned 1",
+    );
+    expect(
+        run(&p, &[OPT, "--rust-providers", "--title-data", root]),
+        1,
+        "--title-data requires",
+    );
+    let flags = [OPT, TRUSTED, "--rust-providers", "--title-data", root];
+    expect(run(&p, &flags), 0, "Guest entry returned 0");
+    for denied in [
+        r"G:\..\outside.rpf",
+        r"G:\link.rpf",
+        r"G:\escape\outside.rpf",
+        r"G:outside.rpf",
+        r"G:\nested\missing.rpf",
+    ] {
+        expect(run(&write(denied), &flags), 1, "Guest entry returned 1");
+    }
+}
+
 const GEO_CODE_CAPACITY: usize = 0x200;
 
 #[repr(C)]

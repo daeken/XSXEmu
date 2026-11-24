@@ -644,9 +644,19 @@ remain unsupported. Do not mix this word encoding with other SRW implementations
 `GetModuleFileNameW(NULL, ...)` with `xgameruntime.dll`. It tests only for
 `INVALID_FILE_ATTRIBUTES`, not individual bits. The provider shares the
 UTF-16 path rules, metadata lookup (without following the final symlink),
-and attribute bits of `GetFileAttributesExW`. It opens no file handle,
-searches no DLL roots, and adds no path mappings. Success preserves guest
+and attribute bits of `GetFileAttributesExW`. Neither returns a file handle
+or searches DLL roots. Success preserves guest
 LastError; failure returns `INVALID_FILE_ATTRIBUTES` and sets guest LastError.
+
+`run --experimental-static-tls --trusted-offline --rust-providers --title-data DIR`
+exposes the selected directory as a read-only guest `G:` drive for those
+attribute probes. The drive is absent by default. Lookups require an absolute
+`G:\` or `G:/` path, match component spelling according to the host volume,
+and reject traversal and links inside the mounted directory. Lookup is
+relative to pinned directory descriptors; generic file creation, writes and
+other drives are unchanged. This does not implement DirectStorage `OpenFile`
+or archive reads. The observed archive probe (return RVA `0x28c8bfe`) checks
+for `INVALID_FILE_ATTRIBUTES` before proceeding to the DirectStorage method.
 
 **Scarlett XGameRuntime startup.** The trace at `8eb79ce` reaches
 `GetFileAttributesW`, `LoadLibraryExW`, and `ReleaseSRWLockExclusive`, then
