@@ -41,3 +41,25 @@ PE_CC=/path/to/x86_64-w64-mingw32-clang sh tools/smoke.sh
 ```
 
 The smoke test checks that missing providers fail, then runs an EXE that relocates a DLL, calls its named and ordinal exports, and returns 42 only after successful DLL process attach. A separate fixture verifies that static TLS is reported and refused before entry until a guest TEB is available. The last fixture links against a legacy Windows API-set contract and round-trips last-error state through the Rust provider without a system DLL on disk.
+
+### Local AMD64 UCRT fixture (static by default)
+
+```sh
+rustup target add x86_64-pc-windows-gnullvm
+sh tools/ucrt-fixture.sh
+```
+
+The script builds an original freestanding Rust `no_std` PE using `rustc` and its bundled `rust-lld` (tested with Rust 1.99.1). It uses no Windows SDK, C compiler, CRT startup objects, or proprietary import libraries. The generated import library contains only references to `ucrtbase.dll!malloc` and `ucrtbase.dll!free`. The linker omits the build timestamp; the script prints the EXE hash to check reproducibility with the same toolchain and removes the temp build on exit.
+
+The script requires `/Volumes/External2/windlls/ucrtbase.dll` with SHA-256 `7ee229626b22799faa28cd7c22d4ff2ad0603c17e5f5ee9086fa7cf6483331fb`. It symlinks that file into an otherwise empty DLL root and uses Rust Win32 providers; sibling Windows DLLs are not searched. The default schema is `/Volumes/External2/gta6/win11-arm64-reference/apisetschema.dll` (only its API-set data is read); set `UCRT_API_SET` to an absolute path to use another local schema. Neither DLL is copied or redistributed.
+
+The default invocation builds a native-host auditor, inspects the EXE, and runs `audit --dll-dir <isolated-root> --api-set <schema> --rust-providers --symbols`. On the fixture's baseline with the default schema, both EXE imports bind, but 20 of the UCRT's 134 IAT slots remain unresolved (for example `HeapCompact` and `RaiseException`): **116/136 resolved, 114 Rust, 0 descriptor failures**. The underlying audit exits nonzero; the script treats the confirmed unresolved-import report as a successful diagnostic. Provider or schema changes can change those counts. No guest code runs in the default mode.
+
+**Future opt-in, not verified:** once the runtime supports `--trace-missing-imports`, use an x86-64 macOS Rust target (and Rosetta on Apple Silicon):
+
+```sh
+rustup target add x86_64-apple-darwin
+sh tools/ucrt-fixture.sh --run
+```
+
+This audits first, then invokes `run <fixture.exe> --dll-dir <isolated-root> --api-set <schema> --rust-providers --trace-missing-imports`. The static import makes the loader map UCRT and call its `DLL_PROCESS_ATTACH` before the EXE entry. The EXE allocates four bytes with `malloc`, writes and reads a marker, calls `free`, and returns 42 on success (1 for a null allocation, 2 for a marker mismatch). Startup or a called missing import can stop the run before a guest result. A static audit does not establish that attach, the heap calls, or detach work. Execution is not sandboxed; this opt-in is for the trusted fixture and pinned local DLL only, never a game title.
