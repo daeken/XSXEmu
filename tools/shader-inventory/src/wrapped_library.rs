@@ -121,9 +121,28 @@ impl GraphicsCoverage {
 
 fn layout_extent(blob: &[u8]) -> Option<(usize, usize)> {
     let count = word(blob, 76)?;
-    let end = 80usize.checked_add(count.checked_mul(36)?)?;
-    let rest = blob.get(end..)?;
-    (matches!(rest.len(), 0 | 4 | 8) && rest.iter().all(|&b| b == 0)).then_some((count, rest.len()))
+    let mut cursor = 80usize;
+    if count > blob.len().checked_sub(cursor)? / 30 {
+        return None;
+    }
+    for _ in 0..count {
+        let n = word(blob, cursor)?;
+        if !(2..=256).contains(&n) {
+            return None;
+        }
+        let start = cursor.checked_add(4)?;
+        let stop = start.checked_add(n)?;
+        let (&0, name) = blob.get(start..stop)?.split_last()? else {
+            return None;
+        };
+        if !name.is_ascii() || name.contains(&0) {
+            return None;
+        }
+        cursor = stop.checked_add(24)?;
+    }
+    let rest = blob.get(cursor..)?;
+    (rest.len() == (4 - cursor % 4) % 4 && rest.iter().all(|&b| b == 0))
+        .then_some((count, rest.len()))
 }
 
 fn digest(blob: &[u8]) -> Option<[u8; 16]> {
@@ -520,7 +539,7 @@ pub(super) fn run(
     );
     for (slots, counts) in vs_layout {
         println!(
-            "  VS ordinary input row count versus layout block count, slots {slots:?} [equal, different, missing source, divergent source counts, unsupported extent]: {counts:?}"
+            "  VS ordinary input row count versus layout record count, slots {slots:?} [equal, different, missing source, divergent source counts, unsupported extent]: {counts:?}"
         );
     }
     for ((slot, multi), c) in source_links {
@@ -657,16 +676,24 @@ mod tests {
     }
 
     #[test]
-    fn layout_extent_uses_checked_count_and_exact_zero_suffix() {
-        let mut bytes = [0u8; 124];
-        bytes[76..80].copy_from_slice(&1u32.to_le_bytes());
-        assert_eq!(layout_extent(&bytes), Some((1, 8)));
-        assert_eq!(layout_extent(&bytes[..120]), Some((1, 4)));
-        assert_eq!(layout_extent(&bytes[..116]), Some((1, 0)));
-        assert_eq!(layout_extent(&bytes[..118]), None);
-        assert_eq!(layout_extent(&bytes[..115]), None);
-        bytes[123] = 1;
+    fn layout_extent_uses_dense_variable_records_and_exact_zero_padding() {
+        let mut bytes = [0u8; 144];
+        bytes[76..80].copy_from_slice(&2u32.to_le_bytes());
+        bytes[80..84].copy_from_slice(&3u32.to_le_bytes());
+        bytes[84..87].copy_from_slice(b"XY\0");
+        bytes[111..115].copy_from_slice(&2u32.to_le_bytes());
+        bytes[115..117].copy_from_slice(b"Z\0");
+        assert_eq!(layout_extent(&bytes), Some((2, 3)));
+        assert_eq!(layout_extent(&bytes[..143]), None);
+        bytes[143] = 1;
         assert_eq!(layout_extent(&bytes), None);
+        bytes[143] = 0;
+        bytes[85] = 0;
+        assert_eq!(layout_extent(&bytes), None);
+        bytes[85] = b'Y';
+        bytes[116] = b'X';
+        assert_eq!(layout_extent(&bytes), None);
+        bytes[116] = 0;
         bytes[76..80].copy_from_slice(&u32::MAX.to_le_bytes());
         assert_eq!(layout_extent(&bytes), None);
     }
