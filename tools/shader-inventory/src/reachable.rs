@@ -383,6 +383,66 @@ fn branch_entries<T>(graph: &BTreeMap<usize, Instruction<T>>) -> BTreeSet<usize>
     entries
 }
 
+type Cut = Option<Option<(usize, usize)>>; // ordinary node / opaque cut / (window start, candidate target)
+
+fn closed_projection(graph: &BTreeMap<usize, Instruction<Cut>>) -> &'static str {
+    let mut entries = branch_entries(graph);
+    for op in graph.values() {
+        match op.op {
+            Some(Some((_, target))) if graph.contains_key(&target) => {
+                entries.insert(target);
+            }
+            Some(_) => return "unresolved cut",
+            None => (),
+        }
+    }
+    for (&pc, op) in graph {
+        if let Some(Some((start, _))) = op.op
+            && entries
+                .range((Excluded(start), Included(pc)))
+                .next()
+                .is_some()
+        {
+            return "entry inside materialization";
+        }
+    }
+    // Check the hypothesis from original entry, not from all root offsets.
+    let (mut pending, mut reached, mut exit) = (vec![0], BTreeSet::new(), false);
+    while let Some(pc) = pending.pop() {
+        if !reached.insert(pc) {
+            continue;
+        }
+        let Some(op) = graph.get(&pc) else {
+            return "unresolved successor";
+        };
+        if let Some(Some((_, target))) = op.op {
+            pending.push(target);
+            continue;
+        }
+        let next = pc + op.width;
+        match op.flow {
+            Flow::Stop => exit = true,
+            Flow::Next => pending.push(next),
+            Flow::Jump(delta) | Flow::Fork(delta) => {
+                let Some(target) = cfg::relative(next, delta) else {
+                    return "unresolved successor";
+                };
+                pending.push(target);
+                if matches!(op.flow, Flow::Fork(_)) {
+                    pending.push(next);
+                }
+            }
+        }
+    }
+    if reached.len() != graph.len() {
+        "unreachable projection nodes"
+    } else if !exit {
+        "no genuine exit"
+    } else {
+        "closed hypothesis with exit"
+    }
+}
+
 #[derive(Default)]
 struct IndirectFrontier {
     incomplete: BTreeMap<&'static str, usize>,
@@ -396,6 +456,7 @@ struct IndirectFrontier {
     extension_cuts: usize,
     extension_cut_windows: BTreeMap<TargetOverlap, usize>,
     new_branch_entries_into_original_windows: usize,
+    closure: BTreeMap<&'static str, usize>,
 }
 
 impl IndirectFrontier {
@@ -486,7 +547,9 @@ impl IndirectFrontier {
             .into_iter()
             .filter(|&pc| frontier_target(&graph, pc) == TargetOverlap::Unvisited)
             .collect();
-        if !roots.is_empty() {
+        if roots.is_empty() {
+            *self.closure.entry(closed_projection(&graph)).or_default() += 1;
+        } else {
             self.additional_roots += roots.len();
             let original = graph.len();
             let earlier_cuts: BTreeMap<_, _> = graph
@@ -500,6 +563,10 @@ impl IndirectFrontier {
             });
             let outcome = match extension {
                 Ok(expanded) => {
+                    *self
+                        .closure
+                        .entry(closed_projection(&expanded))
+                        .or_default() += 1;
                     self.extension_nodes += expanded.len() - original;
                     let expanded_entries = branch_entries(&expanded);
                     let new_entries: BTreeSet<_> =
@@ -750,6 +817,10 @@ impl Report {
             self.indirect_frontier.extension_cut_windows
         );
         println!(
+            "Indirect-cut reference closure hypotheses: {:?}",
+            self.indirect_frontier.closure
+        );
+        println!(
             "Backend triage (not translated): small-wave32-filter={} with-execz-and-uint-gt-cmpx={} with-scc-branch={} single-raw-store-1x1x1={} smallest-single-store-nodes={:?}",
             self.shortlisted,
             self.exec_branch_and_cmpx_gt,
@@ -950,6 +1021,44 @@ mod tests {
             materialize(19).classify(6, 4, 0xbe80_2014, 32),
             IndirectShape::RelativeLiteralUnaligned
         );
+    }
+
+    #[test]
+    fn reference_closure_requires_window_entry_and_a_noncut_exit() {
+        let mut graph = BTreeMap::from([
+            (
+                0,
+                Instruction {
+                    width: 1,
+                    flow: Flow::Next,
+                    op: None,
+                },
+            ),
+            (
+                1,
+                Instruction {
+                    width: 1,
+                    flow: Flow::Stop,
+                    op: Some(Some((0, 2))),
+                },
+            ),
+            (
+                2,
+                Instruction {
+                    width: 1,
+                    flow: Flow::Stop,
+                    op: None,
+                },
+            ),
+        ]);
+        assert_eq!(closed_projection(&graph), "closed hypothesis with exit");
+        graph.get_mut(&1).unwrap().op = Some(Some((0, 1)));
+        assert_eq!(closed_projection(&graph), "entry inside materialization");
+        graph.get_mut(&1).unwrap().op = Some(Some((0, 3)));
+        assert_eq!(closed_projection(&graph), "unresolved cut");
+        graph.get_mut(&1).unwrap().op = Some(Some((0, 0)));
+        graph.remove(&2);
+        assert_eq!(closed_projection(&graph), "no genuine exit");
     }
 
     #[test]
