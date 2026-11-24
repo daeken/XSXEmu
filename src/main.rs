@@ -5,6 +5,7 @@ mod link;
 mod pe;
 mod providers;
 mod startup;
+mod win_cfg;
 
 use pe::{ExportTarget, ImportSymbol, Pe};
 use std::{
@@ -191,6 +192,33 @@ fn inspect(path: &Path, symbols: bool) -> Result<()> {
     }
     if let Some(cookie) = pe.security_cookie_rva()? {
         println!("  security cookie RVA {cookie:#x}");
+    }
+    match win_cfg::CfgMetadata::parse(&pe) {
+        Ok(Some(cfg)) => {
+            use win_cfg::ExportSuppression;
+            let candidates = cfg
+                .entries()
+                .filter(|entry| cfg.permits_rva(entry.rva, ExportSuppression::Disabled))
+                .count();
+            let suppressed = cfg
+                .entries()
+                .filter(|entry| !cfg.permits_rva(entry.rva, ExportSuppression::Enabled))
+                .count();
+            println!(
+                "  GuardCF: flags={:#x} table RVA={:#x} entries={} stride={} check RVA={:#x} dispatch RVA={:#x}",
+                cfg.flags(),
+                cfg.table_rva(),
+                cfg.entries().len(),
+                cfg.stride(),
+                cfg.check_slot_rva(),
+                cfg.dispatch_slot_rva()
+            );
+            println!(
+                "  GuardCF static policy: {candidates} candidates without export suppression; {suppressed} suppressed with export suppression"
+            );
+        }
+        Ok(None) => {}
+        Err(err) => println!("  GuardCF profile unsupported: {err}"),
     }
     println!("  {} DIR64 relocations", pe.relocations()?.len());
     Ok(())
