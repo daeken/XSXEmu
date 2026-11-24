@@ -149,6 +149,29 @@ pub(super) fn vs_outputs(osg: &[u8]) -> Option<VsOutputProjection> {
     Some(projection)
 }
 
+/// Keep mesh vertex outputs and primitive declarations in separate groups.
+/// OSG1 is compared only for the checked profile with no primitive signature.
+pub(super) fn mesh_vertex_outputs(osg: &[u8], psv: &[u8]) -> Option<VsOutputProjection> {
+    let resources = resource_rows(psv, 13)?;
+    let at = if resources.is_empty() {
+        60
+    } else {
+        64 + resources.len()
+    };
+    let ([inputs, vertices, primitives], suffix) = psv_elements(psv, at)?;
+    if !inputs.is_empty()
+        || !primitives.is_empty()
+        || !suffix.is_empty()
+        || psv[30] != 0
+        || psv[29] != 0
+        || psv[35] != 0
+        || Some(vertices.len()) != word(osg, 0)
+    {
+        return None;
+    }
+    vs_outputs(osg)
+}
+
 /// Source declaration flag only; no assumption about native export channels.
 pub(super) fn ps_depth_declared(psv: &[u8]) -> Option<bool> {
     resource_rows(psv, 0)?;
@@ -1337,6 +1360,28 @@ mod tests {
         psv[30] = 1;
         got.add(&psv).unwrap();
         assert_eq!((got.out_of_bounds, got.vectors_without_stream), (1, 1));
+    }
+
+    #[test]
+    fn mesh_vertex_projection_requires_empty_primitive_signature() {
+        let mut psv = [0u8; 72];
+        psv[0] = 52;
+        psv[28] = 13;
+        psv[16] = 3;
+        psv[18] = 4; // Nonzero primitive limit is not a primitive signature.
+        psv[60] = 4;
+        psv[64] = b'm'; // Owned entry name.
+        let empty_osg = [0, 0, 0, 0, 8, 0, 0, 0];
+        assert!(mesh_vertex_outputs(&empty_osg, &psv).is_some());
+        psv[30] = 1;
+        assert!(mesh_vertex_outputs(&empty_osg, &psv).is_none());
+        psv[30] = 0;
+        psv[34] = 1;
+        assert!(mesh_vertex_outputs(&empty_osg, &psv).is_none());
+        psv[34] = 0;
+        let mut unmatched = empty_osg;
+        unmatched[0] = 1;
+        assert!(mesh_vertex_outputs(&unmatched, &psv).is_none());
     }
 
     #[test]

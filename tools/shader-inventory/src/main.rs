@@ -373,8 +373,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if first == "--reachable-graphics"
         || first == "--wrapped-ps-exports"
         || first == "--wrapped-vs-exports"
+        || first == "--wrapped-ms-exports"
     {
-        let usage = "usage: xsx-shader-inventory <--reachable-graphics|--wrapped-ps-exports|--wrapped-vs-exports> <trusted LLVM 21 shared library> <gfx1013|gfx1030> <native FSSM or wrapped DXBC directory>";
+        use graphics_reachability::WrappedStage;
+        let usage = "usage: xsx-shader-inventory <--reachable-graphics|--wrapped-ps-exports|--wrapped-vs-exports|--wrapped-ms-exports> <trusted LLVM 21 shared library> <gfx1013|gfx1030> <native FSSM or wrapped DXBC directory>";
         let lib = args.next().ok_or(usage)?;
         let cpu = llvm::Cpu::parse(&args.next().ok_or(usage)?).ok_or(usage)?;
         let path = args.next().filter(|_| args.next().is_none()).ok_or(usage)?;
@@ -383,7 +385,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 &lib,
                 cpu,
                 std::path::Path::new(&path),
-                first == "--wrapped-vs-exports",
+                if first == "--wrapped-ms-exports" {
+                    WrappedStage::Ms
+                } else if first == "--wrapped-vs-exports" {
+                    WrappedStage::Vs
+                } else {
+                    WrappedStage::Ps
+                },
             );
         }
         return graphics_reachability::run(&lib, cpu, std::path::Path::new(&path));

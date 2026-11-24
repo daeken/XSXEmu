@@ -515,13 +515,47 @@ impl VsComparison {
     }
 }
 
-pub fn run_wrapped(lib: &OsStr, cpu: Cpu, root: &Path, vertex: bool) -> Result<(), Box<dyn Error>> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WrappedStage {
+    Ps,
+    Vs,
+    Ms,
+}
+
+#[derive(Default, Debug)]
+struct MeshComparison {
+    strict_first_blockers: BTreeMap<ResultClass, usize>,
+    projected_vertex_outputs: VsComparison,
+    projected_prim_present: usize,
+}
+
+fn wrapped_mesh_exports(
+    dis: &mut Disassembler,
+    bytes: &[u8],
+) -> (ResultClass, Option<Result<Exports, ResultClass>>) {
+    let strict = checked_exports(dis, bytes);
+    let projected =
+        matches!(&strict, Err(ResultClass::SendMsg(class)) if *class != SendMsgClass::Unclassified)
+            .then(|| project_exports(dis, bytes, true));
+    (result_class(strict), projected)
+}
+
+pub fn run_wrapped(
+    lib: &OsStr,
+    cpu: Cpu,
+    root: &Path,
+    kind: WrappedStage,
+) -> Result<(), Box<dyn Error>> {
     let llvm = Llvm::load(lib)?;
     let mut waves = [llvm.context(cpu, false)?, llvm.context(cpu, true)?];
     let mut totals: [PsComparison; 2] = Default::default();
     let mut vs_totals: [VsComparison; 2] = Default::default();
-    let stage = u16::from(vertex);
-    let native_stage = if vertex { 4 } else { 5 };
+    let mut mesh_totals: [MeshComparison; 2] = Default::default();
+    let (stage, native_stage, stage_name) = match kind {
+        WrappedStage::Ps => (0, 5, "PS"),
+        WrappedStage::Vs => (1, 4, "VS"),
+        WrappedStage::Ms => (13, 7, "MS"),
+    };
     let (mut files, mut matched, mut invalid, mut differences) = (0, 0, 0, 0);
     let (mut wrapper, mut inflated) = (Vec::new(), Vec::new());
     for entry in fs::read_dir(root)? {
@@ -551,27 +585,36 @@ pub fn run_wrapped(lib: &OsStr, cpu: Cpu, root: &Path, vertex: bool) -> Result<(
         if os.next().is_some() {
             return Err("duplicate output signature".into());
         }
-        let colors = (!vertex)
+        let mut psv = parts.iter().filter(|(tag, _)| *tag == b"PSV0");
+        let psv = psv.next().filter(|_| psv.next().is_none()).map(|(_, b)| *b);
+        let colors = (kind == WrappedStage::Ps)
             .then(|| crate::signatures::color_targets(signature))
             .flatten();
-        let outputs = vertex
-            .then(|| crate::signatures::vs_outputs(signature))
-            .flatten();
+        let outputs = match kind {
+            WrappedStage::Ps => None,
+            WrappedStage::Vs => crate::signatures::vs_outputs(signature),
+            WrappedStage::Ms => {
+                psv.and_then(|p| crate::signatures::mesh_vertex_outputs(signature, p))
+            }
+        };
         if colors.is_none() && outputs.is_none() {
             invalid += 1;
             continue;
         }
-        let mut psv = parts.iter().filter(|(tag, _)| *tag == b"PSV0");
-        let depth = psv
-            .next()
-            .filter(|_| psv.next().is_none())
-            .and_then(|(_, bytes)| crate::signatures::ps_depth_declared(bytes));
-        let (mut result, mut native_count) = (None, 0);
+        let depth = (kind == WrappedStage::Ps)
+            .then(|| psv.and_then(crate::signatures::ps_depth_declared))
+            .flatten();
+        let (mut result, mut mesh_result, mut native_count) = (None, None, 0);
         let mut capture = |payload: &[u8]| {
             if payload.get(0x100) == Some(&native_stage) {
                 native_count += 1;
                 if let Some((bytes, _)) = code(payload) {
-                    result = Some(waves.each_mut().map(|dis| checked_exports(dis, bytes)));
+                    if kind == WrappedStage::Ms {
+                        mesh_result =
+                            Some(waves.each_mut().map(|dis| wrapped_mesh_exports(dis, bytes)));
+                    } else {
+                        result = Some(waves.each_mut().map(|dis| checked_exports(dis, bytes)));
+                    }
                 }
             }
         };
@@ -581,8 +624,23 @@ pub fn run_wrapped(lib: &OsStr, cpu: Cpu, root: &Path, vertex: bool) -> Result<(
             invalid += 1;
             continue;
         };
-        if native_count != 1 || (!vertex && n != 1) {
+        if native_count != 1 || (kind != WrappedStage::Vs && n != 1) {
             invalid += 1;
+            continue;
+        }
+        if let Some(result) = mesh_result {
+            let source = outputs.ok_or("missing checked mesh vertex outputs")?;
+            differences += usize::from(result[0] != result[1]);
+            for ((strict, projected), tally) in result.into_iter().zip(&mut mesh_totals) {
+                *tally.strict_first_blockers.entry(strict).or_default() += 1;
+                if let Some(projected) = projected {
+                    if let Ok(exports) = &projected {
+                        tally.projected_prim_present +=
+                            usize::from(exports.primitive_en_values != 0);
+                    }
+                    tally.projected_vertex_outputs.add(source, projected);
+                }
+            }
             continue;
         }
         let Some(result) = result else {
@@ -601,13 +659,18 @@ pub fn run_wrapped(lib: &OsStr, cpu: Cpu, root: &Path, vertex: bool) -> Result<(
     if matched == 0 {
         return Err("no matching wrapped stages".into());
     }
-    let stage_name = if vertex { "VS" } else { "PS" };
     println!(
         "{} LLVM {:?}; {files} wrappers, {matched} {stage_name}, {invalid} unsupported same-wrapper joins; {differences} different wave results",
         cpu.name(),
         llvm.version
     );
-    if vertex {
+    if kind == WrappedStage::Ms {
+        for (wave, t) in [64, 32].into_iter().zip(mesh_totals) {
+            println!("  wave{wave} (checked empty source primitive signatures only): {t:?}");
+        }
+        return Ok(());
+    }
+    if kind == WrappedStage::Vs {
         for (wave, t) in [64, 32].into_iter().zip(vs_totals) {
             println!("  wave{wave}: {t:?}");
         }

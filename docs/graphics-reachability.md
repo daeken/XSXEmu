@@ -32,6 +32,25 @@ Under this hypothesis all 195 GS payloads complete in both CPU passes with no ch
 
 In the complete mesh projections, every payload has both raw `EN=0` and `EN=15` at checked `POS0` exports, and only `EN=1` at checked `PRIM` exports (public target 20 and LLVM symbolic `prim`). `POS1` occurs in 1,906 (`gfx1013`) and 1,644 (`gfx1030`) payloads; no higher `POS` occurs. Nonempty enabled `PARAM` sets are present in 7,543 and 6,785 payloads, respectively, all dense from ordinal zero. No zero-enable `PARAM`, color, `MRTZ`, `NULL`, or unclassified export is seen in these complete projections. The masks describe reachable instruction encodings across a graph, not which sites execute or how primitive payloads or null vertices are interpreted.
 
+### Same-wrapper mesh output comparison
+
+```sh
+cargo run --locked --release --manifest-path tools/shader-inventory/Cargo.toml -- \
+  --wrapped-ms-exports "$TRUSTED_LLVM_21_DYLIB" gfx1013 "$WRAPPED_DXBC_DIRECTORY"
+# Repeat with gfx1030.
+```
+
+All 9,282 DXIL stage-13 wrappers have a single checked raw stage-7 payload. The source projection requires an empty PSV0 input group and primitive signature group, zero primitive signature vectors, and an OSG1 row count equal to the PSV0 vertex output count. It does not require a zero primitive limit. The checked stream-zero OSG1 projection separates public position and clip/cull declarations from ordinary registers. No other system outputs occur in the compared cases.
+
+Both wave settings agree on each wrapper's result. The strict walk stops at a checked allocation message for all 9,282 `gfx1013` wrappers and 8,258 `gfx1030` wrappers; the remaining 1,024 `gfx1030` wrappers stop earlier at decode and are not compared. Every eligible separate message projection is complete. Position presence agrees with `POS0` in every comparison; clip-or-cull presence agrees with `POS1` in both directions (1,906 or 1,644 positives, respectively). Every complete payload still has a checked `PRIM`, although every checked source primitive signature is empty. `PRIM` presence cannot be used to infer a declared per-primitive varying.
+
+| CPU (either wave test) | Projected complete | Native PARAM ordinal count lower / equal / higher than ordinary source register count | Exact unshifted set | Native EN-union bits lower / equal / higher than source primary-mask-union bits |
+|---|---:|---:|---:|---:|
+| `gfx1013` | 9,282 | 3,724 / 5,024 / 534 | 1,811 | 4,558 / 4,233 / 491 |
+| `gfx1030` | 8,258 | 3,458 / 4,452 / 348 | 1,541 | 4,258 / 3,695 / 305 |
+
+Counts use active `PARAM` ordinals and unions grouped separately by native ordinal and source register, as in the VS comparison below. They rule out a uniform one-to-one mapping of these projections. Neither the same-wrapper join nor the presence comparisons identify packing, native linkage, a primitive payload format, an executed wave width, or a launch contract.
+
 ## Native VS export projection
 
 The stage-4 check cross-validates the six-bit public target field for `POS0`–`POS4` and `PARAM0`–`PARAM31` against the LLVM mnemonic and symbolic operand. Under both wave tests every complete `gfx1013` stage-4 graph (1,448) and every complete `gfx1030` stage-4 graph (1,242) contains `POS0` with raw `EN=15` and a nonempty dense set of enabled `PARAM` ordinals starting at zero. Neither pass observes a zero-enable `PARAM` or an export outside `POS`/`PARAM` in a complete stage-4 graph. In each pass 20 payloads also have `POS1`, none has `POS2`–`POS4`. Both wave settings agree on the per-payload projection. These are reachable target and enable-field observations only; they do not correlate parameter ordinals with source declarations, physical interpolation slots, or an individual executed path.
