@@ -403,6 +403,63 @@ fn export_shape(first: u32, len: usize, text: &str) -> Option<ExportShape> {
     })
 }
 
+const NEAREST_DISTANCES: usize = 3;
+const NEAREST_ROWS: usize = 6;
+
+type GapPattern = Vec<(String, usize)>;
+
+#[derive(Default)]
+struct NearestGaps(BTreeMap<usize, BTreeMap<GapPattern, usize>>);
+
+impl NearestGaps {
+    fn observe(&mut self, sites: usize, missing: &BTreeMap<String, usize>) {
+        if sites == 0 {
+            return;
+        }
+        if self.0.len() == NEAREST_DISTANCES {
+            let (&furthest, _) = self.0.last_key_value().unwrap();
+            if sites > furthest {
+                return;
+            }
+            if sites < furthest && !self.0.contains_key(&sites) {
+                self.0.pop_last();
+            }
+        }
+        let pattern = missing.iter().map(|(name, &n)| (name.clone(), n)).collect();
+        *self.0.entry(sites).or_default().entry(pattern).or_default() += 1;
+    }
+
+    fn report(self) {
+        for (sites, patterns) in self.0 {
+            let paths: usize = patterns.values().sum();
+            println!(
+                "    nearest: {sites} unsupported sites in each of {paths} complete graphs; {} mnemonic patterns",
+                patterns.len()
+            );
+            let mut rows: Vec<_> = patterns.into_iter().collect();
+            rows.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            let mut shown = 0;
+            for (pattern, count) in rows.into_iter().take(NEAREST_ROWS) {
+                shown += count;
+                let mut parts = pattern.into_iter().map(|(name, n)| format!("{name} x{n}"));
+                let first = parts.next().unwrap_or_default();
+                let row = parts.fold(first, |mut row, p| {
+                    row.push_str(", ");
+                    row.push_str(&p);
+                    row
+                });
+                println!("      {count} complete graphs: {row}");
+            }
+            if shown < paths {
+                println!(
+                    "      {} complete graphs in other mnemonic patterns",
+                    paths - shown
+                );
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct LiftGaps {
     complete: usize,
@@ -411,6 +468,7 @@ struct LiftGaps {
     only_exp_gap: usize,
     sites: usize,
     accepted_sites: usize,
+    nearest: NearestGaps,
     missing: BTreeMap<String, (usize, usize)>, // payloads, checked sites
     legacy_shapes: BTreeMap<(&'static str, bool), (usize, usize)>,
     export_shapes: BTreeMap<Option<ExportShape>, (usize, usize)>,
@@ -478,6 +536,7 @@ impl LiftGaps {
             self.only_exp_gap += usize::from(!export_shapes.is_empty() && missing.len() == 1);
             self.sites += sites;
             self.accepted_sites += accepted;
+            self.nearest.observe(sites - accepted, &missing);
             for (key, count) in export_shapes {
                 let total = self.export_shapes.entry(key).or_default();
                 total.0 += 1;
@@ -506,6 +565,7 @@ impl LiftGaps {
             "    EXP encoding gate: {}/{} complete graphs without an EXP encoding gap; {} with only EXP encoding gaps",
             self.no_exp_gap, self.complete, self.only_exp_gap
         );
+        self.nearest.report();
         for ((shape, supported), (payloads, sites)) in self.legacy_shapes {
             println!(
                 "    legacy source: {shape} (decoder match = {supported}): {payloads} payloads, {sites} checked sites"
@@ -1215,6 +1275,17 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn nearest_gaps_keep_three_nonzero_distances_and_count_ties() {
+        let mut rank = NearestGaps::default();
+        let profile = |n| BTreeMap::from([("x".to_owned(), n)]);
+        for n in [5, 3, 2, 4, 1, 2, 0, 4] {
+            rank.observe(n, &profile(n));
+        }
+        assert_eq!(rank.0.keys().copied().collect::<Vec<_>>(), [1, 2, 3]);
+        assert_eq!(rank.0[&2][&vec![("x".to_owned(), 2)]], 2);
     }
 
     #[test]
