@@ -126,6 +126,8 @@ audited_bridges! {
         sync::leave_cs, (cs: *mut sync::CriticalSection) -> ();
     xsxemu_tls_delete_cs, delete_cs: b"kernelbase.dll", b"DeleteCriticalSection",
         sync::delete_cs, (cs: *mut sync::CriticalSection) -> ();
+    xsxemu_tls_init_slist, init_slist: b"kernelbase.dll", b"InitializeSListHead",
+        sync::init_slist, (head: *mut sync::SListHeader) -> ();
     xsxemu_tls_get_startup_info_w, get_startup_info_w: b"kernelbase.dll", b"GetStartupInfoW",
         proc::get_startup_info_w, (out: *mut proc::StartupInfoW) -> ();
     xsxemu_tls_getstdhandle, getstdhandle: b"kernelbase.dll", b"GetStdHandle",

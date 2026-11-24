@@ -58,7 +58,7 @@ pub(crate) fn lookup(dll: &[u8], name: &[u8]) -> Option<HostExport> {
         (b"kernelbase.dll" | b"kernel32.dll" | SYNCH_12, b"Sleep") => {
             export!("kernelbase.dll", "Sleep", native::sleep)
         }
-        (b"kernelbase.dll" | b"kernel32.dll", b"InitializeSListHead") => {
+        (b"kernelbase.dll" | b"kernel32.dll" | INTERLOCKED, b"InitializeSListHead") => {
             export!("kernelbase.dll", "InitializeSListHead", native::init_slist)
         }
         (b"kernelbase.dll" | b"kernel32.dll" | INTERLOCKED, b"InterlockedFlushSList") => export!(
@@ -126,6 +126,16 @@ mod registry_tests {
         assert_eq!(Some(entry), crate::providers::lookup(b"kernel32.dll", ex));
         assert!(crate::providers::lookup(SYNCH_12, ex).is_none());
         assert!(crate::providers::lookup(SYNCH, b"initializeCriticalSectionEx").is_none());
+
+        let init = b"InitializeSListHead";
+        let entry = crate::providers::lookup(INTERLOCKED, init).unwrap();
+        assert_eq!(entry.provider, "kernelbase.dll");
+        assert_eq!(entry.symbol.as_bytes(), init);
+        for dll in [b"kernelbase.dll".as_slice(), b"kernel32.dll"] {
+            assert_eq!(Some(entry), crate::providers::lookup(dll, init));
+        }
+        assert!(crate::providers::lookup(SYNCH, init).is_none());
+        assert!(crate::providers::lookup(INTERLOCKED, b"initializeSListHead").is_none());
         assert!(lookup(SYNCH, b"WaitForSingleObject").is_none());
         assert!(lookup(SYNCH, b"Sleep").is_none());
         assert!(lookup(SYNCH_12, b"sleep").is_none());
@@ -334,7 +344,7 @@ pub(crate) mod native {
     }
 
     #[repr(C, align(16))]
-    pub(super) struct SListHeader {
+    pub(crate) struct SListHeader {
         // AMD64 HeaderX64: Depth:16 / Sequence:48, Reserved:4 / NextEntry:60.
         sequence_depth: u64,
         next_and_flags: usize,
@@ -374,7 +384,7 @@ pub(crate) mod native {
         }
     }
 
-    pub(super) unsafe extern "win64" fn init_slist(head: *mut SListHeader) {
+    pub(crate) unsafe extern "win64" fn init_slist(head: *mut SListHeader) {
         if valid_slist(head) {
             let _guard = lock(&SLIST);
             // SAFETY: caller supplies a writable, aligned SLIST_HEADER.
@@ -537,9 +547,14 @@ pub(crate) mod native {
             let b = ptr::from_mut(&mut b);
             let head = head.as_mut_ptr();
             assert_eq!(size_of::<SListHeader>(), 16);
+            assert_eq!(align_of::<SListHeader>(), 16);
             assert_eq!(size_of::<SListEntry>(), 16);
             unsafe {
                 init_slist(head);
+                assert_eq!((*head).sequence_depth, 0);
+                assert_eq!((*head).next_and_flags, 0);
+                assert_eq!(depth_slist(head), 0);
+                assert!(pop_slist(head).is_null());
                 assert!(push_slist(head, a).is_null());
                 assert_eq!(push_slist(head, b), a);
                 assert_eq!(depth_slist(head), 2);

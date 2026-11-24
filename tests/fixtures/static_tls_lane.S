@@ -361,6 +361,43 @@ Lbridge_entry:
         jne Lbad
     .endr
 
+    /* InitializeSListHead takes one pointer to a 16-byte aligned header.
+     * Check a misaligned call leaves storage alone, then initialize the
+     * nonzero header via the exact API-set IAT target and CFG dispatch. */
+    movq $-1, 88(%rsp)          /* canary before the header */
+    movq $-1, 96(%rsp)
+    movq $-1, 104(%rsp)
+    movq $-1, 112(%rsp)        /* canary after the header */
+    movl $0x1234, %gs:0x68
+    leaq 104(%rsp), %rcx
+    leaq Ltext(%rip), %r11
+    movq {iat_delta}+208(%r11), %rax
+    callq *{dispatch_delta}(%r11)
+    cmpl $87, %gs:0x68
+    jne Lbad
+    cmpq $-1, 96(%rsp)
+    jne Lbad
+    cmpq $-1, 104(%rsp)
+    jne Lbad
+    cmpq $-1, 112(%rsp)
+    jne Lbad
+
+    movl $0x1234, %gs:0x68
+    leaq 96(%rsp), %rcx
+    leaq Ltext(%rip), %r11
+    movq {iat_delta}+208(%r11), %rax
+    callq *{dispatch_delta}(%r11)
+    cmpl $0x1234, %gs:0x68
+    jne Lbad
+    cmpq $0, 96(%rsp)
+    jne Lbad
+    cmpq $0, 104(%rsp)
+    jne Lbad
+    cmpq $-1, 88(%rsp)
+    jne Lbad
+    cmpq $-1, 112(%rsp)
+    jne Lbad
+
     /* Win32 dynamic TLS slots are a provider table, not GS:[0x58]. */
     movq %gs:0x58, %rax
     movq %rax, 64(%rsp)
