@@ -7,5 +7,7 @@ description = "Experimental Scarlett PE compatibility launcher"
 
 [features]
 experimental-xbox-rootsig = []
+rpf9-retail = ["dep:sha2"]
 
 [dependencies]
+sha2 = { version = "0.10.9", optional = true }

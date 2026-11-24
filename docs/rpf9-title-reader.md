@@ -72,3 +72,27 @@ The following is order on the traced `fc2540` path; it is not a claim every devi
 `xsxemu::rpf9::Archive::from_prepared(backing, prefix)` owns an already decoded prefix ending at header `+4` (exclusive). The backing reader supplies the file length and stored member bytes. The parser validates directory IDs and arena-relative offsets (nonzero unique IDs, unique in-arena offsets), both index matrix extents, column extents and every non-sentinel cell index. It checks direct member extents when accessed. These are structural checks, not archive authentication or proof that a plausible decoded directory used the right key.
 
 `cargo test --locked --lib rpf9` covers an owned synthetic decoded prefix including inline and split columns, malformed fields, index bounds and stored reads. This parser has no executable loader, transform, or retail fixture. `stored_member` does not decrypt/decompress payloads. It does not implement paths, nested archives, other member kinds or signature verification.
+
+## Opt-in retail adapter
+
+Enable `rpf9-retail` and call `xsxemu::rpf9_retail::open(archive, executable)` with locally supplied, read-only `Read + Seek` inputs. The adapter pins the exact executable size and SHA-256 listed above. It hashes a bounded snapshot before any fixed-offset reads; the reads use those same bytes and the snapshot is discarded when opening completes. It neither executes the binary nor emits transform material or decoded bytes. Archive reads and metadata allocation are bounded. The digest identifies the executable layout only: neither CBC nor the TOC checks authenticate the archive, and the section-6/2 title validation path is not implemented.
+
+Stage one on the local sample yields four unique section IDs (1, 5, 6, 9) with arena-relative offsets `0`, `0x18`, `0x30`, `0x140`. The adapter rejects duplicate or zero IDs, duplicate or out-of-arena section starts, a missing section 1, or a section 1 whose 22-byte descriptor crosses the next section or the stage-one plaintext boundary. It additionally requires a supported algorithm and executable context. A directory that merely looks plausible is not enough: stage two must yield bounded typed columns and valid cell indices, and stored member spans must be in file. These independent checks still do not establish authenticity.
+
+The local test verifies three rows and five columns, all three exact non-overlapping stored spans, and `SGD5` magic at the first two member starts. The third span starts exactly at the independently scanned PS/0/9 zlib pipeline library and ends at the proposed EOF trailer. A scratch instrumentation run of the existing shader inventory counted accepted wrapped records by full containment of the scanner's `[suffix offset, record end)` in each member span:
+
+| Stored span | Accepted wrapped records |
+|---|---:|
+| `[0x9000,0x10286f20)` | 24,804 |
+| `[0x10287000,0x10578a30)` | 1,699 |
+| `[0x10579000,0x1889f950)` | 0 |
+| Outside all three | 0 |
+
+Thus **two of three TOC rows** contain **all 26,503 records** found by the existing wrapped-record scan, not one TOC row per shader. This is not a complete shader inventory: the third row correlates to the separate pipeline library, and the TOC parser does not enumerate its logical programs or unpack payloads. No temporary instrumentation or retail inputs are in Git.
+
+```sh
+cargo test --locked --lib rpf9
+cargo test --locked --features rpf9-retail --lib rpf9
+RPF9_EXE=/path/to/game_scarlett_master.exe RPF9_ARCHIVE=/path/to/shaders.rpf \
+  cargo test --locked --features rpf9-retail --test rpf9_local -- --ignored
+```
