@@ -480,7 +480,7 @@ pub(crate) mod native {
         }
     }
 
-    pub(super) extern "win64" fn sleep(ms: u32) {
+    pub(crate) extern "win64" fn sleep(ms: u32) {
         match ms {
             0 => thread::yield_now(),
             u32::MAX => loop {

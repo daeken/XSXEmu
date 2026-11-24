@@ -278,6 +278,8 @@ audited_bridges! {
         proc::get_environment_strings_w, () -> *mut u16;
     xsxemu_tls_free_environment_strings_w, free_environment_strings_w: b"kernelbase.dll", b"FreeEnvironmentStringsW",
         proc::free_environment_strings_w, (block: *mut u16) -> i32;
+    xsxemu_tls_sleep, sleep: b"kernelbase.dll", b"Sleep",
+        sync::sleep, (milliseconds: u32) -> ();
     xsxemu_tls_get_tick_count64, get_tick_count64: b"kernelbase.dll", b"GetTickCount64",
         proc::get_tick_count64, () -> u64;
     xsxemu_tls_query_performance_frequency, query_performance_frequency: b"kernelbase.dll", b"QueryPerformanceFrequency",

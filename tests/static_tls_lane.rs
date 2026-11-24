@@ -1695,6 +1695,76 @@ fn tick_count64_bridge_returns_monotonic_uptime_and_preserves_last_error() {
     expect(output, 51, "Guest entry returned 51");
 }
 
+const SLEEP_CAPACITY: usize = 0x100;
+
+#[repr(C)]
+struct SleepFixture {
+    entry: u32,
+    code: [u8; SLEEP_CAPACITY],
+}
+
+global_asm!(include_str!("fixtures/static_tls_sleep.S"),
+    capacity = const SLEEP_CAPACITY,
+    iat_delta = const IAT - TEXT,
+    options(att_syntax),
+);
+
+unsafe extern "C" {
+    static static_tls_sleep_fixture: SleepFixture;
+}
+
+#[test]
+fn sleep_bridge_delays_and_preserves_guest_last_error() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let mut exe = image(Kind::Solo);
+    let fixture = unsafe { &static_tls_sleep_fixture };
+    exe[file(TEXT)..file(TEXT) + RAW].fill(0xcc);
+    put(&mut exe, file(TEXT), &fixture.code);
+    w32(&mut exe, OP + 16, TEXT + fixture.entry as usize);
+    w64(&mut exe, file(ARRAY), PREFERRED + TEXT);
+    let imports = LINK + 0x780;
+    dir(&mut exe, 1, imports, 60);
+    for (i, (dll, symbol)) in [
+        (
+            b"api-ms-win-core-synch-l1-2-0.dll\0".as_slice(),
+            b"Sleep\0".as_slice(),
+        ),
+        (b"api-ms-win-core-sysinfo-l1-1-0.dll\0", b"GetTickCount64\0"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let row = file(imports) + 20 * i;
+        let lookup = imports + 0x50 + i * 0x10;
+        let name = imports + 0x80 + i * 0x30;
+        let hint_name = imports + 0xe0 + i * 0x20;
+        w32(&mut exe, row, lookup);
+        w32(&mut exe, row + 12, name);
+        w32(&mut exe, row + 16, IAT + i * 16);
+        w64(&mut exe, file(lookup), hint_name);
+        put(&mut exe, file(name), dll);
+        put(&mut exe, file(hint_name) + 2, symbol);
+    }
+    let path = scratch.write("sleep.exe", &exe);
+    expect(run(&path, &[OPT]), 1, "incomplete dependency graph");
+    let output = launcher(&path, &[OPT, "--rust-providers"])
+        .env("XSXEMU_TRACE_STARTUP", "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr
+            .matches("bridge dispatch kernelbase.dll!Sleep guest_return_pc=")
+            .count(),
+        2,
+        "{stderr}"
+    );
+    expect(output, 57, "Guest entry returned 57");
+}
+
 #[test]
 fn system_file_time_bridge_writes_eight_bytes_and_preserves_last_error() {
     if !rosetta() {

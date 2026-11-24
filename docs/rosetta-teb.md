@@ -302,6 +302,13 @@ union or require any other relationship.
 `GetSystemTimeAsFileTime` uses the same host UTC wall clock as the ordinary
 provider. It writes one Win64 `FILETIME` (two DWORDs encoding 100 ns ticks
 since 1601-01-01 UTC) and preserves `LastError` on success.
+`Sleep` uses the existing `synch-l1-2-0` binding and a one-DWORD void
+bridge, preserving `LastError`. A zero duration yields, a finite duration
+sleeps on the host thread, and `INFINITE` parks without returning (the
+launcher may still terminate the child). The title's thread-creation
+failure path calls `Sleep(250)` before retrying; bridging the delay does
+not make a failed `CreateThread` succeed.
+
 `GetTickCount64` models guest uptime with the macOS raw monotonic clock,
 including host sleep. It returns whole milliseconds as an unsigned 64-bit
 value and preserves `LastError`. Its epoch is independent of the guest's
