@@ -266,6 +266,7 @@ pub(super) fn run(
     }
 
     let mut sources = HashMap::<SourceKey, SourceFamily>::new();
+    let mut vs_counts = HashMap::<SourceKey, Option<usize>>::new();
     let mut counts = BTreeMap::<u16, Payloads>::new();
     let (mut bytes, mut inflate) = (Vec::new(), Vec::new());
     let (mut files, mut joined_wrappers, mut work) = (0, 0, 0usize);
@@ -304,6 +305,17 @@ pub(super) fn run(
             let interface =
                 SourceInterface::parse(table).ok_or("invalid graphics source signature")?;
             sources.entry((stage, key)).or_default().add(interface);
+            if stage == 1 {
+                let mut inputs = parts.iter().filter(|(t, _)| *t == b"ISG1");
+                let (_, table) = inputs.next().ok_or("missing VS input signature")?;
+                if inputs.next().is_some() {
+                    return Err("duplicate VS input signature".into());
+                }
+                let count = SourceInterface::ordinary_row_count(table)
+                    .ok_or("invalid VS input signature")?;
+                let first = !vs_counts.contains_key(&(stage, key));
+                update_projection(vs_counts.entry((stage, key)).or_default(), count, first);
+            }
         }
         let candidates = programs.get_mut(&stage).ok_or("missing program stage")?;
         let mut eligible = Vec::with_capacity(ids.len());
@@ -400,7 +412,8 @@ pub(super) fn run(
     // ever seen for the same program. Unknown slots stay in the grouping key.
     let mut graphics_rows = BTreeMap::<Vec<usize>, GraphicsCoverage>::new();
     let mut state_sizes = BTreeMap::<Vec<usize>, BTreeMap<usize, HashSet<_>>>::new();
-    let mut layouts_seen = HashSet::new();
+    let mut layouts_seen = HashMap::new();
+    let mut vs_layout = BTreeMap::<Vec<usize>, [usize; 5]>::new();
     let mut layout_shapes = BTreeMap::<(usize, usize), usize>::new();
     let mut layout_other = 0;
     let mut source_links = BTreeMap::<(usize, bool), SourceLinkage>::new();
@@ -411,6 +424,7 @@ pub(super) fn run(
         let mut slots = Vec::new();
         let mut candidates = Vec::new();
         let mut families = [None; 3];
+        let mut vs_key = None;
         for (slot, item) in pso.slots.into_iter().enumerate() {
             let Some(item) = item else { continue };
             slots.push(slot);
@@ -424,6 +438,9 @@ pub(super) fn run(
                 let family = sources.get(key);
                 candidates.push(family.map_or(0, |f| f.count));
                 families[slot] = family;
+                if slot == 1 {
+                    vs_key = Some(key);
+                }
             }
         }
         if let [0, upstream @ (1 | 2)] = slots.as_slice()
@@ -458,15 +475,29 @@ pub(super) fn run(
             .entry(state.len())
             .or_default()
             .insert(pso.state);
-        if layouts_seen.insert(pso.input_layout) {
-            let layout = library
-                .blob(pso.input_layout)
-                .ok_or("missing graphics layout span")?;
-            if let Some(shape) = layout_extent(layout) {
-                *layout_shapes.entry(shape).or_default() += 1;
-            } else {
-                layout_other += 1;
+        let extent = match layouts_seen.entry(pso.input_layout) {
+            std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let layout = library
+                    .blob(pso.input_layout)
+                    .ok_or("missing graphics layout span")?;
+                let shape = layout_extent(layout);
+                if let Some(shape) = shape {
+                    *layout_shapes.entry(shape).or_default() += 1;
+                } else {
+                    layout_other += 1;
+                }
+                *entry.insert(shape)
             }
+        };
+        if let Some(key) = vs_key {
+            let bucket = match (extent, vs_counts.get(key)) {
+                (None, _) => 4,
+                (_, None) => 2,
+                (_, Some(None)) => 3,
+                (Some((blocks, _)), Some(Some(rows))) => usize::from(blocks != *rows),
+            };
+            vs_layout.entry(slots.clone()).or_default()[bucket] += 1;
         }
         graphics_rows.entry(slots).or_default().add(candidates);
     }
@@ -487,6 +518,11 @@ pub(super) fn run(
         "  Graphics layout blobs: {} distinct; unsupported extent: {layout_other}; (count, zero suffix bytes) histogram: {layout_shapes:?}",
         layouts_seen.len()
     );
+    for (slots, counts) in vs_layout {
+        println!(
+            "  VS ordinary input row count versus layout block count, slots {slots:?} [equal, different, missing source, divergent source counts, unsupported extent]: {counts:?}"
+        );
+    }
     for ((slot, multi), c) in source_links {
         let cohort = if multi {
             "Invariant multi-candidate"

@@ -112,6 +112,11 @@ pub(super) struct SourceInterface {
 }
 
 impl SourceInterface {
+    pub(super) fn ordinary_row_count(bytes: &[u8]) -> Option<usize> {
+        let (count, _) = check(bytes)?;
+        Some(count.entries - count.ps_linkage_system.iter().sum::<usize>())
+    }
+
     pub(super) fn parse(bytes: &[u8]) -> Option<(Self, SystemInterface)> {
         let (_, rows) = check(bytes)?;
         let mut systems = SystemInterface::default();
