@@ -415,6 +415,60 @@ and attribute bits of `GetFileAttributesExW`. It opens no file handle,
 searches no DLL roots, and adds no path mappings. Success preserves guest
 LastError; failure returns `INVALID_FILE_ATTRIBUTES` and sets guest LastError.
 
+**Scarlett XGameRuntime startup.** The trace at `8eb79ce` reaches
+`GetFileAttributesW`, `LoadLibraryExW`, and `ReleaseSRWLockExclusive`, then
+ends with signal 5. Read-only PE inspection distinguishes three gates:
+
+- The attribute probe checks the `xgameruntime.dll` sibling of the EXE. With
+  that sibling absent the next call is literally
+  `LoadLibraryExW(L"xgameruntime.dll", NULL, 0x800)` (guest System32),
+  through IAT RVA `0x6793540`, return RVA `0x55e2a58`. A present sibling
+  plus a separate policy check selects `0xa00` (application directory
+  plus System32), still passing a bare name. At this revision the TLS
+  adapter can acquire only the explicitly enabled guest entropy module;
+  supplying an arbitrary on-disk DLL alone would not make it discoverable.
+- A null module result becomes HRESULT `0x89240101` before any export lookup
+  or runtime initializer executes. The startup call at RVA `0x5a91bd8`
+  passes zero flags and null options to the init helper through `0x55dcf74`;
+  a negative result reaches an explicit `INT3` at `0x5a91c21`. That branch
+  explains the observed trap without attributing it to a failed runtime
+  initializer. An independently failing initializer would also take it.
+- If loaded, the DLL must supply `QueryApiImpl`, `XErrorReport`,
+  `UninitializeApiImpl`, and at least one of `InitializeApiImpl`,
+  `InitializeApiImplEx`, or `InitializeApiImplEx2` (preferred; some
+  other call paths require Ex2). The Ex2 call for the observed startup
+  route would pass `0x633600002712`, `0x65f400001edd`, flags `2`, and null
+  options on the System32 path. Missing required exports also yield
+  `0x89240101`, but that check is downstream of the observed miss.
+
+The statically reachable success path already needs more than DLL presence.
+Startup setup at `0x5a91c40` reaches the initially empty task queue field
+at `0x71b90a0`. Via `0x1d109e0` and `0x55dd794`, it queries
+`XThreadingImpl` (same class and interface ID,
+`073b7dcb-1fcf-4030-94be-e3c9eb623428`) before dispatching slot 29
+(`XThreadAssertNotTimeSensitive`) and, on a separate successful query,
+slot 12 (`XTaskQueueCreate`, arguments `1, 1, &queue`). Each successful
+query's object is released via slot 2. The queue wrapper handles an error;
+this evidence does not establish that every queue call must succeed or
+that these are the only interfaces needed before device creation. None
+of these runtime calls was observed executing in the failing trace.
+
+Local input inventory was limited to loose files in the title directory,
+its `win11-arm64-reference` tree, the standalone `windlls` tree, and a
+bounded filename search in nearby projects, downloads, ISO and VM
+folders. The title and its GDK-linked `XCurl.dll` and
+`libHttpClient.GDK.dll` are AMD64, but neither companion is the runtime.
+The standalone AMD64 UCRT is unrelated; the desktop ARM64 reference
+DLLs are not substitutes. No matching loose runtime or GDK installer
+was identified. Local Leonida and xcl trees offer reference source, not
+verified GameOS binaries. The manifest declares `Microsoft.GameOs`; the
+local GameOS XVD header inventory reports version `7901.26100.0.32778`
+and encryption, so its filesystem and any runtime inside remain
+unverified. No ISO, VM disk, or XVD filesystem was opened for this search.
+Once the loader can admit it explicitly, the shortest next input is a
+lawfully supplied, matching AMD64 GameOS runtime with its dependencies.
+The observed startup gate is not an optional behavior that can be skipped.
+
 `IsProcessorFeaturePresent` uses the ordinary provider's AMD64 baseline and
 runtime x86 feature detection, preserving `LastError`. It reports
 `PF_FASTFAIL_AVAILABLE` (23) as false: Windows `INT 29h` fast-fail handling is
