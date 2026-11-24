@@ -48,11 +48,24 @@ impl fmt::Display for MissingImport<'_> {
     }
 }
 
-extern "win64" fn called_missing_import(import: &MissingImport<'_>) -> ! {
-    // Best effort if stderr has been closed. Never unwind, continue the guest,
-    // return a substitute value, or run further guest detach callbacks.
+fn report(import: &MissingImport<'_>) {
     let _ = writeln!(std::io::stderr().lock(), "{import}");
+}
+
+extern "win64" fn called_missing_import(import: &MissingImport<'_>) -> ! {
+    // Never unwind, resume the guest, or run guest detach callbacks.
+    report(import);
     std::process::exit(1)
+}
+
+// Reached only by the static TLS assembly gate after checked restoration of
+// host GS. Leave the child's signal policy in place and skip atexit handlers.
+pub extern "C" fn called_missing_import_tls(import: &MissingImport<'_>) -> ! {
+    unsafe extern "C" {
+        fn _exit(status: i32) -> !;
+    }
+    report(import);
+    unsafe { _exit(1) }
 }
 
 pub struct Traps<'a> {
@@ -61,7 +74,7 @@ pub struct Traps<'a> {
 }
 
 impl<'a> Traps<'a> {
-    pub fn new(imports: &'a [MissingImport<'a>]) -> Result<Option<Self>> {
+    pub fn new(imports: &'a [MissingImport<'a>], static_tls: bool) -> Result<Option<Self>> {
         if imports.is_empty() {
             return Ok(None);
         }
@@ -70,6 +83,11 @@ impl<'a> Traps<'a> {
         }
         let len = imports.len() * THUNK_SIZE;
         let mut code = GuestMemory::allocate(len, None)?;
+        let handler = if static_tls {
+            crate::tls_runtime::import_trap_entry()
+        } else {
+            called_missing_import as *const () as u64
+        };
         for (bytes, import) in code.bytes_mut()?.chunks_exact_mut(THUNK_SIZE).zip(imports) {
             // mov rcx, import; mov rax, handler; jmp rax; ud2 (padding).
             // The original Win64 return address, stack alignment and home
@@ -78,8 +96,7 @@ impl<'a> Traps<'a> {
             bytes[2..10]
                 .copy_from_slice(&(import as *const MissingImport<'_> as u64).to_le_bytes());
             bytes[10..12].copy_from_slice(&[0x48, 0xb8]);
-            bytes[12..20]
-                .copy_from_slice(&(called_missing_import as *const () as u64).to_le_bytes());
+            bytes[12..20].copy_from_slice(&handler.to_le_bytes());
             bytes[20..].copy_from_slice(&[0xff, 0xe0, 0x0f, 0x0b]);
         }
         code.seal(&[Region {

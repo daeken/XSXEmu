@@ -8,6 +8,7 @@ _static_tls_fixture:
     .long Lsolo_cb-Ltext, Lsolo_entry-Ltext
     .long Lcfg_entry-Ltext, Lcfg_target-Ltext
     .long Lbridge_cb-Ltext, Lbridge_entry-Ltext
+    .long Ltrace_entry-Ltext
 Ltext:
 .macro tls index
     leaq Ltext(%rip), %r11
@@ -231,6 +232,36 @@ Lbridge_entry:
     popq %rdi
     movl $45, %eax
     retq
+/* Leave the TLS phase at 1: any erroneous detach runs into Lbad. */
+Ltrace_entry:
+    tls 0
+    subq $40, %rsp
+    cmpl $1, {mode_delta}(%r11)
+    jne Ltrace_indirect
+    callq *{iat_delta}(%r11)
+    /* If the first trap returned, a different import would also be called. */
+    leaq Ltext(%rip), %r11
+    callq *{iat_delta}+8(%r11)
+    ud2
+Ltrace_indirect:
+    movq {iat_delta}+8(%r11), %rcx
+    cmpl $2, {mode_delta}(%r11)
+    je Ltrace_check
+    cmpl $5, {mode_delta}(%r11)
+    jne Ltrace_dispatch
+    incq %rcx
+Ltrace_check:
+    callq *{check_delta}(%r11)
+    callq *%rcx
+    ud2
+Ltrace_dispatch:
+    movq %rcx, %rax
+    cmpl $4, {mode_delta}(%r11)
+    jne Ltrace_dispatch_call
+    incq %rax
+Ltrace_dispatch_call:
+    callq *{dispatch_delta}(%r11)
+    ud2
 Lbad:
     ud2
 Lend:

@@ -157,13 +157,14 @@ mod native {
     pub fn run_tls_child(
         images: &[(&str, &[u8])],
         bindings: &[(usize, u32, BindingTarget)],
+        missing: &[MissingImport<'_>],
         attach_order: &[usize],
         rust_providers: bool,
     ) -> Result<u32> {
         run_impl(
             images,
             bindings,
-            &[],
+            missing,
             attach_order,
             None,
             rust_providers,
@@ -196,11 +197,10 @@ mod native {
             .collect::<Result<Vec<_>>>()?
             .into_iter()
             .unzip();
-        if static_tls && !missing.is_empty() {
-            return Err("experimental static TLS does not support trace thunks".into());
-        }
         let tls_writes = static_tls
-            .then(|| tls_runtime::PatchWrites::validate(&pes, bindings, &cfgs, rust_providers))
+            .then(|| {
+                tls_runtime::PatchWrites::validate(&pes, bindings, missing, &cfgs, rust_providers)
+            })
             .transpose()?;
         validate_trap_slots(&pes, bindings, missing)?;
         let mut targets = cfgs.iter().any(Option::is_some).then(Targets::default);
@@ -249,7 +249,7 @@ mod native {
         let tls = tls_writes
             .map(|writes| writes.prepare(&pes, &mut memories))
             .transpose()?;
-        let traps = Traps::new(missing)?;
+        let traps = Traps::new(missing, static_tls)?;
         if let Some(traps) = &traps {
             for (import, addr) in traps.bindings() {
                 let iat = import.binding.iat_rva;
@@ -301,8 +301,8 @@ mod native {
         }
         if let Some(tls) = tls {
             // The existing check/dispatch thunks are GS-neutral leaf assembly.
-            // The registry has only PE GFIDs and bound audited bridge
-            // entries. No loader or unwind provider is installed.
+            // Only exact PE GFIDs and explicitly bound bridge/trace entries are
+            // registered. No loader or unwind provider is installed.
             let _cfg_registration = targets.map(Targets::install).transpose()?;
             return tls_runtime::run(&tls, images, &pes, &memories, attach_order);
         }

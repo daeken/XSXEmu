@@ -44,6 +44,7 @@ struct Fixture {
     cfg_target: u32,
     bridge_cb: u32,
     bridge_entry: u32,
+    trace_entry: u32,
     code: [u8; RAW],
 }
 global_asm!(include_str!("fixtures/static_tls_lane.S"),
@@ -301,11 +302,6 @@ fn opt_in_and_pe_only_lifecycle() {
     let dir = Scratch::new();
     let solo = dir.write("solo.exe", &image(Kind::Solo));
     expect(run(&solo, &[]), 1, "static TLS requires a Windows TEB");
-    expect(
-        run(&solo, &[OPT, "--rust-providers", "--trace-missing-imports"]),
-        1,
-        "does not support trace thunks",
-    );
     expect(run(&solo, &[OPT]), 43, "Guest entry returned 43");
 
     let exe = dir.write("root.exe", &image(Kind::Exe));
@@ -488,6 +484,93 @@ fn guardcf_under_guest_gs_checks_exact_targets_and_seals_slots() {
         err.contains("child terminated by signal 10")
             || err.contains("child terminated by signal 11"),
         "{err}"
+    );
+}
+
+fn trace_image() -> Vec<u8> {
+    let mut pe = image(Kind::Guarded);
+    dir(&mut pe, 1, LINK, 40);
+    w32(&mut pe, file(LINK), LINK + 0x30);
+    w32(&mut pe, file(LINK) + 12, LINK + 0x50);
+    w32(&mut pe, file(LINK) + 16, IAT);
+    w64(&mut pe, file(LINK) + 0x30, LINK + 0x70);
+    w64(&mut pe, file(LINK) + 0x38, (1usize << 63) | 17);
+    put(&mut pe, file(LINK) + 0x50, b"AbsentOwned.dll\0");
+    put(&mut pe, file(LINK) + 0x72, b"Missing\0");
+    pe
+}
+
+#[test]
+fn static_tls_trace_reports_only_the_first_called_slot() {
+    if !rosetta() {
+        return;
+    }
+    let dir = Scratch::new();
+    let mut pe = trace_image();
+    let image = dir.write("trace.exe", &pe);
+    let flags = [OPT, "--trace-missing-imports"];
+    expect(run(&image, &[OPT]), 1, "incomplete dependency graph");
+    let unused = run(&image, &flags);
+    assert!(unused.stderr.is_empty(), "{unused:?}");
+    expect(unused, 44, "Guest entry returned 44");
+
+    let entry = unsafe { static_tls_fixture.trace_entry as usize };
+    w32(&mut pe, OP + 16, TEXT + entry);
+    for (mode, symbol, rva) in [
+        (1, "\"Missing\"", IAT),
+        (2, "#17", IAT + 8),
+        (3, "#17", IAT + 8),
+    ] {
+        w32(&mut pe, file(MODE), mode);
+        dir.write("trace.exe", &pe);
+        let called = run(&image, &flags);
+        assert_eq!(called.status.code(), Some(1), "{called:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&called.stderr),
+            format!(
+                "xsxemu: called missing import: importer={image:?} module=\"AbsentOwned.dll\" symbol={symbol} IAT RVA={rva:#010x}\n"
+            ),
+        );
+        assert!(!String::from_utf8_lossy(&called.stdout).contains("Guest entry returned"));
+    }
+    for mode in [4, 5] {
+        w32(&mut pe, file(MODE), mode);
+        dir.write("trace.exe", &pe);
+        let denied = run(&image, &flags);
+        assert!(!String::from_utf8_lossy(&denied.stderr).contains("called missing import"));
+        expect(denied, 1, "child terminated by signal 4");
+    }
+}
+
+#[test]
+fn static_tls_trace_preserves_startup_refusals() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let flags = [OPT, "--trace-missing-imports"];
+    for (iat, conflict) in [
+        (INDEX, "IAT, security-cookie, or GuardCF write conflict"),
+        (CHECK, "IAT patch overlaps a CFG slot"),
+        (
+            TEMPLATE,
+            "relocation overlaps an IAT or security-cookie slot",
+        ),
+    ] {
+        let mut pe = trace_image();
+        w32(&mut pe, file(LINK) + 16, iat);
+        let image = scratch.write("conflict.exe", &pe);
+        let refused = run(&image, &flags);
+        assert!(!String::from_utf8_lossy(&refused.stderr).contains("called missing import"));
+        expect(refused, 1, conflict);
+    }
+    let mut pe = trace_image();
+    dir(&mut pe, 13, LINK + 0x100, 20);
+    let image = scratch.write("unsupported.exe", &pe);
+    expect(
+        run(&image, &flags),
+        1,
+        "unsupported delay imports directory",
     );
 }
 

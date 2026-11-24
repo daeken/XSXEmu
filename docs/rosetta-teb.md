@@ -274,7 +274,12 @@ only the exact Rust `GetLastError` and `SetLastError` export identities,
 including registry aliases that resolve to those same entries. The ntdll
 `Rtl*LastWin32Error` aliases are not accepted, even though their raw Rust
 addresses match. Unbridged provider bindings fail before entry, and
-`--trace-missing-imports` is not supported in this child.
+`--trace-missing-imports` can be combined with `--experimental-static-tls`.
+This opts into treating every traced slot as a function call target, not as
+data: the unresolved PE import itself does not distinguish the two. Only
+well-formed static slots with an absent provider or export may be traced.
+Their writes participate in the same TLS layout and overlap checks as resolved
+IAT writes.
 
 The startup binder patches and registers the actual Win64 bridge entries,
 not the raw Rust exports. Using the `c800404` frame/GS proof, the thunks
@@ -293,6 +298,14 @@ through its IAT. The callback uses direct calls and the entry uses both
 GuardCF thunks. The fixture checks direct TEB stores against API reads,
 API writes against direct reads, persistence through detach, and Win64
 nonvolatile register sentinels. It does not execute a game or UCRT.
+
+The trace thunks are sealed RX before guest entry. GuardCF admits the exact
+bound thunk addresses, not their interior, common assembly gate or reporter.
+Unused thunks do not report. On the first call, the gate uses the pre-resolved
+Rosetta setter and checks host GS before entering Rust. The reporter prints
+the original importer, module, name or ordinal, and IAT RVA, then exits the
+child with status 1. It never switches back to guest GS, resumes guest code,
+runs guest detach, or restores the signal mask on this terminal path.
 
 ## Controlled execution plan
 

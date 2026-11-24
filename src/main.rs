@@ -36,7 +36,7 @@ const USAGE: &str = "Usage: xsxemu <inspect|map|audit|run> <image.exe> [options]
     map [--base ADDRESS]   Materialize a non-executable image and apply relocations\n\
     audit [--dll-dir DIR] [--symbols]  Resolve the static import graph without executing\n\
     run [--dll-dir DIR]    Start a trusted image (x86-64 macOS/Rosetta only; not sandboxed)\n\
-    run option: --trace-missing-imports  Trap on calls to missing static imports instead of refusing startup\n\
+    run option: --trace-missing-imports  Treat missing static imports as callable and stop on first call (not data imports)\n\
     run option: --experimental-static-tls  Trusted PE-only startup in a disposable Rosetta child\n\
     audit/run options: --api-set SCHEMA.dll, --rust-providers";
 
@@ -97,9 +97,6 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
         return Err("static TLS child requires --experimental-static-tls".into());
     }
     if experimental_tls {
-        if trace_missing_imports {
-            return Err("experimental static TLS does not support trace thunks".into());
-        }
         #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
         return Err("experimental static TLS requires an x86-64 macOS build under Rosetta".into());
         #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
@@ -401,7 +398,7 @@ fn resolve(
         }
         let order = attach_order(&plan)?;
         let status = if tls_child {
-            startup::run_tls_child(&images, &bindings, &order, startup_options.1)?
+            startup::run_tls_child(&images, &bindings, &traps, &order, startup_options.1)?
         } else {
             startup::run(
                 &images,

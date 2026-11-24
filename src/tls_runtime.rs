@@ -10,6 +10,7 @@
 use crate::{
     Result, TLS_CHILD, darwin_guest_mask as mask,
     guest::GuestMemory,
+    import_traps::{MissingImport, called_missing_import_tls},
     link::BindingTarget,
     pe::Pe,
     providers::{self, HostExport},
@@ -93,6 +94,12 @@ unsafe extern "C" {
 unsafe extern "win64" {
     fn xsxemu_tls_get_last_error() -> u32;
     fn xsxemu_tls_set_last_error(error: u32);
+    // Only used as an address; the gate receives the record pointer in RCX.
+    fn xsxemu_tls_missing_import();
+}
+
+pub fn import_trap_entry() -> u64 {
+    xsxemu_tls_missing_import as *const () as u64
 }
 
 pub fn require_rosetta() -> Result<()> {
@@ -134,6 +141,7 @@ global_asm!(include_str!("tls_runtime.S"),
     last_error = const LAST_ERROR_OFFSET,
     get_error = sym providers::tls_child_get_last_error,
     set_error = sym providers::tls_child_set_last_error,
+    missing_import = sym called_missing_import_tls,
     options(att_syntax),
 );
 
@@ -202,6 +210,7 @@ impl PatchWrites {
     pub fn validate(
         pes: &[Pe<'_>],
         bindings: &[(usize, u32, BindingTarget)],
+        missing: &[MissingImport<'_>],
         cfgs: &[Option<CfgMetadata<'_>>],
         rust_providers: bool,
     ) -> Result<Self> {
@@ -219,6 +228,9 @@ impl PatchWrites {
                 bridge_address(export, rust_providers)?;
             }
             writes[i].push(rva);
+        }
+        for import in missing {
+            writes[import.importer].push(import.binding.iat_rva);
         }
         for (i, (slots, pe)) in writes.iter_mut().zip(pes).enumerate() {
             slots.sort_unstable();
