@@ -6,7 +6,7 @@ use crate::{
     Result,
     import_traps::called_missing_import_tls,
     providers::{
-        self, HostExport, native, win_io::native as io, win_loader::native as loader,
+        HostExport, native, win_io::native as io, win_loader::native as loader,
         win_proc::native as proc, win_sync::native as sync, win_text::native as text,
     },
 };
@@ -66,10 +66,12 @@ macro_rules! audited_bridges {
 
         pub fn bridge_address(export: HostExport, opt_in: bool) -> Result<u64> {
             if opt_in {
-                // Check both the canonical identity and the reviewed function.
-                // The Rtl* aliases share raw code, but aren't audited rows.
-                $(if providers::lookup($dll, $symbol) == Some(export)
-                    && export.address() == Some($target as *const () as usize)
+                // HostExport comes from the registry; use its canonical pair.
+                // Comparing function addresses across codegen units is unsound
+                // as an identity check (duplication and deduplication). Rtl*
+                // aliases have distinct canonical identities and stay blocked.
+                $(if export.provider.as_bytes() == $dll
+                    && export.symbol.as_bytes() == $symbol
                 {
                     return Ok($entry as *const () as u64);
                 })*
