@@ -8,6 +8,8 @@ mod startup;
 mod win_cfg;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 mod win_cfg_runtime;
+#[cfg(test)]
+mod xbox_vm;
 
 use pe::{ExportTarget, ImportSymbol, Pe};
 use std::{
