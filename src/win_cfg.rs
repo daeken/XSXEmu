@@ -13,6 +13,12 @@ const FUNCTION_TABLE: usize = 0x80;
 const FUNCTION_COUNT: usize = 0x88;
 const GUARD_FLAGS: usize = 0x90;
 const CFG_END: usize = 0x94;
+const CODE_INTEGRITY_END: usize = 0xa0;
+const VOLATILE_METADATA: usize = 0x100;
+const EH_TABLE: usize = 0x108;
+const EH_COUNT: usize = 0x110;
+const EH_END: usize = 0x118;
+const MAX_AUX_ROWS: usize = 1 << 20;
 
 const CF_INSTRUMENTED: u32 = 0x0000_0100;
 const CF_FUNCTION_TABLE_PRESENT: u32 = 0x0000_0400;
@@ -21,6 +27,7 @@ const PROTECT_DELAYLOAD_IAT: u32 = 0x0000_1000;
 const DELAYLOAD_IAT_IN_ITS_OWN_SECTION: u32 = 0x0000_2000;
 const CF_EXPORT_SUPPRESSION_INFO_PRESENT: u32 = 0x0000_4000;
 const CF_LONGJUMP_TABLE_PRESENT: u32 = 0x0001_0000;
+const EH_CONTINUATION_TABLE_PRESENT: u32 = 0x0040_0000;
 const TABLE_EXTRA_BYTES: u32 = 0xf000_0000;
 const SUPPORTED_FLAGS: u32 = CF_INSTRUMENTED
     | CF_FUNCTION_TABLE_PRESENT
@@ -29,6 +36,7 @@ const SUPPORTED_FLAGS: u32 = CF_INSTRUMENTED
     | DELAYLOAD_IAT_IN_ITS_OWN_SECTION
     | CF_EXPORT_SUPPRESSION_INFO_PRESENT
     | CF_LONGJUMP_TABLE_PRESENT
+    | EH_CONTINUATION_TABLE_PRESENT
     | TABLE_EXTRA_BYTES;
 
 const FID_SUPPRESSED: u8 = 1;
@@ -245,7 +253,7 @@ impl<'a> CfgMetadata<'a> {
     fn parse_guarded(pe: &Pe<'a>, rva: u32, raw: &[u8], size: usize) -> Result<Self> {
         let flags = u32_at(raw, GUARD_FLAGS);
         if flags & !SUPPORTED_FLAGS != 0 {
-            // Includes CFW, RF, EH continuations, XFG, CastGuard, memcpy guard,
+            // Includes CFW, RF, XFG, CastGuard, memcpy guard,
             // process ES opt-in, and any unrecognized future requirement.
             return Err(PeError::Unsupported("GuardFlags requirements"));
         }
@@ -261,15 +269,7 @@ impl<'a> CfgMetadata<'a> {
         {
             return Err(PeError::Unsupported("CFG delay-load IAT protection"));
         }
-        // A long-jump-table hint is allowed if the VA/count are absent or both
-        // zero. Do not silently ignore real auxiliary tables (long-jump, address-
-        // taken IAT, etc.), CodeIntegrity, SEH, or unknown extended data.
-        if nonzero(&raw[0x60..CHECK]) || nonzero(&raw[CFG_END..size]) {
-            return Err(PeError::Unsupported(
-                "additional load-config fields on CFG image",
-            ));
-        }
-
+        let declared = &raw[..size];
         let config = readonly_range(pe, rva, raw.len())?;
         let check_slot_rva = preferred_rva(pe, u64_at(raw, CHECK))?;
         let dispatch_slot_rva = preferred_rva(pe, u64_at(raw, DISPATCH))?;
@@ -292,11 +292,32 @@ impl<'a> CfgMetadata<'a> {
             .checked_mul(stride)
             .ok_or(PeError::Overflow("GFID size"))?;
         let table_range = readonly_range(pe, table_rva, bytes)?;
-        let ranges = [config, check, dispatch, table_range];
+        let mut ranges = vec![config, check, dispatch, table_range];
         for (i, a) in ranges.iter().enumerate() {
             if ranges[..i].iter().any(|b| overlaps(a, b)) {
                 return Err(PeError::Invalid("overlapping CFG metadata or slots"));
             }
+        }
+        validate_auxiliary(pe, declared, rva, flags, stride, &mut ranges)?;
+        if nonzero(tail_between(declared, 0xa0, 0xb0)) {
+            return Err(PeError::Unsupported("CFG address-taken IAT table"));
+        }
+        if nonzero(declared.get(EH_END..).unwrap_or_default()) {
+            return Err(PeError::Unsupported(
+                "post-EHCONT load-config fields on CFG image",
+            ));
+        }
+        // A long-jump hint is allowed only without a table. Keep rejecting
+        // real long-jump tables, SEH, and other extensions.
+        if nonzero(&raw[0x60..CHECK]) || nonzero(tail_between(declared, 0xb0, VOLATILE_METADATA)) {
+            return Err(PeError::Unsupported(
+                "additional load-config fields on CFG image",
+            ));
+        }
+        if nonzero(tail_between(declared, CFG_END, CODE_INTEGRITY_END)) {
+            return Err(PeError::Unsupported(
+                "CodeIntegrity load-config fields on CFG image",
+            ));
         }
         let table = pe.rva_slice(table_rva, bytes)?;
         let mut previous = 0;
@@ -383,6 +404,168 @@ impl<'a> CfgMetadata<'a> {
         self.entry_for_rva(rva)
             .is_some_and(|entry| entry.permitted(export_suppression))
     }
+}
+
+// These are optional inputs to mechanisms this runner does not provide. The
+// child has no Windows EH dispatcher or context-resume primitive. EHCONT rows
+// never grant a call target. Volatile annotations are for optional memory-order
+// optimizations; this runner leaves x86 ordering to native execution/Rosetta.
+fn validate_auxiliary(
+    pe: &Pe<'_>,
+    raw: &[u8],
+    config_rva: u32,
+    flags: u32,
+    stride: usize,
+    ranges: &mut Vec<Range<u32>>,
+) -> Result<()> {
+    let mut va_fixups = [None; 2];
+    let first_aux = ranges.len();
+    let eh_present = flags & EH_CONTINUATION_TABLE_PRESENT != 0;
+    let eh_fields = tail_between(raw, EH_TABLE, EH_END);
+    if !eh_present {
+        if nonzero(eh_fields) {
+            return Err(PeError::Invalid("EHCONT fields without flag"));
+        }
+    } else {
+        if eh_fields.len() != 16 {
+            return Err(PeError::Invalid("truncated EHCONT fields"));
+        }
+        let (va, count) = (u64_at(raw, EH_TABLE), u64_at(raw, EH_COUNT));
+        match (va, count) {
+            (0, 0) => (), // EHCONT opt-in with no continuation targets.
+            (0, _) | (_, 0) => return Err(PeError::Invalid("inconsistent EHCONT VA/count")),
+            _ => {
+                if count > MAX_AUX_ROWS as u64 {
+                    return Err(PeError::Unsupported("EHCONT row budget"));
+                }
+                let rva = preferred_rva(pe, va)?;
+                let table = aux_data(pe, ranges, rva, count as usize * stride)?;
+                validate_code_rvas(pe, table, stride, "EHCONT rows")?;
+                va_fixups[0] = Some(config_rva + EH_TABLE as u32);
+            }
+        }
+    }
+
+    let volatile_field = tail_between(raw, VOLATILE_METADATA, EH_TABLE);
+    if nonzero(volatile_field) {
+        if volatile_field.len() != 8 {
+            return Err(PeError::Invalid("truncated volatile metadata pointer"));
+        }
+        let rva = preferred_rva(pe, u64_at(volatile_field, 0))?;
+        if rva % 4 != 0 {
+            return Err(PeError::Invalid("unaligned volatile metadata header"));
+        }
+        // Only the 24-byte layout with version word 0x0001_0001. The
+        // two table lengths are byte sizes, not entry counts.
+        let header = aux_data(pe, ranges, rva, 24)?;
+        if u32_at(header, 0) != 24 || u32_at(header, 4) != 0x0001_0001 {
+            return Err(PeError::Unsupported("volatile metadata layout or version"));
+        }
+        let accesses = volatile_table(pe, ranges, header, 8, 4)?;
+        validate_code_rvas(pe, accesses, 4, "volatile access rows")?;
+        let ranges_table = volatile_table(pe, ranges, header, 16, 8)?;
+        let mut previous_end = 0;
+        for row in ranges_table.chunks_exact(8) {
+            let (start, len) = (u32_at(row, 0), u32_at(row, 4) as usize);
+            if start == 0 || start < previous_end || len == 0 {
+                return Err(PeError::Invalid("volatile range order or bounds"));
+            }
+            validate_aux_code(pe, start, len)?;
+            previous_end = range(start, len)?.end;
+        }
+        va_fixups[1] = Some(config_rva + VOLATILE_METADATA as u32);
+    }
+
+    if eh_present || va_fixups[1].is_some() {
+        // Auxiliary RVAs, counts and version fields must not be relocated.
+        // The only fixups that may touch the extended fields are their live VAs.
+        let ext_start = config_rva + VOLATILE_METADATA as u32;
+        let ext = ext_start..(config_rva + (raw.len().min(EH_END) as u32));
+        for fix in pe.relocations()? {
+            let fix_range = range(fix, 8)?;
+            if (ext.start < ext.end && overlaps(&ext, &fix_range))
+                || ranges[first_aux..].iter().any(|r| overlaps(r, &fix_range))
+            {
+                let Some(expected) = va_fixups.iter_mut().find(|r| **r == Some(fix)) else {
+                    return Err(PeError::Invalid(
+                        "unexpected auxiliary load-config relocation",
+                    ));
+                };
+                *expected = None;
+            }
+        }
+        if pe.directory(5).is_some() && va_fixups.iter().any(Option::is_some) {
+            return Err(PeError::Invalid("missing auxiliary load-config relocation"));
+        }
+    }
+    Ok(())
+}
+
+fn tail_between(raw: &[u8], start: usize, end: usize) -> &[u8] {
+    raw.get(start..end.min(raw.len())).unwrap_or_default()
+}
+
+fn aux_data<'a>(
+    pe: &Pe<'a>,
+    ranges: &mut Vec<Range<u32>>,
+    rva: u32,
+    len: usize,
+) -> Result<&'a [u8]> {
+    // EHCONT can follow a byte-strided GFID table without DWORD alignment.
+    let span = readonly_range(pe, rva, len)?;
+    if ranges.iter().any(|r| overlaps(r, &span)) {
+        return Err(PeError::Invalid(
+            "overlapping auxiliary load-config metadata",
+        ));
+    }
+    ranges.push(span);
+    pe.rva_slice(rva, len)
+}
+
+fn volatile_table<'a>(
+    pe: &Pe<'a>,
+    ranges: &mut Vec<Range<u32>>,
+    header: &[u8],
+    field: usize,
+    stride: usize,
+) -> Result<&'a [u8]> {
+    let rva = u32_at(header, field);
+    let len = u32_at(header, field + 4) as usize;
+    if rva == 0 && len == 0 {
+        return Ok(&[]);
+    }
+    if rva == 0 || len == 0 || len % stride != 0 || rva % 4 != 0 {
+        return Err(PeError::Invalid("volatile table RVA or size"));
+    }
+    if len / stride > MAX_AUX_ROWS {
+        return Err(PeError::Unsupported("volatile metadata row budget"));
+    }
+    aux_data(pe, ranges, rva, len)
+}
+
+fn validate_code_rvas(pe: &Pe<'_>, table: &[u8], stride: usize, what: &'static str) -> Result<()> {
+    let mut previous = 0;
+    for row in table.chunks_exact(stride) {
+        let rva = u32_at(row, 0);
+        // Unlike GFIDs, no continuation-entry flags are supported.
+        if rva <= previous || nonzero(&row[4..]) {
+            return Err(PeError::Invalid(what));
+        }
+        validate_aux_code(pe, rva, 1)?;
+        previous = rva;
+    }
+    Ok(())
+}
+
+fn validate_aux_code(pe: &Pe<'_>, rva: u32, len: usize) -> Result<()> {
+    let code = section_for(pe, &range(rva, len)?)?;
+    if !code.readable() || !code.executable() || code.writable() {
+        return Err(PeError::Invalid(
+            "auxiliary metadata code section permissions",
+        ));
+    }
+    pe.rva_slice(rva, len)?;
+    Ok(())
 }
 
 fn overlaps(a: &Range<u32>, b: &Range<u32>) -> bool {
@@ -737,18 +920,161 @@ pub(super) mod tests {
         put32(&mut f, DIR + 3 * 8, 0x2300); // Directory 13, delay imports.
         put32(&mut f, DIR + 3 * 8 + 4, 32);
         assert!(matches!(parse(&f), Err(PeError::Unsupported(_))));
-        for flag in [0x200, 0x8000, 0x20000, 0x400000, 0x800000, 0x1000000, 1] {
+        for flag in [0x200, 0x8000, 0x20000, 0x800000, 0x1000000, 1] {
             assert!(
                 matches!(parse(&fixture(1, flag)), Err(PeError::Unsupported(_))),
                 "{flag:#x}"
             );
         }
-        for offset in [0x60, 0x94, 0xa0, 0xb0, 0xb8, 0x107] {
+        for offset in [0x60, 0x94, 0xa0, 0xb0, 0xb8] {
             let mut f = fixture(1, hints);
             f[LC + offset] = 1;
             assert!(
                 matches!(parse(&f), Err(PeError::Unsupported(_))),
                 "{offset:#x}"
+            );
+        }
+    }
+
+    const EH_ROWS: usize = LC + 0x199;
+    const VOL_HEADER: usize = LC + 0x1c0;
+    const ACCESS_ROWS: usize = LC + 0x1e0;
+    const RANGE_ROWS: usize = LC + 0x1f0;
+
+    fn add_auxiliary(file: &mut [u8]) {
+        put32(file, DIR + 4, EH_END as u32);
+        put32(file, LC, EH_END as u32);
+        put64(file, LC + CHECK, BASE + 0x2120);
+        put64(file, LC + DISPATCH, BASE + 0x2128);
+        let flags = u32_at(file, LC + GUARD_FLAGS) | EH_CONTINUATION_TABLE_PRESENT;
+        put32(file, LC + GUARD_FLAGS, flags);
+        put64(file, LC + EH_TABLE, BASE + 0x2199);
+        put64(file, LC + EH_COUNT, 2);
+        put32(file, EH_ROWS, 0x1009); // Not a GFID.
+        put32(file, EH_ROWS + 5, 0x1011); // FID-suppressed GFID.
+        put64(file, LC + VOLATILE_METADATA, BASE + 0x21c0);
+        for (i, field) in [24, 0x10001, 0x21e0, 8, 0x21f0, 16].into_iter().enumerate() {
+            put32(file, VOL_HEADER + i * 4, field);
+        }
+        put32(file, ACCESS_ROWS, 0x1000);
+        put32(file, ACCESS_ROWS + 4, 0x1009);
+        for (i, field) in [0x1000, 2, 0x1009, 1].into_iter().enumerate() {
+            put32(file, RANGE_ROWS + i * 4, field);
+        }
+    }
+
+    fn add_aux_relocations(file: &mut [u8]) {
+        put32(file, OPT + 112 + 5 * 8, 0x2300);
+        put32(file, OPT + 112 + 5 * 8 + 4, 24);
+        put32(file, LC + 0x300, 0x2000);
+        put32(file, LC + 0x304, 24);
+        for (i, word) in [0xa070, 0xa078, 0xa080, 0xa100, 0xa108, 0xa120, 0xa128, 0]
+            .into_iter()
+            .enumerate()
+        {
+            put16(file, LC + 0x308 + i * 2, word);
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    pub(crate) fn executable_aux_fixture(dispatch: bool, target: u32) -> Vec<u8> {
+        let mut file = executable_fixture(dispatch, target, 0);
+        file.copy_within(LC + 0x110..LC + 0x120, LC + 0x120);
+        file[LC + 0x110..LC + 0x120].fill(0);
+        // Move the slots out of the extended load config before installing it.
+        let slot = if dispatch { 0x2128 } else { 0x2120 };
+        put32(&mut file, 0x48d, slot - (0x1080 + 17));
+        add_auxiliary(&mut file);
+        add_aux_relocations(&mut file);
+        file
+    }
+
+    #[test]
+    fn auxiliary_metadata_cannot_widen_gfids() {
+        let mut file = fixture(1, ES);
+        let expected: Vec<_> = parse(&file).unwrap().unwrap().entries().collect();
+        add_auxiliary(&mut file);
+        add_aux_relocations(&mut file);
+        let cfg = parse(&file).unwrap().unwrap();
+        assert_ne!(cfg.flags() & EH_CONTINUATION_TABLE_PRESENT, 0);
+        assert_eq!(cfg.entries().collect::<Vec<_>>(), expected);
+        for rva in [0x1000, 0x1009, 0x1011, 0x1017] {
+            assert!(!cfg.permits_rva(rva, ExportSuppression::Enabled));
+        }
+
+        let mut empty = fixture(1, ES | EH_CONTINUATION_TABLE_PRESENT);
+        add_auxiliary(&mut empty);
+        empty[LC + VOLATILE_METADATA..LC + EH_END].fill(0);
+        assert!(parse(&empty).is_ok());
+    }
+
+    #[test]
+    fn malformed_auxiliary_metadata_is_not_ignored() {
+        let mut good = fixture(1, ES);
+        add_auxiliary(&mut good);
+        for (offset, value) in [
+            (LC, (EH_END - 1) as u32),
+            (LC + GUARD_FLAGS, REQUIRED),
+            (EH_ROWS, 0),
+            (EH_ROWS + 5, 0x1009),
+            (EH_ROWS + 5, 0x1008),
+            (EH_ROWS + 5, 0x1200), // code zero-fill
+            (EH_ROWS + 5, 0x2000), // not code
+            (VOL_HEADER, 28),
+            (VOL_HEADER + 4, 0x20001),
+            (VOL_HEADER + 8, 0),
+            (VOL_HEADER + 8, 0x21c0), // aliases header
+            (VOL_HEADER + 12, 7),
+            (VOL_HEADER + 12, 0),
+            (VOL_HEADER + 16, 0x21e0), // aliases access table
+            (ACCESS_ROWS + 4, 0x1000),
+            (RANGE_ROWS + 4, 0x201),
+            (RANGE_ROWS + 8, 0x1001),
+            (RANGE_ROWS + 12, 0),
+            (RANGE_ROWS + 12, u32::MAX),
+        ] {
+            let mut file = good.clone();
+            put32(&mut file, offset, value);
+            assert!(parse(&file).is_err(), "{offset:#x}, {value:#x}");
+        }
+        for (field, value) in [
+            (EH_TABLE, 0),
+            (EH_TABLE, BASE + 0x2140), // aliases GFIDs
+            (EH_TABLE, BASE + 0x23fc), // short backing bytes
+            (EH_COUNT, 0),
+            (EH_COUNT, u64::MAX),
+            (VOLATILE_METADATA, BASE - 1),
+            (VOLATILE_METADATA, BASE + 0x2120), // aliases check slot
+        ] {
+            let mut file = good.clone();
+            put64(&mut file, LC + field, value);
+            assert!(parse(&file).is_err(), "{field:#x}, {value:#x}");
+        }
+        let mut file = good.clone();
+        file[EH_ROWS + 4] = 1;
+        assert!(parse(&file).is_err());
+        for word in [0, 0xa110, 0xa199, 0xa1c0, 0xa108] {
+            let mut file = good.clone();
+            add_aux_relocations(&mut file);
+            put16(&mut file, LC + 0x30e, word);
+            assert!(parse(&file).is_err(), "relocation {word:#x}");
+        }
+    }
+
+    #[test]
+    fn auxiliary_metadata_does_not_admit_other_requirements() {
+        let mut good = fixture(1, ES);
+        add_auxiliary(&mut good);
+        for field in [0x94, 0xa0, 0xa8, 0xb0, 0xb8, 0xc8, 0xf8, 0x118] {
+            let mut file = good.clone();
+            if field >= EH_END {
+                put32(&mut file, DIR + 4, field as u32 + 8);
+                put32(&mut file, LC, field as u32 + 8);
+            }
+            put64(&mut file, LC + field, 1);
+            assert!(
+                matches!(parse(&file), Err(PeError::Unsupported(_))),
+                "{field:#x}"
             );
         }
     }

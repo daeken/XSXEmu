@@ -351,6 +351,40 @@ GFID enforcement; the dormant slots add no entries to that policy. The tests
 use only original PEs and exercise all five calls, rebasing, near-miss metadata
 and the existing guarded enforcement fixtures. The title was inspected only.
 
+## Active CFG with optional EHCONT and volatile metadata
+
+A guarded AMD64 image can additionally carry bounded EH continuation and
+volatile metadata. The parser checks preferred VAs, sizes, file backing,
+permissions, ordering, disjoint metadata ranges, and the extension's DIR64
+fixups. It recognizes an empty EHCONT table only with the flag and both fields
+zero. Nonempty EHCONT tables contain strictly ordered code RVAs with the
+GuardFlags stride and zero extra bytes. The volatile reader accepts only the
+24-byte header with minimum and maximum version 1; its DWORD access RVAs and
+`(start RVA, byte length)` ranges must lie in file-backed RX code.
+
+[MSVC `/guard:ehcont`][ehcont] describes EHCONT as a list for Windows context
+transfer validation, not indirect call authorization. This child has no
+exception dispatch or Windows context restore. Static unwind and context
+capture do not resume execution from a guest `CONTEXT`. No EHCONT address is
+added to CFG: both active guard slots still enforce exact GFIDs with suppression
+and the existing explicitly bound host targets. Do not reuse this admission
+policy for a runtime that can restore a guest context without implementing
+its continuation checks.
+
+[MSVC `/volatileMetadata`][volatile] describes an optional memory-ordering
+optimization for x86/x64 emulators. The runner doesn't consume the annotations
+to weaken ordering; it relies on native x86 semantics or Rosetta. The binary
+layouts are corroborated by [LLVM's COFF reader][coff] and [LIEF's volatile
+metadata reader][lief], respectively. CodeIntegrity fields, real address-taken
+IAT/long-jump tables, process export-suppression opt-in and other unknown or
+unsupported guard fields still refuse admission. No signature validation is
+performed by this profile.
+
+[ehcont]: https://learn.microsoft.com/en-us/cpp/build/reference/guard-enable-eh-continuation-metadata
+[volatile]: https://learn.microsoft.com/en-us/cpp/build/reference/volatile
+[coff]: https://github.com/llvm/llvm-project/blob/main/llvm/tools/llvm-readobj/COFFDumper.cpp
+[lief]: https://lief.re/doc/latest/doxygen/classLIEF_1_1PE_1_1VolatileMetadata.html
+
 ## Controlled execution plan
 
 1. Separate loading from execution. Reuse PE static TLS metadata but check

@@ -149,7 +149,11 @@ pub const SLOT_THUNKS: [unsafe extern "win64" fn(); 2] = [check, dispatch];
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{link::BindingTarget, providers, startup, win_cfg::tests::executable_fixture};
+    use crate::{
+        link::BindingTarget,
+        providers, startup,
+        win_cfg::tests::{executable_aux_fixture, executable_fixture},
+    };
     use std::{os::unix::process::ExitStatusExt, process::Command};
 
     const CASE: &str = "XSXEMU_OWNED_CFG_TEST_CASE";
@@ -186,7 +190,10 @@ mod tests {
             return;
         }
         let target = u32::from_str_radix(value, 16).unwrap();
-        let file = executable_fixture(form == "dispatch", target, 0);
+        let file = match form {
+            "aux-check" | "aux-dispatch" => executable_aux_fixture(form == "aux-dispatch", target),
+            _ => executable_fixture(form == "dispatch", target, 0),
+        };
         assert_eq!(
             startup::run(&[("cfg-fixture.exe", &file)], &[], &[], &[], None, false).unwrap(),
             42
@@ -217,6 +224,42 @@ mod tests {
                 ("1017", false),
             ] {
                 assert_case(&format!("{form}:{target}"), allowed);
+            }
+        }
+    }
+
+    #[test]
+    fn continuation_metadata_does_not_authorize_indirect_calls() {
+        for form in ["aux-check", "aux-dispatch"] {
+            for (target, allowed) in [("1003", true), ("1009", false), ("1011", false)] {
+                assert_case(&format!("{form}:{target}"), allowed);
+            }
+        }
+    }
+
+    #[test]
+    fn context_transfer_providers_stay_unbound() {
+        for module in [
+            b"ntdll.dll".as_slice(),
+            b"kernel32.dll",
+            b"kernelbase.dll",
+            b"api-ms-win-core-rtlsupport-l1-1-0.dll",
+            b"api-ms-win-core-processthreads-l1-1-0.dll",
+            b"api-ms-win-core-errorhandling-l1-1-0.dll",
+        ] {
+            for name in [
+                b"NtContinue".as_slice(),
+                b"NtContinueEx",
+                b"RtlRestoreContext",
+                b"SetThreadContext",
+                b"RtlUnwind",
+                b"RtlUnwindEx",
+                b"RaiseException",
+            ] {
+                assert!(
+                    providers::lookup(module, name).is_none(),
+                    "{module:?}!{name:?}"
+                );
             }
         }
     }
