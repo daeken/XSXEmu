@@ -12,6 +12,15 @@ On the pinned input (2,684 pairs, 2,684 distinct programs), item word 1 (`u32` a
 - **Tag `0x42`: 92,551 items.** 89,977 have zero word 1; zero is counted separately and not dereferenced. The **2,574 nonzero** values cover 50 programs and 2,574 distinct program/offset pairs. Every value is dword-aligned and selects eight bytes within the matching program, measured as a *byte offset from the program-table span start*. The first dword shifted right by 18 is `0x3d02` (1,702) or `0x3d03` (872). With the associated dispatch wave bit, LLVM 21.1.6 independently decodes all of those as 8-byte `s_load_dwordx4` and `s_load_dwordx8`, respectively, under **both** `gfx1013` and `gfx1030`.
 - **Tag `0x41`: 98,351 items.** 88,103 have word 1 in the four-value set observed in the [DLL-embedded FSPX profile](embedded-shaders.md); 10,248 do not. Even where the value is shared, the FSPX same-container root declaration test is not available for these pairs. Do not treat shared numeric codes as confirmed cross-profile class semantics.
 
+At those 2,574 confirmed patterns, word 2's low byte distinguishes two populations. Comparing raw layout fields to the paired instruction's second dword gives:
+
+| Word 2 low byte | Sites | Second dword low 21 bits are zero | Word 3 is zero | Nonzero word 3 × 4 equals low 21 bits |
+|---|---:|---:|---:|---:|
+| 1 | 1,043 | 24 | 6 | 1 |
+| 2 | 1,531 | 1,530 | 1,531 | 0 |
+
+Word 4 is 0 or 1 in all 2,574 items, and every item has a nonzero byte somewhere in words 5–7. The low-byte-2 group has one counterexample to zero instruction bits. Nor does word 3 generally specify those bits in dwords: excluding the six zero cases, that equality succeeds only once in the low-byte-1 group. These are falsifiable raw-field comparisons, not a decoder for offsets, relocations, or bindings. The zero-word-1 population is excluded from this comparison.
+
 The first two 12-byte groups carry the same partial footer-digest fingerprint checked in DLL FSPX for **2,684/2,684** pairs. Only **2,634** have the third `0xd580` group marker: those are exactly the pairs without a nonzero `0x42` site. All **50** with a nonzero site lack that marker, and one checked scalar-load pattern starts before byte 36. Thus a blanket 36-byte prefix skip for this library would omit a checked site. Neither the 24-byte fingerprint nor the third marker establishes the first executable instruction.
 
 For the 50 pairs with nonzero sites, the same command also tests **conditional** CFG walks starting at byte 24 or 36. Each run excludes the preceding bytes, treats edges before the assumed entry or after the stored span as out of bounds, and requires at least one modeled exit. It does not require every path to terminate. A site counts only at a decoded eight-byte scalar load start in a complete modeled graph; a failed walk does not classify its sites.

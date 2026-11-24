@@ -34,6 +34,34 @@ fn candidate(code: &[u8], offset: usize) -> Option<(&[u8], usize)> {
 }
 
 #[derive(Default)]
+struct SiteFields {
+    // Bucket by word 2 low byte (1, 2, other). These are raw fields, not ABI tags.
+    groups: [[usize; 6]; 3],
+}
+impl SiteFields {
+    fn add(&mut self, item: &[u8], code: &[u8]) -> Option<()> {
+        let w2 = word(item, 8)?;
+        let w3 = word(item, 12)?;
+        let w4 = word(item, 16)?;
+        let low21 = word(code, 4)? & 0x1f_ffff;
+        let tail_zero = item.get(20..32)?.iter().all(|&b| b == 0);
+        let group = match w2 & 255 {
+            1 => 0,
+            2 => 1,
+            _ => 2,
+        };
+        let counts = &mut self.groups[group];
+        counts[0] += 1;
+        counts[1] += usize::from(low21 == 0);
+        counts[2] += usize::from(w3 == 0);
+        counts[3] += usize::from(w3 != 0 && w3.checked_mul(4) == Some(low21));
+        counts[4] += usize::from(w4 > 1);
+        counts[5] += usize::from(!tail_zero);
+        Some(())
+    }
+}
+
+#[derive(Default)]
 struct Hypothesis {
     complete: usize,
     bad_decode: usize,
@@ -212,6 +240,7 @@ pub fn run(lib: &OsStr, path: &Path) -> Result<(), Box<dyn Error>> {
     // Pair counts indexed by presence of nonzero sites, then by fingerprint shape.
     let mut prefixes = [[0; 3]; 2];
     let mut sites_in_first_36 = 0;
+    let mut fields = SiteFields::default();
     let entries = [24, 36];
     let mut walks: [[Hypothesis; 2]; 2] = Default::default();
     for row in library.compute() {
@@ -250,6 +279,9 @@ pub fn run(lib: &OsStr, path: &Path) -> Result<(), Box<dyn Error>> {
                 continue;
             };
             in_pattern += 1;
+            fields
+                .add(item, bytes)
+                .ok_or("truncated scalar-load site fields")?;
             pattern_sites.push(value);
             sites_in_first_36 += usize::from(value < 36);
             let (index, expect) = if dwords == 4 {
@@ -306,6 +338,13 @@ pub fn run(lib: &OsStr, path: &Path) -> Result<(), Box<dyn Error>> {
     println!(
         "Nonzero values selecting a dword-aligned in-span 8-byte SMEM pattern from stored-span start: {in_pattern}/{nonzero}"
     );
+    for (label, [n, zero21, zero3, scaled3, wide4, tail]) in
+        ["1", "2", "other"].into_iter().zip(fields.groups)
+    {
+        println!(
+            "SMEM pattern / word2 low-byte {label}: {n} sites; low21 in second dword zero={zero21}; word3 zero={zero3}; nonzero word3*4 equals low21={scaled3}; word4 above 1={wide4}; nonzero word5..7={tail}"
+        );
+    }
     for (i, [no_match, two, three]) in prefixes.into_iter().enumerate() {
         println!(
             "Digest prefix (nonzero site present={}): {no_match} no match, {two} first two groups only, {three} plus third group marker",
@@ -351,6 +390,27 @@ pub fn run(lib: &OsStr, path: &Path) -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn compares_site_fields_without_requiring_a_relation() {
+        let mut item = [0u8; 32];
+        let mut code = [0u8; 8];
+        let mut counts = SiteFields::default();
+        item[8] = 1;
+        item[12] = 5;
+        code[4..].copy_from_slice(&0xfaa0_0014u32.to_le_bytes());
+        assert_eq!(counts.add(&item, &code), Some(()));
+        item[8] = 2;
+        item[16] = 7;
+        item[31] = 1;
+        code[4] = 0;
+        assert_eq!(counts.add(&item, &code), Some(()));
+        assert_eq!(
+            counts.groups,
+            [[1, 0, 0, 1, 0, 0], [1, 1, 0, 0, 1, 1], [0; 6]]
+        );
+        assert_eq!(counts.add(&item[..31], &code), None);
+    }
+
     #[test]
     fn checks_graphics_layout_framing_without_compute_header() {
         let mut blob = [0; 80];
