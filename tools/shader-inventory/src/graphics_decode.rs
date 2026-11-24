@@ -13,6 +13,7 @@ pub(crate) enum Target {
 pub(crate) enum FloatSource {
     Vgpr(Vgpr),
     InlineBits(u32),
+    LiteralBits(u32),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,16 +82,27 @@ pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeErro
             },
         ));
     }
-    // VOP2 legacy multiply, unmodified VGPR src1. Admit only exact owned inline forms and VGPR src0.
+    // VOP2 legacy multiply, unmodified VGPR src1. Bound literal FP classes explicitly.
     if w & 0xfe00_0000 == 0x0e00_0000 {
         let lhs = match w & 0x1ff {
             128 => FloatSource::InlineBits(0),
             240 => FloatSource::InlineBits(0x3f00_0000),
+            255 => {
+                let bits = ext()?;
+                if bits & 0x7fff_ffff != 0 && !f32::from_bits(bits).is_normal() {
+                    return Err(DecodeError::Unsupported(pc));
+                }
+                FloatSource::LiteralBits(bits)
+            }
             r @ 256..=511 => FloatSource::Vgpr(Vgpr(r as u8)),
             _ => return Err(DecodeError::Unsupported(pc)),
         };
         return Ok((
-            1,
+            if matches!(lhs, FloatSource::LiteralBits(_)) {
+                2
+            } else {
+                1
+            },
             Op::MulLegacyF32 {
                 dst: Vgpr((w >> 17) as u8),
                 lhs,

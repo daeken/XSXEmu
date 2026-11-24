@@ -144,7 +144,9 @@ fn body(out: &mut String, ops: &[Op]) {
             } => {
                 let lhs = match lhs {
                     FloatSource::Vgpr(Vgpr(r)) => format!("r[{r}]"),
-                    FloatSource::InlineBits(bits) => format!("0x{bits:08x}u"),
+                    FloatSource::InlineBits(bits) | FloatSource::LiteralBits(bits) => {
+                        format!("0x{bits:08x}u")
+                    }
                 };
                 writeln!(out, "  r[{dst}] = mul_legacy_f32_bits({lhs}, r[{rhs}]);").unwrap();
             }
@@ -175,6 +177,32 @@ fn body(out: &mut String, ops: &[Op]) {
     }
 }
 
+const MSL_HEADER: &str = "#include <metal_stdlib>\nusing namespace metal;\n\
+static uint mul_legacy_f32_bits(uint a, uint b) {\n\
+  if ((a & 0x7fffffffu) == 0 || (b & 0x7fffffffu) == 0) return 0u;\n\
+  return as_type<uint>(as_type<float>(a) * as_type<float>(b));\n\
+}\n";
+
+const EDGE_VGPR: &[u32] = &[0x0e04_0300]; // v_mul_legacy_f32_e32 v2, v0, v1
+const EDGE_LITERAL: &[u32] = &[0x0e06_02ff, 0x3e80_0000]; // v_mul_legacy_f32_e32 v3, 0.25, v1
+
+#[allow(dead_code)] // Used by the separate owned bit-exact edge probe.
+pub fn translate_legacy_edge_fixture() -> Result<String, DecodeError> {
+    let (a_width, a) = decode(EDGE_VGPR, 0)?;
+    let (b_width, b) = decode(EDGE_LITERAL, 0)?;
+    if (a_width, b_width) != (1, 2)
+        || !matches!(a, Op::MulLegacyF32 { .. })
+        || !matches!(b, Op::MulLegacyF32 { .. })
+    {
+        return Err(DecodeError::Unsupported(0));
+    }
+    let mut msl = MSL_HEADER.to_owned();
+    msl.push_str("kernel void legacy_edges(const device uint2 *in [[buffer(0)]], device uint2 *out [[buffer(1)]], uint id [[thread_position_in_grid]]) {\n  uint r[256]; r[0] = in[id].x; r[1] = in[id].y;\n");
+    body(&mut msl, &[a, b]);
+    msl.push_str("  out[id] = uint2(r[2], r[3]);\n}\n");
+    Ok(msl)
+}
+
 pub fn fixture_programs(literal_bits: Option<u32>) -> (&'static [u32], Vec<u32>) {
     let mut ps = PS.to_vec();
     if let Some(bits) = literal_bits {
@@ -189,13 +217,9 @@ pub fn translate_fixture(literal_bits: Option<u32>) -> Result<String, Reject> {
     let ps = lift(Stage::Pixel, &ps)?;
     // Only the entry/binding convention and one interpolation rule are authored
     // here. All moves, arithmetic, output operands and returns come from the lift.
-    let mut msl = String::from(
-        "#include <metal_stdlib>\nusing namespace metal;\n\
-static uint mul_legacy_f32_bits(uint a, uint b) {\n\
-  if ((a & 0x7fffffffu) == 0 || (b & 0x7fffffffu) == 0) return 0u;\n\
-  return as_type<uint>(as_type<float>(a) * as_type<float>(b));\n\
-}\n\
-struct VertexInput { float4 position; float4 parameter; };\n\
+    let mut msl = MSL_HEADER.to_owned();
+    msl.push_str(
+        "struct VertexInput { float4 position; float4 parameter; };\n\
 struct Varyings { float4 position [[position]]; float4 parameter [[center_no_perspective]]; };\n\
 vertex Varyings translated_vs(uint vid [[vertex_id]], const device VertexInput *input [[buffer(0)]]) {\n\
   uint r[256]; Varyings out;\n\
@@ -228,8 +252,14 @@ mod tests {
             io::Write,
             process::{Command, Stdio},
         };
-        let asm = "v_mov_b32_e32 v8, v4\nexp param0 v8, v5, v6, v7\nexp pos0 v0, v1, v2, v3 done\ns_endpgm\nv_add_f32_e32 v4, 0.25, v0\nv_fma_f32 v5, v1, v2, v3\nv_mul_legacy_f32_e32 v6, v5, v4\nv_mul_legacy_f32_e32 v6, 0.5, v6\nv_mul_legacy_f32_e32 v7, 0, v3\nexp mrt0 v4, v5, v6, v7 done\ns_endpgm\n";
-        let expected: Vec<u8> = VS.iter().chain(PS).flat_map(|w| w.to_le_bytes()).collect();
+        let asm = "v_mov_b32_e32 v8, v4\nexp param0 v8, v5, v6, v7\nexp pos0 v0, v1, v2, v3 done\ns_endpgm\nv_add_f32_e32 v4, 0.25, v0\nv_fma_f32 v5, v1, v2, v3\nv_mul_legacy_f32_e32 v6, v5, v4\nv_mul_legacy_f32_e32 v6, 0.5, v6\nv_mul_legacy_f32_e32 v7, 0, v3\nexp mrt0 v4, v5, v6, v7 done\ns_endpgm\nv_mul_legacy_f32_e32 v2, v0, v1\nv_mul_legacy_f32_e32 v3, 0.25, v1\n";
+        let expected: Vec<u8> = VS
+            .iter()
+            .chain(PS)
+            .chain(EDGE_VGPR)
+            .chain(EDGE_LITERAL)
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
         for cpu in ["gfx1013", "gfx1030"] {
             let mut child = Command::new(&mc)
                 .args(["-triple=amdgcn", &format!("-mcpu={cpu}"), "--show-encoding"])
@@ -254,6 +284,30 @@ mod tests {
                 .collect();
             assert_eq!(bytes, expected, "{cpu}");
         }
+    }
+
+    #[test]
+    fn legacy_literal_extent_and_fp_classes_are_checked() {
+        assert_eq!(
+            decode(&EDGE_LITERAL[..1], 0),
+            Err(DecodeError::Truncated(0))
+        );
+        for bits in [1, 0x7f80_0000, 0x7fc1_2345] {
+            assert_eq!(
+                decode(&[EDGE_LITERAL[0], bits], 0),
+                Err(DecodeError::Unsupported(0))
+            );
+        }
+        assert!(matches!(
+            decode(&[EDGE_LITERAL[0], 0x8000_0000], 0),
+            Ok((
+                2,
+                Op::MulLegacyF32 {
+                    lhs: FloatSource::LiteralBits(0x8000_0000),
+                    ..
+                }
+            ))
+        ));
     }
 
     #[test]

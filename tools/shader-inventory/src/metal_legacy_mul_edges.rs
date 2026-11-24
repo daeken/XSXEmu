@@ -1,0 +1,131 @@
+//! Bit-exact arithmetic probe, separate from the synthetic graphics ABI.
+#[cfg(target_os = "macos")]
+mod graphics_decode;
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+mod graphics_lift;
+#[cfg(target_os = "macos")]
+mod metal_artifact;
+
+#[cfg(target_os = "macos")]
+mod gpu {
+    use metal::*;
+    use std::path::Path;
+
+    pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+        let args: Vec<_> = std::env::args_os().skip(1).collect();
+        if args.len() == 1 && args[0] == "--emit-msl" {
+            print!(
+                "{}",
+                super::graphics_lift::translate_legacy_edge_fixture()
+                    .map_err(|e| format!("decode: {e:?}"))?
+            );
+            return Ok(());
+        }
+        let [mode, lib, path] = args.as_slice() else {
+            return Err(
+                "usage: shader-legacy-mul-edges --emit-msl | <--bake|--replay> LIB ARCHIVE".into(),
+            );
+        };
+        let bake = mode == "--bake";
+        if (!bake && mode != "--replay") || std::env::var_os("MTL_SHADER_VALIDATION").is_some() {
+            return Err("expected --bake or --replay with MTL_SHADER_VALIDATION unset".into());
+        }
+        let dev = Device::system_default().ok_or("no Metal device")?;
+        super::metal_artifact::file_url(Path::new(lib), false)?;
+        let lib = dev.new_library_with_file(Path::new(lib))?;
+        let function = lib.get_function("legacy_edges", None)?;
+        let url = super::metal_artifact::file_url(Path::new(path), bake)?;
+        let ad = BinaryArchiveDescriptor::new();
+        if !bake {
+            ad.set_url(&url);
+        }
+        let archive = dev.new_binary_archive_with_descriptor(&ad)?;
+        let pd = ComputePipelineDescriptor::new();
+        pd.set_compute_function(Some(&function));
+        if bake
+            && (!archive.add_compute_pipeline_functions_with_descriptor(&pd)?
+                || !archive.serialize_to_url(&url)?)
+        {
+            return Err("could not bake owned edge archive".into());
+        }
+        pd.set_binary_archives(&[&archive]);
+        let (pipeline, _) = dev.new_compute_pipeline_state_with_reflection(
+            &pd,
+            MTLPipelineOption::FailOnBinaryArchiveMiss,
+        )?;
+        const P0: u32 = 0;
+        const N0: u32 = 0x8000_0000;
+        const INF: u32 = 0x7f80_0000;
+        const NINF: u32 = 0xff80_0000;
+        const NAN: u32 = 0x7fc1_2345;
+        const N2: u32 = 0xc000_0000;
+        const P3: u32 = 0x4040_0000;
+        const N6: u32 = 0xc0c0_0000;
+        const N_HALF: u32 = 0xbf00_0000;
+        const P_THREE_QUARTERS: u32 = 0x3f40_0000;
+        // Independent oracle: (a,b), then legacy (a*b, (1/4)*b) exact IEEE words.
+        // No assertion of payload preservation when neither input has magnitude zero.
+        let cases = [
+            ([N0, INF], [P0, INF]),
+            ([NAN, N0], [P0, P0]),
+            ([P0, NINF], [P0, NINF]),
+            ([NINF, P0], [P0, P0]),
+            ([N0, N2], [P0, N_HALF]),
+            ([N2, N0], [P0, P0]),
+            ([P3, N2], [N6, N_HALF]),
+            ([N2, P3], [N6, P_THREE_QUARTERS]),
+        ];
+        let inputs = cases.map(|(input, _)| input);
+        let bytes = std::mem::size_of_val(&inputs);
+        let usage = MTLResourceOptions::StorageModeShared;
+        let input = dev.new_buffer_with_data(inputs.as_ptr().cast(), bytes as u64, usage);
+        let output = dev.new_buffer(bytes as u64, usage);
+        let out = output.contents().cast::<[u32; 2]>();
+        if out.is_null() {
+            return Err("unmapped readback".into());
+        }
+        // Shared buffer is owned here; no CPU access during execution.
+        unsafe { out.write_bytes(0xa5, cases.len()) };
+        let queue = dev.new_command_queue();
+        let cmd = queue.new_command_buffer();
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(&input), 0);
+        enc.set_buffer(1, Some(&output), 0);
+        enc.dispatch_threads(
+            MTLSize::new(cases.len() as u64, 1, 1),
+            MTLSize::new(cases.len() as u64, 1, 1),
+        );
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+        if cmd.status() != MTLCommandBufferStatus::Completed {
+            return Err("edge command did not complete".into());
+        }
+        for (i, (_, expected)) in cases.into_iter().enumerate() {
+            // Exact dispatched extent, completed writes, owned allocation still live.
+            let actual = unsafe { out.add(i).read() };
+            if actual != expected {
+                return Err(
+                    format!("edge row {i}: got {actual:08x?}, expected {expected:08x?}").into(),
+                );
+            }
+        }
+        println!(
+            "{}: strict legacy multiply archive, 16/16 exact result words",
+            dev.name()
+        );
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    metal::objc::rc::autoreleasepool(gpu::run)
+}
+#[cfg(not(target_os = "macos"))]
+fn main() {
+    eprintln!("Metal required");
+    std::process::exit(1);
+}

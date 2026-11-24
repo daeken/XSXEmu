@@ -352,6 +352,24 @@ impl PrimitiveCensus {
     }
 }
 
+fn legacy_source_shape(word: u32, len: usize) -> &'static str {
+    if word & 0xfe00_0000 != 0x0e00_0000 {
+        return "encoding mismatch";
+    }
+    match (word & 511, len) {
+        (256..=511, 4) => "VGPR",
+        (0..=105, 4) => "ordinary SGPR selector",
+        (128, 4) => "inline zero",
+        (240, 4) => "inline one-half",
+        (129..=208, 4) => "other inline integer selector",
+        (241..=248, 4) => "other inline float selector",
+        (255, 8) => "literal dword",
+        (249 | 250, 8) => "extended source selector",
+        (_, 4) => "other four-byte selector",
+        _ => "encoding mismatch",
+    }
+}
+
 #[derive(Default)]
 struct LiftGaps {
     complete: usize,
@@ -359,12 +377,14 @@ struct LiftGaps {
     sites: usize,
     accepted_sites: usize,
     missing: BTreeMap<String, (usize, usize)>, // payloads, checked sites
+    legacy_shapes: BTreeMap<(&'static str, bool), (usize, usize)>,
 }
 
 impl LiftGaps {
     fn observe(&mut self, dis: &mut Disassembler, bytes: &[u8]) -> Result<Exports, ResultClass> {
         use crate::graphics_decode::{Op, decode};
         let mut missing = BTreeMap::<String, usize>::new();
+        let mut legacy_shapes = BTreeMap::new();
         let (mut sites, mut accepted) = (0, 0);
         let result = project_exports_observe(dis, bytes, false, |tail, len, name| {
             sites += 1;
@@ -388,6 +408,11 @@ impl LiftGaps {
                         Op::End => name == "s_endpgm",
                     }
             });
+            if name == "v_mul_legacy_f32_e32" {
+                *legacy_shapes
+                    .entry((legacy_source_shape(words[0], len), matches))
+                    .or_insert(0) += 1;
+            }
             if matches {
                 accepted += 1;
             } else if let Some(n) = missing.get_mut(name) {
@@ -401,6 +426,11 @@ impl LiftGaps {
             self.no_encoding_gap += usize::from(missing.is_empty());
             self.sites += sites;
             self.accepted_sites += accepted;
+            for (key, count) in legacy_shapes {
+                let total = self.legacy_shapes.entry(key).or_default();
+                total.0 += 1;
+                total.1 += count;
+            }
             for (name, count) in missing {
                 let total = self.missing.entry(name).or_default();
                 total.0 += 1;
@@ -415,6 +445,11 @@ impl LiftGaps {
             "  wave{width} lift encoding surface (not translations): {}/{} complete graphs without encoding gap; {}/{} checked sites match Rust width and mnemonic",
             self.no_encoding_gap, self.complete, self.accepted_sites, self.sites
         );
+        for ((shape, supported), (payloads, sites)) in self.legacy_shapes {
+            println!(
+                "    legacy source: {shape} (decoder match = {supported}): {payloads} payloads, {sites} checked sites"
+            );
+        }
         let mut rows: Vec<_> = self.missing.into_iter().collect();
         rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         for (mnemonic, (payloads, sites)) in rows {
