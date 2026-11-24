@@ -36,7 +36,9 @@ fn candidate(code: &[u8], offset: usize) -> Option<(&[u8], usize)> {
 #[derive(Default)]
 struct Hypothesis {
     complete: usize,
-    unsupported: usize,
+    bad_decode: usize,
+    indirect_pc: usize,
+    other_control: usize,
     outside: usize,
     invalid: usize,
     no_exit: usize,
@@ -50,21 +52,31 @@ impl Hypothesis {
             self.outside += 1;
             return;
         };
+        let mut control_rejection = None;
         let graph = cfg::walk_extent(body.len() / 4, |pc| {
             let tail = &body[pc * 4..];
             let (len, text) = dis.one(tail, entry + pc * 4, &mut scratch)?;
             let mnemonic = text.split_ascii_whitespace().next()?;
             let first = word(tail, 0)? as u32;
+            let Some(flow) = control(mnemonic, first, len) else {
+                control_rejection =
+                    Some(mnemonic.starts_with("s_setpc") || mnemonic.starts_with("s_swappc"));
+                return None;
+            };
             Some(Instruction {
                 width: len / 4,
-                flow: control(mnemonic, first, len)?,
-                op: (),
+                flow,
+                op: matches!((mnemonic, len), ("s_load_dwordx4" | "s_load_dwordx8", 8)),
             })
         });
         let graph = match graph {
             Ok(graph) => graph,
             Err(cfg::Error::UnsupportedEncoding) => {
-                self.unsupported += 1;
+                match control_rejection {
+                    None => self.bad_decode += 1,
+                    Some(true) => self.indirect_pc += 1,
+                    Some(false) => self.other_control += 1,
+                }
                 return;
             }
             Err(cfg::Error::BadSuccessor) => {
@@ -84,7 +96,7 @@ impl Hypothesis {
         for &site in sites {
             if site
                 .checked_sub(entry)
-                .is_some_and(|p| graph.get(&(p / 4)).is_some_and(|op| op.width == 2))
+                .is_some_and(|p| p % 4 == 0 && graph.get(&(p / 4)).is_some_and(|inst| inst.op))
             {
                 self.starts += 1;
             } else {
@@ -240,10 +252,12 @@ pub fn run(lib: &OsStr, path: &Path) -> Result<(), Box<dyn Error>> {
     for (cpu, per_entry) in cpus.into_iter().zip(walks) {
         for (entry, w) in entries.into_iter().zip(per_entry) {
             println!(
-                "{} conditional entry +{entry}: {} complete, {} decode/control rejects, {} outside successors, {} bad width/overlap, {} no exit; in complete graphs {} site starts, {} other sites",
+                "{} conditional entry +{entry}: {} complete, {} decode rejects, {} indirect PC, {} other control rejects, {} outside successors, {} bad width/overlap, {} no exit; in complete graphs {} site starts, {} other sites",
                 cpu.name(),
                 w.complete,
-                w.unsupported,
+                w.bad_decode,
+                w.indirect_pc,
+                w.other_control,
                 w.outside,
                 w.invalid,
                 w.no_exit,
