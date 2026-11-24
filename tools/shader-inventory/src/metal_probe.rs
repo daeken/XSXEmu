@@ -74,6 +74,7 @@ fn run_alu(
 enum ExecArchive {
     Bake(std::path::PathBuf),
     Replay(std::path::PathBuf),
+    Library(std::path::PathBuf, Option<(bool, std::path::PathBuf)>),
 }
 
 #[cfg(target_os = "macos")]
@@ -92,7 +93,12 @@ fn file_url(
     match std::fs::symlink_metadata(&path) {
         Ok(meta) if !create && meta.is_file() => (),
         Ok(_) => {
-            return Err("archive bake requires a new file; replay requires a regular file".into());
+            return Err(if create {
+                "archive bake requires a new file"
+            } else {
+                "loading a Metal artifact requires a regular nonsymlink file"
+            }
+            .into());
         }
         Err(e) if create && e.kind() == std::io::ErrorKind::NotFound => (),
         Err(e) => return Err(e.into()),
@@ -128,10 +134,28 @@ fn owned_pipeline(
     use metal::{
         BinaryArchiveDescriptor, CompileOptions, ComputePipelineDescriptor, MTLPipelineOption,
     };
-    let lib = dev.new_library_with_source(source, &CompileOptions::new())?;
+    let (lib, archive) = match archive {
+        Some(ExecArchive::Library(path, archive)) => {
+            file_url(&path, false)?;
+            let lib = dev.new_library_with_file(&path)?;
+            let archive = archive.map(|(bake, path)| {
+                if bake {
+                    ExecArchive::Bake(path)
+                } else {
+                    ExecArchive::Replay(path)
+                }
+            });
+            (lib, archive)
+        }
+        archive => (
+            dev.new_library_with_source(source, &CompileOptions::new())?,
+            archive,
+        ),
+    };
     let function = lib.get_function(name, None)?;
     let pipeline = match archive {
         None => dev.new_compute_pipeline_state_with_function(&function)?,
+        Some(ExecArchive::Library(..)) => unreachable!("external library mode was separated above"),
         Some(ExecArchive::Bake(path)) => {
             let url = file_url(&path, true)?;
             let archive = dev.new_binary_archive_with_descriptor(&BinaryArchiveDescriptor::new())?;
@@ -394,13 +418,45 @@ fn run_buffer(
 
 #[cfg(target_os = "macos")]
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let mut args = std::env::args_os().skip(1);
+    let mode = args.next();
+    if mode.as_deref() == Some(std::ffi::OsStr::new("--emit-exec-store-msl")) {
+        if args.next().is_some() {
+            return Err("--emit-exec-store-msl takes no arguments".into());
+        }
+        use std::io::Write as _;
+        let program = exec_store::Program::decode(&exec_store::FIXTURE)?;
+        std::io::stdout()
+            .lock()
+            .write_all(program.msl().as_bytes())?;
+        return Ok(());
+    }
     let dev = metal::Device::system_default().ok_or("unsupported: no Metal device")?;
     let queue = dev.new_command_queue();
-    let mut args = std::env::args_os().skip(1);
-    if let Some(mode) = args.next() {
+    if let Some(mode) = mode {
+        if mode == "--load-exec-store-metallib" {
+            let path = args
+                .next()
+                .filter(|_| args.next().is_none())
+                .ok_or("--load-exec-store-metallib <owned library>")?;
+            return run_exec_store(&dev, &queue, Some(ExecArchive::Library(path.into(), None)));
+        }
         let usage = "usage: shader-metal-probe [--bake-exec-archive | --replay-exec-archive | --bake-exec-store-archive | --replay-exec-store-archive] [file]";
         if std::env::var_os("MTL_SHADER_VALIDATION").is_some_and(|v| v != "0" && !v.is_empty()) {
             return Err("this binary archive probe does not support Metal GPU shader validation instrumentation; use the regular probe for GPU validation".into());
+        }
+        if mode == "--bake-exec-store-metallib-archive"
+            || mode == "--replay-exec-store-metallib-archive"
+        {
+            let usage = "--bake-exec-store-metallib-archive|--replay-exec-store-metallib-archive <owned library> <archive>";
+            let lib = args.next().ok_or(usage)?;
+            let path = args.next().filter(|_| args.next().is_none()).ok_or(usage)?;
+            let bake = mode == "--bake-exec-store-metallib-archive";
+            return run_exec_store(
+                &dev,
+                &queue,
+                Some(ExecArchive::Library(lib.into(), Some((bake, path.into())))),
+            );
         }
         let path = args
             .next()
