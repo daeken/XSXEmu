@@ -1,5 +1,5 @@
 //! Count-only checks for the wrapped DXBC signature profile, not native ABI.
-use crate::{BLOB_LIMIT, coverage::Metadata, dxbc_chunks, shader, stage_name, word};
+use crate::{BLOB_LIMIT, coverage::Metadata, dxbc_chunks, shader_payloads, stage_name, word};
 use std::{
     collections::BTreeMap,
     error::Error,
@@ -195,18 +195,31 @@ impl NativeCompute {
         self.wave32 += usize::from(meta.wave32);
         self.fixed_wave32_mismatch += usize::from(source_fixed_wave32 && !meta.wave32);
     }
+}
 
-    fn wrapper(&mut self, wrapper: &[u8], psv: &[u8], inflate: &mut Vec<u8>) -> Option<()> {
-        let xyz = [word(psv, 40)?, word(psv, 44)?, word(psv, 48)?];
-        let fixed_wave32 = (word(psv, 20)?, word(psv, 24)?) == (32, 32);
-        let (_, _, n) = shader(
-            wrapper,
-            inflate,
-            Some(&mut |payload| self.payload(payload, xyz, fixed_wave32)),
-        )?;
-        self.non_singleton_wrappers += usize::from(n != 1);
-        Some(())
-    }
+fn native_stages(
+    wrapper: &[u8],
+    psv: &[u8],
+    inflate: &mut Vec<u8>,
+    compute: &mut NativeCompute,
+) -> Option<Vec<Option<u8>>> {
+    let is_compute = *psv.get(28)? == 5;
+    let xyz = [word(psv, 40)?, word(psv, 44)?, word(psv, 48)?];
+    let fixed_wave32 = (word(psv, 20)?, word(psv, 24)?) == (32, 32);
+    let mut stages = Vec::new();
+    let (_, _, n) = shader_payloads(
+        wrapper,
+        inflate,
+        None,
+        Some(&mut |payload| {
+            stages.push(payload.get(0x100).copied());
+            if is_compute {
+                compute.payload(payload, xyz, fixed_wave32);
+            }
+        }),
+    )?;
+    compute.non_singleton_wrappers += usize::from(is_compute && n != 1);
+    Some(stages)
 }
 
 #[derive(Default, Debug, PartialEq, Eq)]
@@ -491,6 +504,7 @@ pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
         resources: Resources,
         dependencies: Dependencies,
         runtime: Runtime,
+        native_stage_sequences: BTreeMap<Vec<Option<u8>>, usize>,
     }
     let mut groups = BTreeMap::<u16, Stage>::new();
     let mut bytes = Vec::new();
@@ -529,16 +543,14 @@ pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
         )?;
         let psv = part(b"PSV0").ok_or("missing unique PSV0")?;
         let rows = resource_rows(psv, stage).ok_or("unsupported PSV0 resource table or stage")?;
-        if stage == 5 {
-            compute
-                .wrapper(&bytes, psv, &mut inflate)
-                .ok_or("unsupported wrapped compute XDAT/XBCH framing")?;
-        }
+        let native = native_stages(&bytes, psv, &mut inflate, &mut compute)
+            .ok_or("unsupported wrapped XDAT/XBCH framing")?;
         let elems_at = if rows.is_empty() { 60 } else { 64 + rows.len() };
         let (elements, suffix) =
             psv_elements(psv, elems_at).ok_or("unsupported PSV0 element table")?;
         patch_rows += elements[2].len();
         let totals = groups.entry(stage).or_default();
+        *totals.native_stage_sequences.entry(native).or_default() += 1;
         totals.resources.add(rows);
         totals.runtime.add(psv).ok_or("invalid PSV0 runtime info")?;
         if stage == 0 {
@@ -620,8 +632,19 @@ pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
             resources,
             dependencies: deps,
             runtime,
+            native_stage_sequences,
         } = totals;
         println!("{} (stage {stage}): {files} files", stage_name(stage));
+        for (sequence, count) in native_stage_sequences {
+            let labels: Vec<_> = sequence
+                .into_iter()
+                .map(|s| s.map_or_else(|| "missing".to_owned(), |s| s.to_string()))
+                .collect();
+            println!(
+                "  FSSM stage-byte sequence [{}]: {count} wrappers",
+                labels.join(", ")
+            );
+        }
         println!(
             "  PSV0 runtime: {} default wave bounds, {} fixed wave32, {} other; thread dimensions {} all zero, {} all positive, {} partial",
             runtime.default_waves,

@@ -118,12 +118,21 @@ fn dxil_chunk(data: &[u8]) -> Option<&[u8]> {
     dxil.next().is_none().then_some(payload)
 }
 
-type ComputeSink<'a> = Option<&'a mut dyn FnMut(&[u8])>;
+type PayloadSink<'a> = Option<&'a mut dyn FnMut(&[u8])>;
 
 fn shader(
     data: &[u8],
     unwrapped: &mut Vec<u8>,
-    on_compute: ComputeSink<'_>,
+    on_compute: PayloadSink<'_>,
+) -> Option<(u16, u16, usize)> {
+    shader_payloads(data, unwrapped, Some(5), on_compute)
+}
+
+fn shader_payloads(
+    data: &[u8],
+    unwrapped: &mut Vec<u8>,
+    stage_filter: Option<u16>,
+    on_payload: PayloadSink<'_>,
 ) -> Option<(u16, u16, usize)> {
     let dxil = dxil_chunk(data)?;
     // Specific to this console envelope: the nominal DXIL bitcode field points to NOBC.
@@ -159,8 +168,8 @@ fn shader(
     let key = word(dxil, 0)?;
     // Publish only after every entry in this record passed validation. Keep only
     // the one reusable inflate buffer even for multi-payload envelopes.
-    if key >> 16 == 5
-        && let Some(sink) = on_compute
+    if stage_filter.is_none_or(|stage| usize::from(stage) == key >> 16)
+        && let Some(sink) = on_payload
     {
         for range in &native {
             xbch_payload(&dxil[range.clone()], unwrapped)?;
@@ -196,7 +205,7 @@ fn wrapped_record(
     after_suffix: usize,
     out: &mut Vec<u8>,
     native: &mut Vec<u8>,
-    on_compute: ComputeSink<'_>,
+    on_compute: PayloadSink<'_>,
 ) -> Option<(usize, u16, u16, usize)> {
     let header = data.get(span(after_suffix, 17)?)?;
     let stored = word(header, 1)?;

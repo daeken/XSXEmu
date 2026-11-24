@@ -16,29 +16,34 @@ fn zlib(bytes: &[u8]) -> Vec<u8> {
 }
 
 fn sample_shader() -> Vec<u8> {
-    let fssm = b"FSSM\x01\x01\0\0synthetic marker (not executable)";
-    let compressed = zlib(fssm);
-    let mut xbch = vec![0; 24];
-    xbch[..4].copy_from_slice(b"XBCH");
-    put(&mut xbch, 4, 3);
-    put(&mut xbch, 8, compressed.len());
-    put(&mut xbch, 16, fssm.len());
-    xbch.extend_from_slice(&compressed);
+    let variants = [b'1', b'2'].map(|suffix| {
+        let mut fssm = b"FSSM\x01\x01\0\0synthetic marker (not executable)".to_vec();
+        fssm.push(suffix);
+        let compressed = zlib(&fssm);
+        let mut xbch = vec![0; 24];
+        xbch[..4].copy_from_slice(b"XBCH");
+        put(&mut xbch, 4, 3);
+        put(&mut xbch, 8, compressed.len());
+        put(&mut xbch, 16, fssm.len());
+        xbch.extend_from_slice(&compressed);
+        xbch
+    });
 
     let mut dxil = vec![0; 60];
     put(&mut dxil, 0, 5 << 16 | 0x66);
     dxil[8..12].copy_from_slice(b"DXIL");
-    put(&mut dxil, 16, 60 + 2 * xbch.len() - 8);
     put(&mut dxil, 20, 4);
     dxil[24..28].copy_from_slice(b"XDAT");
     put(&mut dxil, 28, 2);
-    for (i, at) in [36, 48].into_iter().enumerate() {
+    for (xbch, at) in variants.into_iter().zip([36, 48]) {
+        let start = dxil.len();
         put(&mut dxil, at, 13);
-        put(&mut dxil, at + 4, 60 + i * xbch.len());
+        put(&mut dxil, at + 4, start);
         put(&mut dxil, at + 8, xbch.len());
+        dxil.extend_from_slice(&xbch);
     }
-    dxil.extend_from_slice(&xbch);
-    dxil.extend_from_slice(&xbch);
+    let nominal_offset = dxil.len() - 8;
+    put(&mut dxil, 16, nominal_offset);
     dxil.extend_from_slice(b"NOBC");
 
     let mut data = vec![0; 44];
@@ -186,4 +191,25 @@ fn compute_sink_sees_only_fully_validated_compute_envelopes() {
         );
     }
     assert_eq!(count, 2);
+}
+
+#[test]
+fn unrestricted_sink_preserves_validated_noncompute_variant_order() {
+    let mut pixel = sample_shader();
+    put(&mut pixel, 44, 0x66);
+    let mut out = Vec::new();
+    let mut payloads = Vec::new();
+    let mut visit = |payload: &[u8]| payloads.push(payload.to_vec());
+    let mut bad = pixel.clone();
+    put(&mut bad, 44 + 52, u32::MAX as usize);
+    assert!(shader_payloads(&bad, &mut out, None, Some(&mut visit)).is_none());
+    assert_eq!(
+        shader_payloads(&pixel, &mut out, None, Some(&mut visit)),
+        Some((0, 0x66, 2))
+    );
+    assert_eq!(payloads.len(), 2);
+    assert_eq!(
+        (payloads[0].last(), payloads[1].last()),
+        (Some(&b'1'), Some(&b'2'))
+    );
 }
