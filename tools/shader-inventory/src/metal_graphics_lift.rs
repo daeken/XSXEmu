@@ -63,6 +63,7 @@ fn depth_oracle_distinguishes_raster_depth_and_disabled_writes() {
 #[cfg(target_os = "macos")]
 mod gpu {
     use super::*;
+    use graphics_lift::MrtFixture;
     use metal::*;
     use std::path::Path;
 
@@ -70,8 +71,9 @@ mod gpu {
         Source,
         PackedSource(bool),
         PackedLoad(&'a Path, bool),
-        MrtSource(bool),
-        MrtLoad(&'a Path, bool),
+        MrtSource(MrtFixture),
+        SwappedTripleSource,
+        MrtLoad(&'a Path, MrtFixture),
         MultiSource,
         MultiLoad(&'a Path),
         DepthSource,
@@ -103,10 +105,16 @@ mod gpu {
         let args: Vec<_> = std::env::args_os().skip(1).collect();
         let mode = match args.as_slice() {
             [] => Mode::Source,
-            [mode] if mode == "--dual-source" || mode == "--triple-source" => Mode::MrtSource(mode == "--triple-source"),
-            [mode, lib] if mode == "--load-dual-metallib" || mode == "--load-triple-metallib" => Mode::MrtLoad(Path::new(lib), mode == "--load-triple-metallib"),
-            [mode] if mode == "--emit-dual-msl" || mode == "--emit-triple-msl" => {
-                print!("{}", graphics_lift::translate_mrt_fixture(mode == "--emit-triple-msl").map_err(|e| format!("MRT lift rejected: {e:?}"))?);
+            [mode] if mode == "--dual-source" => Mode::MrtSource(MrtFixture::Dual),
+            [mode] if mode == "--triple-source" => Mode::MrtSource(MrtFixture::Triple),
+            [mode] if mode == "--triple-rg-source" => Mode::MrtSource(MrtFixture::TripleRg),
+            [mode] if mode == "--expect-swapped-triple" => Mode::SwappedTripleSource,
+            [mode, lib] if mode == "--load-dual-metallib" => Mode::MrtLoad(Path::new(lib), MrtFixture::Dual),
+            [mode, lib] if mode == "--load-triple-metallib" => Mode::MrtLoad(Path::new(lib), MrtFixture::Triple),
+            [mode, lib] if mode == "--load-triple-rg-metallib" => Mode::MrtLoad(Path::new(lib), MrtFixture::TripleRg),
+            [mode] if mode == "--emit-dual-msl" || mode == "--emit-triple-msl" || mode == "--emit-triple-rg-msl" => {
+                let fixture = if mode == "--emit-triple-rg-msl" { MrtFixture::TripleRg } else if mode == "--emit-triple-msl" { MrtFixture::Triple } else { MrtFixture::Dual };
+                print!("{}", graphics_lift::translate_mrt_fixture(fixture).map_err(|e| format!("MRT lift rejected: {e:?}"))?);
                 return Ok(());
             }
             [mode] if mode == "--multi-source" => Mode::MultiSource,
@@ -135,7 +143,7 @@ mod gpu {
             [mode, lib] if mode == "--load-metallib" || mode == "--load-mutated-metallib" => Mode::Load(Path::new(lib), mode == "--load-mutated-metallib"),
             [mode, lib, archive] if mode == "--expect-owned-metal-miss" => Mode::ExpectStrictMiss(Path::new(lib), Path::new(archive)),
             [mode, lib, archive, compiler] if mode == "--bake-archive" || mode == "--replay-archive" || mode == "--replay-mutated-archive" => Mode::Archive(Path::new(lib), Path::new(archive), mode == "--bake-archive", mode == "--replay-mutated-archive", owned_graphics_artifact::compiler_profile(compiler)?),
-            _ => return Err("usage: shader-metal-graphics-lift [--triple-source | --emit-triple-msl | --load-triple-metallib LIB | --dual-source | --emit-dual-msl | --load-dual-metallib LIB | --multi-source | --emit-multi-msl | --load-multi-metallib LIB | --packed-rg-source | --emit-packed-rg-msl | --load-packed-rg-metallib LIB | --depth-source | --emit-depth-msl | --load-depth-metallib LIB | --packed-source | --emit-packed-msl | --load-packed-metallib LIB | --emit-msl | --emit-mutated-msl | --load-metallib LIB | --load-mutated-metallib LIB | {--bake-archive|--replay-archive|--replay-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-owned-metal-miss MUTATED_LIB ARCHIVE]".into()),
+            _ => return Err("usage: shader-metal-graphics-lift [--expect-swapped-triple | --triple-rg-source | --emit-triple-rg-msl | --load-triple-rg-metallib LIB | --triple-source | --emit-triple-msl | --load-triple-metallib LIB | --dual-source | --emit-dual-msl | --load-dual-metallib LIB | --multi-source | --emit-multi-msl | --load-multi-metallib LIB | --packed-rg-source | --emit-packed-rg-msl | --load-packed-rg-metallib LIB | --depth-source | --emit-depth-msl | --load-depth-metallib LIB | --packed-source | --emit-packed-msl | --load-packed-metallib LIB | --emit-msl | --emit-mutated-msl | --load-metallib LIB | --load-mutated-metallib LIB | {--bake-archive|--replay-archive|--replay-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-owned-metal-miss MUTATED_LIB ARCHIVE]".into()),
         };
         if matches!(mode, Mode::Archive(..) | Mode::ExpectStrictMiss(..))
             && std::env::var_os("MTL_SHADER_VALIDATION").is_some()
@@ -161,23 +169,28 @@ mod gpu {
         let partial = matches!(mode, Mode::PackedSource(true) | Mode::PackedLoad(_, true));
         let depth = matches!(mode, Mode::DepthSource | Mode::DepthLoad(_));
         let multi = matches!(mode, Mode::MultiSource | Mode::MultiLoad(_));
-        let mrt = matches!(mode, Mode::MrtSource(_) | Mode::MrtLoad(..));
-        let triple = matches!(mode, Mode::MrtSource(true) | Mode::MrtLoad(_, true));
-        let attachment_count = if triple {
-            3
-        } else if mrt {
-            2
-        } else {
-            1
+        let fixture = match mode {
+            Mode::MrtSource(f) | Mode::MrtLoad(_, f) => Some(f),
+            Mode::SwappedTripleSource => Some(MrtFixture::Triple),
+            _ => None,
+        };
+        let mrt = fixture.is_some();
+        let partial_mrt = matches!(fixture, Some(MrtFixture::TripleRg));
+        let swapped = matches!(mode, Mode::SwappedTripleSource);
+        let attachment_count = match fixture {
+            None => 1,
+            Some(MrtFixture::Dual) => 2,
+            _ => 3,
         };
         let lib = match mode {
             Mode::Source
             | Mode::PackedSource(_)
             | Mode::DepthSource
             | Mode::MultiSource
-            | Mode::MrtSource(_) => {
-                let msl = if mrt {
-                    graphics_lift::translate_mrt_fixture(triple)
+            | Mode::MrtSource(_)
+            | Mode::SwappedTripleSource => {
+                let msl = if let Some(fixture) = fixture {
+                    graphics_lift::translate_mrt_fixture(fixture)
                 } else if multi {
                     graphics_lift::translate_multi_vertex_fixture()
                 } else if depth {
@@ -205,12 +218,8 @@ mod gpu {
         };
         let desc = RenderPipelineDescriptor::new();
         const DEPTH_FORMAT: MTLPixelFormat = MTLPixelFormat::Depth32Float;
-        let (format, pixel_bytes, default_ps) = if mrt {
-            (
-                MTLPixelFormat::RGBA32Float,
-                16,
-                if triple { "triple_ps" } else { "dual_ps" },
-            )
+        let (format, pixel_bytes, default_ps) = if let Some(fixture) = fixture {
+            (MTLPixelFormat::RGBA32Float, 16, fixture.entry())
         } else if multi {
             (MTLPixelFormat::RGBA32Float, 16, "multi_ps")
         } else if depth {
@@ -256,7 +265,11 @@ mod gpu {
                 .object_at(slot as u64)
                 .ok_or_else(|| format!("no pipeline slot {slot}"))?;
             attachment.set_pixel_format(format);
-            attachment.set_write_mask(MTLColorWriteMask::All);
+            attachment.set_write_mask(if partial_mrt && slot == 1 {
+                MTLColorWriteMask::Red | MTLColorWriteMask::Green
+            } else {
+                MTLColorWriteMask::All
+            });
             attachment.set_blending_enabled(false);
         }
         // Independent owned negative control. No sidecar is read or written;
@@ -333,25 +346,27 @@ mod gpu {
         attachment.set_load_action(MTLLoadAction::Clear);
         attachment.set_store_action(MTLStoreAction::Store);
         let mut colors = vec![color];
+        for _ in 1..attachment_count {
+            colors.push(dev.new_texture(&texture_desc));
+        }
         for (index, clear) in [
-            MTLClearColor::new(0., 0.5, 0., 1.),
+            MTLClearColor::new(0., 0.5, if partial_mrt { 0.75 } else { 0. }, 1.),
             MTLClearColor::new(0.25, 1., 0.5, 0.),
         ]
         .into_iter()
         .take(attachment_count - 1)
         .enumerate()
         {
-            let texture = dev.new_texture(&texture_desc);
             let slot = index + 1;
+            let bound = if swapped { 3 - slot } else { slot };
             let attachment = pass
                 .color_attachments()
                 .object_at(slot as u64)
                 .ok_or_else(|| format!("no pass slot {slot}"))?;
-            attachment.set_texture(Some(&texture));
+            attachment.set_texture(Some(&colors[bound]));
             attachment.set_clear_color(clear);
             attachment.set_load_action(MTLLoadAction::Clear);
             attachment.set_store_action(MTLStoreAction::Store);
-            colors.push(texture);
         }
         let depth_texture = depth.then(|| {
             texture_desc.set_pixel_format(DEPTH_FORMAT);
@@ -468,6 +483,7 @@ mod gpu {
         // The GPU writes have completed and the owned buffer remains alive through the last read.
         let pixels = unsafe { std::slice::from_raw_parts(ptr, extent) };
         let mutated = matches!(mode, Mode::Load(_, true) | Mode::Archive(_, _, _, true, _));
+        let mut mapping_mismatches = 0;
         for y in 0..SIDE {
             for x in 0..SIDE {
                 let at = y * STRIDE + x * pixel_bytes;
@@ -505,22 +521,29 @@ mod gpu {
                 };
                 // Distinct per-slot writes and clears detect swaps, missing
                 // writes and out-of-scissor writes without unpacking inputs.
-                let extra: [([f32; 4], [f32; 4]); 2] = [
-                    ([1.5, -0.5, -2., 0.25], [0., 0.5, 0., 1.]),
-                    ([-2., 0.25, -2., 0.25], [0.25, 1., 0.5, 0.]),
-                ];
-                for (index, (draw, clear)) in
-                    extra.into_iter().take(attachment_count - 1).enumerate()
-                {
+                let inside = (2..6).contains(&x) && (1..6).contains(&y);
+                let extra: [[f32; 4]; 2] = if inside {
+                    [
+                        if partial_mrt {
+                            [1.5, -0.5, 0.75, 1.]
+                        } else {
+                            [1.5, -0.5, -2., 0.25]
+                        },
+                        [-2., 0.25, -2., 0.25],
+                    ]
+                } else {
+                    [
+                        [0., 0.5, if partial_mrt { 0.75 } else { 0. }, 1.],
+                        [0.25, 1., 0.5, 0.],
+                    ]
+                };
+                let extra = extra.map(|rgba| rgba.map(f32::to_le_bytes).as_flattened().to_owned());
+                for index in 0..attachment_count - 1 {
                     let slot = index + 1;
-                    let rgba = if (2..6).contains(&x) && (1..6).contains(&y) {
-                        draw
-                    } else {
-                        clear
-                    };
-                    let expected = rgba.map(f32::to_le_bytes).as_flattened().to_owned();
                     let at = slot * BYTES + at;
                     let got = &pixels[at..at + pixel_bytes];
+                    mapping_mismatches += usize::from(got != extra[index]);
+                    let expected = &extra[if swapped { 1 - index } else { index }];
                     if got != expected {
                         return Err(format!(
                             "slot {slot} pixel ({x},{y}): expected {expected:?}, got {got:?}"
@@ -534,12 +557,23 @@ mod gpu {
                 }
             }
         }
+        if swapped {
+            if mapping_mismatches != 2 * SIDE * SIDE {
+                return Err(format!(
+                    "expected all 128 swapped-slot pixels to differ, got {mapping_mismatches}"
+                ));
+            }
+            println!(
+                "swapped MRT1/MRT2 binding rejected by oracle: all {mapping_mismatches} swapped-slot pixels differ from the normal mapping and match the predicted swap"
+            );
+            return Ok(());
+        }
         if let (Mode::Archive(_, path, true, _, _), Some((job, lib))) = (mode, admitted) {
             owned_graphics_artifact::publish(&job, lib, path)?;
             println!("published owned graphics artifact identity");
         }
         println!(
-            "{} translated GFX10 VS+PS (mutated={mutated}, packed={packed}, partial={partial}, depth={depth}, multi={multi}, colors={attachment_count}): {n}/{n} attachment pixels matched",
+            "{} translated GFX10 VS+PS (mutated={mutated}, packed={packed}, partial={partial}, depth={depth}, multi={multi}, partial_mrt={partial_mrt}, colors={attachment_count}): {n}/{n} attachment pixels matched",
             dev.name(),
             n = SIDE * SIDE * attachment_count
         );

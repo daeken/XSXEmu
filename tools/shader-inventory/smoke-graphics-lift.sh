@@ -96,3 +96,12 @@ compile dual
 "$p" --emit-triple-msl > "$d/triple.metal"
 compile triple
 "$p" --load-triple-metallib "$d/triple.metallib"
+
+# A binding permutation must change both slots, not merely fail to render.
+"$p" --expect-swapped-triple
+
+# Only MRT1 masks off B/A; MRT2 still commits all four components.
+"$p" --triple-rg-source
+"$p" --emit-triple-rg-msl > "$d/triple-rg.metal"
+compile triple-rg
+"$p" --load-triple-rg-metallib "$d/triple-rg.metallib"

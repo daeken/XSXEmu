@@ -539,7 +539,7 @@ impl LiftGaps {
                         } => name == "v_fma_f32",
                         Op::Export { .. }
                         | Op::PackedColor { .. }
-                        | Op::FinalPackedRg0 { .. }
+                        | Op::PackedRg { .. }
                         | Op::FinalPixelDepth { .. } => name == "exp",
                         Op::PackHalfRtz { .. } => name == "v_cvt_pkrtz_f16_f32_e32",
                         Op::CompareNonzero { .. } => name == "v_cmp_ne_u32_e32",
