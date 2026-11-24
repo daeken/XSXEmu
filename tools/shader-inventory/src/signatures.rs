@@ -45,7 +45,7 @@ struct SignatureRow {
     register: usize,
     primary: u8,
     component_type: usize,
-    system: bool,
+    system_code: usize,
 }
 
 fn check(bytes: &[u8]) -> Option<(Count, Vec<SignatureRow>)> {
@@ -74,7 +74,6 @@ fn check(bytes: &[u8]) -> Option<(Count, Vec<SignatureRow>)> {
         let secondary = (mask >> 8) as u8;
         let component_type = word(row, 16)?;
         let system_code = word(row, 12)?;
-        let system = system_code != 0;
         if word(row, 0)? != 0
             || word(row, 28)? != 0
             || !matches!(component_type, 1 | 2 | 3 | 6)
@@ -93,10 +92,10 @@ fn check(bytes: &[u8]) -> Option<(Count, Vec<SignatureRow>)> {
             register: word(row, 20)?,
             primary,
             component_type,
-            system,
+            system_code,
         });
         count.entries += 1;
-        count.system += usize::from(system);
+        count.system += usize::from(system_code != 0);
         count.secondary_outside += usize::from(secondary & !primary != 0);
     }
     Some((count, keys))
@@ -111,15 +110,19 @@ pub(super) struct SourceInterface {
 }
 
 impl SourceInterface {
-    pub(super) fn parse(bytes: &[u8]) -> Option<Self> {
+    pub(super) fn parse(bytes: &[u8]) -> Option<(Self, SystemInterface)> {
         let (_, rows) = check(bytes)?;
-        Some(Self::from_rows(rows))
+        let mut systems = SystemInterface::default();
+        for row in &rows {
+            systems.add(row);
+        }
+        Some((Self::from_rows(rows), systems))
     }
 
     fn from_rows(rows: Vec<SignatureRow>) -> Self {
         let mut result = Self::default();
         for row in rows {
-            if row.system || row.key.0.starts_with(b"sv_") {
+            if ps_linkage_system(&row.key.0, row.system_code).is_some() {
                 result.system_rows += 1;
             } else {
                 result
@@ -133,6 +136,56 @@ impl SourceInterface {
             shapes.sort_unstable();
         }
         result
+    }
+}
+
+// A system declaration is keyed only by its public class and semantic index.
+// This is not a projection of type, lane packing, or rasterizer behavior.
+#[derive(Default, PartialEq, Eq)]
+pub(super) struct SystemInterface {
+    keys: BTreeMap<(usize, usize), usize>,
+    other: usize,
+}
+
+impl SystemInterface {
+    fn add(&mut self, row: &SignatureRow) {
+        match ps_linkage_system(&row.key.0, row.system_code) {
+            Some(4) => self.other += 1,
+            Some(class) => *self.keys.entry((class, row.key.1)).or_default() += 1,
+            None => (),
+        }
+    }
+}
+
+#[derive(Default, Debug)]
+pub(super) struct SystemLinkage {
+    pairs: usize,
+    unique: [usize; 3],
+    missing: [usize; 3],
+    duplicate: [usize; 3],
+    front_face: usize,
+    other_inputs: usize,
+}
+
+impl SystemLinkage {
+    pub(super) fn add(&mut self, producer: &SystemInterface, consumer: &SystemInterface) {
+        self.pairs += 1;
+        self.other_inputs += consumer.other;
+        for (&key @ (class, _), &n_input) in &consumer.keys {
+            if class == 3 {
+                self.front_face += n_input;
+                continue;
+            }
+            let n_output = producer.keys.get(&key).copied().unwrap_or(0);
+            if n_input > 1 || n_output > 1 {
+                self.duplicate[class] += 1;
+            }
+            if n_output == 0 {
+                self.missing[class] += 1;
+            } else if n_input == 1 && n_output == 1 {
+                self.unique[class] += 1;
+            }
+        }
     }
 }
 
@@ -1333,8 +1386,37 @@ mod tests {
             register: 0,
             primary: 1,
             component_type: 3,
-            system: false,
+            system_code: 0,
         }
+    }
+
+    #[test]
+    fn system_linkage_compares_only_public_indexed_producer_keys() {
+        let row = |name, index, system_code| SignatureRow {
+            system_code,
+            ..sig(key(name, index))
+        };
+        let mut output = SystemInterface::default();
+        output.add(&row(b"SV_Position", 0, 1));
+        for _ in 0..2 {
+            output.add(&row(b"SV_ClipDistance", 0, 2));
+        }
+        let mut input = SystemInterface::default();
+        for (name, index, code) in [
+            (b"SV_Position".as_slice(), 0, 1),
+            (b"SV_ClipDistance", 0, 2),
+            (b"SV_ClipDistance", 1, 2),
+            (b"SV_IsFrontFace", 0, 9),
+            (b"SV_CullDistance", 0, 0),
+        ] {
+            input.add(&row(name, index, code));
+        }
+        let mut check = SystemLinkage::default();
+        check.add(&output, &input);
+        assert_eq!(check.unique, [1, 0, 0]);
+        assert_eq!(check.missing, [0, 1, 0]);
+        assert_eq!(check.duplicate, [0, 1, 0]);
+        assert_eq!((check.front_face, check.other_inputs), (1, 1));
     }
 
     #[test]

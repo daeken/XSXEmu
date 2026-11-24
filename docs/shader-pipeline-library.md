@@ -112,6 +112,19 @@ There are no missing or duplicate ordinary keys in these cohorts. All 121,699 un
 
 Multi-candidate rows are checked separately. Each slot's entire wrapper family must agree on the unordered multiset of ordinary `(key, type, register, primary mask)` rows and the **count** of excluded system rows. A disagreement makes that family ineligible; the scanner never selects a wrapper by its interface. All 80 ambiguous PS+VS and 1,951 ambiguous PS+MS rows meet this projection-invariance check. They add 868 and 16,207 unique ordinary key pairs respectively, all matching type/register/mask. All 80 VS rows and 1,859 MS rows have ordinary PS inputs; the other 92 MS rows do not. This extends the same declaration-level result without resolving the wrapper or native variant ambiguity. System-value contents, secondary masks, and incomplete or extra-stage rows are still outside this comparison.
 
+### System-value declaration keys in complete two-stage rows
+
+The same PSO rows are checked independently for public system-value declaration keys `(validated name/enum class, semantic index)`. All candidate families agree on this second projection (class/index multiplicity and count of other/mismatched rows), including the multi-wrapper families. A matching producer declaration is counted for PS Position, ClipDistance, and CullDistance; PS IsFrontFace is a rasterizer-generated declaration and is not looked up in the producer outputs.
+
+| Producer / candidate cohort | PSO rows | Position keys paired | ClipDistance keys paired | CullDistance keys paired | IsFrontFace input rows |
+|---|---:|---:|---:|---:|---:|
+| VS / unique | 13,284 | 6,819 | 1,319 | 1 | 87 |
+| VS / multi | 80 | 80 | 0 | 0 | 26 |
+| MS / unique | 8,775 | 8,775 | 1,134 | 0 | 2,054 |
+| MS / multi | 1,951 | 1,951 | 422 | 0 | 431 |
+
+No compared key is missing or duplicated, and no PS input falls into the other/mismatched system class. Counts are repeated per PSO row. This is a declaration presence test, not a comparison of type, mask, transformed position, interpolation, clip/cull configuration, fixed-function state, or native export locations.
+
 ### Conditional marker-bounded equality
 
 The same scanner separately tests a narrower byte window. On the FSSM side it begins at `start + 40`, removes only trailing `0xbf9f0000` words, and requires the resulting aligned bytes to end in `0xbf810000`. On the library side it looks for the last aligned `0xbf810000` in the final 512 stored bytes and compares through that word from each explicit hypothesis (`+0`, `+24`, `+36`). A raw marker can be a literal or data; it is not a verified instruction or proof of entry/exit.

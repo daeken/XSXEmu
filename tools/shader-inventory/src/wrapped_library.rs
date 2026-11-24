@@ -8,7 +8,7 @@ use crate::{
     llvm::{Cpu, Llvm},
     reachable::reference_walk_result,
     shader_payloads,
-    signatures::{SourceInterface, SourceLinkage},
+    signatures::{SourceInterface, SourceLinkage, SystemInterface, SystemLinkage},
     stage_name, word,
 };
 use std::{
@@ -70,16 +70,22 @@ type SourceKey = (u16, [u8; 16]);
 struct SourceFamily {
     count: usize,
     invariant: Option<SourceInterface>,
+    system_invariant: Option<SystemInterface>,
 }
 
 impl SourceFamily {
-    fn add(&mut self, interface: SourceInterface) {
-        if self.count == 0 {
-            self.invariant = Some(interface);
-        } else if self.invariant.as_ref() != Some(&interface) {
-            self.invariant = None;
-        }
+    fn add(&mut self, (interface, system): (SourceInterface, SystemInterface)) {
+        update_projection(&mut self.invariant, interface, self.count == 0);
+        update_projection(&mut self.system_invariant, system, self.count == 0);
         self.count += 1;
+    }
+}
+
+fn update_projection<T: Eq>(current: &mut Option<T>, candidate: T, first: bool) {
+    if first {
+        *current = Some(candidate);
+    } else if current.as_ref() != Some(&candidate) {
+        *current = None;
     }
 }
 
@@ -388,6 +394,8 @@ pub(super) fn run(
     let mut graphics_rows = BTreeMap::<Vec<usize>, GraphicsCoverage>::new();
     let mut source_links = BTreeMap::<(usize, bool), SourceLinkage>::new();
     let mut divergent = BTreeMap::<usize, usize>::new();
+    let mut system_links = BTreeMap::<(usize, bool), SystemLinkage>::new();
+    let mut system_divergent = [0; 3];
     for pso in library.graphics() {
         let mut slots = Vec::new();
         let mut candidates = Vec::new();
@@ -410,9 +418,20 @@ pub(super) fn run(
         if let [0, upstream @ (1 | 2)] = slots.as_slice()
             && let (Some(producer), Some(consumer)) = (families[*upstream], families[0])
         {
+            let multi = producer.count > 1 || consumer.count > 1;
+            if let (Some(output), Some(input)) =
+                (&producer.system_invariant, &consumer.system_invariant)
+            {
+                system_links
+                    .entry((*upstream, multi))
+                    .or_default()
+                    .add(output, input);
+            } else {
+                system_divergent[*upstream] += 1;
+            }
             if let (Some(output), Some(input)) = (&producer.invariant, &consumer.invariant) {
                 source_links
-                    .entry((*upstream, producer.count > 1 || consumer.count > 1))
+                    .entry((*upstream, multi))
                     .or_default()
                     .add(output, input);
             } else {
@@ -445,6 +464,21 @@ pub(super) fn run(
             divergent.get(&slot).copied().unwrap_or(0)
         );
     }
+    for ((slot, multi), c) in system_links {
+        let cohort = if multi {
+            "Invariant multi-candidate"
+        } else {
+            "Unique-source"
+        };
+        println!(
+            "  {cohort} {} -> PS system key observations [position, clip distance, cull distance]: {c:?}",
+            stage_name(GRAPHICS_STAGES[slot])
+        );
+    }
+    println!(
+        "  VS/MS -> PS rows with differing candidate system projections: {}/{}",
+        system_divergent[1], system_divergent[2]
+    );
     for (stage, stage_programs) in programs {
         let totals = counts.remove(&stage).unwrap_or_default();
         let values = || stage_programs.values();
@@ -535,13 +569,14 @@ mod tests {
         }
         table[40] = b'x';
         let mut f = SourceFamily::default();
-        f.add(SourceInterface::default());
-        f.add(SourceInterface::default());
+        f.add(Default::default());
+        f.add(Default::default());
         assert!(f.invariant.is_some());
         f.add(SourceInterface::parse(&table).unwrap());
-        f.add(SourceInterface::default());
+        f.add(Default::default());
         assert_eq!(f.count, 4);
         assert!(f.invariant.is_none());
+        assert!(f.system_invariant.is_some());
     }
 
     #[test]
