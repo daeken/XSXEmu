@@ -20,7 +20,11 @@ The walk starts at stored-span offset `+40` as an explicit hypothesis. It follow
 
 The message classification requires the public four-byte SOPP opcode and recognized immediate fields to agree with LLVM's symbolic operands. Unrecognized cases stay grouped, with no operands printed. Only the first rejection is counted; neither the operation names nor the reported stream encoding establish how the Xbox schedules or couples stages. No message is treated as fallthrough or exit. The owned fixture also rejects noncanonical bits and a numeric-only operand presentation.
 
-Every complete graph has at least one reachable eight-byte `exp` checked against LLVM and the public GFX10 encoding prefix. No export result is attributed to an incomplete graph. An owned fixture distinguishes reachable, branch-skipped, and seen-before-rejection exports under all four decoder configurations. The census does not establish export targets or masks, payload coupling, message semantics, native linkage, authenticated entry, or executable Metal coverage. No title shader was executed or modified.
+Every complete graph has at least one reachable eight-byte `exp` checked against LLVM and the public GFX10 encoding prefix. No export result is attributed to an incomplete graph. An owned fixture distinguishes reachable, branch-skipped, and seen-before-rejection exports under all four decoder configurations. This census does not establish payload coupling, message semantics, native linkage, authenticated entry, or executable Metal coverage. No title shader was executed or modified.
+
+## Native VS export projection
+
+The stage-4 check cross-validates the six-bit public target field for `POS0`–`POS4` and `PARAM0`–`PARAM31` against the LLVM mnemonic and symbolic operand. Under both wave tests every complete `gfx1013` stage-4 graph (1,448) and every complete `gfx1030` stage-4 graph (1,242) contains `POS0` with raw `EN=15` and a nonempty dense set of enabled `PARAM` ordinals starting at zero. Neither pass observes a zero-enable `PARAM` or an export outside `POS`/`PARAM` in a complete stage-4 graph. In each pass 20 payloads also have `POS1`, none has `POS2`–`POS4`. Both wave settings agree on the per-payload projection. These are reachable target and enable-field observations only; they do not correlate parameter ordinals with source declarations, physical interpolation slots, or an individual executed path.
 
 ## Same-wrapper PS target comparison
 
