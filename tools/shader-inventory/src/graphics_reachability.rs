@@ -372,9 +372,12 @@ fn legacy_source_shape(word: u32, len: usize) -> &'static str {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct ExportShape {
-    target: &'static str,
+    raw_target: u8,
+    target_class: &'static str,
     en: u8,
-    bits_10_to_12: u8,
+    compr: bool,
+    done: bool,
+    vm: bool,
 }
 
 fn export_shape(first: u32, len: usize, text: &str) -> Option<ExportShape> {
@@ -391,9 +394,12 @@ fn export_shape(first: u32, len: usize, text: &str) -> Option<ExportShape> {
         Export::Other => "unclassified",
     };
     Some(ExportShape {
-        target,
+        raw_target: ((first >> 4) & 63) as u8,
+        target_class: target,
         en: (first & 15) as u8,
-        bits_10_to_12: ((first >> 10) & 7) as u8,
+        compr: first & (1 << 10) != 0,
+        done: first & (1 << 11) != 0,
+        vm: first & (1 << 12) != 0,
     })
 }
 
@@ -401,6 +407,8 @@ fn export_shape(first: u32, len: usize, text: &str) -> Option<ExportShape> {
 struct LiftGaps {
     complete: usize,
     no_encoding_gap: usize,
+    no_exp_gap: usize,
+    only_exp_gap: usize,
     sites: usize,
     accepted_sites: usize,
     missing: BTreeMap<String, (usize, usize)>, // payloads, checked sites
@@ -464,6 +472,8 @@ impl LiftGaps {
         if result.is_ok() {
             self.complete += 1;
             self.no_encoding_gap += usize::from(missing.is_empty());
+            self.no_exp_gap += usize::from(export_shapes.is_empty());
+            self.only_exp_gap += usize::from(!export_shapes.is_empty() && missing.len() == 1);
             self.sites += sites;
             self.accepted_sites += accepted;
             for (key, count) in export_shapes {
@@ -489,6 +499,10 @@ impl LiftGaps {
         println!(
             "  wave{width} lift encoding surface (not translations): {}/{} complete graphs without encoding gap; {}/{} checked sites match Rust width and mnemonic",
             self.no_encoding_gap, self.complete, self.accepted_sites, self.sites
+        );
+        println!(
+            "    EXP encoding gate: {}/{} complete graphs without an EXP encoding gap; {} with only EXP encoding gaps",
+            self.no_exp_gap, self.complete, self.only_exp_gap
         );
         for ((shape, supported), (payloads, sites)) in self.legacy_shapes {
             println!(
@@ -1204,19 +1218,33 @@ mod tests {
     #[test]
     fn exp_shape_preserves_raw_flags_and_checks_symbol() {
         let shape = ExportShape {
-            target: "MRT0",
+            raw_target: 0,
+            target_class: "MRT0",
             en: 3,
-            bits_10_to_12: 7,
+            compr: true,
+            done: true,
+            vm: true,
         };
         assert_eq!(
             export_shape(0xf800_1c03, 8, "exp mrt0 v0, v0, off, off done compr vm"),
             Some(shape)
         );
+        assert_eq!(
+            export_shape(0xf800_045f, 8, "exp mrt5 v0, v0, v1, v1 compr"),
+            Some(ExportShape {
+                raw_target: 5,
+                target_class: "MRT1-7",
+                en: 15,
+                compr: true,
+                done: false,
+                vm: false,
+            })
+        );
         assert_eq!(export_shape(0xf800_1c03, 4, "exp mrt0"), None);
         assert_eq!(
             export_shape(0xf800_1c03, 8, "exp mrt1"),
             Some(ExportShape {
-                target: "unclassified",
+                target_class: "unclassified",
                 ..shape
             })
         );
@@ -1246,6 +1274,16 @@ mod tests {
             (1, 0, 3, 2)
         );
         assert_eq!(gaps.missing.get("v_mov_b32_e32"), Some(&(1, 1)));
+        assert_eq!((gaps.no_exp_gap, gaps.only_exp_gap), (1, 0));
+        let unsupported_exp = [0xf800_1890u32, 0, 0xbf81_0000]; // NULL DONE+VM.
+        let bytes: Vec<_> = unsupported_exp
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        assert!(gaps.observe(&mut dis, &bytes[..8]).is_err());
+        assert_eq!((gaps.no_exp_gap, gaps.only_exp_gap), (1, 0));
+        assert!(gaps.observe(&mut dis, &bytes).is_ok());
+        assert_eq!((gaps.no_exp_gap, gaps.only_exp_gap), (1, 1));
     }
 
     #[test]
