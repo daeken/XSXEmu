@@ -443,6 +443,43 @@ An owned Win64 fixture checks the ordinal gate, relocated guest vtable
 addresses, checked calls, exact output writes and token isolation. It
 does not establish further live title progress.
 
+`--dstorage-factory` is a separate opt-in requiring `--trusted-offline`,
+`--experimental-static-tls`, and `--rust-providers`. It admits only the root's
+direct named `XCRDAPI.dll!DStorageGetFactory` import. It neither exposes dynamic
+exports nor replaces desktop DirectStorage. The original private guest PE uses
+audited Win64 bridges and a relocated CFG-admitted guest vtable.
+
+At IAT RVA `0x6793fb8`, the pinned title requests factory IID
+`62959d11-d45f-4884-a0a3-f7862ea243ae`. Its caller requires exactly `S_OK` and a
+non-null factory, then calls factory slot 8 (`+0x40`) with `0x02000000` bytes and
+asserts on a negative HRESULT. The earlier trace stops at the missing import;
+these method calls are static findings, not measurements of live progress.
+Microsoft's [factory](https://learn.microsoft.com/en-us/windows/win32/dstorage/dstorage/nf-dstorage-dstoragegetfactory)
+and [staging size](https://learn.microsoft.com/en-us/windows/win32/dstorage/dstorage/nf-dstorage-idstoragefactory-setstagingbuffersize)
+references describe the API shapes; the Xbox slot and IID are separately
+corroborated by xcl's ABI notes. Leonida documents a fatal null factory on its
+own run. No external implementation code is used.
+
+The facade accepts only the pinned IID at creation and offers that interface
+and `IUnknown` via `QueryInterface`. The active factory has a real reference
+count. Slot 8 accepts only 32 MiB, allocates that much zero-initialized private
+CPU storage on success, and reuses it on repeat calls. Allocation failure is
+reported, and final `Release` frees the backing. There is no guest mapping of
+that buffer, GPU/DMA support, queue, file service, or decompression. Every
+other entry in the known Xbox factory table terminates with its slot number.
+The owned Win64 fixture exercises the import gate, rebasing, CFG, IID/output
+handling, size checks and lifetime; a host test verifies the actual buffer.
+
+Other static sites use factory slot 5 (`+0x28`, one-entry status array, HRESULT
+unchecked) followed by slot 10 (`+0x50`, newer queue IID and a `0x20`-byte
+queue descriptor, negative HRESULT asserts). Separate helpers use slot 4
+(`+0x20`) for file open. They return/store null if it fails. On success they
+retain the DirectStorage object in a wrapper that separately opens and reads
+file metadata via ordinary Win32 I/O. That is not a fallback for a missing
+factory or failed DirectStorage open. The inspected consumers also use queue
+slot 3 to enqueue a request, queue slot 8 to close, and status-array slot 2
+to release. These downstream interfaces remain unimplemented.
+
 `GetModuleFileNameW` reads the registered UTF-16 guest path: a null handle
 selects the root EXE, and a non-null handle must exactly match a mapped image
 base. It performs no filesystem lookup. Success preserves `LastError`;

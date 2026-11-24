@@ -3154,6 +3154,85 @@ fn gameinput_root_ordinal_exposes_guarded_no_device_service() {
     );
 }
 
+const DSTORAGE_CAPACITY: usize = 0x800;
+#[repr(C)]
+struct DStorageFixture {
+    entry: u32,
+    unsupported: u32,
+    code: [u8; DSTORAGE_CAPACITY],
+}
+
+global_asm!(include_str!("fixtures/static_tls_dstorage.S"),
+    capacity = const DSTORAGE_CAPACITY,
+    iat_delta = const IAT - TEXT,
+    dispatch_delta = const DISPATCH - TEXT,
+    options(att_syntax),
+);
+unsafe extern "C" {
+    static static_tls_dstorage_fixture: DStorageFixture;
+}
+
+#[test]
+fn dstorage_exact_root_factory_supports_only_owned_cpu_staging() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let fixture = unsafe { &static_tls_dstorage_fixture };
+    let mut exe = image(Kind::Guarded);
+    put(&mut exe, file(TEXT), &fixture.code);
+    // Force a rebase of the private facade and verify its relocated vtable.
+    const BASE: usize = 0x1_8700_0000;
+    w64(&mut exe, OP + 24, BASE);
+    w64(&mut exe, file(ARRAY), BASE + TEXT);
+    w64(&mut exe, file(LOAD) + 88, BASE + COOKIE);
+    for (field, rva) in [(0x70, CHECK), (0x78, DISPATCH), (0x80, GFIDS)] {
+        w64(&mut exe, file(LOAD) + field, BASE + rva);
+    }
+    for (i, rva) in [TEMPLATE, TEMPLATE + 8, INDEX, ARRAY]
+        .into_iter()
+        .enumerate()
+    {
+        w64(&mut exe, file(RO) + 8 * i, BASE + rva);
+    }
+    w64(&mut exe, file(TEMPLATE), BASE + COOKIE);
+    let set_entry = |exe: &mut [u8], entry| {
+        w32(exe, OP + 16, TEXT + entry as usize);
+        w32(exe, file(GFIDS), TEXT + entry as usize);
+    };
+    set_entry(&mut exe, fixture.entry);
+    dir_import_one(&mut exe, b"XCRDAPI.dll\0", b"DStorageGetFactory\0");
+    let path = scratch.write("dstorage.exe", &exe);
+    let opt = "--dstorage-factory";
+    let args = [OPT, TRUSTED, "--rust-providers", opt];
+    expect(run(&path, &args), 54, "Guest entry returned 54");
+    expect(
+        run(&path, &[OPT, TRUSTED, "--rust-providers"]),
+        1,
+        "incomplete dependency graph",
+    );
+    expect(
+        run(&path, &[OPT, "--rust-providers", opt]),
+        1,
+        "--dstorage-factory requires",
+    );
+    let mut other = exe.clone();
+    dir_import_one(&mut other, b"dstorage.dll\0", b"DStorageGetFactory\0");
+    let path = scratch.write("dstorage-desktop.exe", &other);
+    expect(run(&path, &args), 1, "incomplete dependency graph");
+    let mut other = exe.clone();
+    dir_import_one(&mut other, b"XCRDAPI.dll\0", b"dstoragegetfactory\0");
+    let path = scratch.write("dstorage-wrong-name.exe", &other);
+    expect(run(&path, &args), 1, "incomplete dependency graph");
+    let mut other = exe.clone();
+    w64(&mut other, file(LINK + 0x7b0), (1usize << 63) | 1);
+    let path = scratch.write("dstorage-ordinal.exe", &other);
+    expect(run(&path, &args), 1, "incomplete dependency graph");
+    set_entry(&mut exe, fixture.unsupported);
+    let path = scratch.write("dstorage-unsupported.exe", &exe);
+    expect(run(&path, &args), 87, "unsupported factory vtable slot 10");
+}
+
 const WINSOCK_INIT_CAPACITY: usize = 0x400;
 #[repr(C)]
 struct WinsockInitFixture {

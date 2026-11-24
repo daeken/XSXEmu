@@ -2,6 +2,7 @@
 //! target selection. Each row states an exact reviewed Win64 prototype and
 //! emits a typed SysV adapter plus a matching assembly entry in host text.
 use super::{CONTEXT_OFFSET, Context, LAST_ERROR_OFFSET, called_dormant_guard, startup_trace};
+use crate::dstorage::native as ds;
 use crate::gameinput::native as gi;
 use crate::xgameruntime_compat::native as xgr;
 use crate::{
@@ -105,6 +106,18 @@ macro_rules! audited_bridges {
 }
 
 audited_bridges! {
+    xsxemu_tls_ds_factory, ds_factory: b"xcrdapi.dll", b"DStorageGetFactory",
+        ds::get_factory, (iid: *const [u8; 16], out: *mut usize, vtable: usize) -> i32;
+    xsxemu_tls_ds_query, ds_query: b"xcrdapi.dll", b"QueryInterface",
+        ds::query, (this: usize, iid: *const [u8; 16], out: *mut usize) -> i32;
+    xsxemu_tls_ds_add_ref, ds_add_ref: b"xcrdapi.dll", b"AddRef",
+        ds::add_ref, (this: usize) -> u32;
+    xsxemu_tls_ds_release, ds_release: b"xcrdapi.dll", b"Release",
+        ds::release, (this: usize) -> u32;
+    xsxemu_tls_ds_staging, ds_staging: b"xcrdapi.dll", b"SetStagingBufferSize",
+        ds::set_staging_size, (this: usize, bytes: u32) -> i32;
+    xsxemu_tls_ds_unsupported, ds_unsupported: b"xcrdapi.dll", b"unsupported-vtable-slot",
+        ds::unsupported, (slot: u32) -> !;
     xsxemu_tls_gi_create, gi_create: b"gameinput.dll", b"GameInputCreate",
         gi::create, (out: *mut usize, vtable: usize) -> i32;
     xsxemu_tls_gi_query, gi_query: b"gameinput.dll", b"QueryInterface",

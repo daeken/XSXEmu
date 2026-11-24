@@ -419,6 +419,7 @@ pub struct Options<'a> {
     pub trace_missing_imports: bool,
     pub guest_entropy: bool,
     pub gameinput_no_devices: bool,
+    pub dstorage_factory: bool,
     pub map_extra_dll: Option<&'a Path>,
     pub xgameruntime_dll: Option<&'a Path>,
     pub xgameruntime_compat: bool,
@@ -459,31 +460,36 @@ impl Builder<'_> {
         self.options.rust_providers && providers::has_dll(&dll.to_ascii_lowercase())
     }
 
-    fn admit_gameinput(&mut self) -> Result<usize, LinkError> {
-        use crate::gameinput as gi;
-        let path = Path::new(gi::GUEST_PATH);
+    fn admit_com_facade(
+        &mut self,
+        basename: &str,
+        guest_path: &str,
+        image: fn() -> Vec<u8>,
+        bridges: impl Iterator<Item = (u32, HostExport)>,
+    ) -> Result<usize, LinkError> {
+        let path = Path::new(guest_path);
         if let Some((index, module)) = self
             .plan
             .modules
             .iter()
             .enumerate()
-            .find(|(_, m)| m.name.eq_ignore_ascii_case(gi::BASENAME.as_bytes()))
+            .find(|(_, m)| m.name.eq_ignore_ascii_case(basename.as_bytes()))
         {
             if module.built_in && module.path == path {
                 return Ok(index);
             }
             return Err(LinkError::new(
                 path,
-                "map GameInput facade",
+                "map private COM facade",
                 "duplicate module basename",
             ));
         }
         let index = self.plan.modules.len();
-        let image = gi::image();
+        let image = image();
         if index >= self.max_images || image.len() > self.remaining_bytes {
             return Err(LinkError::new(
                 path,
-                "map GameInput facade",
+                "map private COM facade",
                 "graph limit reached",
             ));
         }
@@ -492,7 +498,7 @@ impl Builder<'_> {
         module.built_in = true;
         module
             .iat
-            .extend(gi::bridges().map(|(iat_rva, export)| IatBinding {
+            .extend(bridges.map(|(iat_rva, export)| IatBinding {
                 iat_rva,
                 dll: export.provider.as_bytes().to_vec(),
                 symbol: Symbol::Name(export.symbol.as_bytes().to_vec()),
@@ -535,7 +541,7 @@ impl Builder<'_> {
             && *symbol == Symbol::Ordinal(gi::ORDINAL)
         {
             let module = self
-                .admit_gameinput()
+                .admit_com_facade(gi::BASENAME, gi::GUEST_PATH, gi::image, gi::bridges())
                 .map_err(|error| Unresolved::InvalidProvider {
                     dll: dll.to_vec(),
                     path: PathBuf::from(gi::GUEST_PATH),
@@ -545,6 +551,29 @@ impl Builder<'_> {
             return Ok(BindingTarget::Pe(ResolvedExport {
                 module,
                 export_rva: gi::CREATE,
+            }));
+        }
+
+        // No alias routing, forwarders, or DLL importers may select this private facade.
+        use crate::dstorage as ds;
+        if importer == 0
+            && self.options.dstorage_factory
+            && self.options.trusted_offline
+            && self.options.rust_providers
+            && dll.eq_ignore_ascii_case(ds::IMPORT.as_bytes())
+            && matches!(symbol, Symbol::Name(name) if name == ds::GET_FACTORY.as_bytes())
+        {
+            let module = self
+                .admit_com_facade(ds::BASENAME, ds::GUEST_PATH, ds::image, ds::bridges())
+                .map_err(|error| Unresolved::InvalidProvider {
+                    dll: dll.to_vec(),
+                    path: PathBuf::from(ds::GUEST_PATH),
+                    error: error.to_string(),
+                })?;
+            self.edge(importer, module);
+            return Ok(BindingTarget::Pe(ResolvedExport {
+                module,
+                export_rva: crate::com_facade::ENTRY,
             }));
         }
 
@@ -1136,6 +1165,62 @@ mod tests {
         assert!(!providers::has_dll(b"ws2_32.dll"));
         assert!(providers::lookup(b"ws2_32.dll", b"WSAStartup").is_none());
         assert!(providers::lookup(b"ws2_32.dll", b"#115").is_none());
+    }
+
+    #[test]
+    fn dstorage_facade_is_private_to_the_exact_direct_root_import() {
+        use crate::dstorage as ds;
+        let temp = TempDir::new();
+        let exe = temp.0.join("Owned.exe");
+        fs::write(
+            &exe,
+            image(
+                &[
+                    ("XCRDAPI.dll", &[Slot::Name(ds::GET_FACTORY)]),
+                    ("xcrdapi", &[Slot::Name(ds::GET_FACTORY)]),
+                    ("dstorage.dll", &[Slot::Name(ds::GET_FACTORY)]),
+                    ("front.dll", &[Slot::Ord(1)]),
+                ],
+                None,
+            ),
+        )
+        .unwrap();
+        fs::write(
+            temp.0.join("front.dll"),
+            dll_image(
+                &[("XCRDAPI.dll", &[Slot::Name(ds::GET_FACTORY)])],
+                Some((1, &[], Some("XCRDAPI.DStorageGetFactory"))),
+            ),
+        )
+        .unwrap();
+        let plan = build_configured(
+            &exe,
+            &[],
+            Options {
+                trusted_offline: true,
+                rust_providers: true,
+                dstorage_factory: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let Ok(BindingTarget::Pe(target)) = plan.modules[0].iat[0].target else {
+            panic!("expected a direct root binding into the original guest facade");
+        };
+        let facade = &plan.modules[target.module];
+        assert!(facade.built_in);
+        assert_eq!(facade.path, Path::new(ds::GUEST_PATH));
+        assert_eq!(target.export_rva, crate::com_facade::ENTRY);
+        assert!(plan.modules[0].iat[1..].iter().all(|b| b.target.is_err()));
+        let front = plan
+            .modules
+            .iter()
+            .find(|m| m.name == b"front.dll")
+            .unwrap();
+        assert!(front.iat[0].target.is_err());
+        assert!(ds::bridges().all(|(_, bridge)| bridge.address().is_none()));
+        assert!(!providers::has_dll(b"xcrdapi.dll"));
+        assert!(providers::lookup(b"xcrdapi.dll", ds::GET_FACTORY.as_bytes()).is_none());
     }
 
     #[test]

@@ -340,6 +340,9 @@ mod native {
         use crate::gameinput as gi;
         let mut expected_gameinput: std::collections::BTreeMap<_, _> = gi::bridges().collect();
         let mut gameinput_module = None;
+        use crate::dstorage as ds;
+        let mut expected_dstorage: std::collections::BTreeMap<_, _> = ds::bridges().collect();
+        let mut dstorage_module = None;
         let mut entropy_module = None;
         for &(importer, slot, target) in bindings {
             if let BindingTarget::Rust(export) = target {
@@ -369,6 +372,21 @@ mod native {
                         );
                     }
                     gameinput_module = Some(importer);
+                }
+                if export.provider == ds::IMPORT {
+                    if !matches!(profile, Profile::TrustedOfflineTlsChild)
+                        || !rust_providers
+                        || importer == 0
+                        || images[importer].0 != ds::GUEST_PATH
+                        || dstorage_module.is_some_and(|module| module != importer)
+                        || expected_dstorage.remove(&slot) != Some(export)
+                    {
+                        return Err(
+                            "DirectStorage bridge requires the original private guest facade"
+                                .into(),
+                        );
+                    }
+                    dstorage_module = Some(importer);
                 }
                 if export == GUEST_ENTROPY {
                     use crate::guest_entropy::{BRIDGE_SLOT, GUEST_PATH};
@@ -416,6 +434,11 @@ mod native {
             && (!expected_gameinput.is_empty() || images[module].1 != gi::image())
         {
             return Err("incomplete or non-original GameInput facade".into());
+        }
+        if let Some(module) = dstorage_module
+            && (!expected_dstorage.is_empty() || images[module].1 != ds::image())
+        {
+            return Err("incomplete or non-original DirectStorage facade".into());
         }
         let slot_thunks = if no_guest_cfg {
             UNCHECKED_SLOT_THUNKS
