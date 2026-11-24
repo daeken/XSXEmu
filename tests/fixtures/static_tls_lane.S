@@ -16,6 +16,7 @@ _static_tls_fixture:
     .long Lregistry_entry-Ltext
     .long Lconfigure_d3d12_vm_entry-Ltext
     .long Lxmem_entry-Ltext
+    .long Lprocessor_topology_entry-Ltext
 Ltext:
 .macro tls index
     leaq Ltext(%rip), %r11
@@ -926,6 +927,57 @@ Lprocessor_feature_entry:
     jne Lbad
     addq $40, %rsp
     movl $43, %eax
+    retq
+Lprocessor_topology_entry:
+    tls 0
+    phase 1, 2
+    subq $2088, %rsp                  /* Home space, length, up to 64 records. */
+    movq $0, 32(%rsp)
+    xorl %ecx, %ecx
+    leaq 32(%rsp), %rdx
+    callq *{iat_delta}(%r11)
+    testl %eax, %eax
+    jne Lbad
+    cmpl $122, %gs:0x68
+    jne Lbad
+    movl 32(%rsp), %eax
+    testl %eax, %eax
+    jz Lbad
+    cmpl $2048, %eax
+    ja Lbad
+    testl $31, %eax
+    jne Lbad
+    movl %eax, 36(%rsp)              /* Length must be a DWORD, not a size_t. */
+    movl $0x87654321, %gs:0x68
+    leaq 40(%rsp), %rcx
+    leaq 32(%rsp), %rdx
+    leaq Ltext(%rip), %r11
+    callq *{iat_delta}(%r11)
+    cmpl $1, %eax
+    jne Lbad
+    cmpl $0x87654321, %gs:0x68
+    jne Lbad
+    movl 32(%rsp), %eax
+    cmpl 36(%rsp), %eax
+    jne Lbad
+    leaq 40(%rsp), %rcx
+    leaq (%rcx,%rax), %rdx
+    movl $1, %r8d
+Lprocessor_topology_next:
+    cmpq %r8, (%rcx)                 /* Contiguous, distinct single-bit masks. */
+    jne Lbad
+    cmpq $0, 8(%rcx)                 /* RelationProcessorCore and padding. */
+    jne Lbad
+    cmpq $0, 16(%rcx)                /* No SMT flag; fully zeroed union. */
+    jne Lbad
+    cmpq $0, 24(%rcx)
+    jne Lbad
+    addq $32, %rcx
+    shlq $1, %r8
+    cmpq %rdx, %rcx
+    jb Lprocessor_topology_next
+    addq $2088, %rsp
+    movl $49, %eax
     retq
 /* Fixture only: the owned caller supplies an initialized condition variable
  * and an exclusively held critical section. There are no possible peers, so

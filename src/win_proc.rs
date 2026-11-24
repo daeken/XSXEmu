@@ -108,6 +108,11 @@ pub(crate) fn lookup(dll: &[u8], name: &[u8]) -> Option<HostExport> {
             "UnhandledExceptionFilter",
             native::unhandled_exception_filter
         ),
+        (BASE | K32 | INFO, b"GetLogicalProcessorInformation") => export!(
+            "kernelbase.dll",
+            "GetLogicalProcessorInformation",
+            native::get_logical_processor_information
+        ),
         (BASE | K32 | INFO, b"GetSystemInfo") => {
             export!("kernelbase.dll", "GetSystemInfo", native::get_system_info)
         }
@@ -159,6 +164,7 @@ pub(crate) mod native {
     const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
     const ERROR_NOT_SUPPORTED: u32 = 50;
     const ERROR_INVALID_PARAMETER: u32 = 87;
+    const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
     const ERROR_ENVVAR_NOT_FOUND: u32 = 203;
     const ERROR_FILENAME_EXCED_RANGE: u32 = 206;
     const CURRENT_PROCESS: usize = usize::MAX;
@@ -533,14 +539,68 @@ pub(crate) mod native {
         processor_revision: u16,
     }
 
+    fn guest_processor_count() -> usize {
+        // Keep the one-group guest profile stable across the size probe and
+        // fill, and use exactly the same count for SYSTEM_INFO.
+        static COUNT: OnceLock<usize> = OnceLock::new();
+        *COUNT.get_or_init(|| {
+            std::thread::available_parallelism()
+                .map_or(1, |n| n.get())
+                .min(u64::BITS as usize)
+        })
+    }
+
+    #[repr(C)]
+    pub(crate) struct LogicalProcessorInformation {
+        processor_mask: u64,
+        relationship: u32,
+        padding: u32,
+        // ProcessorCore.Flags is the first byte of the 16-byte union.
+        data: [u64; 2],
+    }
+
+    const _: () = {
+        assert!(size_of::<LogicalProcessorInformation>() == 32);
+        assert!(std::mem::offset_of!(LogicalProcessorInformation, relationship) == 8);
+        assert!(std::mem::offset_of!(LogicalProcessorInformation, data) == 16);
+    };
+
+    pub(crate) unsafe extern "win64" fn get_logical_processor_information(
+        out: *mut LogicalProcessorInformation,
+        length: *mut u32,
+    ) -> i32 {
+        if length.is_null() {
+            return fail(ERROR_INVALID_PARAMETER);
+        }
+        let count = guest_processor_count();
+        let required = (count * size_of::<LogicalProcessorInformation>()) as u32;
+        // SAFETY: The caller supplies a readable/writable DWORD, separate
+        // from the record buffer. On failure no record bytes are written.
+        let capacity = unsafe { length.read_unaligned() };
+        unsafe { length.write_unaligned(required) };
+        if out.is_null() || capacity < required {
+            return fail(ERROR_INSUFFICIENT_BUFFER);
+        }
+        for i in 0..count {
+            // SAFETY: The caller supplies at least `capacity` writable bytes.
+            unsafe {
+                out.add(i).write_unaligned(LogicalProcessorInformation {
+                    processor_mask: 1u64 << i,
+                    relationship: 0, // RelationProcessorCore
+                    padding: 0,
+                    data: [0; 2], // Flags = 0: one logical processor per modeled core.
+                });
+            }
+        }
+        1 // Success preserves LastError.
+    }
+
     pub(super) unsafe extern "win64" fn get_system_info(out: *mut SystemInfo) {
         if out.is_null() {
             set_last_error(ERROR_INVALID_PARAMETER);
             return;
         }
-        let threads = std::thread::available_parallelism()
-            .map_or(1, |n| n.get())
-            .min(usize::BITS as usize);
+        let threads = guest_processor_count();
         // Describe the AMD64 guest profile, not the ARM machine running Rosetta.
         let info = SystemInfo {
             architecture: 9, // PROCESSOR_ARCHITECTURE_AMD64
@@ -742,6 +802,52 @@ pub(crate) mod native {
         }
 
         #[test]
+        fn logical_processor_information_matches_system_info_and_respects_output_bounds() {
+            use crate::providers::native::get_last_error;
+
+            let mut sys = MaybeUninit::uninit();
+            let sys = unsafe {
+                get_system_info(sys.as_mut_ptr());
+                sys.assume_init()
+            };
+            let required = sys.number_of_processors * 32;
+            let mut buf = [0xa5u8; 64 * 32 + 8];
+            let out = buf.as_mut_ptr().cast();
+            let mut length = required - 1;
+            assert_eq!(
+                unsafe { get_logical_processor_information(out, &mut length) },
+                0
+            );
+            assert_eq!(length, required);
+            assert_eq!(get_last_error(), ERROR_INSUFFICIENT_BUFFER);
+            assert_eq!(
+                unsafe { get_logical_processor_information(out, ptr::null_mut()) },
+                0
+            );
+            assert_eq!(get_last_error(), ERROR_INVALID_PARAMETER);
+            assert!(buf.iter().all(|&byte| byte == 0xa5));
+
+            length = buf.len() as u32;
+            set_last_error(0x1234);
+            assert_eq!(
+                unsafe { get_logical_processor_information(out, &mut length) },
+                1
+            );
+            assert_eq!(get_last_error(), 0x1234);
+            assert_eq!(length, required);
+            let (records, tail) = buf.split_at(length as usize);
+            let mut active_mask = 0;
+            for (i, record) in records.chunks_exact(32).enumerate() {
+                let mask = u64::from_le_bytes(record[..8].try_into().unwrap());
+                assert_eq!(mask, 1u64 << i);
+                assert_eq!(record[8..], [0; 24]);
+                active_mask |= mask;
+            }
+            assert_eq!(active_mask, sys.active_processor_mask as u64);
+            assert!(tail.iter().all(|&byte| byte == 0xa5));
+        }
+
+        #[test]
         fn system_info_and_monotonic_clock() {
             let mut sys = MaybeUninit::uninit();
             let mut hz = 0;
@@ -783,6 +889,7 @@ mod registry_tests {
             (DEBUG, b"IsDebuggerPresent"),
             (ERROR, b"SetErrorMode"),
             (INFO, b"GetSystemInfo"),
+            (INFO, b"GetLogicalProcessorInformation"),
             (PROFILE, b"QueryPerformanceCounter"),
             (UTIL, b"EncodePointer"),
             (UTIL, b"DecodePointer"),

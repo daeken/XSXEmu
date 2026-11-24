@@ -64,6 +64,7 @@ struct Fixture {
     registry_entry: u32,
     configure_d3d12_vm_entry: u32,
     xmem_entry: u32,
+    processor_topology_entry: u32,
     code: [u8; RAW],
 }
 global_asm!(include_str!("fixtures/static_tls_lane.S"),
@@ -1612,6 +1613,42 @@ fn processor_feature_bridge_preserves_last_error_and_reports_fastfail_unavailabl
         43,
         "Guest entry returned 43",
     );
+}
+
+#[test]
+fn processor_topology_bridge_probes_and_fills_win64_records() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let mut exe = image(Kind::Solo);
+    w32(
+        &mut exe,
+        OP + 16,
+        TEXT + unsafe { static_tls_fixture.processor_topology_entry } as usize,
+    );
+    dir_import_one(
+        &mut exe,
+        b"api-ms-win-core-sysinfo-l1-1-0.dll\0",
+        b"GetLogicalProcessorInformation\0",
+    );
+    let path = scratch.write("processor-topology.exe", &exe);
+    expect(run(&path, &[OPT]), 1, "incomplete dependency graph");
+    let output = launcher(&path, &[OPT, "--rust-providers"])
+        .env("XSXEMU_TRACE_STARTUP", "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr
+            .matches(
+                "bridge dispatch kernelbase.dll!GetLogicalProcessorInformation guest_return_pc="
+            )
+            .count(),
+        2,
+        "{stderr}"
+    );
+    expect(output, 49, "Guest entry returned 49");
 }
 
 #[test]

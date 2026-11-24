@@ -284,6 +284,21 @@ graph: null selects the root EXE, and non-null names use the ordinary mapped
 module lookup (CP1252 for `A`, UTF-16 for `W`). Neither loads images nor creates handles for Rust providers
 or API-set contracts. Success preserves `LastError`; an unmatched name
 returns `NULL` and sets `ERROR_MOD_NOT_FOUND` in the guest TEB.
+
+`GetLogicalProcessorInformation` exposes a modeled single-group topology, not
+host physical topology or an Xbox CPU profile. It uses the same process-stable
+logical count as `GetSystemInfo`/`GetNativeSystemInfo`: host available
+parallelism capped at 64 (fallback 1). Each logical processor is represented
+by one `RelationProcessorCore` record with a distinct mask bit and no SMT flag.
+No package, NUMA, cache, or other relationships are modeled. A null or short
+buffer with a valid length pointer returns the required byte count and
+`ERROR_INSUFFICIENT_BUFFER` without writing records. A null length pointer
+returns `ERROR_INVALID_PARAMETER`. Success returns the bytes written and
+preserves `LastError`. The startup consumer probes with a null buffer and zero
+length, checks error 122, and retries. It walks 32-byte records, counting only
+core records and summing the popcounts of their masks; it does not read the
+union or require any other relationship.
+
 `run --experimental-static-tls --trusted-offline --map-extra-dll PATH`
 explicitly maps one additional trusted, entryless PE DLL without imports,
 delay imports or TLS. It uses the file's actual basename and mapped base;
