@@ -872,7 +872,7 @@ Lmodule_handle_dll_main:
     jne Lbad
     subq $40, %rsp
     movl $0x12345678, %gs:0x68
-    leaq Lmodule_handle_name(%rip), %rcx
+    leaq {module_paths_delta}(%r11), %rcx
     callq *{iat_delta}(%r11)
     leaq Ltext(%rip), %r11
     leaq -{text_rva}(%r11), %rdx
@@ -880,7 +880,7 @@ Lmodule_handle_dll_main:
     jne Lbad
     cmpl $0x12345678, %gs:0x68
     jne Lbad
-    leaq Lmodule_handle_missing(%rip), %rcx
+    leaq {module_paths_delta}+64(%r11), %rcx
     callq *{iat_delta}(%r11)
     testq %rax, %rax
     jne Lbad
@@ -927,11 +927,6 @@ Lprocessor_feature_entry:
     addq $40, %rsp
     movl $43, %eax
     retq
-.p2align 1
-Lmodule_handle_name:
-    .short 'O', 'w', 'N', 'e', 'D', 0  /* Case-insensitive, implicit .dll. */
-Lmodule_handle_missing:
-    .short 'k', 'e', 'r', 'n', 'e', 'l', '3', '2', '.', 'd', 'l', 'l', 0
 /* Fixture only: the owned caller supplies an initialized condition variable
  * and an exclusively held critical section. There are no possible peers, so
  * releasing and reacquiring on a zero-timeout poll has no observable effect. */

@@ -1530,44 +1530,62 @@ fn module_handle_bridge_returns_borrowed_mapped_bases_and_sets_teb_error_on_miss
         return;
     }
     const API_SET: &[u8] = b"api-ms-win-core-libraryloader-l1-2-0.dll\0";
-    const SYMBOL: &[u8] = b"GetModuleHandleW\0";
-    let scratch = Scratch::new();
-    let mut exe = image(Kind::Solo);
-    w32(
-        &mut exe,
-        OP + 16,
-        TEXT + unsafe { static_tls_fixture.module_handle_entry } as usize,
-    );
-    dir_import_one(&mut exe, API_SET, SYMBOL);
-    let imports = LINK + 0x780;
-    // Move the API-set thunk after owned.dll's thunk and its null terminator.
-    w32(&mut exe, file(imports) + 16, IAT + 16);
-    w64(&mut exe, file(imports) + 0x30, 0);
-    w32(&mut exe, file(imports), imports + 0x90);
-    w64(&mut exe, file(imports) + 0x90, imports + 0x70);
-    dir(&mut exe, 1, imports, 60);
-    w32(&mut exe, file(imports) + 20, LINK + 0x30);
-    w32(&mut exe, file(imports) + 32, LINK + 0x50);
-    w32(&mut exe, file(imports) + 36, IAT);
-    w64(&mut exe, file(LINK) + 0x30, LINK + 0x70);
-    put(&mut exe, file(LINK) + 0x50, b"owned.dll\0");
-    put(&mut exe, file(LINK) + 0x72, b"Step\0");
-    let exe = scratch.write("module-handle.exe", &exe);
+    for (symbol, name, query) in [
+        (&b"GetModuleHandleW\0"[..], "owned.dll", &b"OwNeD"[..]),
+        (&b"GetModuleHandleA\0"[..], "ownéd.dll", &b"OwN\xc9D"[..]),
+    ] {
+        let scratch = Scratch::new();
+        let mut exe = image(Kind::Solo);
+        w32(
+            &mut exe,
+            OP + 16,
+            TEXT + unsafe { static_tls_fixture.module_handle_entry } as usize,
+        );
+        dir_import_one(&mut exe, API_SET, symbol);
+        let imports = LINK + 0x780;
+        // Move the API-set thunk after owned.dll's thunk and its null terminator.
+        w32(&mut exe, file(imports) + 16, IAT + 16);
+        w64(&mut exe, file(imports) + 0x30, 0);
+        w32(&mut exe, file(imports), imports + 0x90);
+        w64(&mut exe, file(imports) + 0x90, imports + 0x70);
+        dir(&mut exe, 1, imports, 60);
+        w32(&mut exe, file(imports) + 20, LINK + 0x30);
+        w32(&mut exe, file(imports) + 32, LINK + 0x50);
+        w32(&mut exe, file(imports) + 36, IAT);
+        w64(&mut exe, file(LINK) + 0x30, LINK + 0x70);
+        put(
+            &mut exe,
+            file(LINK) + 0x50,
+            [name.as_bytes(), b"\0"].concat().as_slice(),
+        );
+        put(&mut exe, file(LINK) + 0x72, b"Step\0");
+        let exe = scratch.write("module-handle.exe", &exe);
 
-    let mut dll = image(Kind::Dll);
-    dir(&mut dll, 9, 0, 0);
-    w32(
-        &mut dll,
-        OP + 16,
-        TEXT + unsafe { static_tls_fixture.module_handle_dll_main } as usize,
-    );
-    dir_import_one(&mut dll, API_SET, SYMBOL);
-    scratch.write("owned.dll", &dll);
-    expect(
-        run(&exe, &[OPT, "--rust-providers"]),
-        43,
-        "Guest entry returned 43",
-    );
+        let mut dll = image(Kind::Dll);
+        dir(&mut dll, 9, 0, 0);
+        w32(
+            &mut dll,
+            OP + 16,
+            TEXT + unsafe { static_tls_fixture.module_handle_dll_main } as usize,
+        );
+        dir_import_one(&mut dll, API_SET, symbol);
+        for (offset, query) in [(0, query), (64, b"kernel32.dll".as_slice())] {
+            let at = file(MODULE_PATHS) + offset;
+            if symbol == b"GetModuleHandleW\0" {
+                for (i, &ch) in query.iter().enumerate() {
+                    w16(&mut dll, at + 2 * i, usize::from(ch));
+                }
+            } else {
+                put(&mut dll, at, query);
+            }
+        }
+        scratch.write(name, &dll);
+        expect(
+            run(&exe, &[OPT, "--rust-providers"]),
+            43,
+            "Guest entry returned 43",
+        );
+    }
 }
 
 #[test]

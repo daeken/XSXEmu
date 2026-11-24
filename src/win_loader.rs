@@ -25,6 +25,14 @@ pub(crate) fn lookup(dll: &[u8], name: &[u8]) -> Option<HostExport> {
     match (dll, name) {
         (
             b"kernel32.dll" | b"kernelbase.dll" | LIBRARY_LOADER_1_1 | LIBRARY_LOADER_1_2,
+            b"GetModuleHandleA",
+        ) => export!(
+            "kernelbase.dll",
+            "GetModuleHandleA",
+            native::get_module_handle_a
+        ),
+        (
+            b"kernel32.dll" | b"kernelbase.dll" | LIBRARY_LOADER_1_1 | LIBRARY_LOADER_1_2,
             b"GetModuleHandleW",
         ) => {
             export!(
@@ -101,6 +109,7 @@ fn registry_aliases_are_exact() {
     ] {
         assert!(has_dll(dll));
         for name in [
+            "GetModuleHandleA",
             "GetModuleHandleW",
             "GetModuleHandleExW",
             "GetModuleFileNameW",
@@ -776,12 +785,28 @@ pub(crate) mod native {
             .map_err(|_| ERROR_INVALID_PARAMETER)
     }
 
+    pub(crate) unsafe extern "win64" fn get_module_handle_a(name: *const u8) -> usize {
+        if name.is_null() {
+            return mapped_module_handle(None);
+        }
+        let Some(len) = (unsafe { terminated(name, MAX_WIDE_NAME) }) else {
+            return fail(ERROR_INVALID_PARAMETER);
+        };
+        let bytes = unsafe { std::slice::from_raw_parts(name, len) };
+        let name = providers::win_text::native::decode_ansi(bytes);
+        mapped_module_handle(Some(&name))
+    }
+
     pub(crate) unsafe extern "win64" fn get_module_handle_w(name: *const u16) -> usize {
         let name = match unsafe { wide_name(name) } {
             Ok(name) => name,
             Err(error) => return fail(error),
         };
-        graph(|g| g.and_then(|g| g.by_name(name.as_deref())).map(|m| m.base))
+        mapped_module_handle(name.as_deref())
+    }
+
+    fn mapped_module_handle(name: Option<&str>) -> usize {
+        graph(|g| g.and_then(|g| g.by_name(name)).map(|m| m.base))
             .unwrap_or_else(|| fail(ERROR_MOD_NOT_FOUND))
     }
 

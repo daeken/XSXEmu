@@ -124,6 +124,8 @@ audited_bridges! {
         native::heap_free, (heap: *mut c_void, flags: u32, block: *mut c_void) -> i32;
     xsxemu_tls_reg_open_key_w, reg_open_key_w: b"advapi32.dll", b"RegOpenKeyW",
         native::reg_open_key_w, (root: usize, subkey: *const u16, out: *mut usize) -> i32;
+    xsxemu_tls_get_module_handle_a, get_module_handle_a: b"kernelbase.dll", b"GetModuleHandleA",
+        loader::get_module_handle_a, (name: *const u8) -> usize;
     xsxemu_tls_get_module_handle_w, get_module_handle_w: b"kernelbase.dll", b"GetModuleHandleW",
         loader::get_module_handle_w, (name: *const u16) -> usize;
     xsxemu_tls_get_proc_address, get_proc_address: b"kernelbase.dll", b"GetProcAddress",
