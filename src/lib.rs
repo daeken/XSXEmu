@@ -1,5 +1,6 @@
 //! Reusable, host-independent XSXEmu components.
 
+pub mod compute_capture;
 pub mod compute_metadata;
 pub mod pipeline_library;
 pub mod root_signature;

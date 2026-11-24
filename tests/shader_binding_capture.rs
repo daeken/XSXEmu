@@ -3,6 +3,10 @@
 #![cfg(target_arch = "x86_64")]
 
 use std::arch::asm;
+use xsxemu::compute_capture::{
+    CatalogEntry, DispatchShape, GpuHeap, LifetimeId, ListCapture, ProgramEvidence, ProgramId,
+    RootParameter, TableEvidence, TableValue, identify,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Event {
@@ -143,6 +147,92 @@ fn owned_win64_calls_capture_order_and_full_width_table_handles() {
             Some(Event::Pipeline(pipeline_id)),
             Some(Event::Dispatch([13, 11, 3])),
         ]
+    );
+}
+
+#[test]
+fn owned_win64_capture_joins_program_and_the_last_bound_table() {
+    let slots = vtable();
+    let mut list = List {
+        vtable: slots.as_ptr(),
+        events: [None; 8],
+        len: 0,
+        refused: false,
+    };
+    let heap = LifetimeId(23);
+    let root = LifetimeId(29);
+    let pipeline = LifetimeId(31);
+    let base = 0x1122_0000_0000_0040;
+    let heap_arg = [heap.0];
+    // SAFETY: slots and input are exclusively owned by the fixture, as above.
+    unsafe {
+        call::<33>(&mut list, root.0, 0, 0);
+        call::<32>(&mut list, 1, heap_arg.as_ptr() as u64, 0);
+        call::<35>(&mut list, 7, base, 0);
+        call::<35>(&mut list, 7, base + 36, 0);
+        call::<25>(&mut list, pipeline.0, 0, 0);
+        call::<14>(&mut list, 47, 53, 59);
+    }
+    assert!(!list.refused);
+    let id = ProgramId(13);
+    let program = identify(
+        b"owned program",
+        b"owned state",
+        &[CatalogEntry {
+            id,
+            code: b"owned program",
+            launch_state: b"owned state",
+        }],
+    );
+    let pipelines = [(pipeline, program)].into();
+    let heaps = [(
+        heap,
+        Some(GpuHeap {
+            start: base,
+            count: 8.try_into().unwrap(),
+            stride: 12.try_into().unwrap(),
+        }),
+    )]
+    .into();
+    let parameter = RootParameter { root, ordinal: 7 };
+    let mut capture = ListCapture::new(LifetimeId(37));
+    let mut dispatch = None;
+    for event in list.events.into_iter().flatten() {
+        match event {
+            Event::RootSignature(root) => capture.bind_root(LifetimeId(root)),
+            Event::Heaps(values, count) => capture.bind_heaps(
+                values[..count as usize]
+                    .iter()
+                    .copied()
+                    .map(LifetimeId)
+                    .collect(),
+            ),
+            Event::Table { parameter, handle } => {
+                capture.set_table(parameter, TableValue::Full(handle))
+            }
+            Event::Pipeline(pipeline) => capture.bind_pipeline(LifetimeId(pipeline)),
+            Event::Dispatch(groups) => {
+                assert!(dispatch.is_none());
+                dispatch = Some(capture.dispatch(
+                    DispatchShape::DirectGroups(groups),
+                    Some(parameter),
+                    &pipelines,
+                    &heaps,
+                ));
+            }
+        }
+    }
+    let dispatch = dispatch.unwrap();
+    assert_eq!(dispatch.shape, DispatchShape::DirectGroups([47, 53, 59]));
+    assert_eq!(dispatch.program, ProgramEvidence::Exact(id));
+    assert_eq!(dispatch.root, Some(root));
+    assert_eq!(
+        dispatch.table,
+        TableEvidence::Slot {
+            heap,
+            index: 3,
+            gpu_range: base + 36..base + 48
+        }
     );
 }
 
