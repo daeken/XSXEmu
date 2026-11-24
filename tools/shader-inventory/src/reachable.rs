@@ -382,6 +382,8 @@ struct IndirectFrontier {
     root_extensions: BTreeMap<&'static str, usize>,
     extension_nodes: usize,
     extension_cuts: usize,
+    extension_cut_windows: BTreeMap<TargetOverlap, usize>,
+    new_branch_entries_into_original_windows: usize,
 }
 
 impl IndirectFrontier {
@@ -477,7 +479,10 @@ impl IndirectFrontier {
         if !roots.is_empty() {
             self.additional_roots += roots.len();
             let original = graph.len();
-            let earlier_cuts = graph.values().filter(|op| op.op.is_some()).count();
+            let earlier_cuts: BTreeMap<_, _> = graph
+                .iter()
+                .filter_map(|(&pc, node)| node.op.map(|candidate| (pc, candidate)))
+                .collect();
             let mut pattern = PcPattern::default();
             let mut unsupported = "decode";
             let extension = cfg::extend_extent(bytes.len() / 4, graph, roots, |pc| {
@@ -486,8 +491,33 @@ impl IndirectFrontier {
             let outcome = match extension {
                 Ok(expanded) => {
                     self.extension_nodes += expanded.len() - original;
-                    self.extension_cuts +=
-                        expanded.values().filter(|op| op.op.is_some()).count() - earlier_cuts;
+                    let expanded_entries = branch_entries(&expanded);
+                    let new_entries: BTreeSet<_> =
+                        expanded_entries.difference(&entries).copied().collect();
+                    self.new_branch_entries_into_original_windows += earlier_cuts
+                        .iter()
+                        .filter(|&(&pc, pair)| {
+                            pair.is_some_and(|(start, _)| {
+                                new_entries
+                                    .range((Excluded(start), Included(pc)))
+                                    .next()
+                                    .is_some()
+                            })
+                        })
+                        .count();
+                    for (&pc, node) in &expanded {
+                        if let Some(cut) = node.op
+                            && !earlier_cuts.contains_key(&pc)
+                        {
+                            self.extension_cuts += 1;
+                            if let Some((_, target)) = cut {
+                                *self
+                                    .extension_cut_windows
+                                    .entry(frontier_target(&expanded, target))
+                                    .or_default() += 1;
+                            }
+                        }
+                    }
                     "valid direct projection"
                 }
                 Err(cfg::Error::UnsupportedEncoding) => unsupported,
@@ -702,6 +732,12 @@ impl Report {
             self.indirect_frontier.root_extensions,
             self.indirect_frontier.extension_nodes,
             self.indirect_frontier.extension_cuts
+        );
+        println!(
+            "Indirect-cut extra-root cross-check: original windows with newly observed direct interior entries={}; added cut candidates by target overlap={:?}",
+            self.indirect_frontier
+                .new_branch_entries_into_original_windows,
+            self.indirect_frontier.extension_cut_windows
         );
         println!(
             "Backend triage (not translated): small-wave32-filter={} with-execz-and-uint-gt-cmpx={} with-scc-branch={} single-raw-store-1x1x1={} smallest-single-store-nodes={:?}",
