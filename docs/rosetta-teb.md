@@ -658,14 +658,22 @@ or searches DLL roots. Success preserves guest
 LastError; failure returns `INVALID_FILE_ATTRIBUTES` and sets guest LastError.
 
 `run --experimental-static-tls --trusted-offline --rust-providers --title-data DIR`
-exposes the selected directory as a read-only guest `G:` drive for those
-attribute probes. The drive is absent by default. Lookups require an absolute
-`G:\` or `G:/` path, match component spelling according to the host volume,
-and reject traversal and links inside the mounted directory. Lookup is
-relative to pinned directory descriptors; generic file creation, writes and
-other drives are unchanged. This does not implement DirectStorage `OpenFile`
-or archive reads. The observed archive probe (return RVA `0x28c8bfe`) checks
-for `INVALID_FILE_ATTRIBUTES` before proceeding to the DirectStorage method.
+exposes the selected directory as a read-only guest `G:` drive. The drive is
+absent by default. Lookups require an absolute `G:\` or `G:/` path, match
+component spelling according to the host volume, and reject traversal and links
+inside the mounted directory. Lookup is relative to pinned directory descriptors;
+generic file creation, writes and other drives are unchanged. The observed archive
+probe (return RVA `0x28c8bfe`) checks for `INVALID_FILE_ATTRIBUTES` before
+proceeding to DirectStorage `OpenFile`.
+
+The audited `CreateFileW` bridge (IAT RVA `0x6793900`) admits only the archive
+call's tuple: `GENERIC_READ`, `FILE_SHARE_READ`, null security attributes,
+`OPEN_EXISTING`, `FILE_FLAG_NO_BUFFERING`, and a null template. It opens an
+existing regular file through the same confined mount and returns a guest file
+handle that can be closed with `CloseHandle`. It logs that host cache and
+alignment behavior for `FILE_FLAG_NO_BUFFERING` is not modeled. Success
+preserves guest LastError; failure sets it and returns `INVALID_HANDLE_VALUE`.
+This bridge does not add audited seek or read calls.
 
 **Scarlett XGameRuntime startup.** The trace at `8eb79ce` reaches
 `GetFileAttributesW`, `LoadLibraryExW`, and `ReleaseSRWLockExclusive`, then

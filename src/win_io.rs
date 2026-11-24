@@ -833,7 +833,7 @@ pub(crate) mod native {
         Ok(mask)
     }
 
-    pub(super) unsafe extern "win64" fn CreateFileW(
+    pub(crate) unsafe extern "win64" fn CreateFileW(
         name: *const u16,
         desired: u32,
         share: u32,
@@ -925,6 +925,47 @@ pub(crate) mod native {
                     set_last_error(if existed { ALREADY_EXISTS } else { 0 });
                 }
                 Ok(h)
+            })(),
+            INVALID,
+        )
+    }
+
+    // Restrict this audited child adapter to the observed synchronous archive
+    // open, and use the same read-only descriptor walk as DirectStorage.
+    #[cfg(target_os = "macos")]
+    pub(crate) unsafe extern "win64" fn tls_child_create_file_w(
+        name: *const u16,
+        desired: u32,
+        share: u32,
+        security: *const c_void,
+        disposition: u32,
+        flags: u32,
+        template: usize,
+    ) -> usize {
+        ret(
+            (|| {
+                if (desired, share, disposition, flags, template)
+                    != (0x8000_0000, 1, 3, 0x2000_0000, 0)
+                    || !security.is_null()
+                {
+                    return Err(UNSUPPORTED);
+                }
+                let name = unsafe { wide(name)? };
+                let file = crate::title_data::open_regular(&name)?;
+                let md = file.metadata().map_err(win_err)?;
+                let key = file_key(&md, Path::new("")); // Unix uses descriptor identity only.
+                let access = access_mask(desired)?;
+                let mut st = lock(&STATE);
+                st.shares(&key, access, share)?;
+                let handle = st.insert(Entry {
+                    obj: open_file(file, access, share, Some(key), 1),
+                    access,
+                    inheritable: false,
+                })?;
+                eprintln!(
+                    "xsxemu: CreateFileW: opened read-only title data; FILE_FLAG_NO_BUFFERING cache/alignment policy not modeled"
+                );
+                Ok(handle)
             })(),
             INVALID,
         )

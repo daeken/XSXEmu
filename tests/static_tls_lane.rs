@@ -1826,6 +1826,123 @@ fn title_data_mount_is_explicit_and_confines_guest_attributes() {
     }
 }
 
+const TITLE_CREATE_CAPACITY: usize = 0x200;
+const TITLE_CREATE_ARGS: usize = MODULE_PATHS + 0x200;
+
+#[repr(C)]
+struct TitleCreateFixture {
+    entry: u32,
+    code: [u8; TITLE_CREATE_CAPACITY],
+}
+
+global_asm!(include_str!("fixtures/static_tls_title_create_file.S"),
+    capacity = const TITLE_CREATE_CAPACITY,
+    iat_delta = const IAT - TEXT,
+    path_delta = const MODULE_PATHS - TEXT,
+    args_delta = const TITLE_CREATE_ARGS - TEXT,
+    options(att_syntax),
+);
+
+unsafe extern "C" {
+    static static_tls_title_create_file_fixture: TitleCreateFixture;
+}
+
+#[test]
+fn title_data_create_file_returns_closable_handle_and_refuses_other_opens() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let root = scratch.0.join("mounted");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("archive.rpf"), b"owned archive").unwrap();
+    let outside = scratch.write("outside.rpf", b"not mounted");
+    std::os::unix::fs::symlink(outside, root.join("link.rpf")).unwrap();
+    let mut exe = image(Kind::Solo);
+    let fixture = unsafe { &static_tls_title_create_file_fixture };
+    exe[file(TEXT)..file(TEXT) + RAW].fill(0xcc);
+    put(&mut exe, file(TEXT), &fixture.code);
+    w32(&mut exe, OP + 16, TEXT + fixture.entry as usize);
+    w64(&mut exe, file(ARRAY), PREFERRED + TEXT);
+    let imports = LINK + 0x780;
+    dir(&mut exe, 1, imports, 60);
+    for (i, (dll, symbol)) in [
+        (
+            &b"api-ms-win-core-file-l1-1-0.dll\0"[..],
+            &b"CreateFileW\0"[..],
+        ),
+        (
+            &b"api-ms-win-core-handle-l1-1-0.dll\0"[..],
+            &b"CloseHandle\0"[..],
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let row = file(imports) + 20 * i;
+        let lookup = imports + 0x50 + i * 0x10;
+        let name = imports + 0x80 + i * 0x30;
+        let hint_name = imports + 0xe0 + i * 0x20;
+        w32(&mut exe, row, lookup);
+        w32(&mut exe, row + 12, name);
+        w32(&mut exe, row + 16, IAT + i * 16);
+        w64(&mut exe, file(lookup), hint_name);
+        put(&mut exe, file(name), dll);
+        put(&mut exe, file(hint_name) + 2, symbol);
+    }
+    let write = |name: &str, args: [usize; 3]| {
+        let mut exe = exe.clone();
+        for (i, unit) in name.encode_utf16().chain(Some(0)).enumerate() {
+            w16(&mut exe, file(MODULE_PATHS) + 2 * i, usize::from(unit));
+        }
+        for (i, arg) in args.into_iter().enumerate() {
+            w64(&mut exe, file(TITLE_CREATE_ARGS) + 8 * i, arg);
+        }
+        scratch.write("title-create.exe", &exe)
+    };
+    let exact = [3, 0x2000_0000, 0];
+    let archive = r"G:\archive.rpf";
+    let p = write(archive, exact);
+    expect(
+        run(&p, &[OPT, TRUSTED, "--rust-providers"]),
+        15,
+        "Guest entry returned 15",
+    );
+    let flags = [
+        OPT,
+        TRUSTED,
+        "--rust-providers",
+        "--title-data",
+        root.to_str().unwrap(),
+    ];
+    let opened = run(&p, &flags);
+    assert!(
+        String::from_utf8_lossy(&opened.stderr)
+            .contains("FILE_FLAG_NO_BUFFERING cache/alignment policy not modeled")
+    );
+    expect(opened, 60, "Guest entry returned 60");
+    for (name, args, error) in [
+        (r"G:\missing.rpf", exact, 2),
+        (r"G:\link.rpf", exact, 5),
+        (r"G:\", exact, 5),
+        (r"G:\..\outside.rpf", exact, 123),
+        (r"C:\archive.rpf", exact, 123),
+        (archive, [2, exact[1], 0], 50), // CREATE_ALWAYS
+        (archive, [3, 0, 0], 50),
+        (archive, [3, exact[1], 1], 50),
+    ] {
+        expect(
+            run(&write(name, args), &flags),
+            error,
+            &format!("Guest entry returned {error}"),
+        );
+    }
+    assert_eq!(
+        fs::read(root.join("archive.rpf")).unwrap(),
+        b"owned archive"
+    );
+}
+
 const GEO_CODE_CAPACITY: usize = 0x200;
 
 #[repr(C)]
