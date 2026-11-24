@@ -42,6 +42,8 @@ For the compute wrappers only, the scanner compares PSV0 launch fields against t
 
 For PS, payload bytes `+4` and `+5` are the `DepthOutput` and `SampleFrequency` flags. `SampleFrequency` is zero throughout. All 1,171 wrappers with `DepthOutput = 1` have exactly one unallocated PSV0 output element with semantic kind `Depth` (1,156), `DepthLessEqual` (12), or `DepthGreaterEqual` (3). The 10,930 remaining PS wrappers have no depth-kind or unallocated output element. “Unallocated” here means outside the packed vector signature, not absent from shader outputs or proof of native depth export behavior.
 
+For MS, the runtime-info union has little-endian u32 group-shared, view-dependent group-shared, and payload byte counts at `+4/+8/+12`, then u16 maximum vertex and primitive counts at `+16/+18`. Bytes `+30/+31` hold the primitive signature vector count and the mesh output topology. All 9,282 wrappers have both maxima in `1..=256` and topology value `2`. Five have nonzero group-shared bytes; none declares view-dependent group-shared bytes, a nonzero payload size, or primitive signature vectors. The primitive vector count and maximum output primitive count are different fields; zero vectors does not imply no output primitives. These are source declarations, not Metal limits or a native mesh launch contract.
+
 ## Wrapped stage labels versus FSSM stage bytes
 
 The scanner uses the bounded XDAT/XBCH reader for every wrapper and groups the FSSM byte at `+0x100` in native payload directory order. The observed raw sequences account for all 26,698 native payloads in 26,503 wrappers:

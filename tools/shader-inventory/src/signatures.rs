@@ -148,6 +148,7 @@ struct Runtime {
     positive_dims: usize,
     partial_dims: usize,
     depth: PixelDepth,
+    mesh: MeshRuntime,
 }
 
 impl Runtime {
@@ -170,6 +171,31 @@ impl Runtime {
             3 => self.positive_dims += 1,
             _ => self.partial_dims += 1,
         }
+        Some(())
+    }
+}
+
+#[derive(Default)]
+struct MeshRuntime {
+    groupshared: usize,
+    view_dependent_groupshared: usize,
+    payload: usize,
+    primitive_vectors: usize,
+    outside_output_bounds: usize,
+    topology: BTreeMap<u8, usize>,
+}
+
+impl MeshRuntime {
+    fn add(&mut self, psv: &[u8]) -> Option<()> {
+        let vertices = u16::from_le_bytes(psv.get(16..18)?.try_into().ok()?);
+        let primitives = u16::from_le_bytes(psv.get(18..20)?.try_into().ok()?);
+        self.outside_output_bounds +=
+            usize::from(!(1..=256).contains(&vertices) || !(1..=256).contains(&primitives));
+        self.groupshared += usize::from(word(psv, 4)? != 0);
+        self.view_dependent_groupshared += usize::from(word(psv, 8)? != 0);
+        self.payload += usize::from(word(psv, 12)? != 0);
+        self.primitive_vectors += usize::from(*psv.get(30)? != 0);
+        *self.topology.entry(*psv.get(31)?).or_default() += 1;
         Some(())
     }
 }
@@ -553,6 +579,13 @@ pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
         *totals.native_stage_sequences.entry(native).or_default() += 1;
         totals.resources.add(rows);
         totals.runtime.add(psv).ok_or("invalid PSV0 runtime info")?;
+        if stage == 13 {
+            totals
+                .runtime
+                .mesh
+                .add(psv)
+                .ok_or("invalid PSV0 mesh runtime info")?;
+        }
         if stage == 0 {
             totals
                 .runtime
@@ -661,6 +694,18 @@ pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
                 p.declared, p.sample_frequency, p.kinds, p.files_disagreeing
             );
         }
+        if stage == 13 {
+            let m = runtime.mesh;
+            println!(
+                "  PSV0 mesh: {} nonzero group-shared, {} nonzero view-dependent group-shared, {} nonzero payload, {} nonzero primitive vectors, {} outside 1–256 output bounds; topology values {:?}",
+                m.groupshared,
+                m.view_dependent_groupshared,
+                m.payload,
+                m.primitive_vectors,
+                m.outside_output_bounds,
+                m.topology
+            );
+        }
         println!(
             "  PSV0: {} resource rows; {} files without rows, {} nonzero spaces, {} non-singleton ranges, {} nonzero flags",
             resources.rows,
@@ -712,6 +757,31 @@ mod tests {
         c.payload(&bytes, [9, 1, 1], true);
         assert_eq!((c.payloads, c.wave32, c.unsupported_metadata), (4, 1, 1));
         assert_eq!((c.fixed_wave32_mismatch, c.xyz_mismatch), (1, 1));
+    }
+
+    #[test]
+    fn mesh_runtime_counts_two_u16_output_limits_and_separate_bytes() {
+        let mut psv = [0u8; 32];
+        psv[4] = 1;
+        psv[12] = 2;
+        psv[17] = 1; // 256 vertices
+        psv[18] = 1;
+        psv[19] = 1; // 257 primitives
+        psv[30] = 3;
+        psv[31] = 2;
+        let mut got = MeshRuntime::default();
+        got.add(&psv).unwrap();
+        assert_eq!(
+            (
+                got.groupshared,
+                got.view_dependent_groupshared,
+                got.payload,
+                got.primitive_vectors,
+                got.outside_output_bounds
+            ),
+            (1, 0, 1, 1, 1)
+        );
+        assert_eq!(got.topology, BTreeMap::from([(2, 1)]));
     }
 
     #[test]
