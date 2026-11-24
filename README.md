@@ -16,7 +16,9 @@ cargo build --offline --target x86_64-apple-darwin
 - `inspect` reports checked PE metadata, including static imports, exports, relocations, static TLS and the load-config cookie.
 - `map` materializes headers and sections, zero-fills virtual tails and applies DIR64 relocations. It does not bind imports or execute anything.
 - `audit` follows static imports and used export forwarders across user-supplied DLLs. It reports missing providers and symbols and exits unsuccessfully if any binding is unresolved. Add `--symbols` to see individual unresolved slots. Lookup uses explicit `--dll-dir` roots and the EXE's directory; it does not search the host system or download DLLs.
-- `run` is for your own trusted images only. It fails before calling guest code if the static graph is incomplete or the image requests a startup feature outside the supported profile. It maps and binds resolved PE dependencies, seals page permissions (never writable and executable), calls supported DLL process-attach entry points in dependency order, calls the EXE entry, and detaches DLLs in reverse order if control returns. It runs in the host process with your privileges. The guest is not isolated; faults or raw system calls can affect the host process or machine.
+- `run` is for your own trusted images only. By default it fails before calling guest code if the static graph is incomplete. It always refuses startup features outside the supported profile. It maps and binds resolved PE dependencies, seals page permissions (never writable and executable), calls supported DLL process-attach entry points in dependency order, calls the EXE entry, and detaches DLLs in reverse order if control returns. It runs in the host process with your privileges. The guest is not isolated; faults or raw system calls can affect the host process or machine.
+
+For trusted loader bring-up, `run <image.exe> --trace-missing-imports` binds static IAT slots whose provider or export is absent to diagnostic thunks. Unused slots do not prevent startup. The first call to a thunk reports the original importer path, module, name or ordinal, and IAT RVA on stderr, then exits with status 1 without returning to the guest. This is for function-call diagnostics, not missing data imports. Unresolved descriptors without slots, rejected files, malformed bindings, and unsupported startup features (including static TLS) still prevent execution. `audit` remains strict.
 
 App-local MSVC CRT DLLs and an AMD64 `ucrtbase.dll` can be supplied as ordinary PE libraries. Nothing in this project redistributes them. Resolving an import to a CRT export does **not** mean its dependencies or startup work yet.
 
@@ -27,7 +29,7 @@ cargo run --offline -- audit /path/to/title.exe --dll-dir /path/to/x64-dlls \
 
 `--api-set` loads only the schema data (an ARM64 schema is fine). Lookups use exact contracts, respecting importer-specific aliases and then a default host. A desktop schema does not describe all Xbox contracts. `--rust-providers` enables the exact registered KernelBase/Kernel32 and ntdll APIs and selected legacy API-set aliases. Missing system APIs stay unresolved: this mode does not load on-disk replacements for these system providers. Diagnostics name the routed provider, if any; `--symbols` also shows the original module and symbol.
 
-The bounded AMD64 GuardCF profile installs enforcing check and dispatch thunks before entry. Targets are limited to exact validated entries from guarded images and statically bound Rust functions; suppressed entries are denied. Other mitigation configurations can still be rejected.
+The bounded AMD64 GuardCF profile installs enforcing check and dispatch thunks before entry. Targets are limited to exact validated entries from guarded images, statically bound Rust functions, and the exact entry addresses of any bound missing-import traps; suppressed entries are denied. Other mitigation configurations can still be rejected.
 
 A Windows TEB, full exception dispatch, dynamic library loading, and Xbox graphics are still unimplemented. Static AMD64 unwind primitives are available but do not provide exception dispatch. Don't substitute desktop D3D12 for `d3d12_xs.dll`: the Xbox device, memory and layout contracts need an explicit adapter.
 
@@ -35,6 +37,7 @@ A Windows TEB, full exception dispatch, dynamic library loading, and Xbox graphi
 
 ```sh
 cargo test --offline
+cargo test --offline --target x86_64-apple-darwin  # includes the original missing-import and GuardCF fixtures
 # Requires LLVM-MinGW (or compatible Clang/LLD), an x86-64 Apple Rust target,
 # and Rosetta if running on Apple Silicon. Builds original PE fixtures in a temp directory.
 PE_CC=/path/to/x86_64-w64-mingw32-clang sh tools/smoke.sh

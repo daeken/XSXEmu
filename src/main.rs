@@ -1,6 +1,8 @@
 mod apiset;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 mod guest;
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+mod import_traps;
 mod link;
 mod pe;
 mod providers;
@@ -26,11 +28,12 @@ const USAGE: &str = "Usage: xsxemu <inspect|map|audit|run> <image.exe> [options]
     inspect [--symbols]     List headers, imports, exports and startup metadata\n\
     map [--base ADDRESS]   Materialize a non-executable image and apply relocations\n\
     audit [--dll-dir DIR] [--symbols]  Resolve the static import graph without executing\n\
-    run [--dll-dir DIR]    Start a trusted, fully linked image (x86-64 macOS/Rosetta only; not sandboxed)\n\
+    run [--dll-dir DIR]    Start a trusted image (x86-64 macOS/Rosetta only; not sandboxed)\n\
+    run option: --trace-missing-imports  Trap on calls to missing static imports instead of refusing startup\n\
     audit/run options: --api-set SCHEMA.dll, --rust-providers";
 
 fn main() -> ExitCode {
-    match cli() {
+    match cli(std::env::args_os().skip(1)) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("xsxemu: {e}");
@@ -39,8 +42,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn cli() -> Result<ExitCode> {
-    let mut args = std::env::args_os().skip(1);
+fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
     let command = args.next().ok_or(USAGE)?;
     if command == "--help" || command == "-h" {
         println!("{USAGE}");
@@ -53,6 +55,7 @@ fn cli() -> Result<ExitCode> {
     let mut base = None;
     let mut schema = None;
     let mut rust_providers = false;
+    let mut trace_missing_imports = false;
     while let Some(arg) = args.next() {
         match (command, arg.to_str()) {
             ("inspect" | "audit", Some("--symbols")) => symbols = true,
@@ -67,6 +70,7 @@ fn cli() -> Result<ExitCode> {
                 );
             }
             ("audit" | "run", Some("--rust-providers")) => rust_providers = true,
+            ("run", Some("--trace-missing-imports")) => trace_missing_imports = true,
             ("map", Some("--base")) if base.is_none() => {
                 base = Some(parse_base(
                     &args.next().ok_or("--base requires an address")?,
@@ -87,6 +91,7 @@ fn cli() -> Result<ExitCode> {
                 link::Options {
                     api_set: schema.as_ref(),
                     rust_providers,
+                    trace_missing_imports,
                 },
             );
         }
@@ -260,6 +265,7 @@ fn resolve(
     options: link::Options<'_>,
 ) -> Result<ExitCode> {
     use std::collections::BTreeMap;
+    let trace = launch && options.trace_missing_imports;
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
     let startup_options = (options.api_set, options.rust_providers);
     let plan = link::build_configured(image, roots, options)?;
@@ -279,6 +285,7 @@ fn resolve(
         .count();
     let mut groups = BTreeMap::new();
     let mut missing = 0;
+    let mut can_launch = true;
     for (index, import, err) in plan.unresolved() {
         if symbols {
             println!(
@@ -290,6 +297,7 @@ fn resolve(
             );
         }
         missing += 1;
+        can_launch &= trace && err.traceable();
         *groups.entry((index, err.to_string())).or_insert(0) += 1;
     }
     let mut descriptor_failures = 0;
@@ -309,7 +317,7 @@ fn resolve(
         total - missing,
         total
     );
-    if missing != 0 || descriptor_failures != 0 {
+    if !can_launch || descriptor_failures != 0 {
         return Err("incomplete dependency graph; no guest code ran".into());
     }
     if !launch {
@@ -332,16 +340,27 @@ fn resolve(
             .map(|(m, path)| (path.as_ref(), m.image.as_slice()))
             .collect();
         let mut bindings = Vec::new();
+        let mut traps = Vec::new();
         for (i, module) in plan.modules.iter().enumerate() {
             for binding in &module.iat {
-                let target = *binding.target.as_ref().map_err(|e| e.to_string())?;
-                bindings.push((i, binding.iat_rva, target));
+                match &binding.target {
+                    Ok(target) => bindings.push((i, binding.iat_rva, *target)),
+                    Err(err) if trace && err.traceable() => {
+                        traps.push(import_traps::MissingImport {
+                            importer: i,
+                            path: &module.path,
+                            binding,
+                        });
+                    }
+                    Err(err) => return Err(err.to_string().into()),
+                }
             }
         }
         let order = attach_order(&plan)?;
         let status = startup::run(
             &images,
             &bindings,
+            &traps,
             &order,
             startup_options.0,
             startup_options.1,

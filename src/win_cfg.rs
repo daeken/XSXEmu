@@ -448,6 +448,60 @@ pub(super) mod tests {
         file
     }
 
+    /// Original EXE with two imports: a name and an ordinal in the same IAT.
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    pub(crate) fn missing_import_fixture(case: &str) -> Vec<u8> {
+        let mut file = executable_fixture(
+            case != "check",
+            if case == "unused" { 0x1003 } else { 0x2258 },
+            0,
+        );
+        let dir = OPT + 112 + 8;
+        put32(&mut file, dir, 0x2180);
+        put32(&mut file, dir + 4, 40);
+        put32(&mut file, 0x780, 0x21c0); // lookup RVA
+        put32(&mut file, 0x78c, 0x2200); // module name RVA
+        put32(&mut file, 0x790, 0x2250); // IAT RVA
+        file[0x800..0x800 + 12].copy_from_slice(b"AbsentX.dll\0");
+        if case != "no-slot" {
+            put64(&mut file, 0x7c0, 0x21e0); // hint/name RVA
+            put64(&mut file, 0x7c8, (1 << 63) | 17);
+            file[0x7e2..0x7e2 + 8].copy_from_slice(b"Missing\0");
+        }
+        match case {
+            "dispatch" | "check" => file[0x485] = 0x8b, // mov instead of lea
+            "direct" | "missing-export" => {
+                if case == "missing-export" {
+                    file[0x800..0x80a].copy_from_slice(b"ntdll.dll\0");
+                }
+                put16(&mut file, OPT + 70, 0); // no CFG characteristic
+                put64(&mut file, DIR, 0); // no load config
+                // sub rsp, 40; call [IAT RVA 0x2250]; ... second call would
+                // reach #17 only if the first trap returned a fake value.
+                file[0x480..0x494].copy_from_slice(&[
+                    0x48, 0x83, 0xec, 0x28, 0xff, 0x15, 0xc6, 0x11, 0, 0, 0xff, 0x15, 0xc8, 0x11,
+                    0, 0, 0x48, 0x83, 0xc4, 0x28,
+                ]);
+                file[0x494] = 0xc3;
+            }
+            "overlap" => put32(&mut file, 0x790, 0x2110), // CFG check slot
+            "delay" => {
+                put32(&mut file, OPT + 112 + 13 * 8, 0x2300);
+                put32(&mut file, OPT + 112 + 13 * 8 + 4, 20);
+            }
+            "tls" => {
+                put32(&mut file, OPT + 112 + 9 * 8, 0x2280);
+                put32(&mut file, OPT + 112 + 9 * 8 + 4, 40);
+            }
+            "alias" => {
+                file.copy_within(0x780..0x794, 0x794);
+                put32(&mut file, dir + 4, 60);
+            }
+            _ => {}
+        }
+        file
+    }
+
     fn parse(file: &[u8]) -> Result<Option<CfgMetadata<'_>>> {
         CfgMetadata::parse(&Pe::parse(file).expect("synthetic PE header"))
     }

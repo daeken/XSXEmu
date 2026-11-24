@@ -1,5 +1,5 @@
 //! Runtime for the bounded AMD64 GuardCF profile, not a sandbox. Only exact
-//! GFIDs and explicitly bound host functions are valid. FID suppression is
+//! GFIDs and explicitly bound host call targets are valid. FID suppression is
 //! unconditional; export-suppressed entries stay denied for the entire run
 //! (including after GetProcAddress). No Windows export-policy opt-in is supported.
 
@@ -34,7 +34,7 @@ impl Targets {
         Ok(())
     }
 
-    pub fn add_provider(&mut self, address: u64) -> Result<()> {
+    pub fn add_bound_host_target(&mut self, address: u64) -> Result<()> {
         self.add(address)
     }
 
@@ -170,7 +170,15 @@ mod tests {
                 vec![]
             };
             assert_eq!(
-                startup::run(&[("cfg-fixture.exe", &file)], &bindings, &[], None, true).unwrap(),
+                startup::run(
+                    &[("cfg-fixture.exe", &file)],
+                    &bindings,
+                    &[],
+                    &[],
+                    None,
+                    true
+                )
+                .unwrap(),
                 std::process::id()
             );
             return;
@@ -178,7 +186,7 @@ mod tests {
         let target = u32::from_str_radix(value, 16).unwrap();
         let file = executable_fixture(form == "dispatch", target, 0);
         assert_eq!(
-            startup::run(&[("cfg-fixture.exe", &file)], &[], &[], None, false).unwrap(),
+            startup::run(&[("cfg-fixture.exe", &file)], &[], &[], &[], None, false).unwrap(),
             42
         );
     }
@@ -220,7 +228,8 @@ mod tests {
     #[test]
     fn unsupported_policy_refused_before_entry() {
         let file = executable_fixture(true, 0x1003, 0x8000); // process-wide export-suppression opt-in
-        let error = startup::run(&[("cfg-fixture.exe", &file)], &[], &[], None, false).unwrap_err();
+        let error =
+            startup::run(&[("cfg-fixture.exe", &file)], &[], &[], &[], None, false).unwrap_err();
         assert!(
             error.to_string().contains("GuardFlags requirements"),
             "{error}"
@@ -288,9 +297,11 @@ mod tests {
     #[test]
     fn custom_abis_preserve_arguments_and_tail_dispatch() {
         let mut targets = Targets::default();
-        targets.add_provider(mixed as *const () as u64).unwrap();
         targets
-            .add_provider(tail_probe as *const () as u64)
+            .add_bound_host_target(mixed as *const () as u64)
+            .unwrap();
+        targets
+            .add_bound_host_target(tail_probe as *const () as u64)
             .unwrap();
         let _registration = targets.install().unwrap();
         assert_eq!(unsafe { abi_fixture() }, 42);

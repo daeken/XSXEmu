@@ -114,6 +114,16 @@ pub enum Unresolved {
     },
 }
 
+impl Unresolved {
+    /// Only a well-formed binding with an absent provider or export may trap.
+    pub fn traceable(&self) -> bool {
+        matches!(
+            self,
+            Self::MissingProvider { .. } | Self::MissingSymbol { .. }
+        )
+    }
+}
+
 impl fmt::Display for Unresolved {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -332,6 +342,7 @@ fn has_separator(name: &[u8]) -> bool {
 
 fn catalog(
     roots: impl IntoIterator<Item = PathBuf>,
+    include_rejected: bool,
 ) -> Result<HashMap<Vec<u8>, PathBuf>, LinkError> {
     let mut paths = HashMap::new();
     for root in roots {
@@ -345,7 +356,8 @@ fn catalog(
         for entry in entries {
             let kind = entry.file_type().map_err(dir_error)?;
             let path = entry.path();
-            if kind.is_file() || (kind.is_symlink() && path.is_file()) {
+            // In trace mode a named but unusable file must not look absent.
+            if include_rejected || kind.is_file() || (kind.is_symlink() && path.is_file()) {
                 paths
                     .entry(entry.file_name().as_encoded_bytes().to_ascii_lowercase())
                     .or_insert(path);
@@ -383,6 +395,7 @@ fn forwarder(value: &[u8]) -> Option<(Vec<u8>, Symbol)> {
 pub struct Options<'a> {
     pub api_set: Option<&'a ApiSet>,
     pub rust_providers: bool,
+    pub trace_missing_imports: bool,
 }
 
 struct Builder<'a> {
@@ -612,6 +625,7 @@ fn build(
             .iter()
             .cloned()
             .chain(std::iter::once(sibling.to_owned())),
+        options.trace_missing_imports,
     )?;
     Ok(Builder {
         options,

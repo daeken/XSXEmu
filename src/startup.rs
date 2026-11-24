@@ -8,6 +8,7 @@ mod native {
         MAX_IMAGE, Result,
         apiset::ApiSet,
         guest::{GuestMemory, Region},
+        import_traps::{MissingImport, Traps},
         link::BindingTarget,
         pe::Pe,
         providers::{win_loader, win_proc, win_unwind},
@@ -75,6 +76,51 @@ mod native {
         Ok(())
     }
 
+    fn validate_trap_slots(
+        pes: &[Pe<'_>],
+        bindings: &[(usize, u32, BindingTarget)],
+        missing: &[MissingImport<'_>],
+    ) -> Result<()> {
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let mut slots = Vec::new();
+        slots.try_reserve(bindings.len() + missing.len())?;
+        slots.extend(bindings.iter().map(|&(importer, rva, _)| (importer, rva)));
+        for import in missing {
+            let pe = &pes[import.importer];
+            let rva = import.binding.iat_rva;
+            let in_data = pe.sections.iter().any(|s| {
+                s.readable()
+                    && !s.executable()
+                    && rva.checked_sub(s.virtual_address).is_some_and(|off| {
+                        off.checked_add(8).is_some_and(|end| end <= s.mapped_size())
+                    })
+            });
+            if rva % 8 != 0
+                || !in_data
+                || pe
+                    .security_cookie_rva()?
+                    .is_some_and(|cookie| cookie.abs_diff(rva) < 8)
+            {
+                return Err(format!(
+                    "{}: malformed traced IAT slot at {rva:#010x}",
+                    import.path.display()
+                )
+                .into());
+            }
+            slots.push((import.importer, rva));
+        }
+        slots.sort_unstable();
+        if slots
+            .windows(2)
+            .any(|w| w[0].0 == w[1].0 && w[1].1 - w[0].1 < 8)
+        {
+            return Err("overlapping IAT slots in traced dependency graph".into());
+        }
+        Ok(())
+    }
+
     fn new_cookie() -> Result<u64> {
         let mut entropy = [0; 8];
         File::open("/dev/urandom")?.read_exact(&mut entropy)?;
@@ -88,6 +134,7 @@ mod native {
     pub fn run(
         images: &[(&str, &[u8])],
         bindings: &[(usize, u32, BindingTarget)],
+        missing: &[MissingImport<'_>],
         attach_order: &[usize],
         api_set: Option<&ApiSet>,
         rust_providers: bool,
@@ -107,6 +154,7 @@ mod native {
             .collect::<Result<Vec<_>>>()?
             .into_iter()
             .unzip();
+        validate_trap_slots(&pes, bindings, missing)?;
         let mut targets = cfgs.iter().any(Option::is_some).then(Targets::default);
         let mut total = 0usize;
         let mut memories = Vec::new();
@@ -137,12 +185,23 @@ mod native {
                         .ok_or("Rust provider has no executable address on this host")?
                         as u64;
                     if let Some(targets) = &mut targets {
-                        targets.add_provider(addr)?;
+                        targets.add_bound_host_target(addr)?;
                     }
                     addr
                 }
             };
             patch(&mut memories[importer], iat, addr)?;
+        }
+        let traps = Traps::new(missing)?;
+        if let Some(traps) = &traps {
+            for (import, addr) in traps.bindings() {
+                let iat = import.binding.iat_rva;
+                reject_slot_overlap(cfgs[import.importer].as_ref(), iat)?;
+                patch(&mut memories[import.importer], iat, addr)?;
+                if let Some(targets) = &mut targets {
+                    targets.add_bound_host_target(addr)?;
+                }
+            }
         }
         for ((pe, mem), cfg) in pes.iter().zip(&mut memories).zip(&cfgs) {
             let mut regions = vec![Region {
