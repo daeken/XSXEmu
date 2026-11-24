@@ -5,4 +5,7 @@ edition = "2024"
 license = "MIT"
 description = "Experimental Scarlett PE compatibility launcher"
 
+[features]
+experimental-xbox-rootsig = []
+
 [dependencies]

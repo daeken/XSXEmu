@@ -75,12 +75,22 @@ pub fn has_dll(dll: &[u8]) -> bool {
         || win_unwind::has_dll(dll)
         || win_io::has_dll(dll)
         || win_text::has_dll(dll)
+        || (cfg!(feature = "experimental-xbox-rootsig") && dll == b"d3d12_xs.dll")
 }
 
 /// Resolve exact symbol bytes in a lowercase DLL name. API-set rows are exact
 /// contract/symbol pairs used by the bootstrap inputs, not a version fallback
 /// or a claim that the rest of the contract is implemented.
 pub fn lookup(dll: &[u8], name: &[u8]) -> Option<HostExport> {
+    #[cfg(feature = "experimental-xbox-rootsig")]
+    if (dll, name) == (b"d3d12_xs.dll", b"D3D12SerializeVersionedRootSignature") {
+        return export!(
+            "d3d12_xs.dll",
+            "D3D12SerializeVersionedRootSignature",
+            xsxemu::root_signature::win64::serialize_xbox_experimental
+        );
+    }
+
     macro_rules! export {
         ($provider:expr, $symbol:literal, $function:ident) => {{
             #[cfg(target_arch = "x86_64")]

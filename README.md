@@ -58,7 +58,7 @@ The script requires `/Volumes/External2/windlls/ucrtbase.dll` with SHA-256 `7ee2
 
 The default invocation builds a native-host auditor, inspects the EXE, and runs `audit --dll-dir <isolated-root> --api-set <schema> --rust-providers --symbols`. On the fixture's baseline with the default schema, both EXE imports bind, but 20 of the UCRT's 134 IAT slots remain unresolved (for example `HeapCompact` and `RaiseException`): **116/136 resolved, 114 Rust, 0 descriptor failures**. The underlying audit exits nonzero; the script treats the confirmed unresolved-import report as a successful diagnostic. Provider or schema changes can change those counts. No guest code runs in the default mode.
 
-**Future opt-in, not verified:** once the runtime supports `--trace-missing-imports`, use an x86-64 macOS Rust target (and Rosetta on Apple Silicon):
+**Runtime probe:** use an x86-64 macOS Rust target (and Rosetta on Apple Silicon). The first run against this DLL reached `LoadLibraryExW` during UCRT process attach and stopped at the missing-import diagnostic; attach and the heap round-trip have not yet completed.
 
 ```sh
 rustup target add x86_64-apple-darwin

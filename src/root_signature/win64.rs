@@ -86,6 +86,9 @@ unsafe fn read_array<'a, T>(ptr: *const T, count: u32, limit: usize) -> Result<&
 }
 
 unsafe fn encode(desc: &Desc1) -> Result<Vec<u8>, Error> {
+    if desc.flags & !0xfff != 0 {
+        return Err(Error::Invalid("unknown top-level root signature flags"));
+    }
     let parameters = unsafe { read_array(desc.parameters, desc.parameter_count, MAX_PARAMETERS)? };
     let samplers = unsafe { read_array(desc.samplers, desc.sampler_count, MAX_STATIC_SAMPLERS)? };
     let mut ranges_left = MAX_DESCRIPTOR_RANGES;
@@ -194,6 +197,59 @@ pub unsafe extern "win64" fn serialize_versioned_root_signature(
         }
     }
     hr
+}
+
+/// Experimental Xbox import adapter. Applies only the observed complete
+/// 0x03000000 flag combination; other unknown bits are rejected.
+///
+/// # Safety
+/// See [`serialize_versioned_root_signature`].
+#[cfg(feature = "experimental-xbox-rootsig")]
+pub unsafe extern "win64" fn serialize_xbox_experimental(
+    desc: *const VersionedDesc,
+    blob: *mut *mut Blob,
+    error: *mut *mut Blob,
+) -> i32 {
+    use std::io::{Write, stderr};
+    const OBSERVED: u32 = 0x0300_0000;
+    const DESKTOP: u32 = 0xfff;
+    let version = (!desc.is_null() && desc.is_aligned())
+        .then(|| unsafe { ptr::addr_of!((*desc).version).read() });
+    let notice = "WARNING: experimental d3d12_xs.dll!D3D12SerializeVersionedRootSignature; desktop RTS0 only, no Xbox semantic compatibility claimed";
+    if version == Some(VERSION_1_1) {
+        let d = unsafe { &(*desc).desc_1_1 };
+        let unknown = d.flags & !DESKTOP;
+        let ignored = if unknown == OBSERVED { OBSERVED } else { 0 };
+        let _ = writeln!(
+            stderr().lock(),
+            "{notice}; version=2 (1.1), original flags={:#010x}, ignored={ignored:#010x}, unsupported={:#010x}",
+            d.flags,
+            unknown & !ignored
+        );
+        if ignored != 0 {
+            let desktop = VersionedDesc {
+                version: VERSION_1_1,
+                desc_1_1: Desc1 {
+                    flags: d.flags & !ignored,
+                    ..*d
+                },
+            };
+            return unsafe { serialize_versioned_root_signature(&desktop, blob, error) };
+        }
+    } else {
+        let mut log = stderr().lock();
+        let _ = match version {
+            Some(v) => writeln!(
+                log,
+                "{notice}; version={v}, original flags=unavailable (unsupported version), ignored=0x00000000"
+            ),
+            None => writeln!(
+                log,
+                "{notice}; version=unavailable, original flags=unavailable (invalid input), ignored=0x00000000"
+            ),
+        };
+    }
+    unsafe { serialize_versioned_root_signature(desc, blob, error) }
 }
 
 #[repr(C)]

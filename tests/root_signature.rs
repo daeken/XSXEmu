@@ -352,6 +352,16 @@ mod abi {
         }
     }
 
+    #[cfg(feature = "experimental-xbox-rootsig")]
+    #[test]
+    fn xbox_adapter_preserves_desktop_flags_and_input() {
+        let desc = versioned(&mixed(), 0x0300_0005);
+        unsafe {
+            compare(serialize_xbox_experimental, &desc);
+        }
+        assert_eq!(desc.desc_1_1.flags, 0x0300_0005);
+    }
+
     #[test]
     fn win64_early_errors_and_owning_diagnostic() {
         unsafe {
