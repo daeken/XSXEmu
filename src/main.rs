@@ -322,7 +322,15 @@ fn inspect(path: &Path, symbols: bool) -> Result<()> {
             "  Dormant linker guard slots (CFG check/dispatch, XFG check/dispatch/table dispatch, null CastGuard): {:x?}",
             cfg.slots()
         ),
-        Err(err) => println!("  GuardCF profile unsupported: {err}"),
+        Err(err) => match win_cfg::inspect_instrumented_slots(&pe) {
+            Ok(Some(slots)) => {
+                println!(
+                    "  Instrumented linker slots (parse-only; not admitted for execution): {slots:x?}"
+                );
+            }
+            Ok(None) => println!("  GuardCF profile unsupported: {err}"),
+            Err(err) => println!("  GuardCF profile unsupported: {err}"),
+        },
     }
     println!("  {} DIR64 relocations", pe.relocations()?.len());
     Ok(())

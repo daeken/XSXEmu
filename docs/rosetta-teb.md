@@ -485,6 +485,27 @@ No OS policy, startup profile, or exact GFID policy changes.
 [ci-sdk]: https://github.com/microsoft/win32metadata/blob/main/generation/WinSDK/RecompiledIdlHeaders/um/winnt.h
 [integritycheck]: https://learn.microsoft.com/en-us/cpp/build/reference/integritycheck-require-signature-check
 
+## Parse-only: instrumented linker slots without `GUARD_CF`
+
+Read-only inspection of `Bink2Scarlett.dll` found an exact `0x138` PE32+
+load config, clear `GUARD_CF`, and only `CF_INSTRUMENTED` in `GuardFlags`.
+There are no GFID, address-taken IAT, long-jump or EH continuation tables
+and no GuardMemcpy field. The `inspect` classifier checks five linker
+slots and their exact DIR64s, plus an aligned null CastGuard cell entirely
+in non-executable RW zero-fill. Relocations and the declared cookie, IAT
+and TLS index destinations must not overlap the cell.
+
+The classifier matches the descriptive CodeIntegrity tuple without following
+its offset and checks the 24-byte volatile layout and both annotation tables.
+Only this classifier accepts the exact word `0x80028002`. [LIEF's decoder][lief-volatile]
+prints the two halves as minimum and maximum versions masked with `0x7fff`,
+but that does not establish the semantics of either high bit or rule out
+further requirements. Both execution lanes still reject the image pending
+that clarification and CodeIntegrity review. There are no runtime slot
+patches, signature admission changes, or CFG allowlist additions.
+
+[lief-volatile]: https://github.com/lief-project/LIEF/blob/main/src/PE/LoadConfigurations/VolatileMetadata.cpp
+
 ## Controlled execution plan
 
 1. Separate loading from execution. Reuse PE static TLS metadata but check

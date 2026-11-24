@@ -315,6 +315,40 @@ fn dormant_image(kind: Kind) -> Vec<u8> {
 const COMPANION_GFIDS: usize = CHECK + 0x30;
 const CAST: usize = DATA + 0x400;
 
+const TERMINAL_VOLATILE: usize = RO + 0x700;
+const TERMINAL_CAST: usize = DATA + 0x800;
+const DATA_SECTION: usize = OP + 240 + 2 * 40;
+
+// Synthesized linker metadata and stubs; no companion image bytes.
+fn instrumented_terminal_image(kind: Kind) -> Vec<u8> {
+    let mut b = dormant_image(kind);
+    w32(&mut b, file(LOAD) + 0x90, 0x100);
+    w32(&mut b, file(LOAD) + 0x98, 0xbed20);
+    w64(&mut b, file(LOAD) + 0x100, PREFERRED + TERMINAL_VOLATILE);
+    w64(&mut b, file(LOAD) + 0x130, PREFERRED + TERMINAL_CAST);
+    w32(&mut b, DATA_SECTION + 16, TERMINAL_CAST - DATA);
+    for (i, word) in [
+        24,
+        0x8002_8002,
+        TERMINAL_VOLATILE + 24,
+        4,
+        TERMINAL_VOLATILE + 28,
+        8,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        w32(&mut b, file(TERMINAL_VOLATILE) + 4 * i, word);
+    }
+    w32(&mut b, file(TERMINAL_VOLATILE) + 24, TEXT);
+    w32(&mut b, file(TERMINAL_VOLATILE) + 28, TEXT);
+    w32(&mut b, file(TERMINAL_VOLATILE) + 32, 2);
+    dir(&mut b, 5, RELOC, 48);
+    w32(&mut b, file(RELOC) + 4, 48);
+    w16(&mut b, file(RELOC) + 44, 0xa000 | (LOAD + 0x100 - RO));
+    b
+}
+
 fn companion_image(kind: Kind) -> Vec<u8> {
     let mut b = dormant_image(kind);
     let code = unsafe { &static_tls_fixture };
@@ -534,6 +568,202 @@ fn dormant_profile_rejects_metadata_slot_and_relocation_near_misses() {
         let exe = dir.write("dormant.exe", &b);
         expect(run(&exe, &[OPT]), 1, error);
     }
+}
+
+const PARSE_ONLY: &str = "Instrumented linker slots (parse-only; not admitted for execution)";
+
+fn inspect(path: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_xsxemu"))
+        .arg("inspect")
+        .arg(path)
+        .output()
+        .unwrap()
+}
+
+fn expect_unsupported(path: &Path, diagnostic: &str) {
+    let output = inspect(path);
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(!text.contains(PARSE_ONLY), "{text}");
+    expect(output, 0, diagnostic);
+}
+
+#[test]
+fn instrumented_terminal_profile_is_parse_only() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let mut b = instrumented_terminal_image(Kind::Solo);
+    let exe = scratch.write("terminal.exe", &b);
+    expect(inspect(&exe), 0, PARSE_ONLY);
+    expect(run(&exe, &[OPT]), 1, "not dormant linker layout");
+    dir(&mut b, 9, 0, 0); // avoid the earlier default TLS refusal
+    scratch.write("terminal.exe", &b);
+    expect(run(&exe, &[]), 1, "not dormant linker layout");
+}
+
+#[test]
+fn instrumented_terminal_profile_rejects_near_misses() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let original = instrumented_terminal_image(Kind::Solo);
+    let exe = scratch.write("terminal.exe", &original);
+    for (at, byte, diagnostic) in [
+        (OP + 71, 0x40, "CFG without instrumentation"),
+        (file(LOAD), 0x30, "not dormant linker layout"),
+        (OP + 116 + 8 * 10, 0x40, "not dormant linker layout"),
+        (file(LOAD) + 0x91, 5, "not dormant linker layout"),
+        (file(LOAD) + 0x93, 2, "not dormant linker layout"), // GuardMemcpy flag
+        (file(LOAD) + 0x80, 1, "not dormant linker layout"), // GFID
+        (file(LOAD) + 0xa0, 1, "not dormant linker layout"), // address-taken IAT
+        (file(LOAD) + 0xb8, 1, "not dormant linker layout"), // longjump
+        (file(LOAD) + 0x98, 0, "not dormant linker layout"), // catalog offset
+        (
+            DATA_SECTION + 17,
+            9,
+            "CastGuard cell is not aligned RW zero-fill data",
+        ),
+        (
+            DATA_SECTION + 39,
+            0x40,
+            "CastGuard cell is not aligned RW zero-fill data",
+        ),
+        (
+            file(LOAD) + 0x130,
+            1,
+            "CastGuard cell is not aligned RW zero-fill data",
+        ),
+        (
+            file(TEXT) + 0x800,
+            0xc3,
+            "unexpected dormant guard target instructions",
+        ),
+        (
+            file(TEXT) + 0x822,
+            0,
+            "unexpected dormant guard target instructions",
+        ),
+        (file(RELOC) + 25, 0, "missing dormant guard relocation"),
+        (file(RELOC) + 45, 0, "missing dormant guard relocation"),
+        (
+            file(TERMINAL_VOLATILE) + 4,
+            1,
+            "volatile metadata layout or version",
+        ),
+    ] {
+        let mut b = original.clone();
+        b[at] = byte;
+        scratch.write("terminal.exe", &b);
+        expect_unsupported(&exe, diagnostic);
+    }
+    // An actual AT-IAT table and an actual GuardMemcpy pointer are not hints.
+    let mut b = original.clone();
+    w64(
+        &mut b,
+        file(LOAD) + 0xa0,
+        PREFERRED + TERMINAL_VOLATILE + 0x40,
+    );
+    w64(&mut b, file(LOAD) + 0xa8, 1);
+    w32(&mut b, file(TERMINAL_VOLATILE) + 0x40, IAT);
+    scratch.write("terminal.exe", &b);
+    expect_unsupported(&exe, "not dormant linker layout");
+    let mut b = original.clone();
+    dir(&mut b, 10, LOAD, 0x140);
+    w32(&mut b, file(LOAD), 0x140);
+    w64(&mut b, file(LOAD) + 0x138, PREFERRED + CHECK);
+    scratch.write("terminal.exe", &b);
+    expect_unsupported(&exe, "not dormant linker layout");
+
+    // Attempt to add a DIR64 into the null cell, even at preferred base.
+    let mut b = original.clone();
+    const EXTRA_RELOC: usize = RO + 0x780;
+    b.copy_within(file(RELOC)..file(RELOC) + 48, file(EXTRA_RELOC));
+    dir(&mut b, 5, EXTRA_RELOC, 58);
+    w32(&mut b, file(EXTRA_RELOC) + 48, DATA);
+    w32(&mut b, file(EXTRA_RELOC) + 52, 10);
+    w16(
+        &mut b,
+        file(EXTRA_RELOC) + 56,
+        0xa000 | (TERMINAL_CAST - DATA),
+    );
+    scratch.write("terminal.exe", &b);
+    expect_unsupported(&exe, "unexpected dormant guard relocation");
+}
+
+#[test]
+fn instrumented_terminal_cast_cell_excludes_other_loader_writes() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let original = instrumented_terminal_image(Kind::Solo);
+    let mut b = original.clone();
+    w64(&mut b, file(LOAD) + 0x58, PREFERRED + TERMINAL_CAST);
+    let exe = scratch.write("terminal.exe", &b);
+    expect_unsupported(&exe, "security cookie overlaps CastGuard cell");
+    let mut b = original;
+    w64(&mut b, file(RO) + 16, PREFERRED + TERMINAL_CAST + 4);
+    scratch.write("terminal.exe", &b);
+    expect_unsupported(&exe, "TLS index overlaps CastGuard cell");
+
+    let mut b = instrumented_terminal_image(Kind::Exe);
+    w32(&mut b, file(LINK) + 16, TERMINAL_CAST);
+    scratch.write("owned.dll", &image(Kind::Dll));
+    scratch.write("terminal.exe", &b);
+    expect_unsupported(&exe, "IAT overlaps CastGuard cell");
+}
+
+#[test]
+fn instrumented_volatile_header_and_rows_are_bounded() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let original = instrumented_terminal_image(Kind::Solo);
+    for (offset, value, diagnostic) in [
+        (4, 0x8002_0002, "volatile metadata layout or version"),
+        (4, 0x0002_8002, "volatile metadata layout or version"),
+        (4, 0x0002_0002, "volatile metadata layout or version"),
+        (4, 0x8002_8003, "volatile metadata layout or version"),
+        (4, 0x0001_0001, "volatile metadata layout or version"),
+        (12, 3, "volatile table RVA or size"),
+        (20, 7, "volatile table RVA or size"),
+        (24, 0, "volatile access rows"),
+        (24, DATA, "auxiliary metadata code section permissions"),
+        (28, DATA, "auxiliary metadata code section permissions"),
+        (32, 0, "volatile range order or bounds"),
+        (32, RAW + 1, "CFG section range"),
+    ] {
+        let mut b = original.clone();
+        w32(&mut b, file(TERMINAL_VOLATILE) + offset, value);
+        let exe = scratch.write("terminal.exe", &b);
+        expect_unsupported(&exe, diagnostic);
+    }
+}
+
+#[test]
+fn instrumented_volatile_rows_reject_duplicates_and_overlaps() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let original = instrumented_terminal_image(Kind::Solo);
+    let header = file(TERMINAL_VOLATILE);
+    let mut b = original.clone();
+    w32(&mut b, header + 8, TERMINAL_VOLATILE + 0x40);
+    w32(&mut b, header + 12, 8);
+    w32(&mut b, header + 0x40, TEXT);
+    w32(&mut b, header + 0x44, TEXT);
+    let exe = scratch.write("terminal.exe", &b);
+    expect_unsupported(&exe, "volatile access rows");
+    let mut b = original;
+    w32(&mut b, header + 20, 16);
+    w32(&mut b, header + 36, TEXT + 1);
+    w32(&mut b, header + 40, 1);
+    scratch.write("terminal.exe", &b);
+    expect_unsupported(&exe, "volatile range order or bounds");
 }
 
 #[test]
