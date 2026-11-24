@@ -90,3 +90,9 @@ compile multi
 "$p" --emit-dual-msl > "$d/dual.metal"
 compile dual
 "$p" --load-dual-metallib "$d/dual.metallib"
+
+# Three distinct full-mask FP16_ABGR outputs, including nonfinal MRT1.
+"$p" --triple-source
+"$p" --emit-triple-msl > "$d/triple.metal"
+compile triple
+"$p" --load-triple-metallib "$d/triple.metallib"

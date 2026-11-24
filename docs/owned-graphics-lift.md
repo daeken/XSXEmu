@@ -123,7 +123,7 @@ Both wave checks agree: 4,763 / 4,033 new VS sites match under `gfx1013` / `gfx1
 
 ### Owned two-attachment packed export
 
-Both LLVM MC references verify the final full-mask packed MRT1 `DONE+VM` word `0xf8001c1f` and its packed RG/BA source order. The owned profile requires nonfinal packed MRT0, final packed MRT1, and an actual `s_endpgm`, with no EXEC changes. Metal binds native ordinals 0 and 1 explicitly to `[[color(0)]]` and `[[color(1)]]` with separate RGBA32Float attachments, full write masks, and blending disabled. This is not a rule for compacting or recovering title attachment ordinals. Nonfinal MRT1, partial masks on MRT1, and higher targets still reject.
+Both LLVM MC references verify the final full-mask packed MRT1 `DONE+VM` word `0xf8001c1f` and its packed RG/BA source order. The owned profile requires nonfinal packed MRT0, final packed MRT1, and an actual `s_endpgm`, with no EXEC changes. Metal binds native ordinals 0 and 1 explicitly to `[[color(0)]]` and `[[color(1)]]` with separate RGBA32Float attachments, full write masks, and blending disabled. This is not a rule for compacting or recovering title attachment ordinals. The two-attachment profile rejects nonfinal MRT1, partial masks on MRT1, and higher targets.
 
 Reversed source VGPRs produce distinct RGBA colors in the two attachments. Independent CPU expectations check 20 written and 44 untouched pixels per slot, with distinct clears. Apple M4 matched all 128 attachment pixels bit-for-bit from generated MSL and from the offline metallib. This probe does not bake an archive; the original keyed strict regression is unchanged.
 
@@ -136,3 +136,11 @@ The nearest-site audit isolated two PS graphs missing `v_cmp_ne_u32_e32` with in
 The Apple M4 strict offline arithmetic probe matches 8/8 select words in bake and replay. Mixed lanes exercise both operand choices and both predicate transitions, including `+0` vs the nonzero integer bit pattern of `-0`, an infinity word passed through unchanged and a NaN payload returned as raw bits. No floating-point comparison or NaN policy is assumed. The keyed graphics replay is unchanged.
 
 Both wave checks agree: the decoder gains 590 / 404 VS sites and 26,215 / 2,690 PS sites under `gfx1013` / `gfx1030`. Encoding-complete PS reference graphs rise from 320 to 322 (of 12,091 / 6,188); VS stays at ten per reference. Five PS graphs now share the closest incomplete distance of two sites. No title ABI, execution, or translation follows from these counts.
+
+### Owned three-attachment packed export
+
+LLVM MC confirms full-mask compressed MRT1 without DONE or VM (`0xf800041f`) and full-mask compressed MRT2 with DONE+VM (`0xf8001c2f`) on both reference CPUs. The owned three-attachment profile requires nonfinal MRT0, nonfinal MRT1, final MRT2, and an actual `s_endpgm`. It admits only initialized packed RG/BA operands with canonical unused selector bytes and does not change EXEC. Partial MRT1, nonfinal MRT2, and higher targets still reject.
+
+The Metal descriptor explicitly maps ordinals 0–2 to three RGBA32Float textures with full write masks, no blending, and separate clears. Each slot has a distinct output color and clear sentinel. Apple M4 matched all 192 attachment pixels from generated MSL and again from the offline metallib (20 drawn and 44 untouched per slot). The original keyed archive and strict miss controls still pass; the three-slot probe does not bake an archive.
+
+Both wave checks agree. The two exact encodings add 4,901 / 1,223 PS matching sites under `gfx1013` / `gfx1030`, to 4,804,218 / 18,916,461 and 474,414 / 2,027,022. The EXP encoding gate clears for 176 / 163 more complete PS graphs; whole encoding-complete PS counts rise from 322 to 324 on both references (out of 12,091 / 6,188), with VS unchanged at ten per reference. One remaining PS graph is one site short (nonfinal packed MRT1 EN3). The next two are each two short (nonfinal scalar MRTZ and `s_waitcnt`); a wait is not treated as a scheduling hint. These are decoder counts, not validation of retail export order, attachment bindings, translation or bake.

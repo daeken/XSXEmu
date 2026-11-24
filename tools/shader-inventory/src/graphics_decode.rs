@@ -253,8 +253,11 @@ pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeErro
             },
         ));
     }
-    // Full-mask packed MRT0 or final MRT1 with no reserved bits.
-    if matches!(w, 0xf800_040f | 0xf800_1c0f | 0xf800_1c1f) {
+    // Full-mask packed MRT0/MRT1 or final MRT2 with no reserved bits.
+    if matches!(
+        w,
+        0xf800_040f | 0xf800_1c0f | 0xf800_041f | 0xf800_1c1f | 0xf800_1c2f
+    ) {
         let [rg, ba, unused2, unused3] = ext()?.to_le_bytes();
         if unused2 != 0 || unused3 != 0 {
             return Err(DecodeError::Unsupported(pc));

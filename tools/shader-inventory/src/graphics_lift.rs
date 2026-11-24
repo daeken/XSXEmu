@@ -11,6 +11,7 @@ enum Stage {
     PackedPixel,
     PackedRgPixel,
     DualPackedPixel,
+    TriplePackedPixel,
     DepthPixel,
 }
 
@@ -77,6 +78,16 @@ const PACKED_RG_PS: &[u32] = &[0xf800_1c03, 1, 0xbf81_0000];
 
 const DUAL_PS: &[u32] = &[0xf800_040f, 1, 0xf800_1c1f, 0x100, 0xbf81_0000];
 
+const TRIPLE_PS: &[u32] = &[
+    0xf800_040f,
+    1,
+    0xf800_041f,
+    0x100,
+    0xf800_1c2f,
+    0x101,
+    0xbf81_0000,
+];
+
 const DEPTH_PS: &[u32] = &[
     0xf800_040f,
     1, // exp mrt0 v1, v1, v0, v0 compr
@@ -93,7 +104,7 @@ impl Stage {
             Stage::Pixel => 4,
             Stage::PackedPixel => 2,
             Stage::PackedRgPixel => 2,
-            Stage::DualPackedPixel => 2,
+            Stage::DualPackedPixel | Stage::TriplePackedPixel => 2,
             Stage::DepthPixel => 3,
         }
     }
@@ -115,13 +126,15 @@ impl Stage {
             Stage::PackedPixel
             | Stage::PackedRgPixel
             | Stage::DepthPixel
-            | Stage::DualPackedPixel => &[],
+            | Stage::DualPackedPixel
+            | Stage::TriplePackedPixel => &[],
         }
     }
 
     fn export_count(self) -> usize {
         match self {
             Stage::PackedPixel | Stage::PackedRgPixel => 1,
+            Stage::TriplePackedPixel => 3,
             Stage::DepthPixel | Stage::DualPackedPixel => 2,
             _ => self.exports().len(),
         }
@@ -210,6 +223,10 @@ fn lift(stage: Stage, words: &[u32]) -> Result<Vec<Op>, Reject> {
                     Stage::DualPackedPixel => matches!(
                         (exported, slot, done, vm),
                         (0, 0, false, false) | (1, 1, true, true)
+                    ),
+                    Stage::TriplePackedPixel => matches!(
+                        (exported, slot, done, vm),
+                        (0, 0, false, false) | (1, 1, false, false) | (2, 2, true, true)
                     ),
                     _ => false,
                 };
@@ -341,10 +358,10 @@ fn emit_body(out: &mut String, ops: &[Op], packed_color_lvalue: &str, multi: boo
                 src: [Vgpr(rg), Vgpr(ba)],
                 ..
             } => {
-                let packed_color_lvalue = if slot == 1 {
-                    "out.color1"
-                } else {
-                    packed_color_lvalue
+                let packed_color_lvalue = match slot {
+                    1 => "out.color1",
+                    2 => "out.color2",
+                    _ => packed_color_lvalue,
                 };
                 writeln!(out, "  {packed_color_lvalue} = float4(float(as_type<half>(ushort(r[{rg}]))), float(as_type<half>(ushort(r[{rg}] >> 16))), float(as_type<half>(ushort(r[{ba}]))), float(as_type<half>(ushort(r[{ba}] >> 16))));").unwrap();
             }
@@ -512,11 +529,20 @@ fragment DepthOutputs depth_ps(constant uint4 &input [[buffer(0)]]) {\n\
 }
 
 #[allow(dead_code)] // Separate two-attachment render probe.
-pub fn translate_dual_fixture() -> Result<String, Reject> {
+pub fn translate_mrt_fixture(triple: bool) -> Result<String, Reject> {
     let vs = lift(Stage::Vertex, VS)?;
-    let ps = lift(Stage::DualPackedPixel, DUAL_PS)?;
+    let ps = if triple {
+        lift(Stage::TriplePackedPixel, TRIPLE_PS)?
+    } else {
+        lift(Stage::DualPackedPixel, DUAL_PS)?
+    };
     let mut msl = vertex_module(&vs);
-    msl.push_str("struct DualColor { float4 color0 [[color(0)]]; float4 color1 [[color(1)]]; };\nfragment DualColor dual_ps(constant uint2 &input [[buffer(0)]]) {\n  uint r[256]; DualColor out; r[0] = input.x; r[1] = input.y;\n");
+    msl.push_str("struct PackedColors { float4 color0 [[color(0)]]; float4 color1 [[color(1)]];");
+    if triple {
+        msl.push_str(" float4 color2 [[color(2)]];");
+    }
+    let entry = if triple { "triple_ps" } else { "dual_ps" };
+    writeln!(msl, "}};\nfragment PackedColors {entry}(constant uint2 &input [[buffer(0)]]) {{\n  uint r[256]; PackedColors out; r[0] = input.x; r[1] = input.y;").unwrap();
     emit_body(&mut msl, &ps, "out.color0", false);
     Ok(msl)
 }
@@ -584,7 +610,7 @@ mod tests {
             io::Write,
             process::{Command, Stdio},
         };
-        let asm = "v_mov_b32_e32 v8, v4\nexp param0 v8, v5, v6, v7\nexp pos0 v0, v1, v2, v3 done\ns_endpgm\nv_add_f32_e32 v4, 0.25, v0\nv_fma_f32 v5, v1, v2, v3\nv_mul_legacy_f32_e32 v6, v5, v4\nv_mul_legacy_f32_e32 v6, 0.5, v6\nv_mul_legacy_f32_e32 v7, 0, v3\nexp mrt0 v4, v5, v6, v7 done\ns_endpgm\nv_mul_legacy_f32_e32 v2, v0, v1\nv_mul_legacy_f32_e32 v3, 0.25, v1\nv_fmac_f32_e32 v4, v0, v1\nv_cvt_pkrtz_f16_f32_e32 v5, v0, v1\ns_inst_prefetch 3\nv_mov_b32_e32 v6, 0\ns_nop 0\nv_mov_b32_e32 v7, 0.5\nv_mov_b32_e32 v8, 1.0\nv_mov_b32_e32 v9, 0x7fc12345\nv_cmp_ne_u32_e32 vcc_lo, 0, v0\nv_cndmask_b32_e32 v10, 0x7fc12345, v1, vcc_lo\nv_cmp_ne_u32_e32 vcc_lo, 0, v1\nv_cndmask_b32_e32 v11, 0x80000000, v0, vcc_lo\nexp mrt0 v1, v1, v0, v0 done compr vm\ns_endpgm\nexp mrt0 v1, v1, off, off done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrtz v2, off, off, off done vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrt1 v0, v0, v1, v1 done compr vm\ns_endpgm\n";
+        let asm = "v_mov_b32_e32 v8, v4\nexp param0 v8, v5, v6, v7\nexp pos0 v0, v1, v2, v3 done\ns_endpgm\nv_add_f32_e32 v4, 0.25, v0\nv_fma_f32 v5, v1, v2, v3\nv_mul_legacy_f32_e32 v6, v5, v4\nv_mul_legacy_f32_e32 v6, 0.5, v6\nv_mul_legacy_f32_e32 v7, 0, v3\nexp mrt0 v4, v5, v6, v7 done\ns_endpgm\nv_mul_legacy_f32_e32 v2, v0, v1\nv_mul_legacy_f32_e32 v3, 0.25, v1\nv_fmac_f32_e32 v4, v0, v1\nv_cvt_pkrtz_f16_f32_e32 v5, v0, v1\ns_inst_prefetch 3\nv_mov_b32_e32 v6, 0\ns_nop 0\nv_mov_b32_e32 v7, 0.5\nv_mov_b32_e32 v8, 1.0\nv_mov_b32_e32 v9, 0x7fc12345\nv_cmp_ne_u32_e32 vcc_lo, 0, v0\nv_cndmask_b32_e32 v10, 0x7fc12345, v1, vcc_lo\nv_cmp_ne_u32_e32 vcc_lo, 0, v1\nv_cndmask_b32_e32 v11, 0x80000000, v0, vcc_lo\nexp mrt0 v1, v1, v0, v0 done compr vm\ns_endpgm\nexp mrt0 v1, v1, off, off done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrtz v2, off, off, off done vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrt1 v0, v0, v1, v1 done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrt1 v0, v0, v1, v1 compr\nexp mrt2 v1, v1, v1, v1 done compr vm\ns_endpgm\n";
         let mut asm = asm.to_owned();
         for n in 0..7 {
             let r = 4 + 4 * n;
@@ -604,6 +630,7 @@ mod tests {
             .chain(PACKED_RG_PS)
             .chain(DEPTH_PS)
             .chain(DUAL_PS)
+            .chain(TRIPLE_PS)
             .chain(MULTI_VS)
             .flat_map(|w| w.to_le_bytes())
             .collect();
@@ -654,13 +681,40 @@ mod tests {
             0xf800_0c0f,
             0xf800_140f,
             0xf800_0403,
-            0xf800_041f,
+            0xf800_042f,
             0xf800_3c0f,
         ] {
             assert_eq!(decode(&[header, 1], 0), Err(DecodeError::Unsupported(0)));
         }
         assert_eq!(
             decode(&[PACKED_PS[0], 0x10001], 0),
+            Err(DecodeError::Unsupported(0))
+        );
+    }
+
+    #[test]
+    fn triple_packed_requires_nonfinal_mrt1_and_final_mrt2() {
+        assert_eq!(lift(Stage::TriplePackedPixel, TRIPLE_PS).unwrap().len(), 4);
+        assert_eq!(
+            lift(Stage::DualPackedPixel, TRIPLE_PS),
+            Err(Reject::BadExports(2))
+        );
+        assert_eq!(
+            lift(Stage::TriplePackedPixel, DUAL_PS),
+            Err(Reject::BadExports(2))
+        );
+        let mut ps = TRIPLE_PS.to_vec();
+        ps[4] = DUAL_PS[2];
+        assert_eq!(
+            lift(Stage::TriplePackedPixel, &ps),
+            Err(Reject::BadExports(4))
+        );
+        assert_eq!(
+            lift(Stage::TriplePackedPixel, &TRIPLE_PS[..6]),
+            Err(Reject::BadEnd(6))
+        );
+        assert_eq!(
+            decode(&[TRIPLE_PS[4], 0x0100_0101], 0),
             Err(DecodeError::Unsupported(0))
         );
     }
@@ -682,7 +736,7 @@ mod tests {
             lift(Stage::DualPackedPixel, &ps),
             Err(Reject::BadExports(2))
         );
-        for hdr in [0xf800_1c13, 0xf800_1c2f, 0xf800_0c1f, 0xf800_141f] {
+        for hdr in [0xf800_1c13, 0xf800_1c3f, 0xf800_0c1f, 0xf800_141f] {
             assert_eq!(decode(&[hdr, 0], 0), Err(DecodeError::Unsupported(0)));
         }
         assert_eq!(
