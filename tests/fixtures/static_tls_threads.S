@@ -293,6 +293,16 @@ Lthread_join:
     th_api 5
     testl %eax, %eax
     th_ensure e
+    th_ref
+    movl {data}+0x2c(%r11), %r8d
+    movl $0x1fffff, %ecx
+    xorl %edx, %edx
+    th_api 17                /* Completed ID no longer admits new handles. */
+    testq %rax, %rax
+    th_ensure e
+    cmpl $87, %gs:0x68
+    th_ensure e
+    movl $0x1234, %gs:0x68
     th_tls
     cmpq $0x1144, (%r10)
     th_ensure e
@@ -411,6 +421,22 @@ Lthread_worker:
     cmpl $0, %gs:0x68
     th_ensure e
     movl $0x8765, %gs:0x68
+    /* Reopen the current guest worker by ID using the observed full mask. */
+    movl %gs:0x48, %r8d
+    movl $0x1fffff, %ecx
+    xorl %edx, %edx
+    th_api 17
+    testq %rax, %rax
+    th_ensure ne
+    th_ref
+    cmpq {data}+0x08(%r11), %rax
+    th_ensure ne
+    movq %rax, %rcx
+    th_api 8                 /* Closing this handle cannot close the creator's. */
+    cmpl $1, %eax
+    th_ensure e
+    cmpl $0x8765, %gs:0x68
+    th_ensure e
     th_api 10                  /* DLL thread attach followed its TLS callback. */
     cmpq $7, %rax
     th_ensure e

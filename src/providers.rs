@@ -162,6 +162,10 @@ pub fn lookup(dll: &[u8], name: &[u8]) -> Option<HostExport> {
             export!(KERNELBASE, "CreateThread", create_thread)
         }
         #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        (b"kernelbase.dll" | b"kernel32.dll" | PROCESS_THREADS, b"OpenThread") => {
+            export!(KERNELBASE, "OpenThread", open_thread)
+        }
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
         (b"kernelbase.dll" | b"kernel32.dll" | PROCESS_THREADS, b"ResumeThread") => {
             export!(KERNELBASE, "ResumeThread", resume_thread)
         }
@@ -282,7 +286,7 @@ pub(crate) mod native {
     }
 
     #[cfg(target_os = "macos")]
-    pub(super) use super::win_io::native::resume_thread;
+    pub(super) use super::win_io::native::{open_thread, resume_thread};
     #[cfg(target_os = "macos")]
     pub(super) use crate::tls_runtime::create_thread;
 

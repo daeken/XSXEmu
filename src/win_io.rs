@@ -446,6 +446,52 @@ pub(crate) mod native {
         )
     }
 
+    // One membership per live worker, independent of every numeric handle.
+    // The runtime removes it before signaling thread completion.
+    #[cfg(target_os = "macos")]
+    pub(crate) struct ThreadRegistration(u32);
+
+    #[cfg(target_os = "macos")]
+    impl ThreadRegistration {
+        pub(crate) fn publish(id: u32, thread: &Arc<ThreadCompletion>) -> Self {
+            let mut state = lock(&STATE);
+            assert_ne!(id, 0);
+            assert!(state.threads.insert(id, thread.clone()).is_none());
+            Self(id)
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for ThreadRegistration {
+        fn drop(&mut self) {
+            lock(&STATE).threads.remove(&self.0);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) extern "win64" fn open_thread(access: u32, inherit: i32, id: u32) -> usize {
+        const THREAD_ALL_ACCESS: u32 = 0x001f_ffff;
+        ret(
+            (|| {
+                // Exact all-access spelling grants all modeled rights, not
+                // permission for unsupported operations or host threads.
+                let access = if access == THREAD_ALL_ACCESS {
+                    THREAD_RIGHTS
+                } else {
+                    sync_access(access, THREAD_RIGHTS)?
+                };
+                let mut state = lock(&STATE);
+                let thread = state.threads.get(&id).cloned().ok_or(INVALID_PARAM)?;
+                state.insert(Entry {
+                    obj: Arc::new(Object::Thread(thread)),
+                    access,
+                    inheritable: inherit != 0,
+                })
+            })(),
+            0,
+        )
+    }
+
     enum Object {
         #[cfg(target_os = "macos")]
         Thread(Arc<ThreadCompletion>),
@@ -482,6 +528,8 @@ pub(crate) mod native {
     }
     struct State {
         handles: HashMap<usize, Entry>,
+        #[cfg(target_os = "macos")]
+        threads: HashMap<u32, Arc<ThreadCompletion>>,
         next: usize,
         std: [usize; 3],
         #[cfg(target_os = "macos")]
@@ -515,6 +563,8 @@ pub(crate) mod native {
     static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| {
         Mutex::new(State {
             handles: HashMap::new(),
+            #[cfg(target_os = "macos")]
+            threads: HashMap::new(),
             next: 0x1000_0000,
             std: [INVALID; 3],
             #[cfg(target_os = "macos")]
@@ -1145,6 +1195,40 @@ pub(crate) mod native {
             }
             Ok(())
         })())
+    }
+
+    #[cfg(all(target_os = "macos", test))]
+    #[test]
+    fn open_thread_retains_the_live_object_and_limits_access() {
+        use crate::providers::native::{current_thread_id, get_last_error};
+
+        let id = current_thread_id();
+        let (original, thread) = new_thread_handle(true).unwrap();
+        let registration = ThreadRegistration::publish(id, &thread);
+        assert_eq!(CloseHandle(original), 1);
+        let wait_only = open_thread(SYNCHRONIZE, 1, id);
+        assert_ne!(wait_only, 0);
+        assert!(entry(wait_only).unwrap().inheritable);
+        assert_eq!(resume_thread(wait_only), u32::MAX);
+        assert_eq!(get_last_error(), ACCESS);
+        assert_eq!(open_thread(1, 0, id), 0); // THREAD_TERMINATE is not modeled.
+        assert_eq!(get_last_error(), UNSUPPORTED);
+        assert_eq!(open_thread(SYNCHRONIZE, 0, 0), 0);
+        assert_eq!(get_last_error(), INVALID_PARAM);
+        set_last_error(0x4321);
+        let all = open_thread(0x001f_ffff, 0, id);
+        assert_ne!(all, 0);
+        assert_eq!(entry(all).unwrap().access, THREAD_RIGHTS);
+        assert_eq!(resume_thread(all), 1);
+        assert_eq!(get_last_error(), 0x4321);
+        thread.await_start();
+        assert_eq!(CloseHandle(all), 1);
+        drop(registration);
+        thread.finish(0);
+        assert_eq!(open_thread(SYNCHRONIZE, 0, id), 0);
+        assert_eq!(get_last_error(), INVALID_PARAM);
+        assert_eq!(wait_for_single_object(wait_only, 0), WAIT_OBJECT_0);
+        assert_eq!(CloseHandle(wait_only), 1);
     }
 
     #[cfg(all(target_os = "macos", test))]

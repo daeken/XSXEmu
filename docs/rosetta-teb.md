@@ -528,6 +528,16 @@ handle neither resumes nor kills the worker. An unresumed worker at teardown
 is covered by the same bounded fail-closed drain. This does not implement
 priority or affinity APIs, or suspension after launch.
 
+The worker later takes its own ID from `GetCurrentThreadId` and calls
+`OpenThread(0x1fffff, FALSE, id)` through IAT RVA `0x67934d8`. The audited
+bridge opens a new guest handle on the existing worker object; it never
+looks up a host thread. An exact `THREAD_ALL_ACCESS` request grants all
+modeled rights, not support for unimplemented operations. Other access
+masks must be subsets of the modeled rights. Only spawned workers have
+openable IDs; unknown and completed IDs are rejected. A worker stays
+openable even if every handle was closed, and existing handles retain
+waitable completion after its ID is removed.
+
 `CreateEventA` uses a four-argument bridge. The direct calls and tail thunk
 referencing IAT RVA `0x6793ab0` pass null security and name, manual-reset
 `FALSE` or `TRUE`, and initial state `FALSE`. The missing-import trace does

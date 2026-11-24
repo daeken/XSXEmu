@@ -192,6 +192,7 @@ impl Workers {
                     with_context(vector, workers.trace, |ctx, tid| {
                         // Only return success after the worker really owns its
                         // stack, TLS, TEB, ID and checked host GS context.
+                        let registration = io::ThreadRegistration::publish(tid, &completion);
                         ready.send(tid).unwrap();
                         // The producer's unlock publishes its guest parameter
                         // writes. Don't deliver even TLS notifications until
@@ -209,6 +210,7 @@ impl Workers {
                                 "end phase=thread-entry id={tid} status={code:#x}"
                             ));
                         }
+                        drop(registration);
                         completion.finish(code);
                     })?;
                     Ok(())

@@ -3717,7 +3717,7 @@ fn created_guest_thread_has_own_teb_and_tls_and_joins_before_process_detach() {
     w32(&mut dll, file(LINK) + 0x30, TEXT + fixture.probe as usize);
     scratch.write("owned.dll", &dll);
     let mut exe = prepare(Kind::Solo, fixture.entry);
-    dir(&mut exe, 1, LINK, 6 * 20);
+    dir(&mut exe, 1, LINK, 7 * 20);
     let groups: &[(&[u8], &[&[u8]])] = &[
         (
             b"api-ms-win-core-processthreads-l1-1-0.dll\0",
@@ -3746,14 +3746,15 @@ fn created_guest_thread_has_own_teb_and_tls_and_joins_before_process_detach() {
                 b"FlsFree\0",
             ],
         ),
+        (b"kernel32.dll\0", &[b"OpenThread\0"]),
     ];
     // Every descriptor needs its own terminating IAT entry, even when the
     // adjacent lookup table has its own terminator as well.
-    let iat_offsets = [0, 4, 8, 10, 12];
+    let iat_offsets = [0, 4, 8, 10, 12, 17];
     for (i, &(module, imports)) in groups.iter().enumerate() {
         let rec = file(LINK) + 20 * i;
-        let lookup = LINK + 0x80 + 0x28 * i;
-        let name = LINK + 0x160 + 0x40 * i;
+        let lookup = LINK + 0xa0 + 0x28 * i;
+        let name = LINK + 0x1a0 + 0x40 * i;
         w32(&mut exe, rec, lookup);
         w32(&mut exe, rec + 12, name);
         w32(&mut exe, rec + 16, IAT + 8 * iat_offsets[i]);
