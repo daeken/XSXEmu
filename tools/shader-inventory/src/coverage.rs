@@ -17,7 +17,7 @@ fn qword(blob: &[u8], at: usize) -> Option<u64> {
     Some(u64::from_le_bytes(blob.get(at..at + 8)?.try_into().ok()?))
 }
 
-fn code(blob: &[u8]) -> Option<(&[u8], bool)> {
+pub(crate) fn code(blob: &[u8]) -> Option<(&[u8], bool)> {
     let start = usize::try_from(qword(blob, 0xc0)?).ok()?;
     let len = usize::try_from(qword(blob, 0xc8)?).ok()?;
     let recorded_end = qword(blob, 0xe8)?;
@@ -41,14 +41,14 @@ fn code(blob: &[u8]) -> Option<(&[u8], bool)> {
         .then_some((bytes, recorded_end == UNSET))
 }
 
-struct Metadata {
-    wave32: bool,
-    rsrc2: usize,
-    group: [usize; 3],
+pub(crate) struct Metadata {
+    pub wave32: bool,
+    pub rsrc2: usize,
+    pub group: [usize; 3],
 }
 
 impl Metadata {
-    fn parse(blob: &[u8]) -> Option<Self> {
+    pub fn parse(blob: &[u8]) -> Option<Self> {
         let rsrc2 = word(blob, 0x138)?;
         let group = [word(blob, 0x13c)?, word(blob, 0x140)?, word(blob, 0x144)?];
         let threads = group.into_iter().try_fold(1usize, usize::checked_mul)?;
@@ -62,7 +62,7 @@ impl Metadata {
             group,
         })
     }
-    fn lds(&self) -> bool {
+    pub fn lds(&self) -> bool {
         self.rsrc2 & (0x1ff << 15) != 0
     }
 }
@@ -100,7 +100,10 @@ struct Seen {
 
 // Non-exclusive lexical indicators for unimplemented general capabilities,
 // not a classifier of every memory space, modifier or implicit register use.
-fn features<'a>(name: &'a str, line: &'a str) -> impl Iterator<Item = &'static str> + 'a {
+pub(crate) fn features<'a>(
+    name: &'a str,
+    line: &'a str,
+) -> impl Iterator<Item = &'static str> + 'a {
     let has_mask = line
         .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
         .any(|word| {
@@ -437,6 +440,7 @@ mod tests {
         let Some(path) = std::env::var_os("LLVM_DISASM_LIB") else {
             return;
         };
+        let _serial_llvm = crate::llvm::test_lock();
         let mut report = Coverage::new(&path, Cpu::Gfx1013, Cpu::Gfx1030).unwrap();
         // Owned: s_endpgm; gfx1013 v_mad_legacy_f32 v1, v0, v0, v0;
         // invalid dword; s_endpgm. This is a linear census, not an executable shader.

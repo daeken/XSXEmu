@@ -1,6 +1,8 @@
 //! Counts only; never exports assets or interprets the RPF9 TOC.
+mod cfg;
 mod coverage;
 mod llvm;
+mod reachable;
 
 use flate2::{Decompress, FlushDecompress, Status};
 use std::{
@@ -302,6 +304,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args_os().skip(1);
     const USAGE: &str = "usage: xsx-shader-inventory [--header-only | --compute-isa <LLVM shared library> <primary CPU> <reference CPU>] <shaders.rpf> (select gfx1013 and gfx1030, in either order)";
     let first = args.next().ok_or(USAGE)?;
+    if first == "--reachable-compute" {
+        const REACHABLE_USAGE: &str = "usage: xsx-shader-inventory --reachable-compute <trusted LLVM 21 shared library> <gfx1013|gfx1030> <native FSSM directory>";
+        let lib = args.next().ok_or(REACHABLE_USAGE)?;
+        let cpu = llvm::Cpu::parse(&args.next().ok_or(REACHABLE_USAGE)?).ok_or(REACHABLE_USAGE)?;
+        let dir = args
+            .next()
+            .filter(|_| args.next().is_none())
+            .ok_or(REACHABLE_USAGE)?;
+        return reachable::run(&lib, cpu, std::path::Path::new(&dir));
+    }
     let header_only = first == "--header-only";
     let (path, mut coverage) = if first == "--compute-isa" {
         let lib = args.next().ok_or(USAGE)?;

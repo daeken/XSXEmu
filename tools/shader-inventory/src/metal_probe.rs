@@ -4,6 +4,8 @@ mod alu;
 mod buffer;
 #[cfg(any(target_os = "macos", test))]
 mod cfg;
+#[cfg(any(target_os = "macos", test))]
+mod exec;
 
 #[cfg(target_os = "macos")]
 fn run_alu(
@@ -62,6 +64,68 @@ fn run_alu(
         "{}: {}-lane {label} fixture, 96/96 CPU/Metal readback words match",
         dev.name(),
         pipeline.thread_execution_width()
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn run_exec(
+    dev: &metal::DeviceRef,
+    queue: &metal::CommandQueueRef,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use metal::{CompileOptions, MTLCommandBufferStatus, MTLResourceOptions, MTLSize};
+    let program = exec::Program::decode(&exec::FIXTURE)?;
+    let lib = dev.new_library_with_source(&program.msl(), &CompileOptions::new())?;
+    let function = lib.get_function("exec_fixture", None)?;
+    let pipeline = dev.new_compute_pipeline_state_with_function(&function)?;
+    if pipeline.thread_execution_width() != exec::LANES as u64
+        || pipeline.max_total_threads_per_threadgroup() < exec::LANES as u64
+    {
+        return Err("unsupported: EXEC fixture requires a full wave32-sized SIMD group".into());
+    }
+    let opts = MTLResourceOptions::StorageModeShared;
+    let input = std::array::from_fn(|lane| lane as u32);
+    let initialized = [exec::SENTINEL; exec::OUTPUT_WORDS];
+    let input_buf =
+        dev.new_buffer_with_data(input.as_ptr().cast(), size_of_val(&input) as u64, opts);
+    for (mask, survivors, exit) in exec::CASES {
+        let expected = exec::expected(survivors, exit);
+        if program.run(&input, mask) != expected {
+            return Err("EXEC fixture disagrees with CPU oracle".into());
+        }
+        let output = dev.new_buffer_with_data(
+            initialized.as_ptr().cast(),
+            size_of_val(&initialized) as u64,
+            opts,
+        );
+        let work = queue.new_command_buffer();
+        let encoder = work.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(&input_buf), 0);
+        encoder.set_buffer(1, Some(&output), 0);
+        encoder.set_bytes(2, size_of::<u32>() as u64, (&raw const mask).cast());
+        encoder.dispatch_thread_groups(
+            MTLSize::new(1, 1, 1),
+            MTLSize::new(exec::LANES as u64, 1, 1),
+        );
+        encoder.end_encoding();
+        work.commit();
+        work.wait_until_completed();
+        if work.status() != MTLCommandBufferStatus::Completed {
+            return Err(format!("EXEC Metal command failed ({:?})", work.status()).into());
+        }
+        // The aligned shared output was allocated for this many words; the GPU is done.
+        let actual = unsafe {
+            std::slice::from_raw_parts(output.contents().cast::<u32>(), exec::OUTPUT_WORDS)
+        };
+        if let Some(word) = actual.iter().zip(expected).position(|(&a, b)| a != b) {
+            return Err(format!("owned EXEC mismatch: mask {mask:#x}, output index {word}").into());
+        }
+    }
+    let words = exec::CASES.len() * exec::OUTPUT_WORDS;
+    println!(
+        "{}: owned wave32 EXEC/branch, {words}/{words} CPU/Metal words match (including exits)",
+        dev.name()
     );
     Ok(())
 }
@@ -150,6 +214,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let queue = dev.new_command_queue();
     run_alu(&dev, &queue, "ALU", &alu::FIXTURE)?;
     run_alu(&dev, &queue, "branch/literal", &alu::BRANCH_FIXTURE)?;
+    run_exec(&dev, &queue)?;
     run_buffer(&dev, &queue)
 }
 

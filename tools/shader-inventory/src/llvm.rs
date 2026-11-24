@@ -180,3 +180,12 @@ impl Drop for Disassembler {
         unsafe { (self.dispose)(self.ctx) };
     }
 }
+
+// Inventory invokes LLVM on only one thread. Prevent the parallel test harness
+// from initializing another LLVM target registry while a test is using it.
+#[cfg(test)]
+pub fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}

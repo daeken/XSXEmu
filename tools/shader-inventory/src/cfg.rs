@@ -14,6 +14,7 @@ pub enum Flow {
 pub struct Instruction<T> {
     pub width: usize,
     pub flow: Flow,
+    #[allow(dead_code)] // The count-only census uses (); lowering callers use typed ops.
     pub op: T,
 }
 
@@ -34,17 +35,25 @@ pub fn relative(next: usize, displacement: i16) -> Option<usize> {
 /// Reject any edge into the interior of another reachable instruction, regardless
 /// of discovery order. This does not identify independently unreachable data or
 /// secondary entry points. Unsupported indirect PC operations must fail decode.
+#[cfg(any(test, feature = "metal-probe"))]
 pub fn walk<T>(
     code: &[u32],
-    decode: impl Fn(&[u32]) -> Option<Instruction<T>>,
+    mut decode: impl FnMut(&[u32]) -> Option<Instruction<T>>,
+) -> Result<BTreeMap<usize, Instruction<T>>, Error> {
+    walk_extent(code.len(), |pc| decode(&code[pc..]))
+}
+
+/// Same graph validation for an independently bounded decoder with dword PCs.
+pub fn walk_extent<T>(
+    dwords: usize,
+    mut decode: impl FnMut(usize) -> Option<Instruction<T>>,
 ) -> Result<BTreeMap<usize, Instruction<T>>, Error> {
     let mut graph: BTreeMap<usize, Instruction<T>> = BTreeMap::new();
     let mut pending = vec![0];
     while let Some(pc) = pending.pop() {
-        let bytes = code
-            .get(pc..)
-            .filter(|s| !s.is_empty())
-            .ok_or(Error::BadSuccessor)?;
+        if pc >= dwords {
+            return Err(Error::BadSuccessor);
+        }
         if let Some((&start, prior)) = graph.range(..=pc).next_back() {
             if start == pc {
                 continue;
@@ -53,8 +62,8 @@ pub fn walk<T>(
                 return Err(Error::OverlappingInstructions);
             }
         }
-        let inst = decode(bytes).ok_or(Error::UnsupportedEncoding)?;
-        if inst.width == 0 || inst.width > bytes.len() {
+        let inst = decode(pc).ok_or(Error::UnsupportedEncoding)?;
+        if inst.width == 0 || inst.width > dwords - pc {
             return Err(Error::BadWidth);
         }
         let next = pc + inst.width;
