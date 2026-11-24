@@ -3,7 +3,7 @@ use crate::{
     cfg::{self, Flow, Instruction},
     embedded::has_digest_prefix,
     llvm::{Cpu, Disassembler, Llvm},
-    reachable::{control, indirect_reference_closure},
+    reachable::{control, indirect_reference_load_sites},
     span, word,
 };
 use std::{
@@ -67,6 +67,8 @@ struct Hypothesis {
     bad_decode: usize,
     indirect_pc: usize,
     indirect_closed: usize,
+    indirect_starts: usize,
+    indirect_other_sites: usize,
     other_control: usize,
     outside: usize,
     invalid: usize,
@@ -105,8 +107,13 @@ impl Hypothesis {
                     None => self.bad_decode += 1,
                     Some(true) => {
                         self.indirect_pc += 1;
-                        self.indirect_closed +=
-                            usize::from(indirect_reference_closure(dis, body, entry));
+                        if let Some((starts, other)) =
+                            indirect_reference_load_sites(dis, body, entry, sites)
+                        {
+                            self.indirect_closed += 1;
+                            self.indirect_starts += starts;
+                            self.indirect_other_sites += other;
+                        }
                     }
                     Some(false) => self.other_control += 1,
                 }
@@ -384,6 +391,12 @@ pub fn run(lib: &OsStr, path: &Path) -> Result<(), Box<dyn Error>> {
                 w.starts,
                 w.other_sites
             );
+            println!(
+                "{} conditional entry +{entry}, indirect closures only: {} site starts, {} other sites",
+                cpu.name(),
+                w.indirect_starts,
+                w.indirect_other_sites
+            );
         }
     }
     graphics(&library, &mut refs)?;
@@ -430,6 +443,42 @@ mod tests {
             assert!(graphics_items(&blob).is_none());
             blob[at] ^= 4;
         }
+    }
+
+    #[test]
+    fn indirect_projection_counts_only_load_starts_and_preserves_repeated_sites() {
+        let Some(path) = std::env::var_os("LLVM_DISASM_LIB") else {
+            return;
+        };
+        let _serial_llvm = crate::llvm::test_lock();
+        let llvm = Llvm::load(&path).unwrap();
+        let mut dis = llvm.context(Cpu::Gfx1030, true).unwrap();
+        let mut words: [u32; 9] = [
+            0xbe94_1f00,
+            0x8014_ff14,
+            20,
+            0x8215_8015,
+            0xbe80_2014,
+            0xffff_ffff,
+            0xf408_0100,
+            0xfa00_0000,
+            0xbf81_0000,
+        ];
+        let bytes = |code: &[u32]| {
+            code.iter()
+                .flat_map(|n| n.to_le_bytes())
+                .collect::<Vec<_>>()
+        };
+        let sites = [20, 44, 48, 48, 52, 56, 60]; // omitted prefix, skipped word, load twice, extension, exit, end
+        assert_eq!(
+            indirect_reference_load_sites(&mut dis, &bytes(&words), 24, &sites),
+            Some((2, 5))
+        );
+        words[2] = 16; // Reaches the invalid skipped word instead.
+        assert_eq!(
+            indirect_reference_load_sites(&mut dis, &bytes(&words), 24, &sites),
+            None
+        );
     }
 
     #[test]

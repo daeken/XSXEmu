@@ -363,8 +363,39 @@ pub(crate) fn indirect_reference_closure(
     origin: usize,
 ) -> bool {
     let mut frontier = IndirectFrontier::default();
-    frontier.add(dis, bytes, origin);
-    frontier.closure.contains_key("closed hypothesis with exit")
+    frontier.add(dis, bytes, origin).is_some()
+}
+
+/// Counts confirmed scalar-load starts only in a closed indirect projection.
+/// Sites are relative to the original blob; preserve duplicate layout references.
+pub(crate) fn indirect_reference_load_sites(
+    dis: &mut Disassembler,
+    body: &[u8],
+    origin: usize,
+    sites: &[usize],
+) -> Option<(usize, usize)> {
+    let graph = IndirectFrontier::default().add(dis, body, origin)?;
+    let mut scratch = [0; 1024];
+    let starts = sites
+        .iter()
+        .filter(|&&site| {
+            let Some(relative) = site.checked_sub(origin).filter(|n| n.is_multiple_of(4)) else {
+                return false;
+            };
+            if !graph.get(&(relative / 4)).is_some_and(|op| op.width == 2) {
+                return false;
+            }
+            dis.one(&body[relative..], site, &mut scratch)
+                .is_some_and(|(width, line)| {
+                    width == 8
+                        && matches!(
+                            line.split_ascii_whitespace().next(),
+                            Some("s_load_dwordx4" | "s_load_dwordx8")
+                        )
+                })
+        })
+        .count();
+    Some((starts, sites.len() - starts))
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -474,7 +505,12 @@ struct IndirectFrontier {
 }
 
 impl IndirectFrontier {
-    fn add(&mut self, dis: &mut Disassembler, bytes: &[u8], origin: usize) {
+    fn add(
+        &mut self,
+        dis: &mut Disassembler,
+        bytes: &[u8],
+        origin: usize,
+    ) -> Option<BTreeMap<usize, Instruction<Cut>>> {
         // Separate projection: SETPC is a cut, not an exit or an admitted edge.
         // Do not report from a partially visited projection on another error.
         let mut scratch = [0; 1024];
@@ -519,7 +555,7 @@ impl IndirectFrontier {
                     cfg::Error::OverlappingInstructions => "overlap",
                 };
                 *self.incomplete.entry(reason).or_default() += 1;
-                return;
+                return None;
             }
         };
         // The matched window is contiguous. Width/overlap validation rules
@@ -562,7 +598,9 @@ impl IndirectFrontier {
             .filter(|&pc| frontier_target(&graph, pc) == TargetOverlap::Unvisited)
             .collect();
         if roots.is_empty() {
-            *self.closure.entry(closed_projection(&graph)).or_default() += 1;
+            let status = closed_projection(&graph);
+            *self.closure.entry(status).or_default() += 1;
+            (status == "closed hypothesis with exit").then_some(graph)
         } else {
             self.additional_roots += roots.len();
             let original = graph.len();
@@ -575,12 +613,11 @@ impl IndirectFrontier {
             let extension = cfg::extend_extent(bytes.len() / 4, graph, roots, |pc| {
                 decode(pc, &mut pattern, &mut unsupported)
             });
+            let mut closed = None;
             let outcome = match extension {
                 Ok(expanded) => {
-                    *self
-                        .closure
-                        .entry(closed_projection(&expanded))
-                        .or_default() += 1;
+                    let status = closed_projection(&expanded);
+                    *self.closure.entry(status).or_default() += 1;
                     self.extension_nodes += expanded.len() - original;
                     let expanded_entries = branch_entries(&expanded);
                     let new_entries: BTreeSet<_> =
@@ -609,6 +646,7 @@ impl IndirectFrontier {
                             }
                         }
                     }
+                    closed = (status == "closed hypothesis with exit").then_some(expanded);
                     "valid direct projection"
                 }
                 Err(cfg::Error::UnsupportedEncoding) => unsupported,
@@ -617,6 +655,7 @@ impl IndirectFrontier {
                 Err(cfg::Error::OverlappingInstructions) => "overlap",
             };
             *self.root_extensions.entry(outcome).or_default() += 1;
+            closed
         }
     }
 }
@@ -772,8 +811,9 @@ impl Report {
             }
             Err(reason) => {
                 if matches!(reason, Blocker::IndirectPc(_)) {
-                    self.indirect_frontier
-                        .add(&mut waves[usize::from(meta.wave32)], bytes, 0);
+                    let _ =
+                        self.indirect_frontier
+                            .add(&mut waves[usize::from(meta.wave32)], bytes, 0);
                 }
                 *self.blockers.entry(reason).or_default() += 1;
             }
