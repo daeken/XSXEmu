@@ -5,6 +5,7 @@ use crate::{
     llvm::{Cpu, Disassembler, Llvm},
     reachable::{control, indirect_reference_load_sites},
     span, word,
+    wrapped_library::library_to_final_marker,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -61,6 +62,13 @@ impl SiteFields {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ControlRejection {
+    IndirectPc,
+    SetHalt { byte_offset: usize },
+    Other,
+}
+
 #[derive(Default)]
 struct Hypothesis {
     complete: usize,
@@ -70,6 +78,8 @@ struct Hypothesis {
     indirect_starts: usize,
     indirect_other_sites: usize,
     other_control: usize,
+    checked_sethalt: usize,
+    checked_sethalt_before_marker: usize,
     outside: usize,
     invalid: usize,
     no_exit: usize,
@@ -90,8 +100,15 @@ impl Hypothesis {
             let mnemonic = text.split_ascii_whitespace().next()?;
             let first = word(tail, 0)? as u32;
             let Some(flow) = control(mnemonic, first, len) else {
-                control_rejection =
-                    Some(mnemonic.starts_with("s_setpc") || mnemonic.starts_with("s_swappc"));
+                control_rejection = Some(match (mnemonic, first >> 16, len) {
+                    ("s_sethalt", 0xbf8d, 4) => ControlRejection::SetHalt {
+                        byte_offset: entry + pc * 4,
+                    },
+                    (name, _, _) if name.starts_with("s_setpc") || name.starts_with("s_swappc") => {
+                        ControlRejection::IndirectPc
+                    }
+                    _ => ControlRejection::Other,
+                });
                 return None;
             };
             Some(Instruction {
@@ -105,7 +122,7 @@ impl Hypothesis {
             Err(cfg::Error::UnsupportedEncoding) => {
                 match control_rejection {
                     None => self.bad_decode += 1,
-                    Some(true) => {
+                    Some(ControlRejection::IndirectPc) => {
                         self.indirect_pc += 1;
                         if let Some((starts, other)) =
                             indirect_reference_load_sites(dis, body, entry, sites)
@@ -115,7 +132,17 @@ impl Hypothesis {
                             self.indirect_other_sites += other;
                         }
                     }
-                    Some(false) => self.other_control += 1,
+                    Some(ControlRejection::SetHalt { byte_offset }) => {
+                        self.other_control += 1;
+                        self.checked_sethalt += 1;
+                        // Compare geometry only. Neither the suffix nor the raw
+                        // marker is interpreted as an instruction by this check.
+                        self.checked_sethalt_before_marker += usize::from(
+                            library_to_final_marker(code)
+                                .is_some_and(|cut| byte_offset < cut.len() - 4),
+                        );
+                    }
+                    Some(ControlRejection::Other) => self.other_control += 1,
                 }
                 return;
             }
@@ -392,6 +419,12 @@ pub fn run(lib: &OsStr, path: &Path) -> Result<(), Box<dyn Error>> {
                 w.other_sites
             );
             println!(
+                "{} conditional entry +{entry}, other control only: {} checked s_sethalt, {} strictly before bounded final raw end marker",
+                cpu.name(),
+                w.checked_sethalt,
+                w.checked_sethalt_before_marker
+            );
+            println!(
                 "{} conditional entry +{entry}, indirect closures only: {} site starts, {} other sites",
                 cpu.name(),
                 w.indirect_starts,
@@ -442,6 +475,30 @@ mod tests {
             blob[at] ^= 4;
             assert!(graphics_items(&blob).is_none());
             blob[at] ^= 4;
+        }
+    }
+
+    #[test]
+    fn sethalt_remains_a_blocker_before_raw_end_marker() {
+        let Some(path) = std::env::var_os("LLVM_DISASM_LIB") else {
+            return;
+        };
+        let _serial_llvm = crate::llvm::test_lock();
+        let llvm = Llvm::load(&path).unwrap();
+        for cpu in [Cpu::Gfx1013, Cpu::Gfx1030] {
+            let mut dis = llvm.context(cpu, true).unwrap();
+            let code: Vec<u8> = [0x1122_3344u32, 0xbf8d_0001, 0xbf81_0000, 0x1234_5678]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect();
+            for (span, before_marker) in [(&code[..], 1), (&code[..8], 0)] {
+                let mut result = Hypothesis::default();
+                result.add(&mut dis, span, 4, &[]);
+                assert_eq!(result.other_control, 1);
+                assert_eq!(result.checked_sethalt, 1);
+                assert_eq!(result.checked_sethalt_before_marker, before_marker);
+                assert_eq!(result.complete + result.indirect_closed, 0);
+            }
         }
     }
 

@@ -293,7 +293,7 @@ fn fssm_to_marker(mut after_prefix: &[u8]) -> Option<&[u8]> {
     (after_prefix.len().is_multiple_of(4) && after_prefix.ends_with(&END)).then_some(after_prefix)
 }
 
-fn library_to_final_marker(span: &[u8]) -> Option<&[u8]> {
+pub(crate) fn library_to_final_marker(span: &[u8]) -> Option<&[u8]> {
     if !span.len().is_multiple_of(4) {
         return None;
     }
