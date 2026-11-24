@@ -1,5 +1,6 @@
 //! Reusable, host-independent XSXEmu components.
 
+pub mod pipeline_library;
 pub mod root_signature;
 pub mod rpf9;
 #[cfg(feature = "rpf9-retail")]
