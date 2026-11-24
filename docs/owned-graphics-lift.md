@@ -51,3 +51,22 @@ The shape census separates the first source field from its instruction mnemonic.
 `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer sh tools/shader-inventory/smoke-legacy-mul-edges.sh` uses the same instruction decoder and arithmetic emitter in a separate, owned raw-bit compute probe. It exercises two native instruction operands: a VGPR pair and a literal quarter with a VGPR. Fresh-process strict Metal archive replay matches all 16 expected result words on Apple M4, including either-signed zero with infinity or NaN, negative finite inputs, and preservation of a nonzero infinity product. This checks positive zero bit-for-bit rather than relying on UNORM colors; it does not establish behavior for nonzero NaN operands or guest denormal modes.
 
 The probe also checks `v_fmac_f32_e32` with two unmodified VGPR operands. The typed operation reads the old destination as its third input; an undefined destination or scalar source is rejected. Strict replay matches two exact finite FMAC results, including the cancellation case that would give zero after a rounded multiply. This form adds 75,989 VS / 1,211,682 PS matched sites under `gfx1013` and 61,421 VS / 102,414 PS under `gfx1030`, with zero whole graphs free of encoding gaps. The keyed VS/PS fixture is unchanged.
+
+The census also splits unsupported EXP sites by checked numeric and LLVM-symbol target class, raw EN mask, and the raw value of bits 10–12. It retains an unclassified bucket for any rejected EXP whose fields and symbol cannot be reconciled. Both independent wave checks reproduce the same 11 PS shapes per reference. Each table cell counts distinct payloads / static sites; the payload counts are not additive.
+
+| Target | EN | Bits 10–12 | `gfx1013` | `gfx1030` |
+|---|---:|---:|---:|---:|
+| MRT0 | 15 | 1 | 6,353 / 6,353 | 2,155 / 2,155 |
+| MRT0 | 15 | 7 | 2,589 / 2,589 | 1,953 / 1,953 |
+| MRT0 | 3 | 1 | 812 / 812 | 10 / 10 |
+| MRT0 | 3 | 7 | 736 / 736 | 602 / 602 |
+| MRT1–7 | 15 | 1 | 4,013 / 10,645 | 1,048 / 2,716 |
+| MRT1–7 | 15 | 7 | 5,017 / 5,017 | 1,211 / 1,211 |
+| MRT1–7 | 3 | 1 | 970 / 970 | 87 / 87 |
+| MRT1–7 | 3 | 7 | 2,148 / 2,148 | 954 / 954 |
+| MRTZ | 1 | 0 | 31 / 31 | 27 / 27 |
+| MRTZ | 1 | 6 | 1,140 / 1,140 | 1,139 / 1,139 |
+| NULL | 0 | 6 | 6,180 / 6,495 | 2,497 / 2,810 |
+| **Total sites** | | | **36,936** | **13,664** |
+
+VS has two classified gaps on each reference: PARAM1–31 EN15 value 0 (1,172 / 6,364 and 966 / 5,328), and POS1–4 EN15 value 2 (20 / 20 each). This is an encoding census, not an attachment map, output format inference, or export-sequence validator. Owned LLVM MC checks on both references identify bits 10, 11, and 12 as `compr`, `done`, and `vm`. The broadest single PS candidate is compressed full-mask MRT0 without `done` or `vm`. It needs independently verified source packing and an explicit owned target format; partial EN also needs an explicit disabled-component policy. Attachment ordinals, `vm`, and NULL must not be inferred from these counts or treated as unconditional no-ops.

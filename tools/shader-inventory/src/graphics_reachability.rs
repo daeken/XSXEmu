@@ -199,7 +199,7 @@ fn project_exports_observe(
             };
             return None;
         };
-        observe(tail, len, name);
+        observe(tail, len, text);
         pattern.observe(pc, len, name, first, tail, flow);
         Some(Instruction {
             width: len / 4,
@@ -370,6 +370,33 @@ fn legacy_source_shape(word: u32, len: usize) -> &'static str {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct ExportShape {
+    target: &'static str,
+    en: u8,
+    bits_10_to_12: u8,
+}
+
+fn export_shape(first: u32, len: usize, text: &str) -> Option<ExportShape> {
+    let target = match export(first, len, text)? {
+        Export::Color(0, _) => "MRT0",
+        Export::Color(_, _) => "MRT1-7",
+        Export::Mrtz(_) => "MRTZ",
+        Export::Null => "NULL",
+        Export::Position(0, _) => "POS0",
+        Export::Position(_, _) => "POS1-4",
+        Export::Primitive { .. } => "PRIM",
+        Export::Parameter(0, _) => "PARAM0",
+        Export::Parameter(_, _) => "PARAM1-31",
+        Export::Other => "unclassified",
+    };
+    Some(ExportShape {
+        target,
+        en: (first & 15) as u8,
+        bits_10_to_12: ((first >> 10) & 7) as u8,
+    })
+}
+
 #[derive(Default)]
 struct LiftGaps {
     complete: usize,
@@ -378,6 +405,7 @@ struct LiftGaps {
     accepted_sites: usize,
     missing: BTreeMap<String, (usize, usize)>, // payloads, checked sites
     legacy_shapes: BTreeMap<(&'static str, bool), (usize, usize)>,
+    export_shapes: BTreeMap<Option<ExportShape>, (usize, usize)>,
 }
 
 impl LiftGaps {
@@ -385,8 +413,10 @@ impl LiftGaps {
         use crate::graphics_decode::{Op, decode};
         let mut missing = BTreeMap::<String, usize>::new();
         let mut legacy_shapes = BTreeMap::new();
+        let mut export_shapes = BTreeMap::new();
         let (mut sites, mut accepted) = (0, 0);
-        let result = project_exports_observe(dis, bytes, false, |tail, len, name| {
+        let result = project_exports_observe(dis, bytes, false, |tail, len, text| {
+            let name = text.split_ascii_whitespace().next().unwrap_or_default();
             sites += 1;
             let mut words = [word(tail, 0).unwrap_or_default() as u32, 0];
             let count = if len == 8
@@ -413,6 +443,11 @@ impl LiftGaps {
                         Op::End => name == "s_endpgm",
                     }
             });
+            if name == "exp" && !matches {
+                *export_shapes
+                    .entry(export_shape(words[0], len, text))
+                    .or_insert(0) += 1;
+            }
             if name == "v_mul_legacy_f32_e32" {
                 *legacy_shapes
                     .entry((legacy_source_shape(words[0], len), matches))
@@ -431,6 +466,11 @@ impl LiftGaps {
             self.no_encoding_gap += usize::from(missing.is_empty());
             self.sites += sites;
             self.accepted_sites += accepted;
+            for (key, count) in export_shapes {
+                let total = self.export_shapes.entry(key).or_default();
+                total.0 += 1;
+                total.1 += count;
+            }
             for (key, count) in legacy_shapes {
                 let total = self.legacy_shapes.entry(key).or_default();
                 total.0 += 1;
@@ -454,6 +494,11 @@ impl LiftGaps {
             println!(
                 "    legacy source: {shape} (decoder match = {supported}): {payloads} payloads, {sites} checked sites"
             );
+        }
+        let mut shapes: Vec<_> = self.export_shapes.into_iter().collect();
+        shapes.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        for (shape, (payloads, sites)) in shapes {
+            println!("    unsupported EXP {shape:?}: {payloads} payloads, {sites} checked sites");
         }
         let mut rows: Vec<_> = self.missing.into_iter().collect();
         rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
@@ -1154,6 +1199,27 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn exp_shape_preserves_raw_flags_and_checks_symbol() {
+        let shape = ExportShape {
+            target: "MRT0",
+            en: 3,
+            bits_10_to_12: 7,
+        };
+        assert_eq!(
+            export_shape(0xf800_1c03, 8, "exp mrt0 v0, v0, off, off done compr vm"),
+            Some(shape)
+        );
+        assert_eq!(export_shape(0xf800_1c03, 4, "exp mrt0"), None);
+        assert_eq!(
+            export_shape(0xf800_1c03, 8, "exp mrt1"),
+            Some(ExportShape {
+                target: "unclassified",
+                ..shape
+            })
+        );
     }
 
     #[test]
