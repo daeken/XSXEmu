@@ -10,7 +10,7 @@ The local file is **411,695,600 bytes (`0x1889f9f0`)**. A read-only check reprod
 |---|---|---|---|
 | `+0x00` | 4 bytes | `9FPR` | RPF9 magic (`0x52504639` as LE u32) |
 | `+0x04` | LE u32 | `0x8640` | Data start, following Leonida's `docs/rpf.md`; public `SGD5` magic is visible later at `0x9000` |
-| `+0x08` | LE u32 | `0x8620` | Unknown; not treated as a count, a byte length, or a flag |
+| `+0x08` | LE u32 | `0x8620` | Not interpreted by this scanner; the [static title-reader pass](rpf9-title-reader.md) identifies it as the split metadata offset |
 | `+0x0c` | LE u32 | `0xa0` | Candidate EOF trailer size per Leonida's cross-archive survey; contents and purpose unknown |
 
 `--header-only` reads exactly the 16-byte prefix and uses the file length to check the data start (`0x10 <= start < EOF`). The full scanner additionally requires an aligned trailer *length* (multiple of 16), checked subtraction, and a nonempty data interval. Here the resulting half-open scan window is `[0x8640, 0x1889f950)`, leaving `[0x10, 0x8640)` and `[0x1889f950, 0x1889f9f0)` opaque. The first span may include other header fields or padding as well as TOC bytes; its boundaries are not an exact TOC extent. Leonida's survey was inconclusive about the last stored file in `shaders.rpf`. Our pipeline-library walk ends five bytes before the proposed trailer; this is consistent with the convention, not independent proof of the exact last member boundary. One `9FPR` match, at offset zero, was observed at 2 KiB strides; that does not exclude unaligned matches.
