@@ -76,17 +76,26 @@ mod gpu {
             ([P3, N2], [N6, N_HALF]),
             ([N2, P3], [N6, P_THREE_QUARTERS]),
         ];
-        let inputs = cases.map(|(input, _)| input);
-        let bytes = std::mem::size_of_val(&inputs);
+        let mut inputs: Vec<_> = cases.iter().map(|([a, b], _)| [*a, *b, 0, 0]).collect();
+        inputs.extend([
+            [
+                4097_f32.to_bits(),
+                4097_f32.to_bits(),
+                (-16785408_f32).to_bits(),
+                0,
+            ],
+            [P3, N2, 7_f32.to_bits(), 0],
+        ]);
+        let bytes = std::mem::size_of_val(inputs.as_slice());
         let usage = MTLResourceOptions::StorageModeShared;
         let input = dev.new_buffer_with_data(inputs.as_ptr().cast(), bytes as u64, usage);
         let output = dev.new_buffer(bytes as u64, usage);
-        let out = output.contents().cast::<[u32; 2]>();
+        let out = output.contents().cast::<[u32; 4]>();
         if out.is_null() {
             return Err("unmapped readback".into());
         }
         // Shared buffer is owned here; no CPU access during execution.
-        unsafe { out.write_bytes(0xa5, cases.len()) };
+        unsafe { out.write_bytes(0xa5, inputs.len()) };
         let queue = dev.new_command_queue();
         let cmd = queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
@@ -94,8 +103,8 @@ mod gpu {
         enc.set_buffer(0, Some(&input), 0);
         enc.set_buffer(1, Some(&output), 0);
         enc.dispatch_threads(
-            MTLSize::new(cases.len() as u64, 1, 1),
-            MTLSize::new(cases.len() as u64, 1, 1),
+            MTLSize::new(inputs.len() as u64, 1, 1),
+            MTLSize::new(inputs.len() as u64, 1, 1),
         );
         enc.end_encoding();
         cmd.commit();
@@ -106,14 +115,24 @@ mod gpu {
         for (i, (_, expected)) in cases.into_iter().enumerate() {
             // Exact dispatched extent, completed writes, owned allocation still live.
             let actual = unsafe { out.add(i).read() };
-            if actual != expected {
+            if actual[..2] != expected {
                 return Err(
                     format!("edge row {i}: got {actual:08x?}, expected {expected:08x?}").into(),
                 );
             }
         }
+        // Integer oracle: 4097² - 16785408 and 3 × -2 + 7 both equal 1.
+        // The first loses that unit if the multiplication rounds before the add.
+        assert_eq!(4097_i64 * 4097 - 16785408, 1);
+        assert_eq!(4097_f32 * 4097. - 16785408., 0.);
+        for i in cases.len()..inputs.len() {
+            let got = unsafe { out.add(i).read() }[2];
+            if got != 1_f32.to_bits() {
+                return Err(format!("FMAC row {i} returned {got:08x}").into());
+            }
+        }
         println!(
-            "{}: strict legacy multiply archive, 16/16 exact result words",
+            "{}: strict arithmetic archive, 16/16 legacy words and 2/2 FMAC words",
             dev.name()
         );
         Ok(())

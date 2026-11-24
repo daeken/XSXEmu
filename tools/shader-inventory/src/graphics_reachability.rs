@@ -403,7 +403,12 @@ impl LiftGaps {
                         Op::Move { .. } => name == "v_mov_b32_e32",
                         Op::AddF32Literal { .. } => name == "v_add_f32_e32",
                         Op::MulLegacyF32 { .. } => name == "v_mul_legacy_f32_e32",
-                        Op::FmaF32 { .. } => name == "v_fma_f32",
+                        Op::FmaF32 {
+                            accumulate: true, ..
+                        } => name == "v_fmac_f32_e32",
+                        Op::FmaF32 {
+                            accumulate: false, ..
+                        } => name == "v_fma_f32",
                         Op::Export { .. } => name == "exp",
                         Op::End => name == "s_endpgm",
                     }

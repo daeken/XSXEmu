@@ -92,7 +92,7 @@ fn lift(stage: Stage, words: &[u32]) -> Result<Vec<Op>, Reject> {
                 require(rhs)?;
                 live[usize::from(dst.0)] = true;
             }
-            Op::FmaF32 { dst, src } => {
+            Op::FmaF32 { dst, src, .. } => {
                 for r in src {
                     require(r)?;
                 }
@@ -153,6 +153,7 @@ fn body(out: &mut String, ops: &[Op]) {
             Op::FmaF32 {
                 dst: Vgpr(dst),
                 src: [Vgpr(a), Vgpr(b), Vgpr(c)],
+                ..
             } => {
                 writeln!(out, "  r[{dst}] = as_type<uint>(fma(as_type<float>(r[{a}]), as_type<float>(r[{b}]), as_type<float>(r[{c}])));").unwrap();
             }
@@ -185,21 +186,30 @@ static uint mul_legacy_f32_bits(uint a, uint b) {\n\
 
 const EDGE_VGPR: &[u32] = &[0x0e04_0300]; // v_mul_legacy_f32_e32 v2, v0, v1
 const EDGE_LITERAL: &[u32] = &[0x0e06_02ff, 0x3e80_0000]; // v_mul_legacy_f32_e32 v3, 0.25, v1
+const EDGE_FMAC: &[u32] = &[0x5608_0300]; // v_fmac_f32_e32 v4, v0, v1
 
 #[allow(dead_code)] // Used by the separate owned bit-exact edge probe.
 pub fn translate_legacy_edge_fixture() -> Result<String, DecodeError> {
     let (a_width, a) = decode(EDGE_VGPR, 0)?;
     let (b_width, b) = decode(EDGE_LITERAL, 0)?;
-    if (a_width, b_width) != (1, 2)
+    let (c_width, c) = decode(EDGE_FMAC, 0)?;
+    if (a_width, b_width, c_width) != (1, 2, 1)
+        || !matches!(
+            c,
+            Op::FmaF32 {
+                accumulate: true,
+                ..
+            }
+        )
         || !matches!(a, Op::MulLegacyF32 { .. })
         || !matches!(b, Op::MulLegacyF32 { .. })
     {
         return Err(DecodeError::Unsupported(0));
     }
     let mut msl = MSL_HEADER.to_owned();
-    msl.push_str("kernel void legacy_edges(const device uint2 *in [[buffer(0)]], device uint2 *out [[buffer(1)]], uint id [[thread_position_in_grid]]) {\n  uint r[256]; r[0] = in[id].x; r[1] = in[id].y;\n");
-    body(&mut msl, &[a, b]);
-    msl.push_str("  out[id] = uint2(r[2], r[3]);\n}\n");
+    msl.push_str("kernel void legacy_edges(const device uint4 *in [[buffer(0)]], device uint4 *out [[buffer(1)]], uint id [[thread_position_in_grid]]) {\n  uint r[256]; r[0] = in[id].x; r[1] = in[id].y; r[4] = in[id].z;\n");
+    body(&mut msl, &[a, b, c]);
+    msl.push_str("  out[id] = uint4(r[2], r[3], r[4], 0u);\n}\n");
     Ok(msl)
 }
 
@@ -252,12 +262,13 @@ mod tests {
             io::Write,
             process::{Command, Stdio},
         };
-        let asm = "v_mov_b32_e32 v8, v4\nexp param0 v8, v5, v6, v7\nexp pos0 v0, v1, v2, v3 done\ns_endpgm\nv_add_f32_e32 v4, 0.25, v0\nv_fma_f32 v5, v1, v2, v3\nv_mul_legacy_f32_e32 v6, v5, v4\nv_mul_legacy_f32_e32 v6, 0.5, v6\nv_mul_legacy_f32_e32 v7, 0, v3\nexp mrt0 v4, v5, v6, v7 done\ns_endpgm\nv_mul_legacy_f32_e32 v2, v0, v1\nv_mul_legacy_f32_e32 v3, 0.25, v1\n";
+        let asm = "v_mov_b32_e32 v8, v4\nexp param0 v8, v5, v6, v7\nexp pos0 v0, v1, v2, v3 done\ns_endpgm\nv_add_f32_e32 v4, 0.25, v0\nv_fma_f32 v5, v1, v2, v3\nv_mul_legacy_f32_e32 v6, v5, v4\nv_mul_legacy_f32_e32 v6, 0.5, v6\nv_mul_legacy_f32_e32 v7, 0, v3\nexp mrt0 v4, v5, v6, v7 done\ns_endpgm\nv_mul_legacy_f32_e32 v2, v0, v1\nv_mul_legacy_f32_e32 v3, 0.25, v1\nv_fmac_f32_e32 v4, v0, v1\n";
         let expected: Vec<u8> = VS
             .iter()
             .chain(PS)
             .chain(EDGE_VGPR)
             .chain(EDGE_LITERAL)
+            .chain(EDGE_FMAC)
             .flat_map(|w| w.to_le_bytes())
             .collect();
         for cpu in ["gfx1013", "gfx1030"] {
@@ -284,6 +295,18 @@ mod tests {
                 .collect();
             assert_eq!(bytes, expected, "{cpu}");
         }
+    }
+
+    #[test]
+    fn fmac_reads_old_destination_and_rejects_scalar_sources() {
+        assert_eq!(
+            lift(Stage::Pixel, EDGE_FMAC),
+            Err(Reject::Uninitialized(0, 4))
+        );
+        assert_eq!(
+            decode(&[EDGE_FMAC[0] & !(1 << 8)], 0),
+            Err(DecodeError::Unsupported(0))
+        );
     }
 
     #[test]

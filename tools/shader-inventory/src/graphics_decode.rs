@@ -35,6 +35,7 @@ pub(crate) enum Op {
     FmaF32 {
         dst: Vgpr,
         src: [Vgpr; 3],
+        accumulate: bool,
     },
     Export {
         target: Target,
@@ -110,6 +111,18 @@ pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeErro
             },
         ));
     }
+    // VOP2 FMAC: two ordinary VGPR inputs and the old destination as addend.
+    if w & 0xfe00_0100 == 0x5600_0100 {
+        let dst = Vgpr((w >> 17) as u8);
+        return Ok((
+            1,
+            Op::FmaF32 {
+                dst,
+                src: [Vgpr(w as u8), Vgpr((w >> 9) as u8), dst],
+                accumulate: true,
+            },
+        ));
+    }
     // VOP3 v_fma_f32: ordinary VGPRs only. No abs, neg, clamp or output modifier.
     if w & 0xffff_ff00 == 0xd54b_0000 {
         let fields = ext()?;
@@ -125,6 +138,7 @@ pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeErro
                     Vgpr((fields >> 9) as u8),
                     Vgpr((fields >> 18) as u8),
                 ],
+                accumulate: false,
             },
         ));
     }
