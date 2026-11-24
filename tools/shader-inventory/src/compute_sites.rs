@@ -1,7 +1,9 @@
 //! Test the relation between tagged layout words and stored code, without patching it.
 use crate::{
+    cfg::{self, Flow, Instruction},
     embedded::has_digest_prefix,
-    llvm::{Cpu, Llvm},
+    llvm::{Cpu, Disassembler, Llvm},
+    reachable::control,
     span, word,
 };
 use std::{
@@ -29,6 +31,67 @@ fn candidate(code: &[u8], offset: usize) -> Option<(&[u8], usize)> {
         _ => return None,
     };
     Some((bytes, dwords))
+}
+
+#[derive(Default)]
+struct Hypothesis {
+    complete: usize,
+    unsupported: usize,
+    outside: usize,
+    invalid: usize,
+    no_exit: usize,
+    starts: usize,
+    other_sites: usize,
+}
+impl Hypothesis {
+    fn add(&mut self, dis: &mut Disassembler, code: &[u8], entry: usize, sites: &[usize]) {
+        let mut scratch = [0; 1024];
+        let Some(body) = code.get(entry..) else {
+            self.outside += 1;
+            return;
+        };
+        let graph = cfg::walk_extent(body.len() / 4, |pc| {
+            let tail = &body[pc * 4..];
+            let (len, text) = dis.one(tail, entry + pc * 4, &mut scratch)?;
+            let mnemonic = text.split_ascii_whitespace().next()?;
+            let first = word(tail, 0)? as u32;
+            Some(Instruction {
+                width: len / 4,
+                flow: control(mnemonic, first, len)?,
+                op: (),
+            })
+        });
+        let graph = match graph {
+            Ok(graph) => graph,
+            Err(cfg::Error::UnsupportedEncoding) => {
+                self.unsupported += 1;
+                return;
+            }
+            Err(cfg::Error::BadSuccessor) => {
+                self.outside += 1;
+                return;
+            }
+            Err(_) => {
+                self.invalid += 1;
+                return;
+            }
+        };
+        if !graph.values().any(|inst| inst.flow == Flow::Stop) {
+            self.no_exit += 1;
+            return;
+        }
+        self.complete += 1;
+        for &site in sites {
+            if site
+                .checked_sub(entry)
+                .is_some_and(|p| graph.get(&(p / 4)).is_some_and(|op| op.width == 2))
+            {
+                self.starts += 1;
+            } else {
+                self.other_sites += 1;
+            }
+        }
+    }
 }
 
 pub fn run(lib: &OsStr, path: &Path) -> Result<(), Box<dyn Error>> {
@@ -62,6 +125,8 @@ pub fn run(lib: &OsStr, path: &Path) -> Result<(), Box<dyn Error>> {
     // Pair counts indexed by presence of nonzero sites, then by fingerprint shape.
     let mut prefixes = [[0; 3]; 2];
     let mut sites_in_first_36 = 0;
+    let entries = [24, 36];
+    let mut walks: [[Hypothesis; 2]; 2] = Default::default();
     for row in library.compute() {
         let leaf = ComputeMetadata::from_library(&library, row).ok_or("invalid compute leaf")?;
         let wave32 = leaf.dispatch.wave32;
@@ -77,6 +142,7 @@ pub fn run(lib: &OsStr, path: &Path) -> Result<(), Box<dyn Error>> {
             .program(row.program)
             .ok_or("missing compute program")?;
         let mut has_sites = false;
+        let mut pattern_sites = Vec::new();
         for item in layout[24..layout.len() - 32].chunks_exact(32) {
             let value = word(item, 4).unwrap();
             if word(item, 0).unwrap() == 0x41 {
@@ -97,6 +163,7 @@ pub fn run(lib: &OsStr, path: &Path) -> Result<(), Box<dyn Error>> {
                 continue;
             };
             in_pattern += 1;
+            pattern_sites.push(value);
             sites_in_first_36 += usize::from(value < 36);
             let (index, expect) = if dwords == 4 {
                 (0, "s_load_dwordx4")
@@ -123,6 +190,18 @@ pub fn run(lib: &OsStr, path: &Path) -> Result<(), Box<dyn Error>> {
             0
         };
         prefixes[usize::from(has_sites)][shape] += 1;
+        if shape != 0 && !pattern_sites.is_empty() {
+            for (i, profiles) in refs.iter_mut().enumerate() {
+                for (j, entry) in entries.into_iter().enumerate() {
+                    walks[i][j].add(
+                        &mut profiles[usize::from(wave32)],
+                        code,
+                        entry,
+                        &pattern_sites,
+                    );
+                }
+            }
+        }
     }
     println!(
         "Checked {} compute program/layout pairs across {} programs",
@@ -158,8 +237,23 @@ pub fn run(lib: &OsStr, path: &Path) -> Result<(), Box<dyn Error>> {
             nonzero - x4 - x8
         );
     }
+    for (cpu, per_entry) in cpus.into_iter().zip(walks) {
+        for (entry, w) in entries.into_iter().zip(per_entry) {
+            println!(
+                "{} conditional entry +{entry}: {} complete, {} decode/control rejects, {} outside successors, {} bad width/overlap, {} no exit; in complete graphs {} site starts, {} other sites",
+                cpu.name(),
+                w.complete,
+                w.unsupported,
+                w.outside,
+                w.invalid,
+                w.no_exit,
+                w.starts,
+                w.other_sites
+            );
+        }
+    }
     println!(
-        "Byte-pattern correspondence only: no instruction reachability, patch, descriptor or root binding inferred"
+        "Entry assumptions are counterfactual, not validated launch PCs; no patch, descriptor or root binding inferred"
     );
     Ok(())
 }
@@ -167,6 +261,34 @@ pub fn run(lib: &OsStr, path: &Path) -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn conditional_entry_tracks_absolute_site_boundaries() {
+        let Some(path) = std::env::var_os("LLVM_DISASM_LIB") else {
+            return;
+        };
+        let llvm = Llvm::load(&path).unwrap();
+        let mut dis = llvm.context(Cpu::Gfx1030, true).unwrap();
+        let mut code = [0xff; 44];
+        for (at, value) in [
+            (24, 0xf4080100u32),
+            (28, 0xfa000000),
+            (32, 0xbf800000),
+            (36, 0xbf810000),
+        ] {
+            code[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        let mut first = Hypothesis::default();
+        first.add(&mut dis, &code, 24, &[24, 28]);
+        assert_eq!((first.complete, first.starts, first.other_sites), (1, 1, 1));
+        let mut late = Hypothesis::default();
+        late.add(&mut dis, &code, 36, &[24, 28]);
+        assert_eq!((late.complete, late.starts, late.other_sites), (1, 0, 2));
+        // Backward branch targets a word before the assumed entry.
+        code[36..40].copy_from_slice(&0xbf82fffeu32.to_le_bytes());
+        late.add(&mut dis, &code, 36, &[24, 28]);
+        assert_eq!((late.complete, late.outside, late.other_sites), (1, 1, 2));
+    }
+
     #[test]
     fn site_is_relative_to_start_and_bounded_before_decode() {
         let mut code = [0; 24];

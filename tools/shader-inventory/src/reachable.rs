@@ -23,7 +23,7 @@ use std::{
 const HEADER: usize = 0x148;
 const FILE_LIMIT: usize = 100_000;
 
-fn control(name: &str, first: u32, size: usize) -> Option<Flow> {
+pub(crate) fn control(name: &str, first: u32, size: usize) -> Option<Flow> {
     // Verify both the public GFX10 encoding and the selected MC mnemonic. The
     // walker doesn't accept a textual displacement or invent fallthrough for
     // a control instruction it cannot model.

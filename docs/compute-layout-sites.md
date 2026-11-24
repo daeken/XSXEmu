@@ -14,4 +14,15 @@ On the pinned input (2,684 pairs, 2,684 distinct programs), item word 1 (`u32` a
 
 The first two 12-byte groups carry the same partial footer-digest fingerprint checked in DLL FSPX for **2,684/2,684** pairs. Only **2,634** have the third `0xd580` group marker: those are exactly the pairs without a nonzero `0x42` site. All **50** with a nonzero site lack that marker, and one checked scalar-load pattern starts before byte 36. Thus a blanket 36-byte prefix skip for this library would omit a checked site. Neither the 24-byte fingerprint nor the third marker establishes the first executable instruction.
 
+For the 50 pairs with nonzero sites, the same command also tests **conditional** CFG walks starting at byte 24 or 36. Each run excludes the preceding bytes, treats edges before the assumed entry or after the stored span as out of bounds, and requires at least one modeled exit. It does not require every path to terminate. A site counts only at an eight-byte instruction start in a complete modeled graph; a failed walk does not classify its sites.
+
+| LLVM CPU | Assumed entry | Complete / rejected pairs | Site starts / other sites in complete graphs |
+|---|---:|---:|---:|
+| `gfx1013` | 24 | 41 / 9 | 1,855 / 0 |
+| `gfx1013` | 36 | 41 / 9 | 1,853 / 2 |
+| `gfx1030` | 24 | 12 / 38 | 62 / 0 |
+| `gfx1030` | 36 | 12 / 38 | 60 / 2 |
+
+The rejected pairs stopped on an unsupported decode or control transfer, not a detected out-of-bounds edge or overlap. This comparison disfavors assuming byte 36 for these layouts but does not authenticate byte 24 as the hardware entry. The fixture checks a site at entry, a word inside its extension, and a rejected edge back into the omitted prefix.
+
 This supplies strong offset-base and unit evidence for **nonzero** `0x42` word 1 in PS/0/9 compute. It does not establish why the loads are named, what role zero plays, whether any load is reached from an authenticated entry PC, whether the loader patches it, or how the loaded data is bound. The two tested decoder profiles are independent encoding references with no fallback; neither decode proves Xbox execution semantics. An owned unit fixture checks alignment, truncation, overflow, and the accepted words. No title shader was executed or modified.
