@@ -401,12 +401,12 @@ allocates a static slot for every validated directory, even with an empty
 template, and the ordinary lane rejects PE static TLS at startup. The Rust
 provider uses `ERROR_INVALID_HANDLE` for non-DLL handles and
 `ERROR_INVALID_PARAMETER` for a DLL with static TLS. Success preserves
-LastError. There are no guest thread attach/detach notifications to suppress
-in the single-thread model, and process attach/detach still run.
+LastError. On success the shared module graph suppresses worker attach/detach
+for that DLL. Process attach/detach still run.
 `GetCurrentThreadId` returns the existing Rust provider's nonzero, process-local
 DWORD, not a macOS thread ID. The initial guest TEB's `ClientId.UniqueThread`
 (`GS:[0x48]`) is seeded from the same provider before guest execution. The
-bridge preserves `LastError`; it does not add guest thread creation or handles.
+bridge preserves `LastError`. Workers likewise get their own ID and matching TEB field.
 An owned PE imports it through `api-ms-win-core-processthreads-l1-1-0.dll` and
 checks the return against the TEB and verifies `LastError` across repeated calls.
 
@@ -442,14 +442,48 @@ handle.
 
 The first worker statically uses `WaitForSingleObject(handle, INFINITE)`
 through IAT RVA `0x6793b20` and `ReleaseSemaphore(other, 1, NULL)` through
-`0x6793b08`. These audited bridges operate only on semaphore objects. A wait
+`0x6793b08`. The release bridge operates only on semaphore objects. A semaphore wait
 requires `SYNCHRONIZE`, consumes one count on success, and returns
 `WAIT_TIMEOUT` without touching LastError if a zero or finite timeout expires.
 An infinite wait blocks until a count is available. Release requires
 `SEMAPHORE_MODIFY_STATE`, optionally writes the previous count, and rejects
 nonpositive increments and overflow without modifying count or output.
-Closing a handle concurrently with a wait is outside the contract. Other
-object waits and alertable or multiple-object waits are unsupported.
+Closing a handle concurrently with a wait is outside the contract. Object waits other than thread and semaphore waits, and alertable or
+multiple-object waits, are unsupported.
+
+#### Bounded guest worker threads
+
+The first observed `CreateThread` call (IAT RVA `0x67934a0`) follows two
+zero-count binary semaphores. It passes null security, `0x10000` bytes,
+start RVA `0x55e8b00`, an object pointer, flags zero, and a writable thread-ID
+DWORD on the caller stack. The worker immediately waits indefinitely on the
+first semaphore, and releases the second on its work-loop completion path.
+The first wait and release are `WaitForSingleObject` and `ReleaseSemaphore`
+from `api-ms-win-core-synch-l1-1-0.dll`.
+
+The audited six-scalar `CreateThread` bridge accepts only flags zero and
+null security, from the EXE entry or an existing worker start routine. It
+validates the start against sealed executable PE contents and any active
+CFG policy. It creates a genuine host thread (up to 32 concurrent workers),
+with guarded stack space at least as large as the request plus host bridge
+headroom, not Windows reserve/commit semantics. Each worker captures its own
+Rosetta host GS and owns its guest TEB, static TLS vector/templates, dynamic
+TLS values, LastError and ID. The Win64 entry receives the parameter in RCX,
+with aligned stack/home space, and captures the DWORD return after checking
+both GS domains. Loader notifications run serially: dependency-order DLLs
+then EXE TLS callbacks on attach, reverse ordering on detach. Within a module,
+TLS callbacks precede DllMain. No guest routine is invoked inline by the
+creating bridge. Worker FLS stops explicitly when called; it needs a
+process-wide index and callback model beyond the initial-thread provider.
+
+Only thread and semaphore handles participate in non-alertable single
+waits (including polling, timeout and infinite wait). Closing a thread
+handle does not stop the worker. Its object signals after thread detach,
+while separate host join ownership ensures workers are gone before process
+detach and mapping/CFG teardown. If the EXE returns and any workers fail to
+finish within 500 ms, the child exits with a diagnostic without running
+process detach. No suspended creation, `ExitThread`, forced termination,
+alertable/multiple waits, or Windows exception unwinding is added.
 
 `CreateEventA` uses a four-argument bridge. The direct calls and tail thunk
 referencing IAT RVA `0x6793ab0` pass null security and name, manual-reset

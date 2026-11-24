@@ -157,6 +157,10 @@ pub fn lookup(dll: &[u8], name: &[u8]) -> Option<HostExport> {
         (b"kernelbase.dll" | b"kernel32.dll" | PROCESS_THREADS, b"GetCurrentProcessId") => {
             export!(KERNELBASE, "GetCurrentProcessId", current_process_id)
         }
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        (b"kernelbase.dll" | b"kernel32.dll" | PROCESS_THREADS, b"CreateThread") => {
+            export!(KERNELBASE, "CreateThread", create_thread)
+        }
         (b"kernelbase.dll" | b"kernel32.dll" | PROCESS_THREADS, b"GetCurrentThreadId") => {
             export!(KERNELBASE, "GetCurrentThreadId", current_thread_id)
         }
@@ -272,6 +276,9 @@ pub(crate) mod native {
         );
         ERROR_FILE_NOT_FOUND
     }
+
+    #[cfg(target_os = "macos")]
+    pub(super) use crate::tls_runtime::create_thread;
 
     static NEXT_THREAD_ID: AtomicU32 = AtomicU32::new(1);
     // Odd generations are allocated. Even generations are free; a slot with
@@ -668,7 +675,7 @@ mod tests {
         for (dll, name) in [
             (HEAP, b"GetLastError".as_slice()),
             (ERROR_HANDLING, b"HeapAlloc"),
-            (PROCESS_THREADS, b"CreateThread"),
+            (PROCESS_THREADS, b"CreateRemoteThread"),
             (b"api-ms-win-core-heap-l1-2-0.dll", b"HeapAlloc"),
             (b"ntdll.dll", b"GetLastError"),
             (b"kernel32.dll", b"RtlGetLastWin32Error"),

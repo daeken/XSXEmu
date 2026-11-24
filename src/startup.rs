@@ -598,7 +598,13 @@ mod native {
             // Registration remains exact-address, including bounded legacy root
             // callbacks in trusted offline mode. Export lookup never adds targets.
             let _cfg_registration = targets.map(Targets::install).transpose()?;
-            let outcome = tls_runtime::run(&tls, images, &pes, &memories, attach_order);
+            let outcome = tls_runtime::run(
+                std::sync::Arc::new(tls),
+                images,
+                &pes,
+                &memories,
+                attach_order,
+            );
             win_fls::native::finish_initial_thread()?;
             return outcome;
         }

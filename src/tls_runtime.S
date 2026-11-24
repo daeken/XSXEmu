@@ -28,6 +28,12 @@
     callq *{setter}(\ctx)
 .endm
 
+/* Thread start takes a single LPVOID in RCX and returns a DWORD in EAX.
+ * Share the fixed frame and checked return path with notifications. Zero
+ * the unused EDX/R8D arguments; this does not emulate Windows SEH or ExitThread. */
+.globl _xsxemu_tls_thread_call
+_xsxemu_tls_thread_call:
+    xorl %ecx, %ecx
 .globl _xsxemu_tls_call
 _xsxemu_tls_call:
     pushq %r12

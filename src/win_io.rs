@@ -331,7 +331,59 @@ pub(crate) mod native {
         Ok(access)
     }
 
+    #[cfg(target_os = "macos")]
+    #[derive(Default)]
+    pub(crate) struct ThreadCompletion {
+        exit_code: Mutex<Option<u32>>,
+        exited: Condvar,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl ThreadCompletion {
+        pub(crate) fn finish(&self, code: u32) {
+            *lock(&self.exit_code) = Some(code);
+            self.exited.notify_all();
+        }
+
+        fn wait(&self, ms: u32) -> u32 {
+            let code = lock(&self.exit_code);
+            let code = match ms {
+                0 => code,
+                u32::MAX => self
+                    .exited
+                    .wait_while(code, |code| code.is_none())
+                    .unwrap_or_else(|e| e.into_inner()),
+                _ => {
+                    self.exited
+                        .wait_timeout_while(code, Duration::from_millis(ms.into()), |code| {
+                            code.is_none()
+                        })
+                        .unwrap_or_else(|e| e.into_inner())
+                        .0
+                }
+            };
+            if code.is_some() {
+                WAIT_OBJECT_0
+            } else {
+                WAIT_TIMEOUT
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn new_thread_handle() -> Result<(usize, Arc<ThreadCompletion>)> {
+        let completion = Arc::new(ThreadCompletion::default());
+        let handle = lock(&STATE).insert(Entry {
+            obj: Arc::new(Object::Thread(completion.clone())),
+            access: SYNCHRONIZE,
+            inheritable: false,
+        })?;
+        Ok((handle, completion))
+    }
+
     enum Object {
+        #[cfg(target_os = "macos")]
+        Thread(Arc<ThreadCompletion>),
         File(FileObject),
         #[cfg(target_os = "macos")]
         Console(Terminal),
@@ -828,6 +880,13 @@ pub(crate) mod native {
             (|| {
                 // Clone the entry before sleeping; never hold the handle-table lock.
                 let e = entry(h)?;
+                #[cfg(target_os = "macos")]
+                if let Object::Thread(thread) = &*e.obj {
+                    if e.access & SYNCHRONIZE == 0 {
+                        return Err(ACCESS);
+                    }
+                    return Ok(thread.wait(milliseconds));
+                }
                 let Object::Semaphore {
                     count, available, ..
                 } = &*e.obj
@@ -952,7 +1011,7 @@ pub(crate) mod native {
         )
     }
 
-    pub(super) extern "win64" fn CloseHandle(h: usize) -> i32 {
+    pub(crate) extern "win64" fn CloseHandle(h: usize) -> i32 {
         boolean((|| {
             let mut st = lock(&STATE);
             if !st
@@ -1003,6 +1062,8 @@ pub(crate) mod native {
             if options & 2 == 0 {
                 let requested = match &*e.obj {
                     Object::Semaphore { .. } => sync_access(access, SEMAPHORE_ALL_ACCESS)?,
+                    #[cfg(target_os = "macos")]
+                    Object::Thread(_) => sync_access(access, SYNCHRONIZE)?,
                     Object::Event { .. } => sync_access(access, EVENT_ALL_ACCESS)?,
                     Object::Mutex { .. } => sync_access(access, MUTEX_ALL_ACCESS)?,
                     _ => access_mask(access)?,
@@ -1571,6 +1632,8 @@ pub(crate) mod native {
                 #[cfg(target_os = "macos")]
                 Object::Console(_) => Ok(2),
                 Object::Pipe(_) => Ok(3),
+                #[cfg(target_os = "macos")]
+                Object::Thread(_) => Err(BAD_HANDLE),
                 Object::Search(_)
                 | Object::Semaphore { .. }
                 | Object::Event { .. }

@@ -1,12 +1,7 @@
-//! Experimental single-thread static TLS, only in a fresh translated child.
+//! Experimental static TLS and bounded guest threads in a fresh Rosetta child.
 //! This is an ABI experiment for trusted PE code, not confinement or SEH.
-//! The public CLI starts a fresh child before opening the image graph and
-//! kills/reaps it after ten seconds if it has not exited. Only the initial
-//! thread and four TEB fields are provided. There is no dynamic TLS, thread
-//! notification, or exception recovery. DLLs attach dependency-first and
-//! detach in reverse; EXE notifications bracket entry. TLS callbacks precede
-//! the same module's DllMain on both notifications. A rejected attach detaches
-//! only previously attached DLLs.
+//! DLLs attach dependency-first and detach in reverse. In each module TLS
+//! callbacks precede DllMain; the EXE has callbacks but no thread DllMain.
 use crate::{
     Result, TLS_CHILD, darwin_guest_mask as mask,
     guest::GuestMemory,
@@ -30,7 +25,9 @@ use std::{
 
 #[path = "tls_provider_abi.rs"]
 mod provider_abi;
+mod threads;
 pub use provider_abi::bridge_address;
+pub(crate) use threads::create_thread;
 
 const CHILD_TIMEOUT: Duration = Duration::from_secs(10);
 const UNIQUE_THREAD_OFFSET: usize = 0x48;
@@ -92,6 +89,10 @@ unsafe extern "C" {
         new_len: usize,
     ) -> c_int;
     fn _thread_set_tsd_base(base: u64);
+    fn pthread_self() -> *mut c_void;
+    fn pthread_get_stackaddr_np(thread: *mut c_void) -> *mut c_void;
+    fn pthread_get_stacksize_np(thread: *mut c_void) -> usize;
+    fn xsxemu_tls_thread_call(ctx: *const Context, target: u64, parameter: u64) -> u32;
     fn xsxemu_tls_call(ctx: *const Context, target: u64, image: u64, reason: u32) -> u32;
 }
 
@@ -432,7 +433,7 @@ fn startup_trace(message: std::fmt::Arguments<'_>) {
 }
 
 pub fn run(
-    plan: &Plan,
+    plan: std::sync::Arc<Plan>,
     images: &[(&str, &[u8])],
     pes: &[Pe<'_>],
     memories: &[GuestMemory],
@@ -449,31 +450,58 @@ pub fn run(
     if pes[0].entry_rva == 0 {
         return Err("experimental static TLS requires an EXE entry point".into());
     }
+    let trace = std::env::var_os("XSXEMU_TRACE_STARTUP").is_some_and(|v| v == "1");
     let thread = plan.new_thread()?;
     let vector = thread.vector_address().ok_or("missing static TLS vector")?;
-    // Minimal TEB stub: Self, ClientId.UniqueThread, ThreadLocalStoragePointer
-    // and LastErrorValue (zero initially, shared with provider bridges).
-    // Seed the ID from the same host-side thread-local used by the provider.
-    let thread_id = crate::providers::native::current_thread_id();
+    with_context(vector, trace, |ctx, _| {
+        run_primary(plan, images, pes, memories, order, callbacks, ctx)
+    })?
+}
+
+fn with_context<T>(vector: u64, trace: bool, run: impl FnOnce(&Context, u32) -> T) -> Result<T> {
     let mut teb = [0u64; 32];
     let teb_ptr = teb.as_mut_ptr();
-    let guest_base = teb_ptr.addr() as u64;
-    unsafe {
-        teb_ptr.add(0x30 / 8).write(guest_base);
-        teb_ptr
-            .add(UNIQUE_THREAD_OFFSET / 8)
-            .write(u64::from(thread_id));
-        teb_ptr.add(0x58 / 8).write(vector);
-    }
-    let trace = std::env::var_os("XSXEMU_TRACE_STARTUP").is_some_and(|v| v == "1");
+    let guest_base = teb_ptr.expose_provenance() as u64;
+    let id = crate::providers::native::current_thread_id();
+    let (stack_base, stack_limit) = unsafe {
+        let host = pthread_self();
+        let base = pthread_get_stackaddr_np(host).addr();
+        (base, base.checked_sub(pthread_get_stacksize_np(host)))
+    };
+    let stack_limit = stack_limit
+        .filter(|lo| *lo != 0 && *lo < stack_base)
+        .ok_or("invalid host stack bounds")?;
     let ctx = Context::capture(guest_base, vector, trace)?;
-    // Keep this pointer and the stub live through all notifications and entry.
     unsafe {
+        // Distinct physical stacks: each guest calls on its own guarded host
+        // thread stack, above the bridge frames, not on the creator's stack.
+        teb_ptr.add(0x08 / 8).write(stack_base as u64);
+        teb_ptr.add(0x10 / 8).write(stack_limit as u64);
+        teb_ptr.add(0x30 / 8).write(guest_base);
+        teb_ptr.add(UNIQUE_THREAD_OFFSET / 8).write(u64::from(id));
+        teb_ptr.add(0x58 / 8).write(vector);
         teb_ptr
             .add(CONTEXT_OFFSET / 8)
             .cast::<*const Context>()
-            .write(&raw const ctx)
-    };
+            .write(&raw const ctx);
+    }
+    let result = run(&ctx, id);
+    // Assembly reaches this memory indirectly through the published TEB
+    // address, not an ordinary Rust borrow. Keep its initialized storage live.
+    std::hint::black_box(teb_ptr);
+    Ok(result)
+}
+
+fn run_primary(
+    plan: std::sync::Arc<Plan>,
+    images: &[(&str, &[u8])],
+    pes: &[Pe<'_>],
+    memories: &[GuestMemory],
+    order: &[usize],
+    callbacks: Vec<Vec<u64>>,
+    ctx: &Context,
+) -> Result<u32> {
+    let trace = ctx.trace_startup;
     let call = |i: usize, phase, target, image, reason| {
         let module = images[i].0;
         let rva = target - memories[i].base();
@@ -484,7 +512,7 @@ pub fn run(
         }
         // All targets are in sealed executable sections, and the caller opted
         // into running trusted Win64 code that returns without unwinding.
-        let status = unsafe { xsxemu_tls_call(&raw const ctx, target, image, reason) };
+        let status = unsafe { xsxemu_tls_call(ctx, target, image, reason) };
         if trace {
             startup_trace(format_args!(
                 "end phase={phase} module={module:?} target={target:#x} rva={rva:#x}"
@@ -512,6 +540,7 @@ pub fn run(
         pes[i].entry_rva == 0
             || call(i, phase, base + u64::from(pes[i].entry_rva), base, reason) != 0
     };
+    let workers = threads::Workers::new(plan, pes, memories, order, &callbacks, trace)?;
     let original = mask::mask(None)?;
     mask::fault_defaults(original)?;
     mask::apply(mask::BLOCKED, original)?;
@@ -537,13 +566,16 @@ pub fn run(
         }
         crate::providers::win_loader::set_xgameruntime_ready(true);
         notify(0, 1);
-        let status = call(
-            0,
-            "exe-entry",
-            memories[0].base() + u64::from(pes[0].entry_rva),
-            0,
-            0,
-        );
+        let status = workers.enter(|| {
+            call(
+                0,
+                "exe-entry",
+                memories[0].base() + u64::from(pes[0].entry_rva),
+                0,
+                0,
+            )
+        });
+        workers.drain();
         notify(0, 0);
         Ok(status)
     })();

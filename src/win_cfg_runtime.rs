@@ -171,10 +171,23 @@ pub struct Registration {
 
 impl Drop for Registration {
     fn drop(&mut self) {
-        // Startup owns the registration through the last guest call and does not
-        // support concurrent guest execution. Withdraw before unmapping it.
+        // Startup owns the registration through all guest calls and worker
+        // joins. Withdraw before unmapping the table.
         ACTIVE.store(0, Ordering::Release);
     }
+}
+
+// The TLS runtime holds Registration through every worker join. Do not use
+// this from arbitrary host callers, which cannot guarantee that lifetime.
+pub(crate) unsafe fn permits_thread_start(address: u64) -> bool {
+    let table = ACTIVE.load(Ordering::Acquire) as *const u64;
+    table.is_null()
+        || unsafe {
+            let len = table.read() as usize;
+            std::slice::from_raw_parts(table.add(1), len)
+                .binary_search(&address)
+                .is_ok()
+        }
 }
 
 // Handwritten leaf thunks: no host ABI calls, no SIMD instructions (including

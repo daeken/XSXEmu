@@ -135,15 +135,21 @@ fn registry_aliases_are_exact() {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-pub(crate) use native::{register, set_xgameruntime_ready};
+pub(crate) use native::{
+    ThreadGraph, register, set_xgameruntime_ready, thread_notifications_enabled,
+};
 
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod native {
     use crate::{link::Symbol, providers};
     use std::{
-        cell::{Cell, RefCell},
+        cell::RefCell,
         collections::{HashMap, HashSet},
         ffi::c_void,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicU32, Ordering},
+        },
     };
 
     const ERROR_INVALID_HANDLE: u32 = 6;
@@ -186,7 +192,8 @@ pub(crate) mod native {
         is_dll: bool,
         has_static_tls: bool,
         // Startup's ownership is independent of these guest acquisitions.
-        references: Cell<u32>,
+        references: AtomicU32,
+        disable_thread_calls: AtomicBool,
         names: HashMap<Vec<u8>, usize>,
         ordinals: HashMap<u32, usize>,
         targets: Vec<Target>,
@@ -198,11 +205,11 @@ pub(crate) mod native {
         #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
         entropy_module: Option<usize>,
         #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-        xgameruntime: Option<(usize, Cell<bool>)>,
+        xgameruntime: Option<(usize, AtomicBool)>,
     }
 
     thread_local! {
-        static GRAPH: RefCell<Option<Graph>> = const { RefCell::new(None) };
+        static GRAPH: RefCell<Option<Arc<Graph>>> = const { RefCell::new(None) };
     }
 
     fn basename(path: &str) -> &str {
@@ -233,12 +240,9 @@ pub(crate) mod native {
 
     impl Image {
         fn acquire(&self) -> Result<usize, u32> {
-            let next = self
-                .references
-                .get()
-                .checked_add(1)
-                .ok_or(ERROR_NOT_ENOUGH_MEMORY)?;
-            self.references.set(next);
+            self.references
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+                .map_err(|_| ERROR_NOT_ENOUGH_MEMORY)?;
             Ok(self.base)
         }
     }
@@ -327,8 +331,21 @@ pub(crate) mod native {
             win_cfg::{CfgMetadata, ExportSuppression},
         };
         use std::marker::PhantomData;
+        use std::sync::Arc;
 
         pub(crate) struct Registration(PhantomData<*mut ()>);
+
+        impl Registration {
+            pub(super) fn install(graph: Arc<Graph>) -> Result<Self> {
+                GRAPH.with_borrow_mut(|slot| {
+                    if slot.is_some() {
+                        return Err("mapped module graph already installed on this thread".into());
+                    }
+                    *slot = Some(graph);
+                    Ok(Self(PhantomData))
+                })
+            }
+        }
 
         impl Drop for Registration {
             fn drop(&mut self) {
@@ -419,6 +436,7 @@ pub(crate) mod native {
                     // template. Read the source PE metadata, not guest memory.
                     has_static_tls: pe.directory(9).is_some(), // IMAGE_DIRECTORY_ENTRY_TLS
                     references: Default::default(),
+                    disable_thread_calls: Default::default(),
                     names: Default::default(),
                     ordinals: Default::default(),
                     targets: Vec::new(),
@@ -459,19 +477,12 @@ pub(crate) mod native {
             {
                 return Err("invalid xgameruntime mapping registration".into());
             }
-            GRAPH.with(|slot| {
-                let mut slot = slot.borrow_mut();
-                if slot.is_some() {
-                    return Err("mapped module graph already installed on this thread".into());
-                }
-                *slot = Some(Graph {
-                    images,
-                    rust_providers,
-                    entropy_module,
-                    xgameruntime: xgameruntime.map(|i| (i, Default::default())),
-                });
-                Ok(Registration(PhantomData))
-            })
+            Registration::install(Arc::new(Graph {
+                images,
+                rust_providers,
+                entropy_module,
+                xgameruntime: xgameruntime.map(|i| (i, Default::default())),
+            }))
         }
     }
 
@@ -832,8 +843,35 @@ pub(crate) mod native {
         }
     }
 
+    // Share the same module namespace and references, not a worker-local copy.
+    #[cfg(target_os = "macos")]
+    pub(crate) struct ThreadGraph(Arc<Graph>);
+
+    #[cfg(target_os = "macos")]
+    impl ThreadGraph {
+        pub(crate) fn capture() -> crate::Result<Self> {
+            GRAPH.with_borrow(|slot| {
+                slot.clone()
+                    .map(Self)
+                    .ok_or_else(|| "missing mapped module graph".into())
+            })
+        }
+
+        pub(crate) fn install(&self) -> crate::Result<registration::Registration> {
+            registration::Registration::install(self.0.clone())
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn thread_notifications_enabled(base: usize) -> bool {
+        graph(|g| {
+            g.and_then(|g| g.by_handle(base))
+                .is_some_and(|image| !image.disable_thread_calls.load(Ordering::Acquire))
+        })
+    }
+
     fn graph<T>(f: impl FnOnce(Option<&Graph>) -> T) -> T {
-        GRAPH.with(|slot| f(slot.borrow().as_ref()))
+        GRAPH.with(|slot| f(slot.borrow().as_deref()))
     }
 
     fn fail<T: Default>(error: u32) -> T {
@@ -924,14 +962,14 @@ pub(crate) mod native {
     fn xgameruntime_image(graph: Option<&Graph>) -> Option<&Image> {
         let g = graph?;
         let (index, ready) = g.xgameruntime.as_ref()?;
-        ready.get().then(|| &g.images[*index])
+        ready.load(Ordering::Acquire).then(|| &g.images[*index])
     }
 
     #[cfg(target_os = "macos")]
     pub(crate) fn set_xgameruntime_ready(ready: bool) {
         graph(|g| {
             if let Some((_, state)) = g.and_then(|g| g.xgameruntime.as_ref()) {
-                state.set(ready);
+                state.store(ready, Ordering::Release);
             }
         });
     }
@@ -1016,18 +1054,19 @@ pub(crate) mod native {
             if image.has_static_tls {
                 return fail(ERROR_INVALID_PARAMETER);
             }
-            // No guest thread attach/detach events are generated in the current
-            // single-thread model. Process attach/detach are not affected.
+            image.disable_thread_calls.store(true, Ordering::Release);
             1
         })
     }
 
     fn release(image: &Image) -> i32 {
-        let Some(next) = image.references.get().checked_sub(1) else {
-            return fail(ERROR_INVALID_HANDLE);
-        };
-        image.references.set(next);
-        1
+        match image
+            .references
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+        {
+            Ok(_) => 1,
+            Err(_) => fail(ERROR_INVALID_HANDLE),
+        }
     }
 
     pub(crate) extern "win64" fn free_library(module: usize) -> i32 {

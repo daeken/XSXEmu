@@ -25,7 +25,29 @@ pub(crate) fn lookup(dll: &[u8], name: &[u8]) -> Option<HostExport> {
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod native {
     use crate::providers::set_last_error;
+    #[cfg(target_os = "macos")]
+    use std::cell::Cell;
     use std::{cell::RefCell, ffi::c_void, io::Write, ptr};
+
+    #[cfg(target_os = "macos")]
+    fn require_initial_thread() {
+        if GUEST_WORKER.get() {
+            stop(
+                "unsupported FLS operation on a guest worker (process-wide FLS indexes are not implemented)",
+            );
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn require_initial_thread() {}
+
+    #[cfg(target_os = "macos")]
+    thread_local! { static GUEST_WORKER: Cell<bool> = const { Cell::new(false) }; }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn mark_guest_worker() {
+        GUEST_WORKER.set(true);
+    }
 
     const ERROR_INVALID_PARAMETER: u32 = 87;
     const ERROR_NO_MORE_ITEMS: u32 = 259;
@@ -54,6 +76,7 @@ pub(crate) mod native {
     }
 
     pub(crate) extern "win64" fn fls_alloc(callback: Callback) -> u32 {
+        require_initial_thread();
         INITIAL_FIBER.with_borrow_mut(|slots| {
             if let Some((i, slot)) = slots
                 .iter_mut()
@@ -73,6 +96,7 @@ pub(crate) mod native {
     }
 
     pub(crate) extern "win64" fn fls_get_value(index: u32) -> *mut c_void {
+        require_initial_thread();
         INITIAL_FIBER.with_borrow(|slots| {
             if let Some(slot) = slots.get(index as usize).and_then(Option::as_ref) {
                 set_last_error(0); // An allocated slot can hold NULL.
@@ -84,6 +108,7 @@ pub(crate) mod native {
     }
 
     pub(crate) extern "win64" fn fls_set_value(index: u32, value: *mut c_void) -> i32 {
+        require_initial_thread();
         INITIAL_FIBER.with_borrow_mut(|slots| {
             if let Some(slot) = slots.get_mut(index as usize).and_then(Option::as_mut) {
                 slot.value = value;
@@ -95,6 +120,7 @@ pub(crate) mod native {
     }
 
     pub(crate) extern "win64" fn fls_free(index: u32) -> i32 {
+        require_initial_thread();
         let result = INITIAL_FIBER.with_borrow_mut(|slots| {
             let Some(slot) = slots.get_mut(index as usize).filter(|s| s.is_some()) else {
                 return Ok(false);
@@ -113,15 +139,14 @@ pub(crate) mod native {
             }
             // Do not complete the free, return a pretend Win32 failure, or
             // call an unaudited guest target from Rust. Already on host GS.
-            Err(()) => stop_for_callback(index),
+            Err(()) => stop(&format!(
+                "unsupported FLS callback: FlsFree requires invocation for slot {index}"
+            )),
         }
     }
 
-    fn stop_for_callback(index: u32) -> ! {
-        let _ = writeln!(
-            std::io::stderr().lock(),
-            "xsxemu: unsupported FLS callback: FlsFree requires invocation for slot {index}"
-        );
+    fn stop(message: &str) -> ! {
+        let _ = writeln!(std::io::stderr().lock(), "xsxemu: {message}");
         // As with a TLS child missing-import trap, skip host atexit handlers.
         #[cfg(unix)]
         {

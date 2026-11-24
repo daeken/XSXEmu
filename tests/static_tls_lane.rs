@@ -3499,3 +3499,101 @@ fn unsupported_guardcf_policy_and_guard_tls_overlap_fail_preentry() {
         "IAT, security-cookie, or GuardCF write conflict",
     );
 }
+
+const THREAD_CODE: usize = 0x600;
+#[repr(C)]
+struct ThreadFixture {
+    entry: u32,
+    callback: u32,
+    dll: u32,
+    probe: u32,
+    bytes: [u8; THREAD_CODE],
+}
+
+global_asm!(include_str!("fixtures/static_tls_threads.S"),
+    capacity = const THREAD_CODE, iat = const IAT - TEXT, index = const INDEX - TEXT,
+    mode = const MODE - TEXT, data = const DATA + 0x380 - TEXT, cookie = const COOKIE - TEXT,
+    options(att_syntax),
+);
+unsafe extern "C" {
+    static thread_fixture: ThreadFixture;
+}
+
+#[test]
+fn created_guest_thread_has_own_teb_and_tls_and_joins_before_process_detach() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let fixture = unsafe { &thread_fixture };
+    let prepare = |kind: Kind, entry: u32| {
+        let mut pe = image(kind);
+        put(&mut pe, file(TEXT), &fixture.bytes);
+        w32(&mut pe, OP + 16, TEXT + entry as usize);
+        w64(
+            &mut pe,
+            file(ARRAY),
+            PREFERRED + TEXT + fixture.callback as usize,
+        );
+        pe
+    };
+    let mut dll = prepare(Kind::Dll, fixture.dll);
+    w32(&mut dll, file(LINK) + 0x30, TEXT + fixture.probe as usize);
+    scratch.write("owned.dll", &dll);
+    let mut exe = prepare(Kind::Solo, fixture.entry);
+    dir(&mut exe, 1, LINK, 5 * 20);
+    let groups: &[(&[u8], &[&[u8]])] = &[
+        (
+            b"api-ms-win-core-processthreads-l1-1-0.dll\0",
+            &[b"CreateThread\0", b"GetCurrentThreadId\0"],
+        ),
+        (
+            b"api-ms-win-core-synch-l1-1-0.dll\0",
+            &[
+                b"CreateSemaphoreExW\0",
+                b"WaitForSingleObject\0",
+                b"ReleaseSemaphore\0",
+            ],
+        ),
+        (b"api-ms-win-core-handle-l1-1-0.dll\0", &[b"CloseHandle\0"]),
+        (b"owned.dll\0", &[b"Step\0"]),
+    ];
+    // Every descriptor needs its own terminating IAT entry, even when the
+    // adjacent lookup table has its own terminator as well.
+    let iat_offsets = [0, 3, 7, 9];
+    for (i, &(module, imports)) in groups.iter().enumerate() {
+        let rec = file(LINK) + 20 * i;
+        let lookup = LINK + 0x80 + 0x28 * i;
+        let name = LINK + 0x140 + 0x40 * i;
+        w32(&mut exe, rec, lookup);
+        w32(&mut exe, rec + 12, name);
+        w32(&mut exe, rec + 16, IAT + 8 * iat_offsets[i]);
+        put(&mut exe, file(name), module);
+        for (j, symbol) in imports.iter().enumerate() {
+            let entry = LINK + 0x300 + 0x100 * i + 0x30 * j;
+            w64(&mut exe, file(lookup) + 8 * j, entry);
+            put(&mut exe, file(entry) + 2, symbol);
+        }
+    }
+    let flags = [OPT, "--rust-providers"];
+    for mode in [0, 1, 2] {
+        w32(&mut exe, file(MODE), mode);
+        let path = scratch.write(&format!("threads-{mode}.exe"), &exe);
+        let output = launcher(&path, &flags)
+            .env("XSXEMU_TRACE_STARTUP", "1")
+            .output()
+            .unwrap();
+        if mode == 1 {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!stderr.contains("phase=tls-detach"), "{stderr}");
+            expect(
+                output,
+                86,
+                "guest EXE returned with active threads; refusing process detach",
+            );
+        } else {
+            assert!(String::from_utf8_lossy(&output.stderr).contains("status=0xeda7babe"));
+            expect(output, 55, "Guest entry returned 55");
+        }
+    }
+}

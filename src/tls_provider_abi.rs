@@ -46,7 +46,7 @@ macro_rules! audited_bridges {
             let _: unsafe extern "win64" fn($($ty),*) -> $ret = $target;
             let target: unsafe extern "win64" fn($($ty),*) -> $ret = target_for_child!($target $(=> $restricted)?);
             // SAFETY: bridge assembly checked host GS, and passed the live
-            // initial thread's LastError DWORD. Each target was reviewed to
+            // calling thread's LastError DWORD. Each target was reviewed to
             // take only its declared arguments and never re-enter the guest.
             unsafe { native::with_tls_child_last_error(teb_error, || target($($arg),*)) }
         })*
@@ -228,6 +228,12 @@ audited_bridges! {
         proc::get_logical_processor_information, (out: *mut proc::LogicalProcessorInformation, length: *mut u32) -> i32;
     xsxemu_tls_is_processor_feature_present, is_processor_feature_present: b"kernelbase.dll", b"IsProcessorFeaturePresent",
         proc::is_processor_feature_present, (feature: u32) -> i32;
+    // The start address is an opaque integer here. Only the new host lane
+    // may enter it, via the checked SysV -> Win64 boundary.
+    xsxemu_tls_create_thread, create_thread: b"kernelbase.dll", b"CreateThread",
+        super::create_thread, (security: *const c_void, stack: usize, start: u64, parameter: u64, flags: u32, id: *mut u32) -> usize;
+    xsxemu_tls_close_handle, close_handle: b"kernelbase.dll", b"CloseHandle",
+        io::CloseHandle, (handle: usize) -> i32;
     xsxemu_tls_create_semaphore_ex_w, create_semaphore_ex_w: b"kernelbase.dll", b"CreateSemaphoreExW",
         io::create_semaphore_ex_w, (security: *const c_void, initial: i32, maximum: i32, name: *const u16, flags: u32, desired_access: u32) -> usize;
     xsxemu_tls_create_semaphore_w, create_semaphore_w: b"kernelbase.dll", b"CreateSemaphoreW",
