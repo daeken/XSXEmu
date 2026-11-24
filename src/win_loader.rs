@@ -118,7 +118,7 @@ fn registry_aliases_are_exact() {
 pub(crate) use native::register;
 
 #[cfg(target_arch = "x86_64")]
-mod native {
+pub(crate) mod native {
     use crate::{link::Symbol, providers};
     use std::{
         cell::{Cell, RefCell},
@@ -739,26 +739,48 @@ mod native {
             .unwrap_or_else(|| fail(ERROR_MOD_NOT_FOUND))
     }
 
-    pub(super) unsafe extern "win64" fn load_library_ex_w(
+    unsafe fn load_key(name: *const u16, file: usize, flags: u32) -> Result<String, u32> {
+        if file != 0 || name.is_null() {
+            return Err(ERROR_INVALID_PARAMETER);
+        }
+        if !matches!(flags, 0 | LOAD_LIBRARY_SEARCH_SYSTEM32) {
+            return Err(ERROR_NOT_SUPPORTED);
+        }
+        let name = match unsafe { wide_name(name) } {
+            Ok(Some(name)) if !name.is_empty() => name,
+            _ => return Err(ERROR_INVALID_PARAMETER),
+        };
+        if name.contains(['/', '\\', ':']) {
+            return Err(ERROR_NOT_SUPPORTED);
+        }
+        module_key(&name)
+            .filter(|key| !key.is_empty())
+            .ok_or(ERROR_INVALID_PARAMETER)
+    }
+
+    // This TLS child never installs the dynamic loader. Preserve the normal
+    // validation and missing-module result, but structurally cannot yield a
+    // handle even if the regular provider's graph changes in the future.
+    #[cfg(target_os = "macos")]
+    pub(crate) unsafe extern "win64" fn tls_child_load_library_ex_w(
         name: *const u16,
         file: usize,
         flags: u32,
     ) -> usize {
-        if file != 0 || name.is_null() {
-            return fail(ERROR_INVALID_PARAMETER);
-        }
-        if !matches!(flags, 0 | LOAD_LIBRARY_SEARCH_SYSTEM32) {
-            return fail(ERROR_NOT_SUPPORTED);
-        }
-        let name = match unsafe { wide_name(name) } {
-            Ok(Some(name)) if !name.is_empty() => name,
-            _ => return fail(ERROR_INVALID_PARAMETER),
-        };
-        if name.contains(['/', '\\', ':']) {
-            return fail(ERROR_NOT_SUPPORTED);
-        }
-        let Some(key) = module_key(&name).filter(|key| !key.is_empty()) else {
-            return fail(ERROR_INVALID_PARAMETER);
+        let error = unsafe { load_key(name, file, flags) }
+            .err()
+            .unwrap_or(ERROR_MOD_NOT_FOUND);
+        fail(error)
+    }
+
+    pub(crate) unsafe extern "win64" fn load_library_ex_w(
+        name: *const u16,
+        file: usize,
+        flags: u32,
+    ) -> usize {
+        let key = match unsafe { load_key(name, file, flags) } {
+            Ok(key) => key,
+            Err(error) => return fail(error),
         };
         // This search never leaves the graph. In particular API-set routes
         // and statically bound Rust providers do not stand for mapped DLLs.

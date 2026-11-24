@@ -10,17 +10,16 @@
 use crate::{
     Result, TLS_CHILD, darwin_guest_mask as mask,
     guest::GuestMemory,
-    import_traps::{MissingImport, called_missing_import_tls},
+    import_traps::MissingImport,
     link::BindingTarget,
     pe::Pe,
-    providers::{self, HostExport},
     static_tls::{self, Image, ImageId, Limits, PatchSites, Plan},
     win_cfg::CfgMetadata,
 };
 use std::{
-    arch::{asm, global_asm},
+    arch::asm,
     ffi::{OsString, c_char, c_int, c_void},
-    mem::{offset_of, size_of},
+    mem::size_of,
     ops::Range,
     os::unix::process::ExitStatusExt,
     path::Path,
@@ -28,6 +27,10 @@ use std::{
     ptr::null_mut,
     time::{Duration, Instant},
 };
+
+#[path = "tls_provider_abi.rs"]
+mod provider_abi;
+pub use provider_abi::bridge_address;
 
 const CHILD_TIMEOUT: Duration = Duration::from_secs(10);
 const LAST_ERROR_OFFSET: usize = 0x68;
@@ -92,8 +95,6 @@ unsafe extern "C" {
 }
 
 unsafe extern "win64" {
-    fn xsxemu_tls_get_last_error() -> u32;
-    fn xsxemu_tls_set_last_error(error: u32);
     // Only used as an address; the gate receives the record pointer in RCX.
     fn xsxemu_tls_missing_import();
 }
@@ -130,21 +131,6 @@ struct Context {
     setter: SetBase,
 }
 
-global_asm!(include_str!("tls_runtime.S"),
-    host_base = const offset_of!(Context, host_base),
-    guest_base = const offset_of!(Context, guest_base),
-    host0 = const offset_of!(Context, host0),
-    host30 = const offset_of!(Context, host30),
-    vector = const offset_of!(Context, vector),
-    setter = const offset_of!(Context, setter),
-    context_slot = const CONTEXT_OFFSET,
-    last_error = const LAST_ERROR_OFFSET,
-    get_error = sym providers::tls_child_get_last_error,
-    set_error = sym providers::tls_child_set_last_error,
-    missing_import = sym called_missing_import_tls,
-    options(att_syntax),
-);
-
 impl Context {
     fn capture(guest_base: u64, vector: u64) -> Result<Self> {
         // Private Rosetta behavior measured by c800404 and its precursor
@@ -176,25 +162,6 @@ impl Context {
             setter: _thread_set_tsd_base,
         })
     }
-}
-
-// Compare the complete registry identity, not just a name or address. In
-// particular, the Rtl* aliases share raw code but are not audited bridge rows.
-pub fn bridge_address(export: HostExport, opt_in: bool) -> Result<u64> {
-    if opt_in {
-        let lookup = |name| providers::lookup(b"kernelbase.dll", name);
-        if lookup(b"GetLastError") == Some(export) {
-            return Ok(xsxemu_tls_get_last_error as *const () as u64);
-        }
-        if lookup(b"SetLastError") == Some(export) {
-            return Ok(xsxemu_tls_set_last_error as *const () as u64);
-        }
-    }
-    Err(format!(
-        "experimental static TLS has no enabled audited bridge for {}!{}",
-        export.provider, export.symbol
-    )
-    .into())
 }
 
 pub struct PatchWrites(Vec<Vec<u32>>);
@@ -421,7 +388,7 @@ pub fn run(
     let thread = plan.new_thread()?;
     let vector = thread.vector_address().ok_or("missing static TLS vector")?;
     // Minimal TEB stub: Self, ThreadLocalStoragePointer and LastErrorValue
-    // (zero initially, shared by direct guest accesses and the two bridges).
+    // (zero initially, shared between direct guest accesses and provider bridges).
     let mut teb = [0u64; 32];
     let teb_ptr = teb.as_mut_ptr();
     let guest_base = teb_ptr.addr() as u64;

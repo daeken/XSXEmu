@@ -46,7 +46,7 @@ pub(crate) mod win_loader;
 #[path = "win_proc.rs"]
 pub(crate) mod win_proc;
 #[path = "win_sync.rs"]
-mod win_sync;
+pub(crate) mod win_sync;
 #[path = "win_text.rs"]
 mod win_text;
 #[path = "win_unwind.rs"]
@@ -54,9 +54,6 @@ pub(crate) mod win_unwind;
 
 #[cfg(target_arch = "x86_64")]
 pub(crate) use native::set_last_error;
-
-#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-pub(crate) use native::{tls_child_get_last_error, tls_child_set_last_error};
 
 /// Whether the registry has any exports for this exact lowercase module name.
 pub fn has_dll(dll: &[u8]) -> bool {
@@ -184,7 +181,7 @@ pub fn lookup(dll: &[u8], name: &[u8]) -> Option<HostExport> {
 }
 
 #[cfg(target_arch = "x86_64")]
-mod native {
+pub(crate) mod native {
     use std::{
         alloc::{Layout, alloc, alloc_zeroed, dealloc},
         cell::{Cell, RefCell},
@@ -248,7 +245,7 @@ mod native {
         m.lock().unwrap_or_else(|_| std::process::abort())
     }
 
-    pub(super) extern "win64" fn get_last_error() -> u32 {
+    pub(crate) extern "win64" fn get_last_error() -> u32 {
         LAST_ERROR.get()
     }
 
@@ -256,27 +253,20 @@ mod native {
         LAST_ERROR.set(error);
     }
 
-    // These two fixed-signature adapters run with checked host GS, on the
-    // signal-masked initial thread. No callback, unwind, or other provider
-    // is permitted in this scope. The guest DWORD is authoritative between
-    // calls; the ordinary provider's host-thread state is not leaked to it.
+    // Only called on checked host GS by fixed-signature adapters. The guest
+    // DWORD is authoritative between calls. No provider here may re-enter the
+    // guest or exit other than by returning to its adapter.
     #[cfg(target_os = "macos")]
-    pub(crate) unsafe extern "C" fn tls_child_get_last_error(teb_error: *mut u32) -> u32 {
+    pub(crate) unsafe fn with_tls_child_last_error<R>(
+        teb_error: *mut u32,
+        call: impl FnOnce() -> R,
+    ) -> R {
         LAST_ERROR.with(|cell| {
             let saved = cell.replace(unsafe { teb_error.read() });
-            let result = get_last_error();
-            cell.set(saved);
+            let result = call();
+            unsafe { teb_error.write(cell.replace(saved)) };
             result
         })
-    }
-
-    #[cfg(target_os = "macos")]
-    pub(crate) unsafe extern "C" fn tls_child_set_last_error(teb_error: *mut u32, error: u32) {
-        LAST_ERROR.with(|cell| {
-            let saved = cell.get();
-            set_last_error(error);
-            unsafe { teb_error.write(cell.replace(saved)) };
-        });
     }
 
     pub(super) extern "win64" fn current_process_id() -> u32 {
@@ -289,7 +279,7 @@ mod native {
         THREAD_ID.with(|id| *id)
     }
 
-    pub(super) extern "win64" fn tls_alloc() -> u32 {
+    pub(crate) extern "win64" fn tls_alloc() -> u32 {
         let mut slots = lock(&TLS_STATE);
         if let Some((index, generation)) = slots.iter_mut().enumerate().find(|(_, g)| **g % 2 == 0)
         {
@@ -304,7 +294,7 @@ mod native {
         generation % 2 == 1 && generation != RETIRED
     }
 
-    pub(super) extern "win64" fn tls_free(index: u32) -> i32 {
+    pub(crate) extern "win64" fn tls_free(index: u32) -> i32 {
         let mut slots = lock(&TLS_STATE);
         if let Some(generation) = slots.get_mut(index as usize).filter(|g| allocated(**g)) {
             *generation = if *generation == RETIRED - 2 {
@@ -318,7 +308,7 @@ mod native {
         0
     }
 
-    pub(super) extern "win64" fn tls_get_value(index: u32) -> *mut c_void {
+    pub(crate) extern "win64" fn tls_get_value(index: u32) -> *mut c_void {
         let slots = lock(&TLS_STATE);
         let index = index as usize;
         let Some(&generation) = slots.get(index).filter(|g| allocated(**g)) else {
@@ -335,7 +325,7 @@ mod native {
         })
     }
 
-    pub(super) extern "win64" fn tls_set_value(index: u32, value: *mut c_void) -> i32 {
+    pub(crate) extern "win64" fn tls_set_value(index: u32, value: *mut c_void) -> i32 {
         let slots = lock(&TLS_STATE);
         let index = index as usize;
         let Some(&generation) = slots.get(index).filter(|g| allocated(**g)) else {
@@ -401,14 +391,14 @@ mod native {
         }
     }
 
-    pub(super) extern "win64" fn get_process_heap() -> *mut c_void {
+    pub(crate) extern "win64" fn get_process_heap() -> *mut c_void {
         ptr::from_ref(&PROCESS_HEAP_TOKEN).cast_mut().cast()
     }
 
     // The default process heap is always serialized. Exception generation,
     // HEAP_NO_SERIALIZE, and unknown flags are unsupported (failure, not ignored).
     // Alloc/ReAlloc/Size do not report failure through GetLastError.
-    pub(super) extern "win64" fn heap_alloc(
+    pub(crate) extern "win64" fn heap_alloc(
         heap: *mut c_void,
         flags: u32,
         size: usize,
@@ -583,7 +573,7 @@ mod native {
         1
     }
 
-    pub(super) extern "win64" fn heap_free(heap: *mut c_void, flags: u32, ptr: *mut c_void) -> i32 {
+    pub(crate) extern "win64" fn heap_free(heap: *mut c_void, flags: u32, ptr: *mut c_void) -> i32 {
         if heap == get_process_heap() && flags == 0 && lock(&BLOCKS).remove(&ptr.addr()).is_some() {
             return 1;
         }
@@ -669,9 +659,15 @@ mod tests {
             native::set_last_error(500);
             // SAFETY: teb[0] is the live, writable guest LastError DWORD.
             unsafe {
-                assert_eq!(tls_child_get_last_error(teb.as_mut_ptr()), 0x8000_1234);
+                assert_eq!(
+                    native::with_tls_child_last_error(teb.as_mut_ptr(), || native::get_last_error(
+                    )),
+                    0x8000_1234
+                );
                 assert_eq!(native::get_last_error(), 500);
-                tls_child_set_last_error(teb.as_mut_ptr(), 0xfedc_ba98);
+                native::with_tls_child_last_error(teb.as_mut_ptr(), || {
+                    native::set_last_error(0xfedc_ba98)
+                });
             }
             assert_eq!(native::get_last_error(), 500);
             assert_eq!(teb, [0xfedc_ba98, 0x5a5a_4321]);

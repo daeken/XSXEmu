@@ -198,9 +198,9 @@ Lbridge_entry:
     pushq %rdi
     pushq %rsi
     pushq %r12
-    subq $192, %rsp             /* home space and Win64 XMM saves */
+    subq $288, %rsp             /* home space, args, locals, Win64 XMM saves */
     .irp n,6,7,8,9,10,11,12,13,14,15
-        movaps %xmm\n, 32+16*(\n-6)(%rsp)
+        movaps %xmm\n, 128+16*(\n-6)(%rsp)
         pcmpeqb %xmm\n, %xmm\n
     .endr
     movl $0x11111111, %edi
@@ -212,6 +212,115 @@ Lbridge_entry:
     bridge_cfg 8                /* SetLastError writes the guest TEB DWORD */
     cmpl $0xfedcba98, %gs:0x68
     jne Lbad
+    /* Exact scalar results and arguments across the same boundary. */
+    leaq Ltext(%rip), %r11
+    callq *{iat_delta}+16(%r11)  /* GetProcessHeap */
+    testq %rax, %rax
+    je Lbad
+    movq %rax, 48(%rsp)
+    leaq Ltext(%rip), %r11
+    movq %rax, %rcx
+    movl $8, %edx               /* HEAP_ZERO_MEMORY */
+    movq $32, %r8
+    callq *{iat_delta}+24(%r11)  /* HeapAlloc */
+    testq %rax, %rax
+    je Lbad
+    cmpq $0, (%rax)
+    jne Lbad
+    movq $0x12345678, (%rax)
+    movq %rax, 56(%rsp)
+    cmpl $0xfedcba98, %gs:0x68   /* heap success preserves last error */
+    jne Lbad
+
+    xorq %rcx, %rcx             /* wrong heap for HeapFree */
+    xorl %edx, %edx
+    movq 56(%rsp), %r8
+    leaq Ltext(%rip), %r11
+    callq *{iat_delta}+32(%r11)
+    testl %eax, %eax
+    jne Lbad
+    cmpl $87, %gs:0x68          /* host provider failure updates guest TEB */
+    jne Lbad
+    movq 48(%rsp), %rcx
+    xorl %edx, %edx
+    movq 56(%rsp), %r8
+    leaq Ltext(%rip), %r11
+    callq *{iat_delta}+32(%r11)
+    cmpl $1, %eax
+    jne Lbad
+    cmpl $87, %gs:0x68
+    jne Lbad
+    /* Model the observed LoadLibraryExW optional probe. No module handle or
+     * dynamic symbol can escape even for a statically bound provider name. */
+    leaq Lkernelbase(%rip), %rcx
+    xorq %rdx, %rdx
+    movl $0x800, %r8d
+    leaq Ltext(%rip), %r11
+    callq *{iat_delta}+40(%r11)
+    testq %rax, %rax
+    jne Lbad
+    cmpl $126, %gs:0x68
+    jne Lbad
+    xorl %ecx, %ecx
+    xorl %edx, %edx
+    xorl %r8d, %r8d
+    leaq Ltext(%rip), %r11
+    callq *{iat_delta}+40(%r11)
+    testq %rax, %rax
+    jne Lbad
+    cmpl $87, %gs:0x68
+    jne Lbad
+
+    leaq 88(%rsp), %rcx
+    movl $4000, %edx
+    leaq Ltext(%rip), %r11
+    callq *{iat_delta}+48(%r11)
+    cmpl $1, %eax
+    jne Lbad
+    cmpq $4000, 120(%rsp)       /* second arg was written to SpinCount */
+    jne Lbad
+    .irp slot,56,64,72
+        leaq 88(%rsp), %rcx
+        leaq Ltext(%rip), %r11
+        callq *{iat_delta}+\slot(%r11)
+    .endr
+
+    /* Win32 dynamic TLS slots are a provider table, not GS:[0x58]. */
+    movq %gs:0x58, %rax
+    movq %rax, 64(%rsp)
+    movq (%rax), %rax
+    movq %rax, 72(%rsp)
+    leaq Ltext(%rip), %r11
+    callq *{iat_delta}+80(%r11)  /* TlsAlloc */
+    cmpl $-1, %eax
+    je Lbad
+    movl %eax, 80(%rsp)
+    movl %eax, %ecx
+    movabsq $0x123456789abcdef0, %rdx
+    leaq Ltext(%rip), %r11
+    callq *{iat_delta}+88(%r11)  /* TlsSetValue */
+    cmpl $1, %eax
+    jne Lbad
+    movl 80(%rsp), %ecx
+    leaq Ltext(%rip), %r11
+    callq *{iat_delta}+96(%r11)  /* TlsGetValue */
+    movabsq $0x123456789abcdef0, %rcx
+    cmpq %rcx, %rax
+    jne Lbad
+    cmpl $0, %gs:0x68
+    jne Lbad
+    movl 80(%rsp), %ecx
+    leaq Ltext(%rip), %r11
+    callq *{iat_delta}+104(%r11) /* TlsFree */
+    cmpl $1, %eax
+    jne Lbad
+    movq %gs:0x58, %rax
+    cmpq 64(%rsp), %rax
+    jne Lbad
+    movq (%rax), %rax
+    cmpq 72(%rsp), %rax
+    jne Lbad
+    bridge_cfg 8                /* restore detach sentinel */
     cmpq $0x11111111, %rdi
     jne Lbad
     cmpq $0x22222222, %rsi
@@ -224,9 +333,9 @@ Lbridge_entry:
         pmovmskb %xmm0, %eax
         cmpl $0xffff, %eax
         jne Lbad
-        movaps 32+16*(\n-6)(%rsp), %xmm\n
+        movaps 128+16*(\n-6)(%rsp), %xmm\n
     .endr
-    addq $192, %rsp
+    addq $288, %rsp
     popq %r12
     popq %rsi
     popq %rdi
@@ -262,6 +371,8 @@ Ltrace_dispatch:
 Ltrace_dispatch_call:
     callq *{dispatch_delta}(%r11)
     ud2
+Lkernelbase:
+    .short 107,101,114,110,101,108,98,97,115,101,46,100,108,108,0
 Lbad:
     ud2
 Lend:

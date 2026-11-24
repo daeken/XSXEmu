@@ -59,63 +59,6 @@ _xsxemu_tls_call:
 
 Lbad_tls_boundary:
     ud2                     /* default SIGILL, no recovery */
-
-/* Win64 -> SysV bridges specialized from the c800404 proof. Only these
- * shapes are supported: DWORD(void) and void(DWORD). SysV calls below need
- * no home space or extra argument slots. Save Win64 nonvolatiles that SysV
- * may clobber, plus R12 for our context and ECX/EAX across the setter. */
-.set TLS_BRIDGE_FRAME, 200
-.set TLS_BRIDGE_LAST_ERROR, {last_error}
-.macro save_bridge
-    subq $TLS_BRIDGE_FRAME, %rsp         /* RSP % 16 == 0 before SysV calls */
-    .irp n,6,7,8,9,10,11,12,13,14,15
-        movaps %xmm\n, 16*(\n-6)(%rsp)
-    .endr
-    movq %rdi, 160(%rsp)
-    movq %rsi, 168(%rsp)
-    movq %r12, 176(%rsp)
-    movl %ecx, 184(%rsp)
-
-    movq %gs:{context_slot}, %r12
-    check_guest %r12
-    switch_to {host_base}, %r12
-    check_host %r12
-    movq {guest_base}(%r12), %rdi
-    addq $TLS_BRIDGE_LAST_ERROR, %rdi /* explicit DWORD pointer for the Rust adapter */
-.endm
-
-.macro restore_bridge
-    .irp n,6,7,8,9,10,11,12,13,14,15
-        movaps 16*(\n-6)(%rsp), %xmm\n
-    .endr
-    movq 160(%rsp), %rdi
-    movq 168(%rsp), %rsi
-    movq 176(%rsp), %r12
-    addq $TLS_BRIDGE_FRAME, %rsp
-    retq
-.endm
-
-.globl _xsxemu_tls_get_last_error
-_xsxemu_tls_get_last_error:
-    save_bridge
-    callq {get_error}
-    movl %eax, 184(%rsp)
-    check_host %r12
-    switch_to {guest_base}, %r12
-    check_guest %r12
-    movl 184(%rsp), %eax
-    restore_bridge
-
-.globl _xsxemu_tls_set_last_error
-_xsxemu_tls_set_last_error:
-    save_bridge
-    movl 184(%rsp), %esi
-    callq {set_error}
-    check_host %r12
-    switch_to {guest_base}, %r12
-    check_guest %r12
-    restore_bridge
-
 /* Entered from an exact bound Win64 trap thunk with MissingImport in RCX and
  * normal function-entry stack alignment. This path never returns, so guest
  * callee-saved registers need not be restored. */

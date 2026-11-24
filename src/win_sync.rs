@@ -119,7 +119,7 @@ mod registry_tests {
 }
 
 #[cfg(target_arch = "x86_64")]
-mod native {
+pub(crate) mod native {
     use crate::providers::set_last_error;
     use std::{
         collections::HashMap,
@@ -139,7 +139,7 @@ mod native {
     }
 
     #[repr(C)]
-    pub(super) struct CriticalSection {
+    pub(crate) struct CriticalSection {
         debug_info: usize,
         lock_count: i32,
         recursion_count: i32,
@@ -161,7 +161,7 @@ mod native {
         LazyLock::new(|| Mutex::new(HashMap::new()));
     static UNLOCKED: Condvar = Condvar::new();
 
-    pub(super) unsafe extern "win64" fn init_cs_spin(cs: *mut CriticalSection, spin: u32) -> i32 {
+    pub(crate) unsafe extern "win64" fn init_cs_spin(cs: *mut CriticalSection, spin: u32) -> i32 {
         if cs.is_null() || !cs.is_aligned() {
             set_last_error(ERROR_INVALID_PARAMETER);
             return 0;
@@ -243,7 +243,7 @@ mod native {
         }
     }
 
-    pub(super) extern "win64" fn enter_cs(cs: *mut CriticalSection) {
+    pub(crate) extern "win64" fn enter_cs(cs: *mut CriticalSection) {
         acquire(cs, true);
     }
 
@@ -251,7 +251,7 @@ mod native {
         acquire(cs, false)
     }
 
-    pub(super) extern "win64" fn leave_cs(cs: *mut CriticalSection) {
+    pub(crate) extern "win64" fn leave_cs(cs: *mut CriticalSection) {
         let mut sections = lock(&CRITICAL);
         let Some(state) = sections.get_mut(&cs.addr()) else {
             set_last_error(ERROR_INVALID_PARAMETER);
@@ -271,7 +271,7 @@ mod native {
         }
     }
 
-    pub(super) extern "win64" fn delete_cs(cs: *mut CriticalSection) {
+    pub(crate) extern "win64" fn delete_cs(cs: *mut CriticalSection) {
         let mut sections = lock(&CRITICAL);
         match sections.get(&cs.addr()) {
             None => set_last_error(ERROR_INVALID_PARAMETER),

@@ -17,8 +17,8 @@ const RO: usize = 2 * PAGE;
 const DATA: usize = 3 * PAGE;
 const INDEX: usize = DATA;
 const IAT: usize = DATA + 8;
-const COOKIE: usize = DATA + 32;
-const MODE: usize = DATA + 40;
+const COOKIE: usize = DATA + 0x300;
+const MODE: usize = DATA + 0x308;
 const CHECK: usize = RO + 0x200;
 const DISPATCH: usize = CHECK + 8;
 const GFIDS: usize = CHECK + 0x10;
@@ -235,16 +235,29 @@ fn image(kind: Kind) -> Vec<u8> {
     if matches!(kind, Kind::Bridge) {
         dir(&mut b, 1, LINK, 40);
         w32(&mut b, file(LINK), LINK + 0x30);
-        w32(&mut b, file(LINK) + 12, LINK + 0x50);
+        w32(&mut b, file(LINK) + 12, LINK + 0xb0);
         w32(&mut b, file(LINK) + 16, IAT);
-        put(&mut b, file(LINK) + 0x50, b"kernel32.dll\0");
-        for (i, (off, name)) in [
-            (0xa0, &b"GetLastError\0"[..]),
-            (0xc0, &b"SetLastError\0"[..]),
+        put(&mut b, file(LINK) + 0xb0, b"kernel32.dll\0");
+        for (i, name) in [
+            &b"GetLastError\0"[..],
+            &b"SetLastError\0"[..],
+            &b"GetProcessHeap\0"[..],
+            &b"HeapAlloc\0"[..],
+            &b"HeapFree\0"[..],
+            &b"LoadLibraryExW\0"[..],
+            &b"InitializeCriticalSectionAndSpinCount\0"[..],
+            &b"EnterCriticalSection\0"[..],
+            &b"LeaveCriticalSection\0"[..],
+            &b"DeleteCriticalSection\0"[..],
+            &b"TlsAlloc\0"[..],
+            &b"TlsSetValue\0"[..],
+            &b"TlsGetValue\0"[..],
+            &b"TlsFree\0"[..],
         ]
         .into_iter()
         .enumerate()
         {
+            let off = 0xe0 + i * 0x30;
             w64(&mut b, file(LINK) + 0x30 + i * 8, LINK + off);
             put(&mut b, file(LINK) + off + 2, name);
         }
@@ -343,7 +356,7 @@ fn unaudited_exports_and_raw_address_aliases_are_refused_before_entry() {
     let dir = Scratch::new();
     let flags = [OPT, "--rust-providers"];
     let mut unsupported = image(Kind::Bridge);
-    put(&mut unsupported, file(LINK) + 0xc2, b"SetErrorMode\0");
+    put(&mut unsupported, file(LINK) + 0x112, b"SetErrorMode\0");
     let exe = dir.write("unsupported.exe", &unsupported);
     expect(
         run(&exe, &flags),
@@ -351,10 +364,21 @@ fn unaudited_exports_and_raw_address_aliases_are_refused_before_entry() {
         "no enabled audited bridge for kernelbase.dll!SetErrorMode",
     );
 
+    let mut dynamic = image(Kind::Bridge);
+    put(&mut dynamic, file(LINK) + 0x112, b"GetProcAddress\0");
+    let exe = dir.write("dynamic.exe", &dynamic);
+    expect(
+        run(&exe, &flags),
+        1,
+        "no enabled audited bridge for kernelbase.dll!GetProcAddress",
+    );
+
     let mut aliased = image(Kind::Bridge);
-    put(&mut aliased, file(LINK) + 0x50, b"ntdll.dll\0");
-    put(&mut aliased, file(LINK) + 0xa2, b"RtlGetLastWin32Error\0");
-    put(&mut aliased, file(LINK) + 0xc2, b"RtlSetLastWin32Error\0");
+    put(&mut aliased, file(LINK) + 0xb0, b"ntdll.dll\0");
+    put(&mut aliased, file(LINK) + 0xe2, b"RtlGetLastWin32Error\0");
+    put(&mut aliased, file(LINK) + 0x112, b"RtlSetLastWin32Error\0");
+    // Only the renamed ntdll imports belong to this descriptor.
+    w64(&mut aliased, file(LINK) + 0x40, 0);
     let exe = dir.write("aliased.exe", &aliased);
     expect(
         run(&exe, &flags),
