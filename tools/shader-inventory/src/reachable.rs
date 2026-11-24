@@ -253,7 +253,13 @@ impl PcPattern {
             .then_some((base, delta))
     }
 
-    fn classify(&self, pc: usize, size: usize, first: u32, extent: usize) -> IndirectShape {
+    pub(crate) fn classify(
+        &self,
+        pc: usize,
+        size: usize,
+        first: u32,
+        extent: usize,
+    ) -> IndirectShape {
         let Some((base, delta)) = self.literal(pc, size, first) else {
             return IndirectShape::Unmatched;
         };

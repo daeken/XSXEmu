@@ -60,6 +60,7 @@ enum ResultClass {
     CompleteWithExp,
     Decode,
     UnmodeledPc(String),
+    SetPc(IndirectShape),
     SwapPc(IndirectShape),
     SendMsg(SendMsgClass),
     OtherControl(String),
@@ -127,6 +128,8 @@ fn checked_exports(dis: &mut Disassembler, bytes: &[u8]) -> Result<Exports, Resu
         let Some(flow) = control(name, first, len) else {
             unsupported = if name == "s_swappc_b64" {
                 ResultClass::SwapPc(pattern.classify_swap(pc, len, first, bytes.len()))
+            } else if name == "s_setpc_b64" {
+                ResultClass::SetPc(pattern.classify(pc, len, first, bytes.len()))
             } else if name.starts_with("s_setpc") || name.starts_with("s_swappc") {
                 ResultClass::UnmodeledPc(name.to_owned())
             } else if name == "s_sendmsg" {
