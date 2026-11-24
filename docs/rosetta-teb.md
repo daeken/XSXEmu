@@ -585,6 +585,24 @@ remain outside this call-site proof.
 [gdk-thread-assert]: https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xthread/functions/xthreadassertnottimesensitive
 [com-release]: https://learn.microsoft.com/en-us/windows/win32/api/unknwn/nf-unknwn-iunknown-release
 
+**Optional connectivity hint after app registration.** In the live trace
+`/tmp/xsxemu-breadcrumbs.M17Lku`, both app registrations are followed by
+`QueryPerformanceCounter`, a rejected `QueryApiImpl` call, and `XErrorReport`
+with `0x89240107`. The pinned PE calls the optional helper at RVA `0x1cf8f00`
+from `0x5a61164`; its wrapper queries class
+`37e56907-2f10-41e8-b72f-36edb185331a` and interface
+`bf2346b2-39af-4658-b5ea-44713c7e83b3` at `0x55e0e5e`. On success it would
+call slot 15 (`XNetworkingGetConnectivityHint`, corroborated by the xcl ABI
+table) with an output pointer, then release the interface. Failure returns
+from the helper; the trace continues to `WS2_32.dll` ordinal `#115` (IAT RVA
+`0x6793ca8`, call RVA `0x5a61172`), the actual stop.
+
+The unexecuted success branch tests byte `+0xc` of the hint. If zero, it
+attempts to create an `(Immediate, Immediate)` queue and, if setup succeeds,
+registers for connectivity hint changes through slot 16 of the same
+interface. Leave this query unsupported rather than inventing a hint or
+entering the callback path.
+
 Local input inventory was limited to loose files in the title directory,
 its `win11-arm64-reference` tree, the standalone `windlls` tree, and a
 bounded filename search in nearby projects, downloads, ISO and VM
