@@ -46,3 +46,31 @@ All four compute IDs and both graphics state/layout IDs are mandatory. In a grap
 Slots 3–5 are absent everywhere; slot 6's shader stage is unidentified. Graphics combinations: 13,383 PS+VS, 10,726 MS+PS, 1,336 MS-only, 24 VS-only, two PS+VS+slot-6. All 21,522 program IDs are referenced, each by only one stage and with a consistent optional stage/layout blob in this sample. The inverse is not unique: e.g. 9,996 PS programs map to 9,333 blob IDs. All 54,576 blob IDs are referenced; the eight nonempty blob roles (graphics state and input layout, PS/VS/MS metadata, compute state/opaque/layout) are pairwise disjoint. Graphics state/input-layout use 5,680/25,229 distinct IDs; compute dispatch/opaque use 665/2,684. Each of the 2,693 compute keys is different despite nine excess rows over unique full reference tuples (2,676 tuples once, seven twice, one three times). Graphics keys are all distinct and do not intersect compute keys; only 25,229 graphics tuples of state/layout and stage pairs are distinct (excluding the opaque words and key). Neither tuple nor PSO key is a verified Metal cache key.
 
 The secondary sidecar check matched every PSO key, graphics top-level reference and named program slot, and compute dispatch reference and program. The sidecar summaries omit some references; range validation of those fields was done against the binary, not inferred from JSON. The binary gives a useful provenance graph, not a pipeline that can yet be baked: root/descriptor binding, complete fixed-function state, input/output linkage, the opaque fields, unidentified stage, source variants, and runtime-key correspondence remain open.
+
+## Metadata and source-digest joins
+
+Of the eight referenced blob roles, four share an observed layout: 17,634 distinct graphics stage metadata blobs and 2,684 compute layout blobs. The graphics header is 16 bytes and its first u32 is `2`; the compute header is 24 bytes and its first u32 is `0x403` (low byte `3`). The final u32 of either header has low byte `0x40`; its upper bits vary and are **not** a plain record count. After the header are zero or more 32-byte records beginning with u32 `0x41` or `0x42`, then a 32-byte footer: u32 `0x43`, 16 digest bytes in stored order, and 12 zero bytes. Checked each applicable program's blob against this framing. The table-declared size, not a scan for marker bytes, fixes the footer address (`size - 32`). Records' binding semantics, the remaining header bits and the contents of the 20-byte compute blob are unverified. The separate 28-byte dispatch blob's u32 at +16 has bit 20 set for 1,529 distinct CS programs (wave32 field); the u32 at +24 has bit 10 set for 91 distinct CS programs in this extraction (`TG_SIZE_EN` per AMD register definitions). These are bit counts, not verification of dispatch behavior.
+
+Comparing against every local `fspx` pair: **21,522/21,522** `.code` files exactly match their program span (including in-span non-executable bytes). Every `.json` sidecar and index entry agrees on program and stage label; the sidecars also agree on the code arena offset and size, and on the available metadata digest or its absence. This verifies the extraction correspondence, not that the `fspx` directory contains standalone FSPX containers or that the sidecar's executable subrange is correct.
+
+For source provenance, independently walked all 26,503 extracted wrapped DXBC chunk directories. Each had one `HASH` chunk (20-byte payload: 4-byte flags then 16 digest bytes) and a stage in the `DXIL` program header (u16 at payload +2; structural header, not a claim that the bitcode is genuine DXIL). On equality of digest bytes and stage, retaining **all** candidate wrapped files:
+
+| Stage | Matched programs | Of those, multiple source-file candidates | No match |
+|---|---:|---:|---:|
+| CS | 2,680 | 8 | 4 |
+| PS | 9,991 | 27 | 5 |
+| VS | 1,340 | 45 | 3 |
+| MS | 7,498 | 733 | 0 |
+| Unknown slot 6 | 0 | 0 | 1 (no metadata digest) |
+| Total | 21,509 | 813 | 13 |
+
+19,595 extracted wrapped files occur in at least one candidate set; no candidate joined by digest had a conflicting stage. A candidate file count is not a unique shader count. This join establishes source-family provenance only. No first-candidate rule, native FSSM variant selection, signature equivalence, or machine-code equality to wrapped-source payloads was validated.
+
+## Reproduce the structural census
+
+```sh
+cargo test --lib pipeline_library
+cargo run --release --example shader-pipeline-census -- /path/to/local/pipeline/library.bin
+```
+
+The Rust parser is read-only and zero-copy over the supplied inflated bytes, with a 512 MiB input cap. The example reads one file and prints aggregate counts only. It checks structural framing, span placement and ID ranges with explicit absent-slot handling; it does not read the extraction's JSON, open wrapped DXBC, verify blob internals, or decode programs. The sidecar/source comparisons above were separate local experiments. The parser preserves duplicate keys and non-unique joins if encountered; the observed key and tuple cardinalities are evidence, not parse preconditions. No local artifacts or per-record lists are included.
