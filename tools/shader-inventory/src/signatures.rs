@@ -1,5 +1,9 @@
 //! Count-only checks for the wrapped DXBC signature profile, not native ABI.
-use crate::{BLOB_LIMIT, coverage::Metadata, dxbc_chunks, shader_payloads, stage_name, word};
+use crate::{
+    BLOB_LIMIT,
+    coverage::{Metadata, code},
+    dxbc_chunks, shader_payloads, stage_name, word,
+};
 use std::{
     collections::BTreeMap,
     error::Error,
@@ -305,12 +309,20 @@ impl NativeMesh {
     }
 }
 
+#[derive(Default)]
+struct NativeSpans {
+    valid: usize,
+    unsupported: usize,
+    unset_end: usize,
+}
+
 fn native_stages(
     wrapper: &[u8],
     psv: &[u8],
     inflate: &mut Vec<u8>,
     compute: &mut NativeCompute,
     mesh: &mut NativeMesh,
+    spans: &mut BTreeMap<Option<u8>, NativeSpans>,
 ) -> Option<Vec<Option<u8>>> {
     let stage = *psv.get(28)?;
     let is_compute = stage == 5;
@@ -322,7 +334,15 @@ fn native_stages(
         inflate,
         None,
         Some(&mut |payload| {
-            stages.push(payload.get(0x100).copied());
+            let stage_byte = payload.get(0x100).copied();
+            stages.push(stage_byte);
+            let totals = spans.entry(stage_byte).or_default();
+            if let Some((_, unset)) = code(payload) {
+                totals.valid += 1;
+                totals.unset_end += usize::from(unset);
+            } else {
+                totals.unsupported += 1;
+            }
             if is_compute {
                 compute.payload(payload, xyz, fixed_wave32);
             }
@@ -627,6 +647,7 @@ pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
     let mut packing_totals = [PackingTotals::default(), PackingTotals::default()];
     let mut compute = NativeCompute::default();
     let mut mesh = NativeMesh::default();
+    let mut spans = BTreeMap::new();
     let mut inflate = Vec::new();
     for entry in fs::read_dir(path)? {
         let entry = entry?;
@@ -657,8 +678,15 @@ pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
         )?;
         let psv = part(b"PSV0").ok_or("missing unique PSV0")?;
         let rows = resource_rows(psv, stage).ok_or("unsupported PSV0 resource table or stage")?;
-        let native = native_stages(&bytes, psv, &mut inflate, &mut compute, &mut mesh)
-            .ok_or("unsupported wrapped XDAT/XBCH framing")?;
+        let native = native_stages(
+            &bytes,
+            psv,
+            &mut inflate,
+            &mut compute,
+            &mut mesh,
+            &mut spans,
+        )
+        .ok_or("unsupported wrapped XDAT/XBCH framing")?;
         let elems_at = if rows.is_empty() { 60 } else { 64 + rows.len() };
         let (elements, suffix) =
             psv_elements(psv, elems_at).ok_or("unsupported PSV0 element table")?;
@@ -757,6 +785,12 @@ pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
         "PSV0 vs same-wrapper FSSM mesh: {} payloads, {} unsupported pre-body spans, {} XYZ32, {} XYZ16, {} u16 limit-pair raw hits",
         mesh.payloads, mesh.unsupported, mesh.xyz32, mesh.xyz16, mesh.limits16
     );
+    for (stage, s) in spans {
+        println!(
+            "FSSM stage byte {stage:?}: {} matching raw span and suffix, {} unsupported, {} unset end words",
+            s.valid, s.unsupported, s.unset_end
+        );
+    }
     for (stage, totals) in groups {
         let Stage {
             files,
