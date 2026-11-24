@@ -102,6 +102,8 @@ macro_rules! audited_bridges {
 }
 
 audited_bridges! {
+    xsxemu_tls_configure_d3d12_vm, configure_d3d12_vm: b"d3d12_xs.dll", b"D3D12ConfigureVirtualMemoryX",
+        crate::xbox_d3d12_vm::configure, (config: *const u8) -> i32;
     xsxemu_tls_get_last_error, get_error: b"kernelbase.dll", b"GetLastError",
         native::get_last_error, () -> u32;
     xsxemu_tls_set_last_error, set_error: b"kernelbase.dll", b"SetLastError",

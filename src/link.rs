@@ -397,6 +397,7 @@ pub struct Options<'a> {
     pub rust_providers: bool,
     pub trace_missing_imports: bool,
     pub map_extra_dll: Option<&'a Path>,
+    pub trusted_offline: bool,
 }
 
 struct Builder<'a> {
@@ -446,6 +447,17 @@ impl Builder<'_> {
         loop {
             if has_separator(&dll) {
                 return Err(Unresolved::InvalidModuleName { dll });
+            }
+            // Only the direct named import may use this offline Xbox shim,
+            // never a different provider routed here or a PE forwarder.
+            let vm = providers::D3D12_VM_CONFIGURE;
+            if seen.is_empty()
+                && self.options.rust_providers
+                && self.options.trusted_offline
+                && dll.eq_ignore_ascii_case(vm.provider.as_bytes())
+                && matches!(&symbol, Symbol::Name(name) if name == vm.symbol.as_bytes())
+            {
+                return Ok(BindingTarget::Rust(vm));
             }
             if let Some(host) = self.rust_export(&dll, &symbol) {
                 return Ok(BindingTarget::Rust(host));

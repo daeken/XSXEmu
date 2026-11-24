@@ -17,6 +17,8 @@ mod tls_runtime;
 mod win_cfg;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 mod win_cfg_runtime;
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+mod xbox_d3d12_vm;
 #[cfg(test)]
 mod xbox_vm;
 
@@ -187,6 +189,11 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
                     rust_providers,
                     trace_missing_imports,
                     map_extra_dll: map_extra_dll.as_deref(),
+                    trusted_offline: trusted_offline
+                        || matches!(
+                            startup_profile,
+                            Some(startup::Profile::TrustedOfflineTlsChild)
+                        ),
                 },
                 if tls_child {
                     Some(if trusted_offline {

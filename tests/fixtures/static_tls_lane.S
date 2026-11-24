@@ -14,6 +14,7 @@ _static_tls_fixture:
     .long Lprocessor_feature_entry-Ltext
     .long Lsync_entry-Ltext, Lsync_sleep-Ltext, Lsync_wake-Ltext
     .long Lregistry_entry-Ltext
+    .long Lconfigure_d3d12_vm_entry-Ltext
 Ltext:
 .macro tls index
     leaq Ltext(%rip), %r11
@@ -1077,5 +1078,45 @@ Lregistry_entry:
     retq
 Lregistry_subkey:
     .short 'O', 'w', 'n', 'e', 'd', 0
+/* Original one-pointer, 32-byte Win64 caller probe. */
+.macro configure_d3d12_vm expected
+    leaq Ltext(%rip), %r11
+    movq $-1, %rdx                    /* not arguments */
+    movq $-2, %r8
+    movq $-3, %r9
+    callq *{iat_delta}(%r11)
+    cmpl $\expected, %eax
+    jne Lbad
+    cmpl $0xbeef, %gs:0x68             /* guest GS restored, LastError unchanged */
+    jne Lbad
+.endm
+Lconfigure_d3d12_vm_entry:
+    tls 0
+    phase 1, 2
+    subq $72, %rsp                    /* 32-byte home + 32-byte input */
+    movl $0xbeef, %gs:0x68
+    xorps %xmm0, %xmm0
+    movups %xmm0, 32(%rsp)
+    movups %xmm0, 48(%rsp)
+    movl $3, 36(%rsp)
+    leaq 32(%rsp), %rcx
+    configure_d3d12_vm 0
+    cmpl $3, 36(%rsp)
+    jne Lbad
+    movl $4, 36(%rsp)
+    leaq 32(%rsp), %rcx
+    configure_d3d12_vm 0
+    movb $1, 63(%rsp)                 /* unexpected last byte */
+    leaq 32(%rsp), %rcx
+    configure_d3d12_vm 0x80004001
+    movb $0, 63(%rsp)
+    movl $5, 36(%rsp)
+    leaq 32(%rsp), %rcx
+    configure_d3d12_vm 0x80004001
+    xorl %ecx, %ecx
+    configure_d3d12_vm 0x80070057
+    movl $44, %eax
+    addq $72, %rsp
+    retq
 Lend:
     .org Ltext + {capacity}, 0xcc

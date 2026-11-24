@@ -16,7 +16,7 @@ const OPT: &str = "--experimental-static-tls";
 const TRUSTED: &str = "--trusted-offline";
 const WARNING: &str = "neither signature nor catalog is verified; Xbox policy is not evaluated";
 const PAGE: usize = 0x4000;
-const RAW: usize = 0x2200; // Includes the shared fixture's bridge code.
+const RAW: usize = 0x2400; // Includes the shared fixture's bridge code.
 const TEXT: usize = PAGE;
 const RO: usize = 2 * PAGE;
 const DATA: usize = 3 * PAGE;
@@ -62,6 +62,7 @@ struct Fixture {
     sync_sleep: u32,
     sync_wake: u32,
     registry_entry: u32,
+    configure_d3d12_vm_entry: u32,
     code: [u8; RAW],
 }
 global_asm!(include_str!("fixtures/static_tls_lane.S"),
@@ -1885,6 +1886,39 @@ fn reg_open_key_w_bridge_reports_missing_hklm_subkey() {
     expect(output, 41, "Guest entry returned 41");
 }
 
+#[test]
+fn xbox_d3d12_vm_bridge_accepts_only_observed_offline_input() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let mut exe = image(Kind::Solo);
+    let entry = TEXT + unsafe { static_tls_fixture.configure_d3d12_vm_entry } as usize;
+    w32(&mut exe, OP + 16, entry);
+    let symbol = b"D3D12ConfigureVirtualMemoryX\0";
+    let mut desktop = exe.clone();
+    dir_import_one(&mut desktop, b"d3d12.dll\0", symbol);
+    let desktop = scratch.write("desktop-vm.exe", &desktop);
+    dir_import_one(&mut exe, b"D3D12_XS.dll\0", symbol);
+    let xbox = scratch.write("xbox-vm.exe", &exe);
+
+    for (path, flags) in [
+        (&desktop, &[OPT, TRUSTED, "--rust-providers"][..]),
+        (&xbox, &[OPT, "--rust-providers"][..]),
+        (&xbox, &[OPT, TRUSTED][..]),
+    ] {
+        expect(run(path, flags), 1, "incomplete dependency graph");
+    }
+    let output = run(&xbox, &[OPT, TRUSTED, "--rust-providers"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let accepted =
+        "d3d12_xs.dll!D3D12ConfigureVirtualMemoryX: trusted-offline model only; recorded +0x04=";
+    assert_eq!(stderr.matches(accepted).count(), 2, "{stderr}");
+    assert!(stderr.contains(&format!("{accepted}3; skipped Xbox D3D12 VM policy")));
+    assert!(stderr.contains(&format!("{accepted}4; skipped Xbox D3D12 VM policy")));
+    assert_eq!(stderr.matches("unsupported 32-byte input shape").count(), 2);
+    expect(output, 44, "Guest entry returned 44");
+}
 #[test]
 fn startup_trace_identifies_fatal_dllmain_phase_and_last_bridge() {
     if !rosetta() {
