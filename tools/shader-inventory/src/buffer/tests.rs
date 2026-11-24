@@ -33,7 +33,7 @@ fn byte_immediates_are_decoded_for_both_backends() {
     );
     let msl = program.msl();
     assert!(msl.contains("const ulong desc = ulong(args[0]) + 12ul;"));
-    assert!(msl.contains("const ulong offset = ulong(args[3]) + 4ul + 4ul;"));
+    assert!(msl.contains("const ulong offset = ulong(lane_offset) + 4ul + 4ul;"));
 }
 
 #[test]

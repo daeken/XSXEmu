@@ -20,11 +20,17 @@ enum Op {
 
 pub struct Program(BTreeMap<usize, Instruction<Op>>);
 
+pub fn cmpx_limit(word: u32) -> Option<u32> {
+    (0x7da80080..=0x7da800c0)
+        .contains(&word)
+        .then_some(word & 0x7f)
+}
+
 fn decode(words: &[u32]) -> Option<Instruction<Op>> {
     let word = *words.first()?;
     let (flow, op) = match word {
         // VOPC v_cmpx_gt_u32_e32, vsrc1 = v0, src0 = unsigned inline 0..64.
-        0x7da80080..=0x7da800c0 => (Flow::Next, Op::CompareLimitGtV0(word & 0x7f)),
+        0x7da80080..=0x7da800c0 => (Flow::Next, Op::CompareLimitGtV0(cmpx_limit(word)?)),
         0x4a020100 => (Flow::Next, Op::DoubleV0IntoV1),
         0xbf810000 => (Flow::Stop, Op::End),
         0xbf880000..=0xbf88ffff => (Flow::Fork(word as i16), Op::BranchExecZero),

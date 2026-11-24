@@ -6,6 +6,8 @@ mod buffer;
 mod cfg;
 #[cfg(any(target_os = "macos", test))]
 mod exec;
+#[cfg(any(target_os = "macos", test))]
+mod exec_store;
 
 #[cfg(target_os = "macos")]
 fn run_alu(
@@ -117,18 +119,17 @@ fn file_url(
 }
 
 #[cfg(target_os = "macos")]
-fn run_exec(
+fn owned_pipeline(
     dev: &metal::DeviceRef,
-    queue: &metal::CommandQueueRef,
+    source: &str,
+    name: &str,
     archive: Option<ExecArchive>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<Option<metal::ComputePipelineState>, Box<dyn std::error::Error>> {
     use metal::{
-        BinaryArchiveDescriptor, CompileOptions, ComputePipelineDescriptor, MTLCommandBufferStatus,
-        MTLPipelineOption, MTLResourceOptions, MTLSize,
+        BinaryArchiveDescriptor, CompileOptions, ComputePipelineDescriptor, MTLPipelineOption,
     };
-    let program = exec::Program::decode(&exec::FIXTURE)?;
-    let lib = dev.new_library_with_source(&program.msl(), &CompileOptions::new())?;
-    let function = lib.get_function("exec_fixture", None)?;
+    let lib = dev.new_library_with_source(source, &CompileOptions::new())?;
+    let function = lib.get_function(name, None)?;
     let pipeline = match archive {
         None => dev.new_compute_pipeline_state_with_function(&function)?,
         Some(ExecArchive::Bake(path)) => {
@@ -154,10 +155,10 @@ fn run_exec(
                 return Err("Metal did not write the owned compute archive".into());
             }
             println!(
-                "{}: empty archive refused; baked owned EXEC pipeline",
+                "{}: empty archive refused; baked owned {name} pipeline",
                 dev.name()
             );
-            return Ok(());
+            return Ok(None);
         }
         Some(ExecArchive::Replay(path)) => {
             let url = file_url(&path, false)?;
@@ -172,11 +173,25 @@ fn run_exec(
                 MTLPipelineOption::FailOnBinaryArchiveMiss,
             )?;
             println!(
-                "{}: owned EXEC compute pipeline created with FailOnBinaryArchiveMiss",
+                "{}: owned {name} compute pipeline created with FailOnBinaryArchiveMiss",
                 dev.name()
             );
             pipeline
         }
+    };
+    Ok(Some(pipeline))
+}
+
+#[cfg(target_os = "macos")]
+fn run_exec(
+    dev: &metal::DeviceRef,
+    queue: &metal::CommandQueueRef,
+    archive: Option<ExecArchive>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use metal::{MTLCommandBufferStatus, MTLResourceOptions, MTLSize};
+    let program = exec::Program::decode(&exec::FIXTURE)?;
+    let Some(pipeline) = owned_pipeline(dev, &program.msl(), "exec_fixture", archive)? else {
+        return Ok(());
     };
     if pipeline.thread_execution_width() != exec::LANES as u64
         || pipeline.max_total_threads_per_threadgroup() < exec::LANES as u64
@@ -225,6 +240,75 @@ fn run_exec(
     let words = exec::CASES.len() * exec::OUTPUT_WORDS;
     println!(
         "{}: owned wave32 EXEC/branch, {words}/{words} CPU/Metal words match (including exits)",
+        dev.name()
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn run_exec_store(
+    dev: &metal::DeviceRef,
+    queue: &metal::CommandQueueRef,
+    archive: Option<ExecArchive>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use metal::{MTLCommandBufferStatus, MTLResourceOptions, MTLSize};
+    let program = exec_store::Program::decode(&exec_store::FIXTURE)?;
+    let Some(pipeline) = owned_pipeline(dev, &program.msl(), "exec_store_fixture", archive)? else {
+        return Ok(());
+    };
+    let lanes = exec_store::LANES as u64;
+    if pipeline.thread_execution_width() != lanes
+        || pipeline.max_total_threads_per_threadgroup() < lanes
+    {
+        return Err("unsupported: EXEC-store requires a full wave32-sized SIMD group".into());
+    }
+    let opts = MTLResourceOptions::StorageModeShared;
+    let initial = [buffer::SENTINEL; exec_store::OUTPUT];
+    let mut verified = 0;
+    for (index, case) in exec_store::cases().iter().enumerate() {
+        let expected = case.expected();
+        if program.cpu(case) != expected {
+            return Err(format!("EXEC-store case {index}: CPU oracle mismatch").into());
+        }
+        let table = case.owned_table();
+        let table = &table[..case.table_words()];
+        let table_buf =
+            dev.new_buffer_with_data(table.as_ptr().cast(), size_of_val(table) as u64, opts);
+        let output =
+            dev.new_buffer_with_data(initial.as_ptr().cast(), size_of_val(&initial) as u64, opts);
+        let args = [
+            case.table_base,
+            table.len() as u32,
+            (initial.len() - 1) as u32,
+            case.exec,
+            0,
+            0x8000_0000,
+            0,
+            u32::MAX,
+        ];
+        let work = queue.new_command_buffer();
+        let encoder = work.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(&table_buf), 0);
+        encoder.set_buffer(1, Some(&output), 0);
+        encoder.set_bytes(2, size_of_val(&args) as u64, args.as_ptr().cast());
+        encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(lanes, 1, 1));
+        encoder.end_encoding();
+        work.commit();
+        work.wait_until_completed();
+        if work.status() != MTLCommandBufferStatus::Completed {
+            return Err(format!("EXEC-store Metal command failed ({:?})", work.status()).into());
+        }
+        // Metal has completed and the shared allocation contains all output words.
+        let actual =
+            unsafe { std::slice::from_raw_parts(output.contents().cast::<u32>(), initial.len()) };
+        if let Some(word) = actual.iter().zip(expected).position(|(&a, b)| a != b) {
+            return Err(format!("EXEC-store case {index}: mismatch at word {word}").into());
+        }
+        verified += actual.len();
+    }
+    println!(
+        "{}: owned EXEC + bounded store, {verified}/{verified} CPU/Metal words match",
         dev.name()
     );
     Ok(())
@@ -314,7 +398,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let queue = dev.new_command_queue();
     let mut args = std::env::args_os().skip(1);
     if let Some(mode) = args.next() {
-        let usage = "usage: shader-metal-probe [--bake-exec-archive <new file> | --replay-exec-archive <file>]";
+        let usage = "usage: shader-metal-probe [--bake-exec-archive | --replay-exec-archive | --bake-exec-store-archive | --replay-exec-store-archive] [file]";
         if std::env::var_os("MTL_SHADER_VALIDATION").is_some_and(|v| v != "0" && !v.is_empty()) {
             return Err("this binary archive probe does not support Metal GPU shader validation instrumentation; use the regular probe for GPU validation".into());
         }
@@ -323,19 +407,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .filter(|_| args.next().is_none())
             .ok_or(usage)?
             .into();
-        let archive = if mode == "--bake-exec-archive" {
-            ExecArchive::Bake(path)
-        } else if mode == "--replay-exec-archive" {
-            ExecArchive::Replay(path)
-        } else {
-            return Err(usage.into());
-        };
-        return run_exec(&dev, &queue, Some(archive));
+        match mode.to_str() {
+            Some("--bake-exec-archive") => {
+                return run_exec(&dev, &queue, Some(ExecArchive::Bake(path)));
+            }
+            Some("--replay-exec-archive") => {
+                return run_exec(&dev, &queue, Some(ExecArchive::Replay(path)));
+            }
+            Some("--bake-exec-store-archive") => {
+                return run_exec_store(&dev, &queue, Some(ExecArchive::Bake(path)));
+            }
+            Some("--replay-exec-store-archive") => {
+                return run_exec_store(&dev, &queue, Some(ExecArchive::Replay(path)));
+            }
+            _ => return Err(usage.into()),
+        }
     }
     run_alu(&dev, &queue, "ALU", &alu::FIXTURE)?;
     run_alu(&dev, &queue, "branch/literal", &alu::BRANCH_FIXTURE)?;
     run_exec(&dev, &queue, None)?;
-    run_buffer(&dev, &queue)
+    run_buffer(&dev, &queue)?;
+    run_exec_store(&dev, &queue, None)
 }
 
 #[cfg(target_os = "macos")]

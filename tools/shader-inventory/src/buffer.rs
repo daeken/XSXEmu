@@ -67,14 +67,26 @@ impl Program {
     }
 
     pub fn msl(&self) -> String {
+        format!(
+            r#"{}
+kernel void buffer_fixture(device const uint* table [[buffer(0)]],
+                           device uint* output [[buffer(1)]],
+                           constant uint* args [[buffer(2)]]) {{
+    bounded_store(table, output, args, args[3], args[4]);
+}}
+"#,
+            self.msl_helper()
+        )
+    }
+
+    pub fn msl_helper(&self) -> String {
         // The scalar load is synchronous in this lowering. The exact
         // lgkmcnt(0) is required by decode; no general waitcnt is modeled.
         format!(
             r#"#include <metal_stdlib>
 using namespace metal;
-kernel void buffer_fixture(device const uint* table [[buffer(0)]],
-                           device uint* output [[buffer(1)]],
-                           constant uint* args [[buffer(2)]]) {{
+inline void bounded_store(device const uint* table, device uint* output,
+                          constant uint* args, uint lane_offset, uint v0) {{
     const ulong table_bytes = ulong(args[1]) * 4ul;
     const ulong desc = ulong(args[0]) + {load_imm}ul;
     if ((desc & 3ul) != 0 || desc > table_bytes || table_bytes - desc < 16ul) return;
@@ -86,10 +98,10 @@ kernel void buffer_fixture(device const uint* table [[buffer(0)]],
     if (binding != 0u || mode != {RAW_WRITE}u || ((base | extent) & 3ul) != 0) return;
     const ulong output_bytes = ulong(args[2]) * 4ul;
     if (base > output_bytes || extent > output_bytes - base) return;
-    const ulong offset = ulong(args[3]) + {store_imm}ul + {SCALAR_OFFSET}ul;
+    const ulong offset = ulong(lane_offset) + {store_imm}ul + {SCALAR_OFFSET}ul;
     if ((offset & 3ul) != 0 || offset > extent || extent - offset < {STORE_BYTES}ul) return;
     const ulong dst = (base + offset) / 4ul;
-    output[dst] = args[4] ^ {XOR}u;
+    output[dst] = v0 ^ {XOR}u;
     output[dst + 1] = args[5];
     output[dst + 2] = args[6];
     output[dst + 3] = args[7];
