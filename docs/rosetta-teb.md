@@ -375,10 +375,10 @@ its continuation checks.
 optimization for x86/x64 emulators. The runner doesn't consume the annotations
 to weaken ordering; it relies on native x86 semantics or Rosetta. The binary
 layouts are corroborated by [LLVM's COFF reader][coff] and [LIEF's volatile
-metadata reader][lief], respectively. CodeIntegrity fields, real address-taken
-IAT/long-jump tables, process export-suppression opt-in and other unknown or
-unsupported guard fields still refuse admission. No signature validation is
-performed by this profile.
+metadata reader][lief], respectively. CodeIntegrity fields still block guarded
+startup, as do real long-jump tables, process export-suppression opt-in, and
+other unsupported guard fields. No signature validation is performed by this
+profile.
 
 [ehcont]: https://learn.microsoft.com/en-us/cpp/build/reference/guard-enable-eh-continuation-metadata
 [volatile]: https://learn.microsoft.com/en-us/cpp/build/reference/volatile
@@ -408,9 +408,20 @@ The active CFG slots retain the existing exact GFID policy. Neither this
 classification nor installing a gate adds a policy target.
 
 The non-opt-in launcher still rejects these fields. CodeIntegrity metadata
-and the real address-taken IAT table in `vcruntime140.dll` remain independent
-pre-entry blockers. Other unsupported guard metadata is not normalized. Only
-owned fixtures are executed for this profile.
+remains an independent pre-entry blocker for guarded startup. Other
+unsupported guard metadata is not normalized. Only owned fixtures are
+executed for this profile.
+
+## Opt-in child: address-taken IAT validation
+
+The static TLS child validates an address-taken IAT table using the GFID
+stride with zero reserved bytes and strictly ordered IAT slot RVAs. Each slot
+must resolve through static binding to an executable PE export that is
+independently allowed by the existing exact CFG policy. The table cannot
+unsuppress exports or authorize host, dynamic, unresolved, or traced targets.
+The validated metadata and slots are sealed; no target is added to CFG. The
+default startup and offline catalog inspection have no such binding checks
+and continue to reject nonempty address-taken IAT fields.
 
 ## Offline CodeIntegrity and embedded certificate envelopes
 
@@ -430,8 +441,9 @@ headers/section data (zero alignment padding) and end exactly at EOF. The
 payload is not decoded. Read-only inspection of `msvcp140.dll` found the opaque
 catalog offset `0xc0ce0` and, separately, the embedded table at file offset
 `0x87800`, size `0x27f0`. Nothing from either payload is used to admit targets.
-The address-taken IAT table in `vcruntime140.dll` and the inconsistent export
-suppression stride in `msvcp140_codecvt_ids.dll` still fail the guard profile.
+Offline inspection refuses the address-taken IAT table in `vcruntime140.dll`
+because it cannot validate the bound slots. The inconsistent export suppression
+stride in `msvcp140_codecvt_ids.dll` still fails the guard profile.
 
 The [Windows SDK][ci-sdk] identifies these as CodeIntegrity information fields;
 it does not establish Xbox catalog policy for this tuple. Microsoft's

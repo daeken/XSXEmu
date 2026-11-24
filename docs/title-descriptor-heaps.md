@@ -8,7 +8,22 @@ This model asks a bookkeeping question: **if the caller already has a guest virt
 - XCL's [`HANDOFF.md` retail bring-up notes](https://github.com/ivall/xcl/blob/91f9a5e/HANDOFF.md#retail-game-bring-up-2026-11-23) report using title `__XMemAllocationHooks__` to obtain descriptor heap memory. That is evidence for studying title-supplied memory, not verification of the callback ABI, allocation rules, or placement behavior across console versions.
 - Leonida's `docs/d3d12_vulkan.md` §3.4 (D3D-329) reports 32-bit bases and static T#/S# offsets in a shader census. This is evidence about those shaders' GPU-side inputs, not a CPU guest VA limit or a universal API stride. Leonida's `docs/d3d12_xs_surface.md` §9 does not report a measured API increment; XCL's `HANDOFF.md` describes the view and sampler increments used by its compatibility layer. This model takes the guest VA window, base alignment and stride explicitly and does not assign implied values by heap kind.
 
-Only factual observations from the GPL-licensed reports informed this work. The Rust implementation and numeric fixtures are original.
+Only factual observations were taken from the GPL-licensed reports. The Rust implementation and numeric fixtures are original.
+
+### Static retail cross-check
+
+Coordinated with the D3D12 ABI investigation and checked the local retail PE (SHA-256 `e95020b2fa4a721db3df59fdecf75621730ac559d8835252f6c3b658d5a08993`) by static disassembly only. The locations below are RVAs:
+
+| Location | Caller observation |
+| --- | --- |
+| `0x5a54712`, `0x5cabb3c` | Two callers of wrapper `0x1cf3280`: the former passes zero in R8; the latter forwards its own first argument in R8 and divides its second argument by the device slot-15 return to compute R9. |
+| `0x2478eab`–`0x2478eb5` | The upstream call into the latter caller takes the expected base from title global `0x75df188`. This does not establish how the global was allocated or populated. |
+| `0x1cf32a7`, `0x1cf32be`–`0x1cf32dd` | The wrapper saves incoming R8 in RBX, calls device slot 15 (`+0x78`) using the first dword of the descriptor as the type argument, and records the supplied base alongside the product of the return value and incoming R9. The caller arithmetic is consistent with a descriptor increment; no numeric increment is recovered. |
+| `0x1cf3332`, `0x1cf32fa` | For a nonzero supplied base, a helper links a record containing a pointer to that base/size pair before device slot 14 (`+0x70`, `CreateDescriptorHeap`-shaped call with the heap IID at `0x61e0628`). The base is not an extra direct argument to slot 14. |
+| `0x1cf3358`–`0x1cf336c` | The success path consumes the slot-9 (`+0x48`) return in RAX and traps on mismatch with the supplied base, but only if the supplied base is nonzero. |
+| `0x1cf3392`–`0x1cf3398` | A flag-gated slot-10 (`+0x50`) call returns in RAX; the caller stores its difference from the slot-9 value, rather than requiring the two to match. |
+
+This corroborates a title-supplied expected base on one path. It does not prove the consumer of the linked record, a callback signature, page ownership, a universal heap-placement rule, or how a GPU address relates to the CPU VA.
 
 ## Model contract
 
