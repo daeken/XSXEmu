@@ -16,7 +16,7 @@ const OPT: &str = "--experimental-static-tls";
 const TRUSTED: &str = "--trusted-offline";
 const WARNING: &str = "neither signature nor catalog is verified; Xbox policy is not evaluated";
 const PAGE: usize = 0x4000;
-const RAW: usize = 0x2000; // Includes the shared fixture's bridge code.
+const RAW: usize = 0x2200; // Includes the shared fixture's bridge code.
 const TEXT: usize = PAGE;
 const RO: usize = 2 * PAGE;
 const DATA: usize = 3 * PAGE;
@@ -61,6 +61,7 @@ struct Fixture {
     sync_entry: u32,
     sync_sleep: u32,
     sync_wake: u32,
+    registry_entry: u32,
     code: [u8; RAW],
 }
 global_asm!(include_str!("fixtures/static_tls_lane.S"),
@@ -1864,6 +1865,24 @@ fn module_filename_bridge_uses_mapped_paths_and_teb_last_error() {
         43,
         "Guest entry returned 43",
     );
+}
+
+#[test]
+fn reg_open_key_w_bridge_reports_missing_hklm_subkey() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let mut exe = image(Kind::Solo);
+    let entry = TEXT + unsafe { static_tls_fixture.registry_entry } as usize;
+    w32(&mut exe, OP + 16, entry);
+    dir_import_one(&mut exe, b"ADVAPI32.dll\0", b"RegOpenKeyW\0");
+    let exe = scratch.write("empty-registry.exe", &exe);
+    let output = run(&exe, &[OPT, "--rust-providers"]);
+    assert!(String::from_utf8_lossy(&output.stderr).contains(
+        "advapi32.dll!RegOpenKeyW: empty guest registry (HKLM subkey), ERROR_FILE_NOT_FOUND"
+    ));
+    expect(output, 41, "Guest entry returned 41");
 }
 
 #[test]

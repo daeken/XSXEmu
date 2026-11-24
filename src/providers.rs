@@ -68,6 +68,7 @@ pub fn has_dll(dll: &[u8]) -> bool {
         b"kernelbase.dll"
             | b"kernel32.dll"
             | b"ntdll.dll"
+            | b"advapi32.dll"
             | ERROR_HANDLING
             | PROCESS_THREADS
             | HEAP
@@ -109,6 +110,9 @@ pub fn lookup(dll: &[u8], name: &[u8]) -> Option<HostExport> {
     }
 
     match (dll, name) {
+        (b"advapi32.dll", b"RegOpenKeyW") => {
+            export!("advapi32.dll", "RegOpenKeyW", reg_open_key_w)
+        }
         (b"kernelbase.dll" | b"kernel32.dll" | ERROR_HANDLING, b"GetLastError") => {
             export!(KERNELBASE, "GetLastError", get_last_error)
         }
@@ -213,6 +217,34 @@ pub(crate) mod native {
             Some(mode & VALID | previous & STICKY_ALIGNMENT)
         });
         updated.unwrap_or_else(|_| std::process::abort())
+    }
+
+    // Bootstrap-only empty guest registry: nonempty subkeys under HKLM are
+    // absent. Opening a root itself or using other handles is not modeled.
+    // The LSTATUS carries the failure; leave both phkResult and LastError alone.
+    pub(crate) unsafe extern "win64" fn reg_open_key_w(
+        root: usize,
+        subkey: *const u16,
+        out: *mut usize,
+    ) -> i32 {
+        const HKEY_LOCAL_MACHINE: usize = 0x8000_0002u32 as i32 as isize as usize;
+        const ERROR_FILE_NOT_FOUND: i32 = 2;
+        const ERROR_NOT_SUPPORTED: i32 = 50;
+        if out.is_null() {
+            return ERROR_INVALID_PARAMETER as i32;
+        }
+        // Trusted Win64 caller supplies a readable UTF-16 string. Only the
+        // first code unit matters; don't scan or log the caller's key name.
+        if root != HKEY_LOCAL_MACHINE || subkey.is_null() || unsafe { subkey.read() } == 0 {
+            return ERROR_NOT_SUPPORTED;
+        }
+        // Static TLS reaches this Rust code only after restoring host GS.
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "xsxemu: advapi32.dll!RegOpenKeyW: empty guest registry (HKLM subkey), ERROR_FILE_NOT_FOUND"
+        );
+        ERROR_FILE_NOT_FOUND
     }
 
     static NEXT_THREAD_ID: AtomicU32 = AtomicU32::new(1);

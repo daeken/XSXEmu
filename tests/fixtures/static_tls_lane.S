@@ -13,6 +13,7 @@ _static_tls_fixture:
     .long Lmodule_handle_dll_main-Ltext, Lmodule_handle_entry-Ltext
     .long Lprocessor_feature_entry-Ltext
     .long Lsync_entry-Ltext, Lsync_sleep-Ltext, Lsync_wake-Ltext
+    .long Lregistry_entry-Ltext
 Ltext:
 .macro tls index
     leaq Ltext(%rip), %r11
@@ -1053,5 +1054,28 @@ Lsync_sleep_name:
     .asciz "SleepConditionVariableCS"
 Lsync_wake_name:
     .asciz "WakeAllConditionVariable"
+Lregistry_entry:
+    tls 0
+    phase 1, 2
+    subq $40, %rsp
+    movl $0x1234, %gs:0x68
+    movq $0, 32(%rsp)
+    leaq 32(%rsp), %r8
+    leaq Lregistry_subkey(%rip), %rdx
+    movq $-2147483646, %rcx             /* sign-extended HKEY_LOCAL_MACHINE */
+    callq *{iat_delta}(%r11)            /* RegOpenKeyW */
+    testl %eax, %eax
+    jz Lbad                            /* must take the optional-key fallback */
+    cmpl $2, %eax                      /* ERROR_FILE_NOT_FOUND */
+    jne Lbad
+    cmpq $0, 32(%rsp)                   /* no handle returned */
+    jne Lbad
+    cmpl $0x1234, %gs:0x68               /* LSTATUS, not LastError */
+    jne Lbad
+    movl $41, %eax
+    addq $40, %rsp
+    retq
+Lregistry_subkey:
+    .short 'O', 'w', 'n', 'e', 'd', 0
 Lend:
     .org Ltext + {capacity}, 0xcc
