@@ -382,6 +382,7 @@ impl LiftGaps {
                     && match op {
                         Op::Move { .. } => name == "v_mov_b32_e32",
                         Op::AddF32Literal { .. } => name == "v_add_f32_e32",
+                        Op::FmaF32 { .. } => name == "v_fma_f32",
                         Op::Export { .. } => name == "exp",
                         Op::End => name == "s_endpgm",
                     }

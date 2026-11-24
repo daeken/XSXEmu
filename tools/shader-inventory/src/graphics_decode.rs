@@ -20,6 +20,10 @@ pub(crate) enum Op {
         src: Vgpr,
         literal_bits: u32,
     },
+    FmaF32 {
+        dst: Vgpr,
+        src: [Vgpr; 3],
+    },
     Export {
         target: Target,
         src: [Vgpr; 4],
@@ -63,6 +67,24 @@ pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeErro
                 dst: Vgpr((w >> 17) as u8),
                 src: Vgpr((w >> 9) as u8),
                 literal_bits,
+            },
+        ));
+    }
+    // VOP3 v_fma_f32: ordinary VGPRs only. No abs, neg, clamp or output modifier.
+    if w & 0xffff_ff00 == 0xd54b_0000 {
+        let fields = ext()?;
+        if fields & 0xfc02_0100 != 0x0402_0100 {
+            return Err(DecodeError::Unsupported(pc));
+        }
+        return Ok((
+            2,
+            Op::FmaF32 {
+                dst: Vgpr(w as u8),
+                src: [
+                    Vgpr(fields as u8),
+                    Vgpr((fields >> 9) as u8),
+                    Vgpr((fields >> 18) as u8),
+                ],
             },
         ));
     }

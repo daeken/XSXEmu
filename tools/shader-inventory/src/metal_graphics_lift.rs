@@ -7,11 +7,13 @@ mod graphics_lift;
 mod metal_artifact;
 
 // Integer oracle for the chosen fullscreen triangle and no-perspective varying.
-// Red = (x + 0.5)/16 + native literal (1/4 or 1/2); GB are native export swizzles.
+// Red/blue share a gradient. Green/alpha use the exact fused integer result
+// 4097*4097 - 16785408 = 1. Separate float32 multiply rounds to 16785408.
 #[cfg(any(test, target_os = "macos"))]
 fn expected(x: usize, mutated: bool) -> [u8; 4] {
     let red_numerator = 2 * x + 1 + if mutated { 16 } else { 8 };
-    [((red_numerator * 255 + 16) / 32) as u8, 191, 64, 255]
+    let gradient = ((red_numerator * 255 + 16) / 32) as u8;
+    [gradient, 255, gradient, 255]
 }
 
 #[cfg(target_os = "macos")]
@@ -141,9 +143,9 @@ mod gpu {
         enc.set_render_pipeline_state(&pipeline);
         // Three records of {position float4, one native PARAM0 input float4}.
         let vertices: [[f32; 8]; 3] = [
-            [-1., -1., 0., 1., 0., 0.25, 0.75, 1.],
-            [3., -1., 0., 1., 1., 0.25, 0.75, 1.],
-            [-1., 3., 0., 1., 0., 0.25, 0.75, 1.],
+            [-1., -1., 0., 1., 0., 4097., 4097., -16785408.],
+            [3., -1., 0., 1., 1., 4097., 4097., -16785408.],
+            [-1., 3., 0., 1., 0., 4097., 4097., -16785408.],
         ];
         enc.set_vertex_bytes(
             0,
@@ -218,8 +220,10 @@ fn main() {
 
 #[test]
 fn oracle_endpoints_and_gradient() {
-    assert_eq!(expected(0, false), [72, 191, 64, 255]);
-    assert_eq!(expected(7, false), [183, 191, 64, 255]);
-    assert_eq!(expected(0, true), [135, 191, 64, 255]);
-    assert_eq!(expected(7, true), [247, 191, 64, 255]);
+    assert_eq!(4097_i64 * 4097 - 16785408, 1);
+    assert_eq!(4097_f32 * 4097. - 16785408., 0.);
+    assert_eq!(expected(0, false), [72, 255, 72, 255]);
+    assert_eq!(expected(7, false), [183, 255, 183, 255]);
+    assert_eq!(expected(0, true), [135, 255, 135, 255]);
+    assert_eq!(expected(7, true), [247, 255, 247, 255]);
 }

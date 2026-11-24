@@ -32,9 +32,10 @@ const VS: &[u32] = &[
 const PS: &[u32] = &[
     0x0608_00ff,
     0x3e80_0000, // v_add_f32_e32 v4, 0.25, v0
-    0x7e0a_0302, // v_mov_b32_e32 v5, v2
+    0xd54b_0005,
+    0x040e_0501, // v_fma_f32 v5, v1, v2, v3
     0xf800_080f,
-    0x0301_0504, // exp mrt0 v4, v5, v1, v3 done
+    0x0504_0504, // exp mrt0 v4, v5, v4, v5 done
     0xbf81_0000, // s_endpgm
 ];
 
@@ -81,6 +82,12 @@ fn lift(stage: Stage, words: &[u32]) -> Result<Vec<Op>, Reject> {
                 require(src)?;
                 live[usize::from(dst.0)] = true;
             }
+            Op::FmaF32 { dst, src } => {
+                for r in src {
+                    require(r)?;
+                }
+                live[usize::from(dst.0)] = true;
+            }
             Op::Export { target, src, done } => {
                 if stage.exports().get(exported) != Some(&(target, done)) {
                     return Err(Reject::BadExports(pc));
@@ -119,6 +126,12 @@ fn body(out: &mut String, ops: &[Op]) {
                 literal_bits,
             } => {
                 writeln!(out, "  r[{dst}] = as_type<uint>(as_type<float>(0x{literal_bits:08x}u) + as_type<float>(r[{src}]));").unwrap();
+            }
+            Op::FmaF32 {
+                dst: Vgpr(dst),
+                src: [Vgpr(a), Vgpr(b), Vgpr(c)],
+            } => {
+                writeln!(out, "  r[{dst}] = as_type<uint>(fma(as_type<float>(r[{a}]), as_type<float>(r[{b}]), as_type<float>(r[{c}])));").unwrap();
             }
             Op::Export {
                 target,
@@ -185,7 +198,7 @@ mod tests {
             io::Write,
             process::{Command, Stdio},
         };
-        let asm = "v_mov_b32_e32 v8, v4\nexp param0 v8, v5, v6, v7\nexp pos0 v0, v1, v2, v3 done\ns_endpgm\nv_add_f32_e32 v4, 0.25, v0\nv_mov_b32_e32 v5, v2\nexp mrt0 v4, v5, v1, v3 done\ns_endpgm\n";
+        let asm = "v_mov_b32_e32 v8, v4\nexp param0 v8, v5, v6, v7\nexp pos0 v0, v1, v2, v3 done\ns_endpgm\nv_add_f32_e32 v4, 0.25, v0\nv_fma_f32 v5, v1, v2, v3\nexp mrt0 v4, v5, v4, v5 done\ns_endpgm\n";
         let expected: Vec<u8> = VS.iter().chain(PS).flat_map(|w| w.to_le_bytes()).collect();
         for cpu in ["gfx1013", "gfx1030"] {
             let mut child = Command::new(&mc)
@@ -221,15 +234,20 @@ mod tests {
         vs[0] |= 128;
         assert_eq!(lift(Stage::Vertex, &vs), Err(Reject::Uninitialized(0, 132)));
         assert_eq!(lift(Stage::Pixel, &PS[..1]), Err(Reject::Truncated(0)));
-        assert_eq!(lift(Stage::Pixel, &PS[..5]), Err(Reject::BadEnd(5)));
+        assert_eq!(lift(Stage::Pixel, &PS[..6]), Err(Reject::BadEnd(6)));
         let mut ps = PS.to_vec();
-        ps[3] |= 0x400; // compressed export is unsupported, not lowered as four lanes
-        assert_eq!(lift(Stage::Pixel, &ps), Err(Reject::Unsupported(3)));
-        ps[3] = 0xf800_000f; // missing DONE
-        assert_eq!(lift(Stage::Pixel, &ps), Err(Reject::BadExports(3)));
+        ps[3] ^= 1 << 29; // Unmodeled negative modifier.
+        assert_eq!(lift(Stage::Pixel, &ps), Err(Reject::Unsupported(2)));
+        ps[3] = PS[3] & !(1 << 17); // SGPR instead of ordinary VGPR.
+        assert_eq!(lift(Stage::Pixel, &ps), Err(Reject::Unsupported(2)));
         ps[3] = PS[3];
+        ps[4] |= 0x400; // compressed export is unsupported, not lowered as four lanes
+        assert_eq!(lift(Stage::Pixel, &ps), Err(Reject::Unsupported(4)));
+        ps[4] = 0xf800_000f; // missing DONE
+        assert_eq!(lift(Stage::Pixel, &ps), Err(Reject::BadExports(4)));
+        ps[4] = PS[4];
         ps.push(0);
-        assert_eq!(lift(Stage::Pixel, &ps), Err(Reject::BadEnd(5)));
+        assert_eq!(lift(Stage::Pixel, &ps), Err(Reject::BadEnd(6)));
     }
 
     #[test]
