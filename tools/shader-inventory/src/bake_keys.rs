@@ -73,7 +73,11 @@ pub enum Pipeline {
     Compute {
         threads: [u16; 3],
     },
-    /// Procedural vertices; triangle list, filled, uncullled, one sample.
+    /// Procedural vertices, triangle list, filled, no culling, one sample,
+    /// one linear RGBA8Unorm color attachment, no stencil. `alpha_blend`
+    /// selects additive blending with (srcAlpha, oneMinusSrcAlpha) for RGB
+    /// and (one, oneMinusSrcAlpha) for alpha; otherwise replace enabled
+    /// channels. Mask bits 0..3 correspond to R, G, B, A.
     ProceduralTriangleRgba8 {
         write_mask: u8,
         alpha_blend: bool,
