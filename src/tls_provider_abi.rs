@@ -1,7 +1,7 @@
 //! Static IAT-only entry points. No runtime code generation or raw provider
 //! target selection. Each row states an exact reviewed Win64 prototype and
 //! emits a typed SysV adapter plus a matching assembly entry in host text.
-use super::{CONTEXT_OFFSET, Context, LAST_ERROR_OFFSET, called_dormant_guard};
+use super::{CONTEXT_OFFSET, Context, LAST_ERROR_OFFSET, called_dormant_guard, startup_trace};
 use crate::{
     Result,
     import_traps::called_missing_import_tls,
@@ -48,6 +48,17 @@ macro_rules! audited_bridges {
             unsafe { native::with_tls_child_last_error(teb_error, || target($($arg),*)) }
         })*
 
+        // Called after the bridge checks host GS. The return PC is logged as
+        // an integer only; neither guest code nor guest memory is read here.
+        extern "C" fn trace_bridge(entry: u64, return_pc: u64) {
+            $(if entry == $entry as *const () as u64 {
+                let dll = std::str::from_utf8($dll).unwrap_or("?");
+                let symbol = std::str::from_utf8($symbol).unwrap_or("?");
+                startup_trace(format_args!("bridge dispatch {dll}!{symbol} guest_return_pc={return_pc:#x}"));
+                return;
+            })*
+        }
+
         global_asm!(
             include_str!("tls_runtime.S"),
             include_str!("tls_provider_abi.S"),
@@ -59,6 +70,8 @@ macro_rules! audited_bridges {
             host30 = const offset_of!(Context, host30),
             vector = const offset_of!(Context, vector),
             setter = const offset_of!(Context, setter),
+            trace_startup = const offset_of!(Context, trace_startup),
+            trace_bridge = sym trace_bridge,
             context_slot = const CONTEXT_OFFSET,
             last_error = const LAST_ERROR_OFFSET,
             missing_import = sym called_missing_import_tls,

@@ -1420,6 +1420,71 @@ fn disable_thread_library_calls_checks_dllmain_handle_and_static_tls() {
     }
 }
 
+#[test]
+fn startup_trace_identifies_fatal_dllmain_phase_and_last_bridge() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let mut exe = image(Kind::Solo);
+    dir_import_one(&mut exe, b"owned.dll\0", b"Step\0");
+    let exe = scratch.write("trace.exe", &exe);
+    let mut dll = image(Kind::Dll);
+    dir_import_one(&mut dll, b"kernel32.dll\0", b"DisableThreadLibraryCalls\0");
+    let entry = TEXT + unsafe { static_tls_fixture.dll_main as usize };
+    // sub rsp,40; call [rip+IAT]; ud2. RCX already holds the DLL handle.
+    put(&mut dll, file(entry), &[0x48, 0x83, 0xec, 40, 0xff, 0x15]);
+    let return_rva = entry + 10;
+    w32(&mut dll, file(entry + 6), IAT - return_rva);
+    put(&mut dll, file(return_rva), &[0x0f, 0x0b]);
+    scratch.write("owned.dll", &dll);
+
+    let flags = [OPT, "--rust-providers"];
+    let quiet = launcher(&exe, &flags)
+        .env_remove("XSXEMU_TRACE_STARTUP")
+        .output()
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&quiet.stderr).contains("xsxemu: startup "));
+    expect(quiet, 1, "child terminated by signal 4");
+
+    let output = launcher(&exe, &flags)
+        .env("XSXEMU_TRACE_STARTUP", "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let found: Vec<_> = stderr
+        .lines()
+        .filter(|l| l.contains("xsxemu: startup ") && !l.contains("startup image "))
+        .collect();
+    assert_eq!(found.len(), 4, "{stderr}");
+    assert!(
+        found[0].contains("begin phase=tls-attach") && found[0].contains("owned.dll"),
+        "{stderr}"
+    );
+    assert_eq!(found[0].replace("startup begin", "startup end"), found[1]);
+    assert!(
+        found[2].contains("begin phase=dllmain-attach") && found[2].contains("owned.dll"),
+        "{stderr}"
+    );
+    assert!(found[2].ends_with(&format!("rva={entry:#x}")), "{stderr}");
+    let target = found[2]
+        .split_once(" target=0x")
+        .unwrap()
+        .1
+        .split_whitespace()
+        .next()
+        .unwrap();
+    let target = u64::from_str_radix(target, 16).unwrap();
+    assert!(
+        found[3].ends_with(&format!(
+            "bridge dispatch kernelbase.dll!DisableThreadLibraryCalls guest_return_pc={:#x}",
+            target + 10
+        )),
+        "{stderr}"
+    );
+    expect(output, 1, "child terminated by signal 4");
+}
+
 fn dir_import_one(b: &mut [u8], dll: &[u8], symbol: &[u8]) {
     let imports = LINK + 0x780;
     dir(b, 1, imports, 40);
@@ -1447,6 +1512,13 @@ fn audited_iat_bridges_share_teb_last_error_and_preserve_win64_state() {
     );
     let flags = [OPT, "--rust-providers"];
     expect(run(&exe, &flags), 45, "Guest entry returned 45");
+
+    let traced = launcher(&exe, &flags)
+        .env("XSXEMU_TRACE_STARTUP", "1")
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&traced.stderr).contains("end phase=tls-detach"));
+    expect(traced, 45, "Guest entry returned 45");
 
     // CFG refuses non-exact addresses even adjacent to a registered bridge.
     for mode in [1, 2] {

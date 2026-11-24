@@ -178,10 +178,11 @@ struct Context {
     host30: u64,
     vector: u64,
     setter: SetBase,
+    trace_startup: bool,
 }
 
 impl Context {
-    fn capture(guest_base: u64, vector: u64) -> Result<Self> {
+    fn capture(guest_base: u64, vector: u64, trace_startup: bool) -> Result<Self> {
         // Private Rosetta behavior measured by c800404 and its precursor
         // probes: THREAD_IDENTIFIER_INFO.thread_handle is the host TSD base.
         let mut info = IdentifierInfo::default();
@@ -209,6 +210,7 @@ impl Context {
             // Take the function address on host GS rather than making a lazy
             // symbol-stub call from the guest window.
             setter: _thread_set_tsd_base,
+            trace_startup,
         })
     }
 }
@@ -421,6 +423,13 @@ fn check_sites(
     Ok(())
 }
 
+// Called only on host GS. Do not hold the stderr lock across a guest transfer
+// or turn a diagnostic I/O error into a startup failure.
+fn startup_trace(message: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr().lock(), "xsxemu: startup {message}");
+}
+
 pub fn run(
     plan: &Plan,
     images: &[(&str, &[u8])],
@@ -450,7 +459,8 @@ pub fn run(
         teb_ptr.add(0x30 / 8).write(guest_base);
         teb_ptr.add(0x58 / 8).write(vector);
     }
-    let ctx = Context::capture(guest_base, vector)?;
+    let trace = std::env::var_os("XSXEMU_TRACE_STARTUP").is_some_and(|v| v == "1");
+    let ctx = Context::capture(guest_base, vector, trace)?;
     // Keep this pointer and the stub live through all notifications and entry.
     unsafe {
         teb_ptr
@@ -458,23 +468,57 @@ pub fn run(
             .cast::<*const Context>()
             .write(&raw const ctx)
     };
-    let call = |target, image, reason| {
+    let call = |i: usize, phase, target, image, reason| {
+        let module = images[i].0;
+        let rva = target - memories[i].base();
+        if trace {
+            startup_trace(format_args!(
+                "begin phase={phase} module={module:?} target={target:#x} rva={rva:#x}"
+            ));
+        }
         // All targets are in sealed executable sections, and the caller opted
         // into running trusted Win64 code that returns without unwinding.
-        unsafe { xsxemu_tls_call(&raw const ctx, target, image, reason) }
+        let status = unsafe { xsxemu_tls_call(&raw const ctx, target, image, reason) };
+        if trace {
+            startup_trace(format_args!(
+                "end phase={phase} module={module:?} target={target:#x} rva={rva:#x}"
+            ));
+        }
+        status
     };
     let notify = |i: usize, reason| {
+        let phase = if reason == 1 {
+            "tls-attach"
+        } else {
+            "tls-detach"
+        };
         for &target in &callbacks[i] {
-            call(target, memories[i].base(), reason);
+            call(i, phase, target, memories[i].base(), reason);
         }
     };
     let dll_entry = |i: usize, reason| {
+        let phase = if reason == 1 {
+            "dllmain-attach"
+        } else {
+            "dllmain-detach"
+        };
         let base = memories[i].base();
-        pes[i].entry_rva == 0 || call(base + u64::from(pes[i].entry_rva), base, reason) != 0
+        pes[i].entry_rva == 0
+            || call(i, phase, base + u64::from(pes[i].entry_rva), base, reason) != 0
     };
     let original = mask::mask(None)?;
     mask::fault_defaults(original)?;
     mask::apply(mask::BLOCKED, original)?;
+
+    if trace {
+        for (i, &(module, _)) in images.iter().enumerate() {
+            let base = memories[i].base();
+            let size = pes[i].size_of_image;
+            startup_trace(format_args!(
+                "image module={module:?} base={base:#x} size={size:#x}"
+            ));
+        }
+    }
 
     let mut attached = 0;
     let outcome = (|| -> Result<u32> {
@@ -486,7 +530,13 @@ pub fn run(
             attached += 1;
         }
         notify(0, 1);
-        let status = call(memories[0].base() + u64::from(pes[0].entry_rva), 0, 0);
+        let status = call(
+            0,
+            "exe-entry",
+            memories[0].base() + u64::from(pes[0].entry_rva),
+            0,
+            0,
+        );
         notify(0, 0);
         Ok(status)
     })();

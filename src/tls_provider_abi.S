@@ -34,6 +34,13 @@
     check_guest %r12
     switch_to {host_base}, %r12
     check_host %r12
+    cmpb $0, {trace_startup}(%r12)
+    je 1f
+    /* Log only under checked host GS, before setting adapter arguments. */
+    leaq \entry(%rip), %rdi
+    movq TLS_BRIDGE_FRAME(%rsp), %rsi  /* guest return PC, not fault RIP */
+    callq {trace_bridge}
+1:
     movq {guest_base}(%r12), %rdi
     addq ${last_error}, %rdi
     .if \argc >= 1
