@@ -102,7 +102,12 @@ pub(crate) fn lookup(dll: &[u8], name: &[u8]) -> Option<HostExport> {
             "CreateSemaphoreExW",
             crate::providers::win_io::native::create_semaphore_ex_w
         ),
-        // Semaphore creation alone does not implement semaphore release or waits.
+        (b"kernelbase.dll" | b"kernel32.dll" | SYNCH, b"CreateEventA") => export!(
+            "kernelbase.dll",
+            "CreateEventA",
+            crate::providers::win_io::native::create_event_a
+        ),
+        // Creation does not implement release, signaling, or waits.
         _ => None,
     }
 }
@@ -141,15 +146,21 @@ mod registry_tests {
         }
         assert!(crate::providers::lookup(SYNCH, init).is_none());
         assert!(crate::providers::lookup(INTERLOCKED, b"initializeSListHead").is_none());
-        let create = b"CreateSemaphoreExW";
-        let entry = crate::providers::lookup(SYNCH, create).unwrap();
-        assert_eq!(entry.provider, "kernelbase.dll");
-        assert_eq!(entry.symbol.as_bytes(), create);
-        for dll in [b"kernelbase.dll".as_slice(), b"kernel32.dll"] {
-            assert_eq!(Some(entry), crate::providers::lookup(dll, create));
+        for create in [b"CreateSemaphoreExW".as_slice(), b"CreateEventA"] {
+            let entry = crate::providers::lookup(SYNCH, create).unwrap();
+            assert_eq!(entry.provider, "kernelbase.dll");
+            assert_eq!(entry.symbol.as_bytes(), create);
+            for dll in [b"kernelbase.dll".as_slice(), b"kernel32.dll"] {
+                assert_eq!(Some(entry), crate::providers::lookup(dll, create));
+            }
+            assert!(crate::providers::lookup(SYNCH_12, create).is_none());
         }
-        assert!(crate::providers::lookup(SYNCH_12, create).is_none());
-        for name in [b"ReleaseSemaphore".as_slice(), b"WaitForSingleObject"] {
+        for name in [
+            b"ReleaseSemaphore".as_slice(),
+            b"SetEvent",
+            b"ResetEvent",
+            b"WaitForSingleObject",
+        ] {
             assert!(crate::providers::lookup(SYNCH, name).is_none());
             assert!(crate::providers::lookup(b"kernelbase.dll", name).is_none());
         }

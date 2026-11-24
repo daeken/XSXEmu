@@ -369,6 +369,17 @@ security attributes, `ReleaseSemaphore`, and wait APIs remain unsupported.
 The owned PE tests both stack DWORDs with nonzero upper halves, distinct
 handles, and guest LastError on success and failure.
 
+`CreateEventA` uses a four-argument bridge. The direct calls and tail thunk
+referencing IAT RVA `0x6793ab0` pass null security and name, manual-reset
+`FALSE` or `TRUE`, and initial state `FALSE`. The missing-import trace does
+not distinguish the callers. The provider stores reset mode and signal state
+on a typed, noninheritable guest event with `EVENT_ALL_ACCESS`; both Win32
+BOOLs use zero/nonzero semantics. Success preserves LastError. Non-null
+name or security fails with `ERROR_NOT_SUPPORTED` without dereferencing
+either pointer. Ordinary handle closure and duplication use the same object
+lifetime rules as for semaphores. This implements creation only: event
+signaling, reset, and wait APIs remain unbound.
+
 `IsProcessorFeaturePresent` uses the ordinary provider's AMD64 baseline and
 runtime x86 feature detection, preserving `LastError`. It reports
 `PF_FASTFAIL_AVAILABLE` (23) as false: Windows `INT 29h` fast-fail handling is

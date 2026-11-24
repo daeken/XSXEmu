@@ -309,8 +309,10 @@ pub(crate) mod native {
     // SYNCHRONIZE | SEMAPHORE_MODIFY_STATE. No generic/standard rights mapping.
     const SEMAPHORE_RIGHTS: u32 = 0x0010_0002;
 
-    fn semaphore_access(access: u32) -> Result<u32> {
-        if access & !SEMAPHORE_RIGHTS != 0 {
+    const EVENT_ALL_ACCESS: u32 = 0x001f_0003;
+
+    fn sync_access(access: u32, supported: u32) -> Result<u32> {
+        if access & !supported != 0 {
             return Err(UNSUPPORTED);
         }
         Ok(access)
@@ -327,6 +329,14 @@ pub(crate) mod native {
         Semaphore {
             count: i32,
             maximum: i32,
+        },
+        #[allow(
+            dead_code,
+            reason = "event signaling and waits are not implemented yet"
+        )]
+        Event {
+            manual_reset: bool,
+            signaled: bool,
         },
     }
     #[derive(Clone)]
@@ -753,13 +763,38 @@ pub(crate) mod native {
                 if !name.is_null() || !security.is_null() {
                     return Err(UNSUPPORTED);
                 }
-                let access = semaphore_access(desired_access)?;
+                let access = sync_access(desired_access, SEMAPHORE_RIGHTS)?;
                 lock(&STATE).insert(Entry {
                     obj: Arc::new(Object::Semaphore {
                         count: initial,
                         maximum,
                     }),
                     access,
+                    inheritable: false,
+                })
+            })(),
+            0,
+        )
+    }
+
+    pub(crate) extern "win64" fn create_event_a(
+        security: *const c_void,
+        manual_reset: i32,
+        initial_state: i32,
+        name: *const u8,
+    ) -> usize {
+        ret(
+            (|| {
+                // No namespace, security descriptor or inheritance support.
+                if !security.is_null() || !name.is_null() {
+                    return Err(UNSUPPORTED);
+                }
+                lock(&STATE).insert(Entry {
+                    obj: Arc::new(Object::Event {
+                        manual_reset: manual_reset != 0,
+                        signaled: initial_state != 0,
+                    }),
+                    access: EVENT_ALL_ACCESS,
                     inheritable: false,
                 })
             })(),
@@ -817,7 +852,8 @@ pub(crate) mod native {
             }
             if options & 2 == 0 {
                 let requested = match &*e.obj {
-                    Object::Semaphore { .. } => semaphore_access(access)?,
+                    Object::Semaphore { .. } => sync_access(access, SEMAPHORE_RIGHTS)?,
+                    Object::Event { .. } => sync_access(access, EVENT_ALL_ACCESS)?,
                     _ => access_mask(access)?,
                 };
                 if requested & !e.access != 0 {
@@ -891,6 +927,32 @@ pub(crate) mod native {
         assert_eq!(CloseHandle(duplicate), 1);
         assert!(weak.upgrade().is_none());
         assert_eq!(CloseHandle(other), 1);
+    }
+
+    #[test]
+    fn event_handles_retain_reset_mode_and_signal_state() {
+        use crate::providers::native::get_last_error;
+
+        let mut previous = 0;
+        for (manual_reset, initial_state) in [(0, 0), (1, 0), (0, 1), (-1, -2)] {
+            set_last_error(0x1234);
+            let h = create_event_a(ptr::null(), manual_reset, initial_state, ptr::null());
+            assert_ne!(h, 0);
+            assert_ne!(h, previous);
+            previous = h;
+            assert_eq!(get_last_error(), 0x1234);
+            let e = entry(h).unwrap();
+            assert_eq!(e.access, EVENT_ALL_ACCESS);
+            assert!(!e.inheritable);
+            assert!(
+                matches!(*e.obj, Object::Event { manual_reset: manual, signaled }
+                if manual == (manual_reset != 0) && signaled == (initial_state != 0))
+            );
+            assert_eq!(GetFileType(h), 0);
+            assert_eq!(get_last_error(), BAD_HANDLE);
+            assert_eq!(CloseHandle(h), 1);
+            assert!(entry(h).is_err());
+        }
     }
 
     fn std_slot(n: u32) -> Result<usize> {
@@ -1265,7 +1327,9 @@ pub(crate) mod native {
                 #[cfg(target_os = "macos")]
                 Object::Console(_) => Ok(2),
                 Object::Pipe(_) => Ok(3),
-                Object::Search(_) | Object::Semaphore { .. } => Err(BAD_HANDLE),
+                Object::Search(_) | Object::Semaphore { .. } | Object::Event { .. } => {
+                    Err(BAD_HANDLE)
+                }
             }),
             0,
         )

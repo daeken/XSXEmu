@@ -2127,6 +2127,60 @@ fn semaphore_bridge_passes_both_stack_dwords_and_round_trips_last_error() {
     expect(output, 49, "Guest entry returned 49");
 }
 
+const EVENT_CODE_CAPACITY: usize = 0x200;
+
+#[repr(C)]
+struct EventFixture {
+    entry: u32,
+    code: [u8; EVENT_CODE_CAPACITY],
+}
+
+global_asm!(include_str!("fixtures/static_tls_event.S"),
+    capacity = const EVENT_CODE_CAPACITY,
+    iat_delta = const IAT - TEXT,
+    options(att_syntax),
+);
+
+unsafe extern "C" {
+    static static_tls_event_fixture: EventFixture;
+}
+
+#[test]
+fn event_bridge_creates_distinct_unnamed_events_and_rejects_pointer_inputs() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let mut exe = image(Kind::Solo);
+    let fixture = unsafe { &static_tls_event_fixture };
+    exe[file(TEXT)..file(TEXT) + RAW].fill(0xcc);
+    put(&mut exe, file(TEXT), &fixture.code);
+    w32(&mut exe, OP + 16, TEXT + fixture.entry as usize);
+    w64(&mut exe, file(ARRAY), PREFERRED + TEXT);
+    dir_import_one(
+        &mut exe,
+        b"api-ms-win-core-synch-l1-1-0.dll\0",
+        b"CreateEventA\0",
+    );
+    let path = scratch.write("event.exe", &exe);
+    expect(run(&path, &[OPT]), 1, "incomplete dependency graph");
+    let flags = [OPT, "--rust-providers"];
+    expect(run(&path, &flags), 51, "Guest entry returned 51");
+    let output = launcher(&path, &flags)
+        .env("XSXEMU_TRACE_STARTUP", "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr
+            .matches("bridge dispatch kernelbase.dll!CreateEventA guest_return_pc=")
+            .count(),
+        4,
+        "{stderr}"
+    );
+    expect(output, 51, "Guest entry returned 51");
+}
+
 const EXCEPTION_FILTER_CODE_CAPACITY: usize = 0x200;
 
 #[repr(C)]
