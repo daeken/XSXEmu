@@ -41,7 +41,7 @@ All 2,236 VS wrappers join their checked `OSG1` to the unique raw stage-4 FSSM p
 | `gfx1013` | 1,448 | 434 | 878 | 136 | 5 |
 | `gfx1030` | 1,242 | 394 | 712 | 136 | 5 |
 
-The ordinary projection counts distinct source register numbers, including shared registers once. The native projection counts distinct reachable nonzero-enable `PARAM` ordinals. Neither direct ordinal equality nor a uniform one-to-one compaction explains the corpus. No native linkage or stage-pair placement is inferred.
+The ordinary projection counts distinct source register numbers, including shared registers once. The native projection counts distinct reachable nonzero-enable `PARAM` ordinals. Neither direct ordinal equality nor a uniform one-to-one compaction explains the corpus. Counting mask bits also fails to establish uniform correspondence: union the `OSG1` ordinary primary masks per source register, union reachable raw `EN` masks per native `PARAM` ordinal, then compare the total set bits. The native total is lower/equal/higher in 93/121/1,234 `gfx1013` cases and 65/118/1,059 `gfx1030` cases. These are comparisons of stored and encoded mask bits, not live channels, lane values, compression semantics, native linkage, or stage-pair placement.
 
 ## Same-wrapper PS target comparison
 

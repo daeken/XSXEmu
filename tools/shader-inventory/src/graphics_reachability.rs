@@ -108,6 +108,7 @@ struct Exports {
     mrtz_masks: u16,
     positions: [u16; 5], // bit for each raw EN value, per position target
     active_parameters: u32,
+    parameter_en_union: [u8; 32],
     disabled_parameters: u32,
     null: bool,
     other: bool,
@@ -147,7 +148,10 @@ fn checked_exports(dis: &mut Disassembler, bytes: &[u8]) -> Result<Exports, Resu
                     Export::Mrtz(en) => exports.mrtz_masks |= 1 << en,
                     Export::Position(i, en) => exports.positions[i as usize] |= 1 << en,
                     Export::Parameter(i, 0) => exports.disabled_parameters |= 1 << i,
-                    Export::Parameter(i, _) => exports.active_parameters |= 1 << i,
+                    Export::Parameter(i, en) => {
+                        exports.active_parameters |= 1 << i;
+                        exports.parameter_en_union[i as usize] |= en;
+                    }
                     Export::Null => exports.null = true,
                     Export::Other => exports.other = true,
                 }
@@ -391,6 +395,7 @@ struct VsComparison {
     complete: usize,
     rejected: usize,
     ordinary_count_native_lower_equal_higher: [usize; 3],
+    ordinary_primary_vs_raw_en_bits_native_lower_equal_higher: [usize; 3],
     unshifted_exact: usize,
     position_presence_equal: usize,
     clip_or_cull_vs_pos1: [[usize; 2]; 2],
@@ -419,6 +424,14 @@ impl VsComparison {
             Greater => 2,
         };
         self.ordinary_count_native_lower_equal_higher[bucket] += 1;
+        let bits = |masks: &[u8; 32]| masks.iter().map(|m| m.count_ones()).sum::<u32>();
+        let bucket =
+            match bits(&native.parameter_en_union).cmp(&bits(&source.ordinary_primary_masks)) {
+                Less => 0,
+                Equal => 1,
+                Greater => 2,
+            };
+        self.ordinary_primary_vs_raw_en_bits_native_lower_equal_higher[bucket] += 1;
         self.unshifted_exact += usize::from(source.ordinary == native.active_parameters);
         self.position_presence_equal += usize::from(source.position == (native.positions[0] != 0));
         self.clip_or_cull_vs_pos1[usize::from(source.clip_or_cull)]
@@ -603,6 +616,7 @@ mod tests {
         let mut comparison = VsComparison::default();
         let source = crate::signatures::VsOutputProjection {
             ordinary: 6,
+            ordinary_primary_masks: [15; 32],
             position: true,
             clip_or_cull: true,
             other_system: false,
