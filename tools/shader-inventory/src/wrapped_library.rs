@@ -119,6 +119,13 @@ impl GraphicsCoverage {
     }
 }
 
+fn layout_extent(blob: &[u8]) -> Option<(usize, usize)> {
+    let count = word(blob, 76)?;
+    let end = 80usize.checked_add(count.checked_mul(36)?)?;
+    let rest = blob.get(end..)?;
+    (matches!(rest.len(), 0 | 4 | 8) && rest.iter().all(|&b| b == 0)).then_some((count, rest.len()))
+}
+
 fn digest(blob: &[u8]) -> Option<[u8; 16]> {
     let start = blob.len().checked_sub(32)?;
     blob.get(start + 4..start + 20)?.try_into().ok()
@@ -392,6 +399,10 @@ pub(super) fn run(
     // A row uses the digest on its exact metadata reference, not all digests
     // ever seen for the same program. Unknown slots stay in the grouping key.
     let mut graphics_rows = BTreeMap::<Vec<usize>, GraphicsCoverage>::new();
+    let mut state_sizes = BTreeMap::<Vec<usize>, BTreeMap<usize, HashSet<_>>>::new();
+    let mut layouts_seen = HashSet::new();
+    let mut layout_shapes = BTreeMap::<(usize, usize), usize>::new();
+    let mut layout_other = 0;
     let mut source_links = BTreeMap::<(usize, bool), SourceLinkage>::new();
     let mut divergent = BTreeMap::<usize, usize>::new();
     let mut system_links = BTreeMap::<(usize, bool), SystemLinkage>::new();
@@ -438,6 +449,25 @@ pub(super) fn run(
                 *divergent.entry(*upstream).or_default() += 1;
             }
         }
+        let state = library
+            .blob(pso.state)
+            .ok_or("missing graphics state span")?;
+        state_sizes
+            .entry(slots.clone())
+            .or_default()
+            .entry(state.len())
+            .or_default()
+            .insert(pso.state);
+        if layouts_seen.insert(pso.input_layout) {
+            let layout = library
+                .blob(pso.input_layout)
+                .ok_or("missing graphics layout span")?;
+            if let Some(shape) = layout_extent(layout) {
+                *layout_shapes.entry(shape).or_default() += 1;
+            } else {
+                layout_other += 1;
+            }
+        }
         graphics_rows.entry(slots).or_default().add(candidates);
     }
     for (slots, c) in graphics_rows {
@@ -446,6 +476,17 @@ pub(super) fn run(
             c.complete_unique, c.complete_multi, c.missing, c.missing_and_multi, c.no_known_slots,
         );
     }
+    for (slots, by_size) in state_sizes {
+        let counts: Vec<_> = by_size
+            .into_iter()
+            .map(|(size, ids)| (size, ids.len()))
+            .collect();
+        println!("  Graphics state blobs, slots {slots:?}, (bytes, distinct IDs): {counts:?}");
+    }
+    println!(
+        "  Graphics layout blobs: {} distinct; unsupported extent: {layout_other}; (count, zero suffix bytes) histogram: {layout_shapes:?}",
+        layouts_seen.len()
+    );
     for ((slot, multi), c) in source_links {
         let cohort = if multi {
             "Invariant multi-candidate"
@@ -577,6 +618,21 @@ mod tests {
         assert_eq!(f.count, 4);
         assert!(f.invariant.is_none());
         assert!(f.system_invariant.is_some());
+    }
+
+    #[test]
+    fn layout_extent_uses_checked_count_and_exact_zero_suffix() {
+        let mut bytes = [0u8; 124];
+        bytes[76..80].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(layout_extent(&bytes), Some((1, 8)));
+        assert_eq!(layout_extent(&bytes[..120]), Some((1, 4)));
+        assert_eq!(layout_extent(&bytes[..116]), Some((1, 0)));
+        assert_eq!(layout_extent(&bytes[..118]), None);
+        assert_eq!(layout_extent(&bytes[..115]), None);
+        bytes[123] = 1;
+        assert_eq!(layout_extent(&bytes), None);
+        bytes[76..80].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(layout_extent(&bytes), None);
     }
 
     #[test]
