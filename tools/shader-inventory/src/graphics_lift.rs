@@ -10,6 +10,7 @@ enum Stage {
     Pixel,
     PackedPixel,
     PackedRgPixel,
+    DualPackedPixel,
     DepthPixel,
 }
 
@@ -74,6 +75,8 @@ const PACKED_PS: &[u32] = &[
 
 const PACKED_RG_PS: &[u32] = &[0xf800_1c03, 1, 0xbf81_0000];
 
+const DUAL_PS: &[u32] = &[0xf800_040f, 1, 0xf800_1c1f, 0x100, 0xbf81_0000];
+
 const DEPTH_PS: &[u32] = &[
     0xf800_040f,
     1, // exp mrt0 v1, v1, v0, v0 compr
@@ -90,6 +93,7 @@ impl Stage {
             Stage::Pixel => 4,
             Stage::PackedPixel => 2,
             Stage::PackedRgPixel => 2,
+            Stage::DualPackedPixel => 2,
             Stage::DepthPixel => 3,
         }
     }
@@ -108,14 +112,17 @@ impl Stage {
                 (Target::Position, true),
             ],
             Stage::Pixel => &[(Target::Color, true)],
-            Stage::PackedPixel | Stage::PackedRgPixel | Stage::DepthPixel => &[],
+            Stage::PackedPixel
+            | Stage::PackedRgPixel
+            | Stage::DepthPixel
+            | Stage::DualPackedPixel => &[],
         }
     }
 
     fn export_count(self) -> usize {
         match self {
             Stage::PackedPixel | Stage::PackedRgPixel => 1,
-            Stage::DepthPixel => 2,
+            Stage::DepthPixel | Stage::DualPackedPixel => 2,
             _ => self.exports().len(),
         }
     }
@@ -174,15 +181,24 @@ fn lift(stage: Stage, words: &[u32]) -> Result<Vec<Op>, Reject> {
                 }
                 exported += 1;
             }
-            Op::PackedColor0 { src, done, vm } => {
+            Op::PackedColor {
+                slot,
+                src,
+                done,
+                vm,
+            } => {
                 // An explicit FP16_ABGR target. Neither profile changes EXEC;
                 // the final export must communicate ordinary raster coverage.
                 let valid = match stage {
-                    Stage::PackedPixel => done && vm,
-                    Stage::DepthPixel => !done && !vm,
+                    Stage::PackedPixel => exported == 0 && slot == 0 && done && vm,
+                    Stage::DepthPixel => exported == 0 && slot == 0 && !done && !vm,
+                    Stage::DualPackedPixel => matches!(
+                        (exported, slot, done, vm),
+                        (0, 0, false, false) | (1, 1, true, true)
+                    ),
                     _ => false,
                 };
-                if !valid || exported != 0 {
+                if !valid {
                     return Err(Reject::BadExports(pc));
                 }
                 for r in src {
@@ -287,10 +303,16 @@ fn emit_body(out: &mut String, ops: &[Op], packed_color_lvalue: &str, multi: boo
                 )
                 .unwrap();
             }
-            Op::PackedColor0 {
+            Op::PackedColor {
+                slot,
                 src: [Vgpr(rg), Vgpr(ba)],
                 ..
             } => {
+                let packed_color_lvalue = if slot == 1 {
+                    "out.color1"
+                } else {
+                    packed_color_lvalue
+                };
                 writeln!(out, "  {packed_color_lvalue} = float4(float(as_type<half>(ushort(r[{rg}]))), float(as_type<half>(ushort(r[{rg}] >> 16))), float(as_type<half>(ushort(r[{ba}]))), float(as_type<half>(ushort(r[{ba}] >> 16))));").unwrap();
             }
             Op::FinalPackedRg0 { src: Vgpr(rg) } => {
@@ -444,6 +466,16 @@ fragment DepthOutputs depth_ps(constant uint4 &input [[buffer(0)]]) {\n\
     Ok(msl)
 }
 
+#[allow(dead_code)] // Separate two-attachment render probe.
+pub fn translate_dual_fixture() -> Result<String, Reject> {
+    let vs = lift(Stage::Vertex, VS)?;
+    let ps = lift(Stage::DualPackedPixel, DUAL_PS)?;
+    let mut msl = vertex_module(&vs);
+    msl.push_str("struct DualColor { float4 color0 [[color(0)]]; float4 color1 [[color(1)]]; };\nfragment DualColor dual_ps(constant uint2 &input [[buffer(0)]]) {\n  uint r[256]; DualColor out; r[0] = input.x; r[1] = input.y;\n");
+    emit_body(&mut msl, &ps, "out.color0", false);
+    Ok(msl)
+}
+
 #[allow(dead_code)] // Separate linkage probe; the fragment consumer is authored.
 pub fn translate_multi_vertex_fixture() -> Result<String, Reject> {
     let vs = lift(Stage::MultiVertex, MULTI_VS)?;
@@ -507,7 +539,7 @@ mod tests {
             io::Write,
             process::{Command, Stdio},
         };
-        let asm = "v_mov_b32_e32 v8, v4\nexp param0 v8, v5, v6, v7\nexp pos0 v0, v1, v2, v3 done\ns_endpgm\nv_add_f32_e32 v4, 0.25, v0\nv_fma_f32 v5, v1, v2, v3\nv_mul_legacy_f32_e32 v6, v5, v4\nv_mul_legacy_f32_e32 v6, 0.5, v6\nv_mul_legacy_f32_e32 v7, 0, v3\nexp mrt0 v4, v5, v6, v7 done\ns_endpgm\nv_mul_legacy_f32_e32 v2, v0, v1\nv_mul_legacy_f32_e32 v3, 0.25, v1\nv_fmac_f32_e32 v4, v0, v1\nv_cvt_pkrtz_f16_f32_e32 v5, v0, v1\ns_inst_prefetch 3\nv_mov_b32_e32 v6, 0\ns_nop 0\nv_mov_b32_e32 v7, 0.5\nv_mov_b32_e32 v8, 1.0\nv_mov_b32_e32 v9, 0x7fc12345\nexp mrt0 v1, v1, v0, v0 done compr vm\ns_endpgm\nexp mrt0 v1, v1, off, off done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrtz v2, off, off, off done vm\ns_endpgm\n";
+        let asm = "v_mov_b32_e32 v8, v4\nexp param0 v8, v5, v6, v7\nexp pos0 v0, v1, v2, v3 done\ns_endpgm\nv_add_f32_e32 v4, 0.25, v0\nv_fma_f32 v5, v1, v2, v3\nv_mul_legacy_f32_e32 v6, v5, v4\nv_mul_legacy_f32_e32 v6, 0.5, v6\nv_mul_legacy_f32_e32 v7, 0, v3\nexp mrt0 v4, v5, v6, v7 done\ns_endpgm\nv_mul_legacy_f32_e32 v2, v0, v1\nv_mul_legacy_f32_e32 v3, 0.25, v1\nv_fmac_f32_e32 v4, v0, v1\nv_cvt_pkrtz_f16_f32_e32 v5, v0, v1\ns_inst_prefetch 3\nv_mov_b32_e32 v6, 0\ns_nop 0\nv_mov_b32_e32 v7, 0.5\nv_mov_b32_e32 v8, 1.0\nv_mov_b32_e32 v9, 0x7fc12345\nexp mrt0 v1, v1, v0, v0 done compr vm\ns_endpgm\nexp mrt0 v1, v1, off, off done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrtz v2, off, off, off done vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrt1 v0, v0, v1, v1 done compr vm\ns_endpgm\n";
         let mut asm = asm.to_owned();
         for n in 0..7 {
             let r = 4 + 4 * n;
@@ -525,6 +557,7 @@ mod tests {
             .chain(PACKED_PS)
             .chain(PACKED_RG_PS)
             .chain(DEPTH_PS)
+            .chain(DUAL_PS)
             .chain(MULTI_VS)
             .flat_map(|w| w.to_le_bytes())
             .collect();
@@ -575,13 +608,39 @@ mod tests {
             0xf800_0c0f,
             0xf800_140f,
             0xf800_0403,
-            0xf800_1c1f,
+            0xf800_041f,
             0xf800_3c0f,
         ] {
             assert_eq!(decode(&[header, 1], 0), Err(DecodeError::Unsupported(0)));
         }
         assert_eq!(
             decode(&[PACKED_PS[0], 0x10001], 0),
+            Err(DecodeError::Unsupported(0))
+        );
+    }
+
+    #[test]
+    fn dual_packed_requires_exact_slots_and_final_valid_mask() {
+        assert_eq!(lift(Stage::DualPackedPixel, DUAL_PS).unwrap().len(), 3);
+        assert_eq!(
+            lift(Stage::PackedPixel, &DUAL_PS[2..]),
+            Err(Reject::BadExports(0))
+        );
+        assert_eq!(
+            lift(Stage::DualPackedPixel, &DUAL_PS[..4]),
+            Err(Reject::BadEnd(4))
+        );
+        let mut ps = DUAL_PS.to_vec();
+        ps[2] = 0xf800_1c0f;
+        assert_eq!(
+            lift(Stage::DualPackedPixel, &ps),
+            Err(Reject::BadExports(2))
+        );
+        for hdr in [0xf800_1c13, 0xf800_1c2f, 0xf800_0c1f, 0xf800_141f] {
+            assert_eq!(decode(&[hdr, 0], 0), Err(DecodeError::Unsupported(0)));
+        }
+        assert_eq!(
+            decode(&[DUAL_PS[2], 0x10100], 0),
             Err(DecodeError::Unsupported(0))
         );
     }

@@ -84,3 +84,9 @@ compile depth
 "$p" --emit-multi-msl > "$d/multi.metal"
 compile multi
 "$p" --load-multi-metallib "$d/multi.metallib"
+
+# Two explicitly mapped FP16_ABGR exports, each with independent readback.
+"$p" --dual-source
+"$p" --emit-dual-msl > "$d/dual.metal"
+compile dual
+"$p" --load-dual-metallib "$d/dual.metallib"

@@ -538,7 +538,7 @@ impl LiftGaps {
                             accumulate: false, ..
                         } => name == "v_fma_f32",
                         Op::Export { .. }
-                        | Op::PackedColor0 { .. }
+                        | Op::PackedColor { .. }
                         | Op::FinalPackedRg0 { .. }
                         | Op::FinalPixelDepth { .. } => name == "exp",
                         Op::PackHalfRtz { .. } => name == "v_cvt_pkrtz_f16_f32_e32",

@@ -70,6 +70,8 @@ mod gpu {
         Source,
         PackedSource(bool),
         PackedLoad(&'a Path, bool),
+        DualSource,
+        DualLoad(&'a Path),
         MultiSource,
         MultiLoad(&'a Path),
         DepthSource,
@@ -101,6 +103,12 @@ mod gpu {
         let args: Vec<_> = std::env::args_os().skip(1).collect();
         let mode = match args.as_slice() {
             [] => Mode::Source,
+            [mode] if mode == "--dual-source" => Mode::DualSource,
+            [mode, lib] if mode == "--load-dual-metallib" => Mode::DualLoad(Path::new(lib)),
+            [mode] if mode == "--emit-dual-msl" => {
+                print!("{}", graphics_lift::translate_dual_fixture().map_err(|e| format!("dual lift rejected: {e:?}"))?);
+                return Ok(());
+            }
             [mode] if mode == "--multi-source" => Mode::MultiSource,
             [mode, lib] if mode == "--load-multi-metallib" => Mode::MultiLoad(Path::new(lib)),
             [mode] if mode == "--emit-multi-msl" => {
@@ -127,7 +135,7 @@ mod gpu {
             [mode, lib] if mode == "--load-metallib" || mode == "--load-mutated-metallib" => Mode::Load(Path::new(lib), mode == "--load-mutated-metallib"),
             [mode, lib, archive] if mode == "--expect-owned-metal-miss" => Mode::ExpectStrictMiss(Path::new(lib), Path::new(archive)),
             [mode, lib, archive, compiler] if mode == "--bake-archive" || mode == "--replay-archive" || mode == "--replay-mutated-archive" => Mode::Archive(Path::new(lib), Path::new(archive), mode == "--bake-archive", mode == "--replay-mutated-archive", owned_graphics_artifact::compiler_profile(compiler)?),
-            _ => return Err("usage: shader-metal-graphics-lift [--multi-source | --emit-multi-msl | --load-multi-metallib LIB | --packed-rg-source | --emit-packed-rg-msl | --load-packed-rg-metallib LIB | --depth-source | --emit-depth-msl | --load-depth-metallib LIB | --packed-source | --emit-packed-msl | --load-packed-metallib LIB | --emit-msl | --emit-mutated-msl | --load-metallib LIB | --load-mutated-metallib LIB | {--bake-archive|--replay-archive|--replay-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-owned-metal-miss MUTATED_LIB ARCHIVE]".into()),
+            _ => return Err("usage: shader-metal-graphics-lift [--dual-source | --emit-dual-msl | --load-dual-metallib LIB | --multi-source | --emit-multi-msl | --load-multi-metallib LIB | --packed-rg-source | --emit-packed-rg-msl | --load-packed-rg-metallib LIB | --depth-source | --emit-depth-msl | --load-depth-metallib LIB | --packed-source | --emit-packed-msl | --load-packed-metallib LIB | --emit-msl | --emit-mutated-msl | --load-metallib LIB | --load-mutated-metallib LIB | {--bake-archive|--replay-archive|--replay-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-owned-metal-miss MUTATED_LIB ARCHIVE]".into()),
         };
         if matches!(mode, Mode::Archive(..) | Mode::ExpectStrictMiss(..))
             && std::env::var_os("MTL_SHADER_VALIDATION").is_some()
@@ -153,9 +161,16 @@ mod gpu {
         let partial = matches!(mode, Mode::PackedSource(true) | Mode::PackedLoad(_, true));
         let depth = matches!(mode, Mode::DepthSource | Mode::DepthLoad(_));
         let multi = matches!(mode, Mode::MultiSource | Mode::MultiLoad(_));
+        let dual = matches!(mode, Mode::DualSource | Mode::DualLoad(_));
         let lib = match mode {
-            Mode::Source | Mode::PackedSource(_) | Mode::DepthSource | Mode::MultiSource => {
-                let msl = if multi {
+            Mode::Source
+            | Mode::PackedSource(_)
+            | Mode::DepthSource
+            | Mode::MultiSource
+            | Mode::DualSource => {
+                let msl = if dual {
+                    graphics_lift::translate_dual_fixture()
+                } else if multi {
                     graphics_lift::translate_multi_vertex_fixture()
                 } else if depth {
                     graphics_lift::translate_depth_fixture()
@@ -171,6 +186,7 @@ mod gpu {
             }
             Mode::PackedLoad(path, _)
             | Mode::MultiLoad(path)
+            | Mode::DualLoad(path)
             | Mode::DepthLoad(path)
             | Mode::Load(path, _)
             | Mode::Archive(path, _, _, _, _)
@@ -181,7 +197,9 @@ mod gpu {
         };
         let desc = RenderPipelineDescriptor::new();
         const DEPTH_FORMAT: MTLPixelFormat = MTLPixelFormat::Depth32Float;
-        let (format, pixel_bytes, default_ps) = if multi {
+        let (format, pixel_bytes, default_ps) = if dual {
+            (MTLPixelFormat::RGBA32Float, 16, "dual_ps")
+        } else if multi {
             (MTLPixelFormat::RGBA32Float, 16, "multi_ps")
         } else if depth {
             desc.set_depth_attachment_pixel_format(DEPTH_FORMAT);
@@ -220,6 +238,15 @@ mod gpu {
             MTLColorWriteMask::All
         });
         color_attachment.set_blending_enabled(false);
+        if dual {
+            let slot1 = desc
+                .color_attachments()
+                .object_at(1)
+                .ok_or("no pipeline slot 1")?;
+            slot1.set_pixel_format(MTLPixelFormat::RGBA32Float);
+            slot1.set_write_mask(MTLColorWriteMask::All);
+            slot1.set_blending_enabled(false);
+        }
         // Independent owned negative control. No sidecar is read or written;
         // success is possible only for the specific Metal archive-miss error.
         if let Mode::ExpectStrictMiss(_, path) = mode {
@@ -293,6 +320,17 @@ mod gpu {
         ));
         attachment.set_load_action(MTLLoadAction::Clear);
         attachment.set_store_action(MTLStoreAction::Store);
+        let color1 = dual.then(|| dev.new_texture(&texture_desc));
+        if let Some(texture) = color1.as_ref() {
+            let slot1 = pass
+                .color_attachments()
+                .object_at(1)
+                .ok_or("no pass slot 1")?;
+            slot1.set_texture(Some(texture));
+            slot1.set_clear_color(MTLClearColor::new(0., 0.5, 0., 1.));
+            slot1.set_load_action(MTLLoadAction::Clear);
+            slot1.set_store_action(MTLStoreAction::Store);
+        }
         let depth_texture = depth.then(|| {
             texture_desc.set_pixel_format(DEPTH_FORMAT);
             dev.new_texture(&texture_desc)
@@ -358,7 +396,7 @@ mod gpu {
                 );
                 enc.draw_primitives(MTLPrimitiveType::Triangle, 0, 3);
             }
-        } else if packed {
+        } else if packed || dual {
             enc.set_scissor_rect(MTLScissorRect {
                 x: 2,
                 y: 1,
@@ -376,13 +414,14 @@ mod gpu {
             enc.draw_primitives(MTLPrimitiveType::Triangle, 0, 3);
         }
         enc.end_encoding();
-        let readback = dev.new_buffer(BYTES as u64, MTLResourceOptions::StorageModeShared);
+        let extent = if dual { 2 * BYTES } else { BYTES };
+        let readback = dev.new_buffer(extent as u64, MTLResourceOptions::StorageModeShared);
         let ptr = readback.contents().cast::<u8>();
         if ptr.is_null() {
             return Err("unmapped graphics readback".into());
         }
         // No CPU access to the shared buffer while the GPU executes.
-        unsafe { ptr.write_bytes(0xa5, BYTES) };
+        unsafe { ptr.write_bytes(0xa5, extent) };
         let blit = cmd.new_blit_command_encoder();
         blit.copy_from_texture_to_buffer(
             &color,
@@ -396,6 +435,20 @@ mod gpu {
             0,
             MTLBlitOption::None,
         );
+        if let Some(texture) = color1.as_ref() {
+            blit.copy_from_texture_to_buffer(
+                texture,
+                0,
+                0,
+                MTLOrigin { x: 0, y: 0, z: 0 },
+                MTLSize::new(SIDE as u64, SIDE as u64, 1),
+                &readback,
+                BYTES as u64,
+                STRIDE as u64,
+                0,
+                MTLBlitOption::None,
+            );
+        }
         blit.end_encoding();
         cmd.commit();
         cmd.wait_until_completed();
@@ -403,7 +456,7 @@ mod gpu {
             return Err(format!("translated render command: {:?}", cmd.status()));
         }
         // The GPU writes have completed and the owned buffer remains alive through the last read.
-        let pixels = unsafe { std::slice::from_raw_parts(ptr, BYTES) };
+        let pixels = unsafe { std::slice::from_raw_parts(ptr, extent) };
         let mutated = matches!(mode, Mode::Load(_, true) | Mode::Archive(_, _, _, true, _));
         for y in 0..SIDE {
             for x in 0..SIDE {
@@ -423,7 +476,7 @@ mod gpu {
                         .as_flattened()
                         .to_owned();
                     &fp32
-                } else if packed {
+                } else if packed || dual {
                     // Independent numeric oracle; this does not unpack input dwords.
                     let rgba: [f32; 4] = if (2..6).contains(&x) && (1..6).contains(&y) {
                         if partial {
@@ -440,6 +493,22 @@ mod gpu {
                     ordinary = expected(x, mutated);
                     &ordinary
                 };
+                if dual {
+                    // Slot 1 reverses the two source VGPRs; neither color nor
+                    // the clear sentinel matches slot 0.
+                    let rgba: [f32; 4] = if (2..6).contains(&x) && (1..6).contains(&y) {
+                        [1.5, -0.5, -2., 0.25]
+                    } else {
+                        [0., 0.5, 0., 1.]
+                    };
+                    let expected1 = rgba.map(f32::to_le_bytes).as_flattened().to_owned();
+                    let got1 = &pixels[BYTES + at..BYTES + at + pixel_bytes];
+                    if got1 != expected1 {
+                        return Err(format!(
+                            "slot 1 pixel ({x},{y}): expected {expected1:?}, got {got1:?}"
+                        ));
+                    }
+                }
                 if got != expected {
                     return Err(format!(
                         "pixel ({x},{y}): expected {expected:?}, got {got:?}"
@@ -452,9 +521,9 @@ mod gpu {
             println!("published owned graphics artifact identity");
         }
         println!(
-            "{} translated GFX10 VS+PS (mutated={mutated}, packed={packed}, partial={partial}, depth={depth}, multi={multi}): {n}/{n} pixels matched",
+            "{} translated GFX10 VS+PS (mutated={mutated}, packed={packed}, partial={partial}, depth={depth}, multi={multi}, dual={dual}): {n}/{n} attachment pixels matched",
             dev.name(),
-            n = SIDE * SIDE
+            n = SIDE * SIDE * if dual { 2 } else { 1 }
         );
         Ok(())
     }
