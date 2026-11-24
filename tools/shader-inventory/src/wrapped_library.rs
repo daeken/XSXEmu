@@ -1,7 +1,7 @@
 //! Test byte-equality hypotheses inside stage/digest candidate families, not native ABI equivalence.
 use crate::{
-    ARCHIVE_LIMIT, BLOB_LIMIT, compute_sites::graphics_items, dxbc_chunks, shader_payloads,
-    stage_name, word,
+    ARCHIVE_LIMIT, BLOB_LIMIT, compute_sites::graphics_items, coverage::Metadata, dxbc_chunks,
+    shader_payloads, stage_name, word,
 };
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -22,12 +22,31 @@ struct Program {
     adjusted_equal: bool,
     marker_present: bool,
     conditional_equal: [bool; 3],
+    library_profiles: HashSet<([usize; 3], bool)>,
+    agreeing_profile: bool,
+    disagreeing_profile: bool,
+    equal_window_agreeing_profile: bool,
+    equal_window_disagreeing_profile: bool,
+}
+
+impl Program {
+    fn compare_profile(&mut self, profile: ([usize; 3], bool), byte_match: bool) {
+        // Compare all dispatch profiles that reference this program; retaining both
+        // flags prevents a matching reference from hiding a contradictory one.
+        let agrees = self.library_profiles.contains(&profile);
+        let disagrees = self.library_profiles.iter().any(|&d| d != profile);
+        self.agreeing_profile |= agrees;
+        self.disagreeing_profile |= disagrees;
+        self.equal_window_agreeing_profile |= byte_match && agrees;
+        self.equal_window_disagreeing_profile |= byte_match && disagrees;
+    }
 }
 
 #[derive(Default)]
 struct Payloads {
     compared: usize,
     invalid: usize,
+    unsupported_compute_profiles: usize,
 }
 
 fn digest(blob: &[u8]) -> Option<[u8; 16]> {
@@ -122,8 +141,11 @@ pub(super) fn run(wrapped: &Path, path: &Path) -> Result<(), Box<dyn Error>> {
             add(stage, item.program, blob).ok_or("missing graphics metadata digest")?;
         }
     }
+    let mut profiles = HashMap::<_, HashSet<_>>::new();
     for pso in library.compute() {
-        ComputeMetadata::from_library(&library, pso).ok_or("invalid compute metadata framing")?;
+        let dispatch = ComputeMetadata::from_library(&library, pso)
+            .ok_or("invalid compute metadata framing")?
+            .dispatch;
         add(
             5,
             pso.program,
@@ -132,6 +154,18 @@ pub(super) fn run(wrapped: &Path, path: &Path) -> Result<(), Box<dyn Error>> {
                 .ok_or("missing compute layout span")?,
         )
         .ok_or("missing compute layout digest")?;
+        profiles
+            .entry(pso.program)
+            .or_default()
+            .insert((dispatch.xyz, dispatch.wave32));
+    }
+    let multi_profiles = profiles.values().filter(|p| p.len() > 1).count();
+    for (id, profile) in profiles {
+        programs
+            .get_mut(&5)
+            .and_then(|p| p.get_mut(&id))
+            .ok_or("missing indexed compute program")?
+            .library_profiles = profile;
     }
 
     let mut counts = BTreeMap::<u16, Payloads>::new();
@@ -193,6 +227,13 @@ pub(super) fn run(wrapped: &Path, path: &Path) -> Result<(), Box<dyn Error>> {
             };
             count.compared += eligible.len();
             let fssm_cut = fssm_to_marker(&raw[40..]);
+            let profile = if stage == 5 && payload.get(0x100) == Some(&6) {
+                Metadata::parse(payload).map(|m| (m.group, m.wave32))
+            } else {
+                None
+            };
+            count.unsupported_compute_profiles +=
+                usize::from(stage == 5 && profile.is_none()) * eligible.len();
             for (id, lib) in &eligible {
                 // Only length-sensitive, exact byte equality. No candidate selection.
                 let p = candidates
@@ -200,13 +241,19 @@ pub(super) fn run(wrapped: &Path, path: &Path) -> Result<(), Box<dyn Error>> {
                     .expect("eligible IDs came from candidates");
                 p.stored_equal |= raw == *lib;
                 p.adjusted_equal |= raw[40..] == **lib;
+                let mut byte_match = false;
                 if let Some(library_cut) = library_to_final_marker(lib) {
                     p.marker_present = true;
                     if let Some(fssm_cut) = fssm_cut {
                         for (k, start) in STARTS.into_iter().enumerate() {
-                            p.conditional_equal[k] |= library_cut.get(start..) == Some(fssm_cut);
+                            let equal = library_cut.get(start..) == Some(fssm_cut);
+                            byte_match |= equal;
+                            p.conditional_equal[k] |= equal;
                         }
                     }
+                }
+                if let Some(profile) = profile {
+                    p.compare_profile(profile, byte_match);
                 }
             }
         };
@@ -244,6 +291,21 @@ pub(super) fn run(wrapped: &Path, path: &Path) -> Result<(), Box<dyn Error>> {
                 .count(),
             offsets
         );
+        if stage == 5 {
+            println!(
+                "  Compute launch cross-check: {multi_profiles} programs with multiple library XYZ/wave-bit pairs; {} comparisons with unsupported FSSM profiles; candidate programs {} with agreement, {} with disagreement, {} with both; byte-window positives {} with agreement, {} with disagreement",
+                totals.unsupported_compute_profiles,
+                values().filter(|p| p.agreeing_profile).count(),
+                values().filter(|p| p.disagreeing_profile).count(),
+                values()
+                    .filter(|p| p.agreeing_profile && p.disagreeing_profile)
+                    .count(),
+                values().filter(|p| p.equal_window_agreeing_profile).count(),
+                values()
+                    .filter(|p| p.equal_window_disagreeing_profile)
+                    .count()
+            );
+        }
     }
     Ok(())
 }
@@ -251,6 +313,22 @@ pub(super) fn run(wrapped: &Path, path: &Path) -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn agreeing_dispatch_reference_does_not_hide_a_disagreeing_one() {
+        let a = ([1, 2, 3], true);
+        let mut program = Program {
+            library_profiles: HashSet::from([a, ([1, 2, 3], false)]),
+            ..Program::default()
+        };
+        program.compare_profile(a, false);
+        assert!(program.agreeing_profile && program.disagreeing_profile);
+        assert!(
+            !program.equal_window_agreeing_profile && !program.equal_window_disagreeing_profile
+        );
+        program.compare_profile(a, true);
+        assert!(program.equal_window_agreeing_profile && program.equal_window_disagreeing_profile);
+    }
+
     #[test]
     fn marker_hypothesis_uses_bounded_final_aligned_word_not_execution() {
         let mut span = [0u8; 520];

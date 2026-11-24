@@ -98,6 +98,8 @@ The same scanner separately tests a narrower byte window. On the FSSM side it be
 
 The 51 compute positives are distinct programs. These are exact byte-window correspondences within the digest families under the stated cut hypotheses; they do not establish the actual executable extents, a global skip rule, register bindings, or an identity for the remaining candidates. The owned fixture exercises alignment, the backward search bound and last-marker selection.
 
+For compute, the scanner also compares the FSSM XYZ and wave-width bit to every distinct dispatch XYZ/wave-bit pair referencing the digest-joined library program. No program has multiple such library pairs in this corpus. All 2,689 candidate payload/program comparisons have readable compute metadata. All 2,680 joined compute programs agree, including the 51 conditional byte-window positives, with no disagreeing profile. This is launch metadata agreement, not an observed dispatch or a descriptor ABI. The checker retains disagreement even when another candidate or library reference agrees.
+
 ## Reproduce the structural census
 
 ```sh
