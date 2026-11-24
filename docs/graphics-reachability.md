@@ -13,9 +13,11 @@ The walk starts at stored-span offset `+40` as an explicit hypothesis. It follow
 | Raw stage byte | Payloads | `gfx1013` complete | `gfx1013` first rejection | `gfx1030` complete | `gfx1030` first rejection |
 |---|---:|---:|---|---:|---|
 | 2 (VS wrapper companion) | 195 | 0 | 37 `s_setpc_b64`, 158 `s_swappc_b64` | 0 | same |
-| 3 (GS) | 195 | 0 | 195 `s_sendmsg` | 0 | same |
+| 3 (GS) | 195 | 0 | 195 `s_sendmsg` (`MSG_GS`, `GS_OP_EMIT`) | 0 | same |
 | 4 (VS) | 2,236 | 1,448 | 788 `s_swappc_b64` | 1,242 | 788 `s_swappc_b64`, 206 decode |
-| 5 (PS) | 12,101 | 12,091 | 10 `s_sendmsg` | 6,188 | 5,913 decode |
-| 7 (MS) | 9,282 | 0 | 9,282 `s_sendmsg` | 0 | 8,258 `s_sendmsg`, 1,024 decode |
+| 5 (PS) | 12,101 | 12,091 | 10 unclassified `s_sendmsg` | 6,188 | 5,913 decode |
+| 7 (MS) | 9,282 | 0 | 9,282 `s_sendmsg` (`MSG_GS_ALLOC_REQ`) | 0 | 8,258 `MSG_GS_ALLOC_REQ`, 1,024 decode |
+
+The message classification requires the public four-byte SOPP opcode and recognized immediate fields to agree with LLVM's symbolic operands. Unrecognized cases stay grouped, with no operands printed. Only the first rejection is counted; neither the operation names nor the reported stream encoding establish how the Xbox schedules or couples stages. No message is treated as fallthrough or exit. The owned fixture also rejects noncanonical bits and a numeric-only operand presentation.
 
 Every complete graph has at least one reachable eight-byte `exp` checked against LLVM and the public GFX10 encoding prefix. No export result is attributed to an incomplete graph. An owned fixture distinguishes reachable, branch-skipped, and seen-before-rejection exports under all four decoder configurations. The census does not establish export targets or masks, payload coupling, message semantics, native linkage, authenticated entry, or executable Metal coverage. No title shader was executed or modified.

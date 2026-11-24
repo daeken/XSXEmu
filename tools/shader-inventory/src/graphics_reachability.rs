@@ -17,11 +17,50 @@ use std::{
 };
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum SendMsgClass {
+    GsAllocReq,
+    GsEmit,
+    GsCut,
+    GsEmitCut,
+    GsDone,
+    Unclassified,
+}
+
+fn sendmsg_class(first: u32, len: usize, text: &str) -> SendMsgClass {
+    use SendMsgClass::*;
+    if len != 4 || first >> 16 != 0xbf90 {
+        return Unclassified;
+    }
+    let text = text.trim().strip_prefix("s_sendmsg").map(str::trim);
+    let imm = first as u16;
+    match (imm, text) {
+        (9, Some("sendmsg(MSG_GS_ALLOC_REQ)")) => GsAllocReq,
+        (3, Some("sendmsg(MSG_GS_DONE, GS_OP_NOP)")) => GsDone,
+        (_, Some(operand)) => {
+            let stream = (imm >> 8) & 3;
+            let (op, class) = match imm & !0x0300 {
+                0x12 => ("GS_OP_CUT", GsCut),
+                0x22 => ("GS_OP_EMIT", GsEmit),
+                0x32 => ("GS_OP_EMIT_CUT", GsEmitCut),
+                _ => return Unclassified,
+            };
+            if operand == format!("sendmsg(MSG_GS, {op}, {stream})") {
+                class
+            } else {
+                Unclassified
+            }
+        }
+        _ => Unclassified,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum ResultClass {
     CompleteWithoutExp,
     CompleteWithExp,
     Decode,
     UnmodeledPc(String),
+    SendMsg(SendMsgClass),
     OtherControl(String),
     BadSuccessor,
     BadWidth,
@@ -40,6 +79,8 @@ fn walk(dis: &mut Disassembler, bytes: &[u8]) -> ResultClass {
         let Some(flow) = control(name, first, len) else {
             unsupported = if name.starts_with("s_setpc") || name.starts_with("s_swappc") {
                 ResultClass::UnmodeledPc(name.to_owned())
+            } else if name == "s_sendmsg" {
+                ResultClass::SendMsg(sendmsg_class(first, len, text))
             } else {
                 ResultClass::OtherControl(name.to_owned())
             };
@@ -151,6 +192,38 @@ pub fn run(lib: &OsStr, cpu: Cpu, root: &Path) -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recognized_sendmsg_is_still_an_unmodeled_control_blocker() {
+        let Some(path) = std::env::var_os("LLVM_DISASM_LIB") else {
+            return;
+        };
+        let _serial_llvm = crate::llvm::test_lock();
+        let llvm = Llvm::load(&path).unwrap();
+        for cpu in [Cpu::Gfx1013, Cpu::Gfx1030] {
+            for wave32 in [false, true] {
+                let mut dis = llvm.context(cpu, wave32).unwrap();
+                for (msg, class) in [
+                    (0xbf90_0222u32, SendMsgClass::GsEmit),
+                    (0xbf90_0009, SendMsgClass::GsAllocReq),
+                ] {
+                    let bytes: Vec<u8> = [msg, 0xbf81_0000]
+                        .into_iter()
+                        .flat_map(u32::to_le_bytes)
+                        .collect();
+                    assert_eq!(walk(&mut dis, &bytes), ResultClass::SendMsg(class));
+                }
+            }
+        }
+        assert_eq!(
+            sendmsg_class(0xbf90_0622, 4, "s_sendmsg sendmsg(MSG_GS, GS_OP_EMIT, 2)"),
+            SendMsgClass::Unclassified
+        );
+        assert_eq!(
+            sendmsg_class(0xbf90_0009, 4, "s_sendmsg 9"),
+            SendMsgClass::Unclassified
+        );
+    }
 
     #[test]
     fn export_is_counted_only_on_a_complete_reachable_path() {
