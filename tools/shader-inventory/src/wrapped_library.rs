@@ -698,6 +698,7 @@ pub(super) fn run(
     }
     let mut windows = HashSet::new();
     let mut zero_shapes = BTreeMap::<[bool; 8], usize>::new();
+    let mut leading_bytes = BTreeMap::<_, [HashSet<u8>; 2]>::new();
     let (mut contexts, mut multiple_bases, mut unprofiled, mut short, mut unaligned, mut zero_tail) =
         (0, 0, 0, 0, 0, 0);
     for (&id, bases) in &state_bases {
@@ -718,6 +719,14 @@ pub(super) fn run(
             let zero_shape = std::array::from_fn(|i| window[i * 4..i * 4 + 4] == [0; 4]);
             *zero_shapes.entry(zero_shape).or_default() += 1;
             zero_tail += usize::from(following == [0; 12]);
+            for (extra, observed) in [45, 46]
+                .into_iter()
+                .zip(leading_bytes.entry(base).or_default())
+            {
+                if let Some(byte) = base.checked_sub(extra).and_then(|i| blob.get(i)) {
+                    observed.insert(*byte);
+                }
+            }
         }
     }
     println!(
@@ -725,6 +734,20 @@ pub(super) fn run(
         state_bases.len(),
         windows.len(),
     );
+    if let (Some(vs), Some(ms)) = (leading_bytes.get(&380), leading_bytes.get(&464)) {
+        let profiles = std::array::from_fn::<_, 2, _>(|i| {
+            [
+                vs[i].len(),
+                ms[i].len(),
+                vs[i].intersection(&ms[i]).count(),
+                usize::from(vs[i].contains(&0)),
+                usize::from(ms[i].contains(&0)),
+            ]
+        });
+        println!(
+            "  State bytes 45 / 46 before baselines [VS distinct, MS distinct, shared distinct, VS includes zero, MS includes zero]: {profiles:?}"
+        );
+    }
     for (slots, by_size) in state_sizes {
         let counts: Vec<_> = by_size
             .into_iter()
@@ -741,7 +764,8 @@ pub(super) fn run(
         state_ps_profiles.get(&[0, 2][..]),
     ) {
         let mut counts = [0; 6];
-        let mut extended = [[0; 2]; 2];
+        let extended_offsets = [44, 45, 46, 48];
+        let mut extended = [[0; 2]; 4];
         for (id, (_, vs_states)) in vs {
             let Some((_, ms_states)) = ms.get(id) else {
                 continue;
@@ -770,7 +794,7 @@ pub(super) fn run(
                         usize::from(all_nonempty && pair.iter().all(|set| set.len() == 1));
                 }
             }
-            for (extra, totals) in [44, 48].into_iter().zip(&mut extended) {
+            for (extra, totals) in extended_offsets.into_iter().zip(&mut extended) {
                 let mut pair = [HashSet::new(), HashSet::new()];
                 let mut all_bounded = true;
                 for (i, ids, base) in [(0, vs_states, 380), (1, ms_states, 464)] {
@@ -793,7 +817,7 @@ pub(super) fn run(
             "  PS programs shared by VS/MS cohorts [total, both nonempty, any equal suffix, invariant, any equal suffix plus previous eight, invariant]: {counts:?}"
         );
         println!(
-            "  Earlier state starts (44 / 48 bytes before baselines), [any equal suffix, invariant]: {extended:?}"
+            "  Earlier state starts ({extended_offsets:?} bytes before baselines), [any equal suffix, invariant]: {extended:?}"
         );
     }
     for (slots, (programs, metadata)) in state_ps_profiles {
