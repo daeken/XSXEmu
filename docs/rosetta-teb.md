@@ -299,6 +299,10 @@ length, checks error 122, and retries. It walks 32-byte records, counting only
 core records and summing the popcounts of their masks; it does not read the
 union or require any other relationship.
 
+`GetSystemTimeAsFileTime` uses the same host UTC wall clock as the ordinary
+provider. It writes one Win64 `FILETIME` (two DWORDs encoding 100 ns ticks
+since 1601-01-01 UTC) and preserves `LastError` on success.
+
 `run --experimental-static-tls --trusted-offline --map-extra-dll PATH`
 explicitly maps one additional trusted, entryless PE DLL without imports,
 delay imports or TLS. It uses the file's actual basename and mapped base;

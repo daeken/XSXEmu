@@ -1021,7 +1021,7 @@ const CASE_CHANGES: [(u16, u16, u16); 121] = [
 
     #[repr(C)]
     #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-    pub(super) struct FileTime {
+    pub(crate) struct FileTime {
         low: u32,
         high: u32,
     }
@@ -1146,7 +1146,7 @@ const CASE_CHANGES: [(u16, u16, u16); 121] = [
         u64::try_from(ns.div_euclid(100) + UNIX_EPOCH_TICKS).ok()
     }
 
-    pub(super) unsafe extern "win64" fn get_system_time_as_file_time(out: *mut FileTime) {
+    pub(crate) unsafe extern "win64" fn get_system_time_as_file_time(out: *mut FileTime) {
         if !good(out) {
             fail(INVALID);
             return;

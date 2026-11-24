@@ -17,6 +17,7 @@ _static_tls_fixture:
     .long Lconfigure_d3d12_vm_entry-Ltext
     .long Lxmem_entry-Ltext
     .long Lprocessor_topology_entry-Ltext
+    .long Lsystem_file_time_entry-Ltext
 Ltext:
 .macro tls index
     leaq Ltext(%rip), %r11
@@ -927,6 +928,31 @@ Lprocessor_feature_entry:
     jne Lbad
     addq $40, %rsp
     movl $43, %eax
+    retq
+Lsystem_file_time_entry:
+    tls 0
+    phase 1, 2
+    subq $56, %rsp
+    movq $-1, 36(%rsp)                /* FILETIME needs DWORD, not qword, alignment. */
+    movl $0x12345678, 32(%rsp)
+    movl $0x76543210, 44(%rsp)
+    movl $0x87654321, %gs:0x68
+    leaq 36(%rsp), %rcx
+    callq *{iat_delta}(%r11)
+    cmpl $0x87654321, %gs:0x68
+    jne Lbad
+    cmpl $0x12345678, 32(%rsp)
+    jne Lbad
+    cmpl $0x76543210, 44(%rsp)
+    jne Lbad
+    movabsq $116444736000000000, %rdx  /* Unix epoch in FILETIME ticks. */
+    movq 36(%rsp), %rax
+    cmpq %rdx, %rax
+    jb Lbad
+    testq %rax, %rax                  /* Reject untouched all-ones and invalid high words. */
+    js Lbad
+    addq $56, %rsp
+    movl $50, %eax
     retq
 Lprocessor_topology_entry:
     tls 0
