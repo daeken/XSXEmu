@@ -268,6 +268,29 @@ Lbridge_entry:
     cmpl $0xfedcba98, %gs:0x68   /* heap success preserves last error */
     jne Lbad
 
+    /* HeapSize returns a full-width SIZE_T, including its failure sentinel.
+     * Neither success nor failure changes LastError. */
+    movq 48(%rsp), %rcx
+    xorl %edx, %edx
+    movq 56(%rsp), %r8
+    leaq Ltext(%rip), %r11
+    callq *{iat_delta}+248(%r11) /* HeapSize via the heap API set */
+    cmpq $32, %rax
+    jne Lbad
+    cmpl $0xfedcba98, %gs:0x68
+    jne Lbad
+
+    movl $0x87654321, %gs:0x68
+    movq 48(%rsp), %rcx
+    movl $8, %edx               /* HEAP_ZERO_MEMORY is invalid for HeapSize */
+    movq 56(%rsp), %r8
+    leaq Ltext(%rip), %r11
+    callq *{iat_delta}+248(%r11)
+    cmpq $-1, %rax
+    jne Lbad
+    cmpl $0x87654321, %gs:0x68
+    jne Lbad
+
     xorq %rcx, %rcx             /* wrong heap for HeapFree */
     xorl %edx, %edx
     movq 56(%rsp), %r8

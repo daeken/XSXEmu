@@ -96,6 +96,8 @@ audited_bridges! {
         native::get_process_heap, () -> *mut c_void;
     xsxemu_tls_heap_alloc, heap_alloc: b"kernelbase.dll", b"HeapAlloc",
         native::heap_alloc, (heap: *mut c_void, flags: u32, size: usize) -> *mut c_void;
+    xsxemu_tls_heap_size, heap_size: b"kernelbase.dll", b"HeapSize",
+        native::heap_size, (heap: *mut c_void, flags: u32, block: *const c_void) -> usize;
     xsxemu_tls_heap_free, heap_free: b"kernelbase.dll", b"HeapFree",
         native::heap_free, (heap: *mut c_void, flags: u32, block: *mut c_void) -> i32;
     xsxemu_tls_load_library_ex_w, load_library_ex_w: b"kernelbase.dll", b"LoadLibraryExW",

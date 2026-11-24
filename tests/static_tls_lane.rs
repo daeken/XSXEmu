@@ -235,8 +235,8 @@ fn image(kind: Kind) -> Vec<u8> {
         Kind::Solo => (),
     }
     if matches!(kind, Kind::Bridge) {
-        let imports = LINK + 0x450;
-        dir(&mut b, 1, imports, 120);
+        let imports = LINK + 0x780;
+        dir(&mut b, 1, imports, 140);
         w32(&mut b, file(imports), LINK + 0x30);
         w32(&mut b, file(imports) + 12, LINK + 0xd0);
         w32(&mut b, file(imports) + 16, IAT);
@@ -335,6 +335,18 @@ fn image(kind: Kind) -> Vec<u8> {
             w64(&mut b, file(LINK) + 0x6a0 + i * 8, LINK + off);
             put(&mut b, file(LINK) + off + 2, name);
         }
+
+        let heap = imports + 100;
+        w32(&mut b, file(heap), LINK + 0x720);
+        w32(&mut b, file(heap) + 12, LINK + 0x730);
+        w32(&mut b, file(heap) + 16, IAT + 248);
+        w64(&mut b, file(LINK) + 0x720, LINK + 0x750);
+        put(
+            &mut b,
+            file(LINK) + 0x730,
+            b"api-ms-win-core-heap-l1-1-0.dll\0",
+        );
+        put(&mut b, file(LINK) + 0x752, b"HeapSize\0");
     }
     b
 }

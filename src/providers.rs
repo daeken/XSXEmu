@@ -422,7 +422,7 @@ pub(crate) mod native {
         result.cast()
     }
 
-    pub(super) extern "win64" fn heap_size(
+    pub(crate) extern "win64" fn heap_size(
         heap: *mut c_void,
         flags: u32,
         ptr: *const c_void,
