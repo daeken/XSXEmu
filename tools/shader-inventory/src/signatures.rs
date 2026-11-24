@@ -132,6 +132,46 @@ fn packing(r: &[u8]) -> Option<Option<Packing>> {
     }))
 }
 
+fn entry_name(strings: &[u8], offset: usize) -> Option<()> {
+    let name = strings.get(offset..)?;
+    let n = name.iter().position(|&b| b == 0)?;
+    (n != 0 && name[..n].is_ascii()).then_some(())
+}
+
+#[derive(Default)]
+struct Runtime {
+    default_waves: usize,
+    fixed_wave32: usize,
+    other_waves: usize,
+    zero_dims: usize,
+    positive_dims: usize,
+    partial_dims: usize,
+}
+
+impl Runtime {
+    fn add(&mut self, psv: &[u8]) -> Option<()> {
+        let waves = (word(psv, 20)?, word(psv, 24)?);
+        if waves.0 > waves.1 {
+            return None;
+        }
+        match waves {
+            (0, 0xffff_ffff) => self.default_waves += 1,
+            (32, 32) => self.fixed_wave32 += 1,
+            _ => self.other_waves += 1,
+        }
+        match [word(psv, 40)?, word(psv, 44)?, word(psv, 48)?]
+            .into_iter()
+            .filter(|&d| d != 0)
+            .count()
+        {
+            0 => self.zero_dims += 1,
+            3 => self.positive_dims += 1,
+            _ => self.partial_dims += 1,
+        }
+        Some(())
+    }
+}
+
 fn psv_elements(psv: &[u8], at: usize) -> Option<([Vec<Element>; 3], &[u8])> {
     let size = word(psv, at)?;
     let start = at.checked_add(4)?;
@@ -140,6 +180,7 @@ fn psv_elements(psv: &[u8], at: usize) -> Option<([Vec<Element>; 3], &[u8])> {
     if size % 4 != 0 || strings.last() != Some(&0) {
         return None;
     }
+    entry_name(strings, word(psv, 52)?)?;
     let indices = word(psv, end)?;
     let indices_start = end.checked_add(4)?;
     let at = indices_start.checked_add(indices.checked_mul(4)?)?;
@@ -374,7 +415,15 @@ impl Resources {
 }
 
 pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
-    let mut groups = BTreeMap::<u16, (usize, [Count; 2], Resources, Dependencies)>::new();
+    #[derive(Default)]
+    struct Stage {
+        files: usize,
+        sizes: [Count; 2],
+        resources: Resources,
+        dependencies: Dependencies,
+        runtime: Runtime,
+    }
+    let mut groups = BTreeMap::<u16, Stage>::new();
     let mut bytes = Vec::new();
     let mut files = 0;
     let (mut count_disagreements, mut patch_rows) = (0, 0);
@@ -414,13 +463,14 @@ pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
             psv_elements(psv, elems_at).ok_or("unsupported PSV0 element table")?;
         patch_rows += elements[2].len();
         let totals = groups.entry(stage).or_default();
-        totals.2.add(rows);
-        totals.0 += 1;
+        totals.resources.add(rows);
+        totals.runtime.add(psv).ok_or("invalid PSV0 runtime info")?;
+        totals.files += 1;
         let mut same = true;
         let mut occupancy = [[[0; 256]; 4]; 2];
         for (i, (tag, total)) in [b"ISG1", b"OSG1"]
             .into_iter()
-            .zip(totals.1.iter_mut())
+            .zip(totals.sizes.iter_mut())
             .enumerate()
         {
             let (c, keys) = part(tag)
@@ -441,7 +491,7 @@ pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
             total.secondary_outside += c.secondary_outside;
         }
         totals
-            .3
+            .dependencies
             .add(psv, suffix, &occupancy)
             .ok_or("unsupported PSV0 dependency profile or invalid suffix extent")?;
         count_disagreements += usize::from(!same);
@@ -471,8 +521,24 @@ pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
             c.packed_mask_different
         );
     }
-    for (stage, (files, sizes, resources, deps)) in groups {
+    for (stage, totals) in groups {
+        let Stage {
+            files,
+            sizes,
+            resources,
+            dependencies: deps,
+            runtime,
+        } = totals;
         println!("{} (stage {stage}): {files} files", stage_name(stage));
+        println!(
+            "  PSV0 runtime: {} default wave bounds, {} fixed wave32, {} other; thread dimensions {} all zero, {} all positive, {} partial",
+            runtime.default_waves,
+            runtime.fixed_wave32,
+            runtime.other_waves,
+            runtime.zero_dims,
+            runtime.positive_dims,
+            runtime.partial_dims
+        );
         println!(
             "  PSV0: {} resource rows; {} files without rows, {} nonzero spaces, {} non-singleton ranges, {} nonzero flags",
             resources.rows,
@@ -506,6 +572,26 @@ pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn runtime_bounds_are_directional_and_entry_name_is_bounded() {
+        let mut psv = [0; 56];
+        psv[20] = 32;
+        psv[24] = 16;
+        let mut runtime = Runtime::default();
+        assert!(runtime.add(&psv).is_none());
+        psv[24] = 32;
+        psv[40] = 32;
+        psv[44] = 4;
+        psv[48] = 1;
+        runtime.add(&psv).unwrap();
+        assert_eq!((runtime.fixed_wave32, runtime.positive_dims), (1, 1));
+        assert!(entry_name(b"\0X\0", 1).is_some());
+        assert!(entry_name(b"\0X\0", 0).is_none());
+        assert!(entry_name(b"\0X\0", 3).is_none());
+        assert!(entry_name(b"\0X", 1).is_none());
+        assert!(entry_name(b"\0\xff\0", 1).is_none());
+    }
+
     #[test]
     fn validates_psv_semantic_indices_and_returns_exact_suffix() {
         let mut psv = [0; 97];

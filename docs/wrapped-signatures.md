@@ -32,6 +32,12 @@ Both signature chunks start with a little-endian entry count and row offset 8, f
 
 No input row has secondary bits outside its primary mask. An input-style subset rule is therefore unsuitable as a validator for outputs. The empty MS inputs do not imply absence of resource, payload or other launch data. This command does not resolve producer/consumer pairs, infer interpolation or hardware export indices, or establish a Metal stage interface. An owned fixture checks offset bounds, mask asymmetry, a name without a terminator, and unsupported fields.
 
+## PSV0 runtime-info fields
+
+The 52-byte block begins after its size word. Payload offsets `+20` and `+24` are the ordered expected minimum/maximum wave-lane counts; `+40`, `+44`, `+48` are the X/Y/Z thread dimensions. The `+52` word is an offset into the string table after the resource declarations, not an offset into DXBC or the native program. All 26,503 offsets resolve to nonempty, NUL-terminated ASCII; the scanner validates the span without printing names.
+
+Four of 2,689 CS wrappers declare `(32, 32)` wave bounds. All other wrappers have `(0, 0xffffffff)`, the unspecified pair; this is not evidence for wave64 or for a particular native wave mode. All CS and MS wrappers have three nonzero thread dimensions; all PS, VS and GS wrappers have three zero dimensions. These are source declarations, not validated native launch dimensions or Metal device limits.
+
 ## PSV0 resource declarations
 
 After the 52-byte runtime-info block, the payload has a `u32` row count at `+56`. If nonzero, a `u32` stride at `+60` is 24 in every checked file, with rows starting at `+64`. If zero, no stride word is consumed. The six little-endian row words are resource type, register space, lower bound, upper bound, kind and flags. The checker verifies type in 1–8, ordered bounds, and complete table extent. The resource checker stops at the end of this table; the element checker starts there.
