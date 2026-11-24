@@ -1657,6 +1657,39 @@ fn mapped_sync_facade_exports_must_already_be_callable_cfg_entries() {
         contract_path,
     ];
     expect(run(&rooted_path, &opt_in), 46, "Guest entry returned 46");
+
+    // The same exact exports work through a verified dormant root slot.
+    // No CFG policy is sourced from the root's original guard stubs.
+    let mut dormant = dormant_image(Kind::Solo);
+    dormant[file(LINK)..file(RO) + RAW].copy_from_slice(&rooted[file(LINK)..file(RO) + RAW]);
+    dir(&mut dormant, 1, LINK, 60);
+    w32(&mut dormant, OP + 16, TEXT + f.sync_entry as usize);
+    let dormant_path = scratch.write("dormant-sync.exe", &dormant);
+    expect(run(&dormant_path, &opt_in), 46, "Guest entry returned 46");
+    // An unregistered but callable RX address would return 101 through
+    // the original unchecked jmp rax. The exact dispatcher must reject it.
+    dormant_call(&mut dormant, DISPATCH);
+    scratch.write("dormant-sync.exe", &dormant);
+    expect(
+        run(&dormant_path, &opt_in),
+        1,
+        "child terminated by signal 4",
+    );
+    for (slot, name) in [
+        (CHECK, "CFG check"),
+        (CHECK + 0x10, "XFG check"),
+        (CHECK + 0x18, "XFG dispatch"),
+        (CHECK + 0x20, "XFG table dispatch"),
+    ] {
+        dormant_call(&mut dormant, slot);
+        scratch.write("dormant-sync.exe", &dormant);
+        expect(
+            run(&dormant_path, &opt_in),
+            86,
+            &format!("called dormant linker guard slot: {name}"),
+        );
+    }
+
     w32(&mut rooted, file(MODE), 4);
     scratch.write("explicit-sync.exe", &rooted);
     expect(

@@ -460,6 +460,12 @@ mod native {
                     let mut readonly = cfg.readonly_ranges();
                     readonly.extend(memcpy.map(slot_range));
                     if let Some(targets) = legacy {
+                        // Only a trusted offline root with an existing mixed-image
+                        // policy can use ordinary dispatch. Reuse the exact RAX
+                        // check without admitting the slot or its original stub.
+                        let [_, dispatch_slot, ..] = *slots;
+                        let [_, checked_dispatch] = SLOT_THUNKS;
+                        patch(mem, dispatch_slot, checked_dispatch as usize as u64)?;
                         targets.add_legacy_root(pe, mem, &regions, slots)?;
                     }
                     mem.seal_with_readonly(&regions, &readonly)?;

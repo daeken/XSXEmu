@@ -406,12 +406,15 @@ from a missing header bit alone or claim that static analysis proved the slots
 unreachable.
 
 Only the opt-in static TLS child accepts this profile. After relocation and
-before any guest callback, the binder replaces all five callable slots with
-terminal gates and seals the slots read-only; the CastGuard cell stays zero.
-An attempted call restores and checks host GS, reports the slot kind and exits
-with status 86, without returning to the guest or dispatching to the candidate.
-An advertised guarded image still requires its own supported policy and exact
-GFID enforcement; the dormant slots add no entries to that policy. The tests
+before any guest callback, the binder replaces the five callable slots and
+seals them read-only; the CastGuard cell stays zero. By default all five are
+terminal gates. An attempted call restores and checks host GS, reports the
+slot kind and exits with status 86. If `--trusted-offline` is set and a mapped
+image already supplies an active CFG policy, only the root executable's
+dormant ordinary CFG dispatch slot uses the existing exact RAX dispatcher.
+An unapproved address terminates with SIGILL. Dormant CFG check, XFG, and
+all dormant DLL slots remain terminal. The slot replacement adds no targets
+and never runs the original linker stubs. The tests
 use only original PEs and exercise all five calls, rebasing, near-miss metadata
 and the existing guarded enforcement fixtures. The title was inspected only.
 
