@@ -1,6 +1,7 @@
 //! Counts only; never exports assets or interprets the RPF9 TOC.
 mod cfg;
 mod coverage;
+mod library_index;
 mod llvm;
 mod reachable;
 
@@ -304,6 +305,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args_os().skip(1);
     const USAGE: &str = "usage: xsx-shader-inventory [--header-only | --compute-isa <LLVM shared library> <primary CPU> <reference CPU>] <shaders.rpf> (select gfx1013 and gfx1030, in either order)";
     let first = args.next().ok_or(USAGE)?;
+    if first == "--pipeline-index" {
+        let path = args
+            .next()
+            .filter(|_| args.next().is_none())
+            .ok_or("usage: xsx-shader-inventory --pipeline-index <expanded PS/0/9 library>")?;
+        return library_index::run(&path);
+    }
     if first == "--reachable-compute" {
         const REACHABLE_USAGE: &str = "usage: xsx-shader-inventory --reachable-compute <trusted LLVM 21 shared library> <gfx1013|gfx1030> <native FSSM directory>";
         let lib = args.next().ok_or(REACHABLE_USAGE)?;

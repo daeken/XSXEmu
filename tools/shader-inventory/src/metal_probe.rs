@@ -69,15 +69,115 @@ fn run_alu(
 }
 
 #[cfg(target_os = "macos")]
+enum ExecArchive {
+    Bake(std::path::PathBuf),
+    Replay(std::path::PathBuf),
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unexpected_cfgs)] // objc 0.2 selector macros refer to cargo-clippy.
+fn file_url(
+    path: &std::path::Path,
+    create: bool,
+) -> Result<metal::URL, Box<dyn std::error::Error>> {
+    use std::fmt::Write;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    let filename = path.file_name().ok_or("expected an archive file name")?;
+    let path = parent.canonicalize()?.join(filename);
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if !create && meta.is_file() => (),
+        Ok(_) => {
+            return Err("archive bake requires a new file; replay requires a regular file".into());
+        }
+        Err(e) if create && e.kind() == std::io::ErrorKind::NotFound => (),
+        Err(e) => return Err(e.into()),
+    }
+    let mut url = String::from("file://");
+    for b in path.to_str().ok_or("archive path must be UTF-8")?.bytes() {
+        if b.is_ascii_alphanumeric() || b"/._-~".contains(&b) {
+            url.push(b as char);
+        } else {
+            write!(url, "%{b:02X}").unwrap();
+        }
+    }
+    use metal::{
+        foreign_types::ForeignType,
+        objc::{msg_send, sel, sel_impl},
+    };
+    let url = metal::URL::new_with_string(&url);
+    // metal 0.33 wraps an autoreleased URLWithString as an owned URL;
+    // retain once to give Rust's Drop its own reference.
+    unsafe {
+        let _: *mut metal::NSURL = msg_send![url.as_ptr(), retain];
+    }
+    Ok(url)
+}
+
+#[cfg(target_os = "macos")]
 fn run_exec(
     dev: &metal::DeviceRef,
     queue: &metal::CommandQueueRef,
+    archive: Option<ExecArchive>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use metal::{CompileOptions, MTLCommandBufferStatus, MTLResourceOptions, MTLSize};
+    use metal::{
+        BinaryArchiveDescriptor, CompileOptions, ComputePipelineDescriptor, MTLCommandBufferStatus,
+        MTLPipelineOption, MTLResourceOptions, MTLSize,
+    };
     let program = exec::Program::decode(&exec::FIXTURE)?;
     let lib = dev.new_library_with_source(&program.msl(), &CompileOptions::new())?;
     let function = lib.get_function("exec_fixture", None)?;
-    let pipeline = dev.new_compute_pipeline_state_with_function(&function)?;
+    let pipeline = match archive {
+        None => dev.new_compute_pipeline_state_with_function(&function)?,
+        Some(ExecArchive::Bake(path)) => {
+            let url = file_url(&path, true)?;
+            let archive = dev.new_binary_archive_with_descriptor(&BinaryArchiveDescriptor::new())?;
+            let desc = ComputePipelineDescriptor::new();
+            desc.set_compute_function(Some(&function));
+            desc.set_binary_archives(&[&archive]);
+            if dev
+                .new_compute_pipeline_state_with_reflection(
+                    &desc,
+                    MTLPipelineOption::FailOnBinaryArchiveMiss,
+                )
+                .is_ok()
+            {
+                return Err("expected strict miss with an empty Metal binary archive".into());
+            }
+            // Populate using the same function and descriptor settings as replay.
+            desc.set_binary_archives(&[]);
+            if !archive.add_compute_pipeline_functions_with_descriptor(&desc)?
+                || !archive.serialize_to_url(&url)?
+            {
+                return Err("Metal did not write the owned compute archive".into());
+            }
+            println!(
+                "{}: empty archive refused; baked owned EXEC pipeline",
+                dev.name()
+            );
+            return Ok(());
+        }
+        Some(ExecArchive::Replay(path)) => {
+            let url = file_url(&path, false)?;
+            let archive_desc = BinaryArchiveDescriptor::new();
+            archive_desc.set_url(&url);
+            let archive = dev.new_binary_archive_with_descriptor(&archive_desc)?;
+            let desc = ComputePipelineDescriptor::new();
+            desc.set_compute_function(Some(&function));
+            desc.set_binary_archives(&[&archive]);
+            let (pipeline, _) = dev.new_compute_pipeline_state_with_reflection(
+                &desc,
+                MTLPipelineOption::FailOnBinaryArchiveMiss,
+            )?;
+            println!(
+                "{}: owned EXEC compute pipeline created with FailOnBinaryArchiveMiss",
+                dev.name()
+            );
+            pipeline
+        }
+    };
     if pipeline.thread_execution_width() != exec::LANES as u64
         || pipeline.max_total_threads_per_threadgroup() < exec::LANES as u64
     {
@@ -212,9 +312,29 @@ fn run_buffer(
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let dev = metal::Device::system_default().ok_or("unsupported: no Metal device")?;
     let queue = dev.new_command_queue();
+    let mut args = std::env::args_os().skip(1);
+    if let Some(mode) = args.next() {
+        let usage = "usage: shader-metal-probe [--bake-exec-archive <new file> | --replay-exec-archive <file>]";
+        if std::env::var_os("MTL_SHADER_VALIDATION").is_some_and(|v| v != "0" && !v.is_empty()) {
+            return Err("this binary archive probe does not support Metal GPU shader validation instrumentation; use the regular probe for GPU validation".into());
+        }
+        let path = args
+            .next()
+            .filter(|_| args.next().is_none())
+            .ok_or(usage)?
+            .into();
+        let archive = if mode == "--bake-exec-archive" {
+            ExecArchive::Bake(path)
+        } else if mode == "--replay-exec-archive" {
+            ExecArchive::Replay(path)
+        } else {
+            return Err(usage.into());
+        };
+        return run_exec(&dev, &queue, Some(archive));
+    }
     run_alu(&dev, &queue, "ALU", &alu::FIXTURE)?;
     run_alu(&dev, &queue, "branch/literal", &alu::BRANCH_FIXTURE)?;
-    run_exec(&dev, &queue)?;
+    run_exec(&dev, &queue, None)?;
     run_buffer(&dev, &queue)
 }
 
