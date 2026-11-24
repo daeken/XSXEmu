@@ -6,49 +6,61 @@ const HEIGHT: usize = 4;
 const CLEAR: [u8; 4] = [0, 0, 0, 255];
 
 #[derive(Clone, Copy)]
-enum ColorWrites {
+enum ColorPipeline {
     Rgba,
     Green,
+    AlphaBlend,
+}
+
+impl ColorPipeline {
+    const ALL: [Self; 3] = [Self::Rgba, Self::Green, Self::AlphaBlend];
 }
 
 #[derive(Clone, Copy)]
 struct Draw {
     x: (usize, usize), // Half-open scissor interval, full height.
     depth_eighths: u8,
-    color: [u8; 4], // Exact UNORM endpoints, expressed as bytes.
-    writes: ColorWrites,
+    color: [u8; 4], // UNORM values expressed as bytes.
+    pipeline: ColorPipeline,
     depth_write: bool,
 }
 
-fn draws(overlay_depth_write: bool) -> [Draw; 4] {
+fn draws(overlay_depth_write: bool) -> [Draw; 5] {
     [
         Draw {
             x: (0, 7),
             depth_eighths: 6,
             color: [255, 0, 0, 255],
-            writes: ColorWrites::Rgba,
+            pipeline: ColorPipeline::Rgba,
             depth_write: true,
         },
         Draw {
             x: (4, 7),
             depth_eighths: 2,
             color: [0, 255, 0, 0],
-            writes: ColorWrites::Green,
+            pipeline: ColorPipeline::Green,
             depth_write: overlay_depth_write,
         },
         Draw {
             x: (0, 2),
             depth_eighths: 7,
             color: [255; 4],
-            writes: ColorWrites::Rgba,
+            pipeline: ColorPipeline::Rgba,
             depth_write: true,
         },
         Draw {
             x: (2, 6),
             depth_eighths: 4,
             color: [0, 0, 255, 255],
-            writes: ColorWrites::Rgba,
+            pipeline: ColorPipeline::Rgba,
             depth_write: true,
+        },
+        Draw {
+            x: (1, 2),
+            depth_eighths: 1,
+            color: [0, 255, 0, 102],
+            pipeline: ColorPipeline::AlphaBlend,
+            depth_write: false,
         },
     ]
 }
@@ -63,9 +75,18 @@ fn reference(draws: &[Draw]) -> [[u8; 4]; WIDTH] {
             if draw.depth_eighths >= depth[x] {
                 continue;
             }
-            match draw.writes {
-                ColorWrites::Rgba => row[x] = draw.color,
-                ColorWrites::Green => row[x][1] = draw.color[1],
+            match draw.pipeline {
+                ColorPipeline::Rgba => row[x] = draw.color,
+                ColorPipeline::Green => row[x][1] = draw.color[1],
+                ColorPipeline::AlphaBlend => {
+                    let a = u32::from(draw.color[3]);
+                    for (src, dst) in draw.color[..3].iter().zip(&mut row[x][..3]) {
+                        // Integer oracle for src*a + dst*(1-a), rounded to UNORM8.
+                        *dst =
+                            ((u32::from(*src) * a + u32::from(*dst) * (255 - a) + 127) / 255) as u8;
+                    }
+                    row[x][3] = row[x][3].saturating_sub(draw.color[3]);
+                }
             }
             if draw.depth_write {
                 depth[x] = draw.depth_eighths;
@@ -77,17 +98,18 @@ fn reference(draws: &[Draw]) -> [[u8; 4]; WIDTH] {
 
 #[cfg(test)]
 #[test]
-fn oracle_distinguishes_mask_scissor_depth_test_and_depth_write() {
+fn oracle_distinguishes_blend_mask_scissor_depth_test_and_depth_write() {
     let red = [255, 0, 0, 255];
+    let blended = [153, 102, 0, 153];
     let yellow = [255, 255, 0, 255];
     let blue = [0, 0, 255, 255];
     assert_eq!(
         reference(&draws(true)),
-        [red, red, blue, blue, yellow, yellow, yellow, CLEAR]
+        [red, blended, blue, blue, yellow, yellow, yellow, CLEAR]
     );
     assert_eq!(
         reference(&draws(false)),
-        [red, red, blue, blue, blue, blue, yellow, CLEAR]
+        [red, blended, blue, blue, blue, blue, yellow, CLEAR]
     );
 }
 
@@ -126,7 +148,7 @@ fragment float4 owned_fragment(constant float4 &color [[buffer(0)]]) { return co
 
     fn pipeline_descriptor(
         lib: &LibraryRef,
-        writes: ColorWrites,
+        pipeline: ColorPipeline,
     ) -> Result<RenderPipelineDescriptor, String> {
         let desc = RenderPipelineDescriptor::new();
         let vs = lib.get_function("owned_vertex", None)?;
@@ -140,11 +162,19 @@ fragment float4 owned_fragment(constant float4 &color [[buffer(0)]]) { return co
             .object_at(0)
             .ok_or("missing pipeline color slot")?;
         color.set_pixel_format(COLOR);
-        color.set_blending_enabled(false);
-        color.set_write_mask(match writes {
-            ColorWrites::Rgba => MTLColorWriteMask::All,
-            ColorWrites::Green => MTLColorWriteMask::Green,
+        color.set_blending_enabled(matches!(pipeline, ColorPipeline::AlphaBlend));
+        color.set_write_mask(match pipeline {
+            ColorPipeline::Rgba | ColorPipeline::AlphaBlend => MTLColorWriteMask::All,
+            ColorPipeline::Green => MTLColorWriteMask::Green,
         });
+        if matches!(pipeline, ColorPipeline::AlphaBlend) {
+            color.set_rgb_blend_operation(MTLBlendOperation::Add);
+            color.set_source_rgb_blend_factor(MTLBlendFactor::SourceAlpha);
+            color.set_destination_rgb_blend_factor(MTLBlendFactor::OneMinusSourceAlpha);
+            color.set_alpha_blend_operation(MTLBlendOperation::ReverseSubtract);
+            color.set_source_alpha_blend_factor(MTLBlendFactor::One);
+            color.set_destination_alpha_blend_factor(MTLBlendFactor::One);
+        }
         Ok(desc)
     }
 
@@ -187,13 +217,15 @@ fragment float4 owned_fragment(constant float4 &color [[buffer(0)]]) { return co
         } else {
             dev.new_library_with_source(MSL, &CompileOptions::new())?
         };
-        let all_desc = pipeline_descriptor(&lib, ColorWrites::Rgba)?;
-        let green_desc = pipeline_descriptor(&lib, ColorWrites::Green)?;
-        let (all, green) = match archive {
-            None => (
-                dev.new_render_pipeline_state(&all_desc)?,
-                dev.new_render_pipeline_state(&green_desc)?,
-            ),
+        let descriptors: Vec<_> = ColorPipeline::ALL
+            .into_iter()
+            .map(|pipeline| pipeline_descriptor(&lib, pipeline))
+            .collect::<Result<_, _>>()?;
+        let pipelines: Vec<_> = match archive {
+            None => descriptors
+                .iter()
+                .map(|desc| dev.new_render_pipeline_state(desc))
+                .collect::<Result<_, _>>()?,
             Some((path, bake)) => {
                 let url = metal_artifact::file_url(path, bake).map_err(|e| e.to_string())?;
                 let desc = BinaryArchiveDescriptor::new();
@@ -201,35 +233,41 @@ fragment float4 owned_fragment(constant float4 &color [[buffer(0)]]) { return co
                     desc.set_url(&url);
                 }
                 let archive = dev.new_binary_archive_with_descriptor(&desc)?;
-                all_desc.set_binary_archives(&[&archive]);
-                green_desc.set_binary_archives(&[&archive]);
+                for desc in &descriptors {
+                    desc.set_binary_archives(&[&archive]);
+                }
                 if bake {
-                    if strict_pipeline(&dev, &all_desc).is_ok()
-                        || strict_pipeline(&dev, &green_desc).is_ok()
-                    {
-                        return Err("expected strict misses for both render descriptors with an empty binary archive".into());
+                    for desc in &descriptors {
+                        if strict_pipeline(&dev, desc).is_ok() {
+                            return Err("expected strict misses for all render descriptors with an empty binary archive".into());
+                        }
+                        desc.set_binary_archives(&[]);
                     }
-                    all_desc.set_binary_archives(&[]);
-                    green_desc.set_binary_archives(&[]);
-                    if !archive.add_render_pipeline_functions_with_descriptor(&all_desc)?
-                        || !archive.add_render_pipeline_functions_with_descriptor(&green_desc)?
-                        || !archive.serialize_to_url(&url)?
-                    {
+                    for desc in &descriptors {
+                        if !archive.add_render_pipeline_functions_with_descriptor(desc)? {
+                            return Err("Metal did not add the owned render descriptor".into());
+                        }
+                    }
+                    if !archive.serialize_to_url(&url)? {
                         return Err("Metal did not write the owned render archive".into());
                     }
                     println!(
-                        "{}: empty archive refused; baked both owned render descriptors",
-                        dev.name()
+                        "{}: empty archive refused; baked {} owned render descriptors",
+                        dev.name(),
+                        descriptors.len()
                     );
                     return Ok(());
                 }
-                let all = strict_pipeline(&dev, &all_desc)?;
-                let green = strict_pipeline(&dev, &green_desc)?;
+                let strict = descriptors
+                    .iter()
+                    .map(|desc| strict_pipeline(&dev, desc))
+                    .collect::<Result<_, _>>()?;
                 println!(
-                    "{}: both owned render pipelines created with FailOnBinaryArchiveMiss",
-                    dev.name()
+                    "{}: {} owned render pipelines created with FailOnBinaryArchiveMiss",
+                    dev.name(),
+                    descriptors.len()
                 );
-                (all, green)
+                strict
             }
         };
         let queue = dev.new_command_queue();
@@ -256,10 +294,7 @@ fragment float4 owned_fragment(constant float4 &color [[buffer(0)]]) { return co
             let cmd = queue.new_command_buffer();
             let enc = cmd.new_render_command_encoder(pass);
             for draw in draws {
-                enc.set_render_pipeline_state(match draw.writes {
-                    ColorWrites::Rgba => &all,
-                    ColorWrites::Green => &green,
-                });
+                enc.set_render_pipeline_state(&pipelines[draw.pipeline as usize]);
                 enc.set_depth_stencil_state(if draw.depth_write { &write } else { &retain });
                 enc.set_scissor_rect(MTLScissorRect {
                     x: draw.x.0 as u64,
