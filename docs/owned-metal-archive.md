@@ -40,7 +40,7 @@ p=tools/shader-inventory/target/debug/shader-metal-probe
 d=$(mktemp -d)
 trap 'rm -rf "$d"' EXIT
 "$p" --emit-exec-store-msl > "$d/store.metal"
-xcrun -sdk macosx metal -c "$d/store.metal" -o "$d/store.air"
+xcrun -sdk macosx metal -std=metal3.1 -c "$d/store.metal" -o "$d/store.air"
 xcrun -sdk macosx metallib "$d/store.air" -o "$d/store.metallib"
 MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 "$p" --load-exec-store-metallib "$d/store.metallib"
 unset MTL_SHADER_VALIDATION
@@ -50,3 +50,11 @@ export MTL_DEBUG_LAYER=1
 ```
 
 The first load creates a pipeline without an archive. The archive replay instead loads the compiled library, requires a strict archive hit and does not use the in-memory MSL compile path. All file inputs must be trusted, locally baked artifacts from the owned fixture. On Apple M4/macOS 27.0.1, Xcode 27A266a and `metalfe-32023.921.6`, both runs matched **1,088/1,088** words with the independent validation settings above. Missing, invalid and symlinked libraries were refused, a differently named function failed lookup, and changing the kernel’s empty-mask result **without changing its function name** caused a strict archive miss. No game assets were used; this is not a title cache key, proof of cross-device portability, or a retail pipeline bake.
+
+## Owned archive identity guard
+
+The smoke also exercises `--bake-keyed-exec-store-archive` and `--replay-keyed-exec-store-archive`. Each takes four paths: the offline metallib, archive, compiler profile, and manifest. The script records the Xcode and SDK builds, Metal compiler version and target, and compile/link flags; it omits the compiler installation path. The probe treats that profile as an opaque, trusted bake input, not as an attestation of how a metallib was produced.
+
+The v1 key hashes length-delimited fields with SHA-256: the emitted MSL and metallib digest; the compiler profile digest; the local Metal device name and registry ID, macOS build, host architecture and API validation setting; and the single modeled compute pipeline contract (entry, default descriptor with no specialization, resource slots and inline constants ABI, one-wave dispatch). The sidecar stores the schema magic, key, and a separate archive SHA-256. Replay compares it before loading either artifact into Metal and still uses `FailOnBinaryArchiveMiss`. A missing or malformed sidecar does not permit fallback. The smoke checks successful separate-process keyed replay (**1,088/1,088** Apple M4 readback words) and rejects a changed same-name metallib, stale compiler profile, modified archive bytes, and changed API validation setting before pipeline creation. The separate unkeyed negative still proves that Metal itself refuses the changed same-name function.
+
+This is deliberately a conservative same-host, trusted scratch cache; the registry ID is not a portability identifier. The digest is for cache identity and accidental replacement detection, not authentication or protection against concurrent writers. It does not define a general PSO canonicalization or cover optional compute descriptor settings, specialized functions, graphics state, or retail pipelines.

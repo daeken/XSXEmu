@@ -8,6 +8,8 @@ mod cfg;
 mod exec;
 #[cfg(any(target_os = "macos", test))]
 mod exec_store;
+#[cfg(any(target_os = "macos", test))]
+mod metal_cache;
 
 #[cfg(target_os = "macos")]
 fn run_alu(
@@ -270,6 +272,95 @@ fn run_exec(
 }
 
 #[cfg(target_os = "macos")]
+const STORE_ENTRY: &str = "exec_store_fixture";
+#[cfg(target_os = "macos")]
+const STORE_BUFFER_SLOTS: [u64; 3] = [0, 1, 2];
+#[cfg(target_os = "macos")]
+const STORE_ARGS_WORDS: usize = 8;
+
+#[cfg(target_os = "macos")]
+fn keyed_exec_store(
+    dev: &metal::DeviceRef,
+    queue: &metal::CommandQueueRef,
+    bake: bool,
+    [library, archive, profile, manifest_path]: [std::path::PathBuf; 4],
+) -> Result<(), Box<dyn std::error::Error>> {
+    use metal_cache::{Key, digest_file, manifest};
+    use std::io::{Read, Write};
+    file_url(&library, false)?;
+    file_url(&profile, false)?;
+    file_url(&archive, bake)?;
+    file_url(&manifest_path, bake)?;
+    if std::fs::metadata(&profile)?.len() == 0 {
+        return Err("owned cache compiler profile is empty".into());
+    }
+    let os_build = std::process::Command::new("/usr/bin/sw_vers")
+        .arg("-buildVersion")
+        .output()?;
+    if !os_build.status.success() || os_build.stdout.is_empty() {
+        return Err("owned cache requires the macOS build version".into());
+    }
+    let source = exec_store::Program::decode(&exec_store::FIXTURE)?.msl();
+    let debug_layer = std::env::var_os("MTL_DEBUG_LAYER").unwrap_or_default();
+    let mut key = Key::new();
+    key.field("stage-entry", STORE_ENTRY.as_bytes())
+        .field("msl", source.as_bytes())
+        .field("metallib-sha256", &digest_file(&library)?)
+        .field("compiler-profile-sha256", &digest_file(&profile)?)
+        .field("os-build", &os_build.stdout)
+        .field("host-arch", std::env::consts::ARCH.as_bytes())
+        .field("device-name", dev.name().as_bytes())
+        .field("device-registry-id", &dev.registry_id().to_le_bytes())
+        .field("metal-debug-layer", debug_layer.as_encoded_bytes())
+        .field(
+            "pipeline-descriptor",
+            b"compute defaults plus entry; no specialization",
+        )
+        .field(
+            "binding-abi",
+            b"shared u32 table ro, shared u32 output rw, inline constants; offset zero",
+        )
+        .field("inline-arg-count", &(STORE_ARGS_WORDS as u64).to_le_bytes())
+        .field(
+            "inline-arg-layout",
+            b"u32 table_base,table_words,last_output_index,exec,data[4]",
+        )
+        .field(
+            "launch-profile",
+            b"one group; y=z=1; SIMD width must equal local x",
+        )
+        .field("local-x", &(exec_store::LANES as u64).to_le_bytes());
+    for slot in STORE_BUFFER_SLOTS {
+        key.field("slot", &slot.to_le_bytes());
+    }
+    let key = key.finish();
+    if !bake {
+        let expected = manifest(key, digest_file(&archive)?);
+        let mut bytes = Vec::with_capacity(expected.len() + 1);
+        std::fs::File::open(&manifest_path)?
+            .take((expected.len() + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        if bytes != expected {
+            return Err("owned cache identity mismatch (rejected before pipeline creation)".into());
+        }
+    }
+    run_exec_store(
+        dev,
+        queue,
+        Some(ExecArchive::Library(library, Some((bake, archive.clone())))),
+    )?;
+    if bake {
+        let bytes = manifest(key, digest_file(&archive)?);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(manifest_path)?
+            .write_all(&bytes)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
 fn run_exec_store(
     dev: &metal::DeviceRef,
     queue: &metal::CommandQueueRef,
@@ -277,7 +368,7 @@ fn run_exec_store(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use metal::{MTLCommandBufferStatus, MTLResourceOptions, MTLSize};
     let program = exec_store::Program::decode(&exec_store::FIXTURE)?;
-    let Some(pipeline) = owned_pipeline(dev, &program.msl(), "exec_store_fixture", archive)? else {
+    let Some(pipeline) = owned_pipeline(dev, &program.msl(), STORE_ENTRY, archive)? else {
         return Ok(());
     };
     let lanes = exec_store::LANES as u64;
@@ -300,7 +391,7 @@ fn run_exec_store(
             dev.new_buffer_with_data(table.as_ptr().cast(), size_of_val(table) as u64, opts);
         let output =
             dev.new_buffer_with_data(initial.as_ptr().cast(), size_of_val(&initial) as u64, opts);
-        let args = [
+        let args: [u32; STORE_ARGS_WORDS] = [
             case.table_base,
             table.len() as u32,
             (initial.len() - 1) as u32,
@@ -313,9 +404,10 @@ fn run_exec_store(
         let work = queue.new_command_buffer();
         let encoder = work.new_compute_command_encoder();
         encoder.set_compute_pipeline_state(&pipeline);
-        encoder.set_buffer(0, Some(&table_buf), 0);
-        encoder.set_buffer(1, Some(&output), 0);
-        encoder.set_bytes(2, size_of_val(&args) as u64, args.as_ptr().cast());
+        let [table_slot, output_slot, args_slot] = STORE_BUFFER_SLOTS;
+        encoder.set_buffer(table_slot, Some(&table_buf), 0);
+        encoder.set_buffer(output_slot, Some(&output), 0);
+        encoder.set_bytes(args_slot, size_of_val(&args) as u64, args.as_ptr().cast());
         encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(lanes, 1, 1));
         encoder.end_encoding();
         work.commit();
@@ -444,6 +536,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let usage = "usage: shader-metal-probe [--bake-exec-archive | --replay-exec-archive | --bake-exec-store-archive | --replay-exec-store-archive] [file]";
         if std::env::var_os("MTL_SHADER_VALIDATION").is_some_and(|v| v != "0" && !v.is_empty()) {
             return Err("this binary archive probe does not support Metal GPU shader validation instrumentation; use the regular probe for GPU validation".into());
+        }
+        if mode == "--bake-keyed-exec-store-archive" || mode == "--replay-keyed-exec-store-archive"
+        {
+            let usage = "--bake-keyed-exec-store-archive|--replay-keyed-exec-store-archive <owned metallib> <archive> <compiler profile> <manifest>";
+            let paths = args
+                .map(std::path::PathBuf::from)
+                .take(5)
+                .collect::<Vec<_>>();
+            return keyed_exec_store(
+                &dev,
+                &queue,
+                mode == "--bake-keyed-exec-store-archive",
+                paths.try_into().map_err(|_| usage)?,
+            );
         }
         if mode == "--bake-exec-store-metallib-archive"
             || mode == "--replay-exec-store-metallib-archive"
