@@ -14,7 +14,7 @@ Both signature chunks start with a little-endian entry count and row offset 8, f
 | +0 | Stream index, zero in the checked profile |
 | +4 | Byte offset from chunk start to a nonempty NUL-terminated ASCII semantic name, after the row array |
 | +8 | Semantic index, used in the same-wrapper correspondence check |
-| +12 | System-value field; only zero versus nonzero counted |
+| +12 | System-value field; zero versus nonzero counted globally, with a name/enum comparison for the PS linkage directions below |
 | +16 | Component-type field, observed values 1, 2, 3, 6 |
 | +20 | Source signature register field, compared to PSV0 packing below, not mapped to native registers |
 | +24/+25 | Primary and secondary mask bytes respectively; nonzero primary nibble and secondary nibble |
@@ -31,6 +31,18 @@ Both signature chunks start with a little-endian entry count and row offset 8, f
 | Total | 26,503 | 105,152 | 119,226 | 45,827 |
 
 No input row has secondary bits outside its primary mask. An input-style subset rule is therefore unsuitable as a validator for outputs. The empty MS inputs do not imply absence of resource, payload or other launch data. This command does not resolve producer/consumer pairs, infer interpolation or hardware export indices, or establish a Metal stage interface. An owned fixture checks offset bounds, mask asymmetry, a name without a terminator, and unsupported fields.
+
+## System-value rows relevant to pixel input
+
+The scanner checks four public DXBC name/enum pairs in PS inputs and potential VS/MS producer outputs: `SV_Position`/1, `SV_ClipDistance`/2, `SV_CullDistance`/3, and `SV_IsFrontFace`/9. It uses ASCII case folding, keeps a separate other/mismatched counter for any unclassified nonzero enum or `sv_` name, and emits no source names. These counts are per wrapper, not per library PSO reference.
+
+| Table | Position | Clip distance | Cull distance | Front face | Other/mismatched |
+|---|---:|---:|---:|---:|---:|
+| PS `ISG1` | 11,322 | 1,806 | 2 | 1,984 | 0 |
+| VS `OSG1` | 2,236 | 29 | 2 | 0 | 0 |
+| MS `OSG1` | 9,282 | 1,906 | 0 | 0 | 0 |
+
+The PS front-face declaration is not a required matching output of the preceding shader: it describes a rasterizer-produced value. The other counts identify declarations to compare in actual PSO rows; aggregate similarity cannot pair wrappers, validate rasterizer transforms, or identify a native export.
 
 ## PSV0 runtime-info fields
 

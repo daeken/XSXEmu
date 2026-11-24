@@ -17,12 +17,26 @@ struct Count {
     entries: usize,
     system: usize,
     secondary_outside: usize,
+    ps_linkage_system: [usize; 5],
 }
 
 type Key = (Vec<u8>, usize);
 
 fn key(name: &[u8], index: usize) -> Key {
     (name.to_ascii_lowercase(), index)
+}
+
+// Narrow, public DXBC system-value names relevant to the observed PS inputs.
+// Unknown or inconsistent rows never emit the source string.
+fn ps_linkage_system(name: &[u8], code: usize) -> Option<usize> {
+    match (name, code) {
+        (b"sv_position", 1) => Some(0),
+        (b"sv_clipdistance", 2) => Some(1),
+        (b"sv_culldistance", 3) => Some(2),
+        (b"sv_isfrontface", 9) => Some(3),
+        (_, 0) if !name.starts_with(b"sv_") => None,
+        _ => Some(4),
+    }
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
@@ -59,7 +73,8 @@ fn check(bytes: &[u8]) -> Option<(Count, Vec<SignatureRow>)> {
         let primary = mask as u8;
         let secondary = (mask >> 8) as u8;
         let component_type = word(row, 16)?;
-        let system = word(row, 12)? != 0;
+        let system_code = word(row, 12)?;
+        let system = system_code != 0;
         if word(row, 0)? != 0
             || word(row, 28)? != 0
             || !matches!(component_type, 1 | 2 | 3 | 6)
@@ -69,8 +84,12 @@ fn check(bytes: &[u8]) -> Option<(Count, Vec<SignatureRow>)> {
         {
             return None;
         }
+        let key = key(&bytes[name_start..name_start + name], word(row, 8)?);
+        if let Some(i) = ps_linkage_system(&key.0, system_code) {
+            count.ps_linkage_system[i] += 1;
+        }
         keys.push(SignatureRow {
-            key: key(&bytes[name_start..name_start + name], word(row, 8)?),
+            key,
             register: word(row, 20)?,
             primary,
             component_type,
@@ -904,6 +923,9 @@ pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
             total.entries += c.entries;
             total.system += c.system;
             total.secondary_outside += c.secondary_outside;
+            for (sum, count) in total.ps_linkage_system.iter_mut().zip(c.ps_linkage_system) {
+                *sum += count;
+            }
         }
         totals
             .dependencies
@@ -1057,6 +1079,12 @@ pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
                 "  {tag}: {} rows; {} nonzero system field; {} secondary mask has bits outside primary",
                 c.entries, c.system, c.secondary_outside
             );
+            if (stage == 0 && tag == "ISG1") || (matches!(stage, 1 | 13) && tag == "OSG1") {
+                println!(
+                    "    System rows [position, clip distance, cull distance, front face, other/mismatched]: {:?}",
+                    c.ps_linkage_system
+                );
+            }
         }
     }
     Ok(())
@@ -1307,6 +1335,15 @@ mod tests {
             component_type: 3,
             system: false,
         }
+    }
+
+    #[test]
+    fn ps_linkage_system_needs_both_public_name_and_correct_enum() {
+        assert_eq!(ps_linkage_system(b"sv_isfrontface", 9), Some(3));
+        assert_eq!(ps_linkage_system(b"sv_position", 9), Some(4));
+        assert_eq!(ps_linkage_system(b"sv_position", 0), Some(4));
+        assert_eq!(ps_linkage_system(b"other", 1), Some(4));
+        assert_eq!(ps_linkage_system(b"other", 0), None);
     }
 
     #[test]
