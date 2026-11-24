@@ -87,6 +87,7 @@ pub struct OfflineGuardSlots {
 enum Profile {
     Standard,
     TlsChild,
+    TrustedOfflineTlsChild,
     OfflineCatalog,
     OfflineGuardSlots,
 }
@@ -145,6 +146,7 @@ const SUPPORTED_VOLATILE_VERSION: u32 = 0x0001_0001;
 enum DormantLayout {
     Legacy,
     InstrumentedNoPolicy,
+    TrustedOfflineInstrumented,
     BinkInspection,
 }
 
@@ -186,23 +188,29 @@ impl DormantSlots {
 
     fn parse(pe: &Pe<'_>, rva: u32, raw: &[u8], size: usize, profile: Profile) -> Result<Self> {
         let instrumented = u32_at(raw, GUARD_FLAGS) == CF_INSTRUMENTED;
-        // This decision never calls the Bink classifier. In particular, a
-        // nonzero CodeIntegrity tuple is not authorized by a structural match.
+        // This decision never calls the parse-only Bink classifier.
         let layout = if instrumented {
-            if nonzero(&raw[CFG_END..raw.len().min(CODE_INTEGRITY_END)]) {
-                return Err(PeError::Unsupported(
-                    "CodeIntegrity on instrumented dormant image",
-                ));
-            }
-            match profile {
-                Profile::TlsChild => DormantLayout::InstrumentedNoPolicy,
-                _ => DormantLayout::Legacy,
+            if matches!(profile, Profile::TrustedOfflineTlsChild) {
+                DormantLayout::TrustedOfflineInstrumented
+            } else {
+                if nonzero(&raw[CFG_END..raw.len().min(CODE_INTEGRITY_END)]) {
+                    return Err(PeError::Unsupported(
+                        "CodeIntegrity on instrumented dormant image",
+                    ));
+                }
+                match profile {
+                    Profile::TlsChild => DormantLayout::InstrumentedNoPolicy,
+                    _ => DormantLayout::Legacy,
+                }
             }
         } else {
             DormantLayout::Legacy
         };
         let (slots, config) = validate_dormant(pe, rva, raw, size, layout)?;
-        if layout == DormantLayout::InstrumentedNoPolicy {
+        if matches!(
+            layout,
+            DormantLayout::InstrumentedNoPolicy | DormantLayout::TrustedOfflineInstrumented
+        ) {
             validate_castguard_write_exclusion(pe, slots[DORMANT_CALLABLE])?;
         }
         let _ = &config;
@@ -273,8 +281,9 @@ fn validate_dormant(
     layout: DormantLayout,
 ) -> Result<([u32; DORMANT_FIELDS.len()], Range<u32>)> {
     let instrumented = layout != DormantLayout::Legacy;
+    let trusted_offline = layout == DormantLayout::TrustedOfflineInstrumented;
     let volatile_version = match layout {
-        DormantLayout::Legacy => None,
+        DormantLayout::Legacy | DormantLayout::TrustedOfflineInstrumented => None,
         DormantLayout::InstrumentedNoPolicy => Some(SUPPORTED_VOLATILE_VERSION),
         DormantLayout::BinkInspection => Some(INSTRUMENTED_VOLATILE_VERSION),
     };
@@ -282,6 +291,7 @@ fn validate_dormant(
     let (ci_flags_catalog, catalog_offset) = match layout {
         DormantLayout::Legacy => (1, 0), // existing profile, unchanged
         DormantLayout::InstrumentedNoPolicy => (0, 0),
+        DormantLayout::TrustedOfflineInstrumented => (0, 0), // fields ignored
         DormantLayout::BinkInspection => (1, INSTRUMENTED_CATALOG_OFFSET),
     };
     if size != DORMANT_SIZE
@@ -291,12 +301,14 @@ fn validate_dormant(
         || nonzero(&raw[0x60..CHECK])
         || nonzero(&raw[FUNCTION_TABLE..GUARD_FLAGS])
         || u32_at(raw, GUARD_FLAGS) != expected_flags
-        || u32_at(raw, CFG_END) != ci_flags_catalog
-        || u32_at(raw, CFG_END + 4) != catalog_offset
-        || nonzero(&raw[CFG_END + 8..VOLATILE_METADATA])
+        || (!trusted_offline
+            && (u32_at(raw, CFG_END) != ci_flags_catalog
+                || u32_at(raw, CFG_END + 4) != catalog_offset
+                || nonzero(&raw[CFG_END + 8..CODE_INTEGRITY_END])
+                || pe.directory(4).is_some()))
+        || nonzero(&raw[CODE_INTEGRITY_END..VOLATILE_METADATA])
         || nonzero(&raw[EH_TABLE..EH_END])
-        || (u64_at(raw, VOLATILE_METADATA) != 0) != volatile_version.is_some()
-        || pe.directory(4).is_some()
+        || (!trusted_offline && (u64_at(raw, VOLATILE_METADATA) != 0) != volatile_version.is_some())
     {
         return Err(PeError::Invalid(
             "CFG metadata without GUARD_CF characteristic (not dormant linker layout)",
@@ -361,12 +373,19 @@ fn validate_dormant(
         remaining.push(rva + 0x58);
     }
     let mut metadata = vec![config.clone()];
-    if let Some(version) = volatile_version {
+    if instrumented {
         for &slot in &slots {
             metadata.push(range(slot, 8)?);
         }
-        validate_volatile(pe, u64_at(raw, VOLATILE_METADATA), version, &mut metadata)?;
-        remaining.push(rva + VOLATILE_METADATA as u32);
+        let va = u64_at(raw, VOLATILE_METADATA);
+        if let Some(version) = volatile_version {
+            validate_volatile(pe, va, version, &mut metadata)?;
+        } else if va != 0 {
+            bound_ignored_volatile(pe, va, &mut metadata)?;
+        }
+        if va != 0 {
+            remaining.push(rva + VOLATILE_METADATA as u32);
+        }
     }
     for fix in pe.relocations()? {
         let fix_range = range(fix, 8)?;
@@ -604,6 +623,11 @@ impl<'a> CfgProfile<'a> {
         Self::parse_profile(pe, Profile::TlsChild)
     }
 
+    /// TLS child checks, except for unused signing and volatile annotations.
+    pub fn parse_trusted_offline_tls_child(pe: &Pe<'a>) -> Result<Self> {
+        Self::parse_profile(pe, Profile::TrustedOfflineTlsChild)
+    }
+
     /// Classify an envelope on a caller-trusted input, only for offline reporting.
     /// This does not determine whether the external catalog carries policy or
     /// authorize the image for either startup lane.
@@ -794,8 +818,17 @@ impl<'a> CfgMetadata<'a> {
                 return Err(PeError::Invalid("overlapping CFG metadata or slots"));
             }
         }
-        validate_auxiliary(pe, declared, rva, flags, stride, &mut ranges)?;
-        let static_tls = matches!(profile, Profile::TlsChild);
+        let trusted_offline = matches!(profile, Profile::TrustedOfflineTlsChild);
+        validate_auxiliary(
+            pe,
+            declared,
+            rva,
+            flags,
+            stride,
+            &mut ranges,
+            trusted_offline,
+        )?;
+        let static_tls = trusted_offline || matches!(profile, Profile::TlsChild);
         let address_taken_iat =
             AddressTakenIat::parse(pe, declared, flags, stride, static_tls, &mut ranges)?;
         let one_hop = matches!(profile, Profile::OfflineGuardSlots);
@@ -832,12 +865,19 @@ impl<'a> CfgMetadata<'a> {
         let ci = tail_between(declared, CFG_END, CODE_INTEGRITY_END);
         if !matches!(
             profile,
-            Profile::OfflineCatalog | Profile::OfflineGuardSlots
+            Profile::OfflineCatalog | Profile::OfflineGuardSlots | Profile::TrustedOfflineTlsChild
         ) && nonzero(ci)
         {
             return Err(PeError::Unsupported(
                 "CodeIntegrity load-config fields on CFG image",
             ));
+        }
+        if trusted_offline && nonzero(ci) {
+            if ci.len() != CODE_INTEGRITY_END - CFG_END {
+                return Err(PeError::Invalid("truncated CodeIntegrity fields"));
+            }
+            // No interpretation of the fields or directory #4 in this lane.
+            validate_ci_relocations(pe, rva, ci.len())?;
         }
         let table = pe.rva_slice(table_rva, bytes)?;
         let mut previous = 0;
@@ -870,12 +910,7 @@ impl<'a> CfgMetadata<'a> {
             if ci.len() != 12 || u32_at(ci, 0) != 1 || u32_at(ci, 4) == 0 || u32_at(ci, 8) != 0 {
                 return Err(PeError::Unsupported("offline CodeIntegrity tuple"));
             }
-            let fields = range(rva + CFG_END as u32, ci.len())?;
-            for fix in pe.relocations()? {
-                if overlaps(&fields, &range(fix, 8)?) {
-                    return Err(PeError::Invalid("CodeIntegrity relocation"));
-                }
-            }
+            validate_ci_relocations(pe, rva, ci.len())?;
             Some(OfflineCatalogEnvelope {
                 catalog_offset: u32_at(ci, 4),
                 embedded: pe.embedded_certificate_envelope()?,
@@ -1038,6 +1073,7 @@ fn validate_auxiliary(
     flags: u32,
     stride: usize,
     ranges: &mut Vec<Range<u32>>,
+    trusted_offline: bool,
 ) -> Result<()> {
     let mut va_fixups = [None; 2];
     let first_aux = ranges.len();
@@ -1072,12 +1108,12 @@ fn validate_auxiliary(
         if volatile_field.len() != 8 {
             return Err(PeError::Invalid("truncated volatile metadata pointer"));
         }
-        validate_volatile(
-            pe,
-            u64_at(volatile_field, 0),
-            SUPPORTED_VOLATILE_VERSION,
-            ranges,
-        )?;
+        let va = u64_at(volatile_field, 0);
+        if trusted_offline {
+            bound_ignored_volatile(pe, va, ranges)?;
+        } else {
+            validate_volatile(pe, va, SUPPORTED_VOLATILE_VERSION, ranges)?;
+        }
         va_fixups[1] = Some(config_rva + VOLATILE_METADATA as u32);
     }
 
@@ -1103,6 +1139,27 @@ fn validate_auxiliary(
             return Err(PeError::Invalid("missing auxiliary load-config relocation"));
         }
     }
+    Ok(())
+}
+
+fn validate_ci_relocations(pe: &Pe<'_>, config: u32, len: usize) -> Result<()> {
+    let fields = range(config + CFG_END as u32, len)?;
+    for fix in pe.relocations()? {
+        if overlaps(&fields, &range(fix, 8)?) {
+            return Err(PeError::Invalid("CodeIntegrity relocation"));
+        }
+    }
+    Ok(())
+}
+
+fn bound_ignored_volatile(pe: &Pe<'_>, va: u64, ranges: &mut Vec<Range<u32>>) -> Result<()> {
+    // Retain pointer/header bounds and metadata separation. Do not decode
+    // the header or follow its table pointers in the trusted offline lane.
+    let rva = preferred_rva(pe, va)?;
+    if rva % 4 != 0 {
+        return Err(PeError::Invalid("unaligned volatile metadata header"));
+    }
+    aux_data(pe, ranges, rva, 24)?;
     Ok(())
 }
 

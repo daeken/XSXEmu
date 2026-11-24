@@ -8,6 +8,7 @@ use crate::{Result, pe::Pe, win_cfg::CfgProfile};
 pub enum Profile {
     Standard,
     StaticTlsChild,
+    TrustedOfflineTlsChild,
 }
 
 impl Profile {
@@ -15,7 +16,18 @@ impl Profile {
         match self {
             Self::Standard => "standard",
             Self::StaticTlsChild => "static-tls-child",
+            Self::TrustedOfflineTlsChild => "trusted-offline-static-tls-child",
         }
+    }
+
+    pub fn uses_static_tls(self) -> bool {
+        !matches!(self, Self::Standard)
+    }
+
+    pub fn warning(self) -> Option<&'static str> {
+        matches!(self, Self::TrustedOfflineTlsChild).then_some(
+            "trusted offline diagnostic: neither signature nor catalog is verified; Xbox policy is not evaluated",
+        )
     }
 }
 
@@ -34,7 +46,7 @@ pub fn validate_image(
     if pe.dll_characteristics & DLL_FORCE_INTEGRITY != 0 {
         return Err("FORCE_INTEGRITY requires Windows signature verification, which this loader does not provide".into());
     }
-    let static_tls = matches!(profile, Profile::StaticTlsChild);
+    let static_tls = profile.uses_static_tls();
     if !static_tls && pe.tls()?.is_some() {
         return Err(
             "static TLS requires a Windows TEB and is not supported by this startup profile".into(),
@@ -52,10 +64,10 @@ pub fn validate_image(
             return Err(format!("unsupported {label} directory").into());
         }
     }
-    let cfg = if static_tls {
-        CfgProfile::parse_tls_child(&pe)
-    } else {
-        CfgProfile::parse(&pe)
+    let cfg = match profile {
+        Profile::Standard => CfgProfile::parse(&pe),
+        Profile::StaticTlsChild => CfgProfile::parse_tls_child(&pe),
+        Profile::TrustedOfflineTlsChild => CfgProfile::parse_trusted_offline_tls_child(&pe),
     }?;
     if matches!(cfg, CfgProfile::Dormant(_)) && !static_tls {
         return Err("dormant guard slots require the experimental static TLS child".into());
@@ -266,7 +278,9 @@ mod native {
         missing: &[MissingImport<'_>],
         attach_order: &[usize],
         rust_providers: bool,
+        profile: Profile,
     ) -> Result<u32> {
+        assert!(profile.uses_static_tls());
         run_impl(
             images,
             bindings,
@@ -274,7 +288,7 @@ mod native {
             attach_order,
             None,
             rust_providers,
-            Profile::StaticTlsChild,
+            profile,
         )
     }
 
@@ -288,12 +302,17 @@ mod native {
         profile: Profile,
     ) -> Result<u32> {
         use crate::tls_runtime;
-        let static_tls = matches!(profile, Profile::StaticTlsChild);
+        let static_tls = profile.uses_static_tls();
         let (pes, cfgs): (Vec<_>, Vec<_>) = images
             .iter()
             .enumerate()
             .map(|(index, (name, bytes))| {
-                validate_image(bytes, index != 0, profile).map_err(|e| format!("{name}: {e}"))
+                let validated = validate_image(bytes, index != 0, profile)
+                    .map_err(|e| format!("{name}: {e}"))?;
+                if let Some(warning) = profile.warning() {
+                    eprintln!("xsxemu: {name}: warning: {warning}");
+                }
+                Ok::<_, String>(validated)
             })
             .collect::<std::result::Result<Vec<_>, _>>()?
             .into_iter()

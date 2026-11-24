@@ -37,10 +37,11 @@ const USAGE: &str = "Usage: xsxemu <inspect|map|audit|run> <image.exe> [options]
     inspect option: --offline-guard-slots  Check the one-hop CFG linker slot form on a trusted PE\n\
     map [--base ADDRESS]   Materialize a non-executable image and apply relocations\n\
     audit [--dll-dir DIR] [--symbols]  Resolve the static import graph without executing\n\
-    audit option: --startup-profile standard|static-tls-child  Report per-image startup checks\n\
+    audit option: --startup-profile standard|static-tls-child|trusted-offline-static-tls-child  Report per-image startup checks\n\
     run [--dll-dir DIR]    Start a trusted image (x86-64 macOS/Rosetta only; not sandboxed)\n\
     run option: --trace-missing-imports  Treat missing static imports as callable and stop on first call (not data imports)\n\
     run option: --experimental-static-tls  Trusted PE-only startup in a disposable Rosetta child\n\
+    run option: --trusted-offline  Ignore opaque CodeIntegrity and volatile hints (requires --experimental-static-tls)\n\
     audit/run options: --api-set SCHEMA.dll, --rust-providers";
 
 fn main() -> ExitCode {
@@ -75,6 +76,7 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
     let mut rust_providers = false;
     let mut trace_missing_imports = false;
     let mut experimental_tls = false;
+    let mut trusted_offline = false;
     let mut startup_profile = None;
     let mut options = args.iter();
     while let Some(arg) = options.next() {
@@ -95,15 +97,19 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
                 startup_profile = Some(match options.next().and_then(|arg| arg.to_str()) {
                     Some("standard") => startup::Profile::Standard,
                     Some("static-tls-child") => startup::Profile::StaticTlsChild,
+                    Some("trusted-offline-static-tls-child") => {
+                        startup::Profile::TrustedOfflineTlsChild
+                    }
                     _ => {
                         return Err(
-                            "--startup-profile requires standard or static-tls-child".into()
+                            "--startup-profile requires standard, static-tls-child, or trusted-offline-static-tls-child".into()
                         );
                     }
                 });
             }
             ("run", Some("--trace-missing-imports")) => trace_missing_imports = true,
             ("run", Some("--experimental-static-tls")) => experimental_tls = true,
+            ("run", Some("--trusted-offline")) => trusted_offline = true,
             ("map", Some("--base")) if base.is_none() => {
                 base = Some(parse_base(
                     options.next().ok_or("--base requires an address")?,
@@ -111,6 +117,9 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
             }
             _ => return Err(format!("unexpected option {arg:?}\n{USAGE}").into()),
         }
+    }
+    if trusted_offline && !experimental_tls {
+        return Err("--trusted-offline requires --experimental-static-tls".into());
     }
     if tls_child && !experimental_tls {
         return Err("static TLS child requires --experimental-static-tls".into());
@@ -158,8 +167,15 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
                     rust_providers,
                     trace_missing_imports,
                 },
-                tls_child,
-                startup_profile,
+                if tls_child {
+                    Some(if trusted_offline {
+                        startup::Profile::TrustedOfflineTlsChild
+                    } else {
+                        startup::Profile::StaticTlsChild
+                    })
+                } else {
+                    startup_profile
+                },
             );
         }
         _ => return Err(USAGE.into()),
@@ -380,11 +396,6 @@ fn resolve(
     launch: bool,
     symbols: bool,
     options: link::Options<'_>,
-    #[cfg_attr(
-        not(all(target_os = "macos", target_arch = "x86_64")),
-        allow(unused_variables)
-    )]
-    tls_child: bool,
     startup_profile: Option<startup::Profile>,
 ) -> Result<ExitCode> {
     use std::collections::BTreeMap;
@@ -440,7 +451,7 @@ fn resolve(
         total - missing,
         total
     );
-    let refused = if let Some(profile) = startup_profile {
+    let refused = if let Some(profile) = startup_profile.filter(|_| !launch) {
         report_startup_profile(&plan, profile, std::io::stdout().lock())?
     } else {
         0
@@ -458,6 +469,7 @@ fn resolve(
     return Err("execution requires an x86-64 macOS build (Rosetta on Apple Silicon)".into());
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
     {
+        let tls_child = startup_profile.is_some();
         let paths: Vec<_> = plan
             .modules
             .iter()
@@ -502,8 +514,15 @@ fn resolve(
             }
         }
         let order = attach_order(&plan)?;
-        let status = if tls_child {
-            startup::run_tls_child(&images, &bindings, &traps, &order, startup_options.1)?
+        let status = if let Some(profile) = startup_profile {
+            startup::run_tls_child(
+                &images,
+                &bindings,
+                &traps,
+                &order,
+                startup_options.1,
+                profile,
+            )?
         } else {
             startup::run(
                 &images,
@@ -532,7 +551,13 @@ fn report_startup_profile(
     let mut refused = 0;
     for (index, module) in plan.modules.iter().enumerate() {
         match startup::validate_image(&module.image, index != 0, profile) {
-            Ok(_) => writeln!(out, "  {}: structural checks passed", module.path.display())?,
+            Ok(_) => {
+                write!(out, "  {}: structural checks passed", module.path.display())?;
+                if let Some(warning) = profile.warning() {
+                    write!(out, "; warning: {warning}")?;
+                }
+                writeln!(out)?;
+            }
             Err(e) => {
                 refused += 1;
                 writeln!(out, "  {}: refused: {e}", module.path.display())?;

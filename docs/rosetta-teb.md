@@ -476,10 +476,9 @@ stride in `msvcp140_codecvt_ids.dll` still fails the guard profile.
 The [Windows SDK][ci-sdk] identifies these as CodeIntegrity information fields;
 it does not establish Xbox catalog policy for this tuple. Microsoft's
 [`/INTEGRITYCHECK`][integritycheck] explicitly requires load-time signature
-checking; both run lanes still reject `FORCE_INTEGRITY`. A clear bit is not
-proof of trust or of the catalog's purpose. This option reports
-**signature/catalog not verified** and is unavailable in either run lane.
-No OS policy, startup profile, or exact GFID policy changes.
+checking; all run profiles reject `FORCE_INTEGRITY`. A clear bit is not
+proof of trust or of the catalog's purpose. The inspection option reports
+**signature/catalog not verified** and does not affect startup.
 
 [pe-format]: https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#the-attribute-certificate-table-image-only
 [ci-sdk]: https://github.com/microsoft/win32metadata/blob/main/generation/WinSDK/RecompiledIdlHeaders/um/winnt.h
@@ -497,11 +496,10 @@ and TLS index destinations must not overlap the cell.
 
 The classifier matches the descriptive CodeIntegrity tuple without following
 its offset and checks the 24-byte volatile layout and both annotation tables.
-Only this classifier accepts the exact word `0x80028002`. [LIEF's decoder][lief-volatile]
+The classifier recognizes the exact word `0x80028002`. [LIEF's decoder][lief-volatile]
 prints the two halves as minimum and maximum versions masked with `0x7fff`,
 but that does not establish the semantics of either high bit or rule out
-further requirements. Both execution lanes still reject the image pending
-that clarification and independent interpretation of CodeIntegrity `Flags=1`.
+further requirements. Both default execution profiles still reject the image.
 
 A separate TLS-child-only form, tested with owned fixtures, requires all-zero
 CodeIntegrity, no security directory, and the already-supported volatile
@@ -512,6 +510,29 @@ Bink's version or CodeIntegrity tuple, change signature admission, or add CFG
 targets.
 
 [lief-volatile]: https://github.com/lief-project/LIEF/blob/main/src/PE/LoadConfigurations/VolatileMetadata.cpp
+
+## Trusted offline diagnostic child (explicit opt-in)
+
+For independently trusted local images only, use `run FILE --experimental-static-tls
+--trusted-offline`. The second flag is unavailable without the disposable
+Rosetta child. Use `audit FILE --startup-profile trusted-offline-static-tls-child`
+with the same DLL roots and provider options to report file-only checks without
+running the guest. Both commands warn per structurally accepted image: neither
+signature nor catalog is verified; Xbox policy is not evaluated. This is not a
+sandbox, authentication, or a Windows/Xbox trust decision.
+
+In the supported active CFG and instrumented dormant layouts, the child treats
+bounded CodeIntegrity fields as opaque. It does not follow the catalog offset
+or parse an embedded certificate, and the separate inspection command remains
+unchanged. Where those layouts carry a volatile metadata pointer, the child
+still checks bounds, separation, and relocation but does not interpret its
+contents or follow annotation tables. It does not perform the optimizations
+those hints describe. Normal startup and `--experimental-static-tls` without
+`--trusted-offline` retain their old checks. `FORCE_INTEGRITY` remains fatal;
+active CFG and address-taken IAT enforcement are unchanged and unsupported
+dormant calls still terminate. Unknown guard requirements and load-config
+extensions (including GuardMemcpy layouts) are still refused. No host policy
+or PE file is modified.
 
 ## Controlled execution plan
 

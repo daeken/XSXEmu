@@ -915,6 +915,11 @@ mod tests {
                 "Owned.exe: structural checks passed",
                 2,
             ),
+            (
+                Profile::TrustedOfflineTlsChild,
+                "Owned.exe: structural checks passed",
+                2,
+            ),
         ] {
             let mut report = Vec::new();
             let refused = crate::report_startup_profile(&plan, profile, &mut report).unwrap();
@@ -928,6 +933,13 @@ mod tests {
             assert!(lines[4].contains("plain.dll: structural checks passed"));
             assert!(lines[5].contains(&format!("{expected_refused}/4 discovered images refused")));
             assert!(lines[6].contains("This is not startup admission."));
+            if let Some(warning) = profile.warning() {
+                assert!(lines[1].contains(warning));
+                assert!(lines[4].contains(warning));
+                assert_eq!(report.matches(warning).count(), 2);
+            } else {
+                assert!(!report.contains("warning:"));
+            }
             assert!(!report.contains("missing.dll"));
         }
     }

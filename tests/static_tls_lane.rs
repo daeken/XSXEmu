@@ -10,6 +10,8 @@ use std::{
 };
 
 const OPT: &str = "--experimental-static-tls";
+const TRUSTED: &str = "--trusted-offline";
+const WARNING: &str = "neither signature nor catalog is verified; Xbox policy is not evaluated";
 const PAGE: usize = 0x4000;
 const RAW: usize = 0x1000;
 const TEXT: usize = PAGE;
@@ -416,7 +418,7 @@ fn launcher(path: &Path, opts: &[&str]) -> Command {
     cmd
 }
 #[test]
-fn force_integrity_is_refused_in_both_execution_profiles() {
+fn force_integrity_is_refused_in_all_execution_profiles() {
     if !rosetta() {
         return;
     }
@@ -424,7 +426,7 @@ fn force_integrity_is_refused_in_both_execution_profiles() {
     let mut bytes = image(Kind::Solo);
     w16(&mut bytes, OP + 70, 0x0080);
     let exe = dir.write("requires-signature.exe", &bytes);
-    for flags in [&[][..], &[OPT][..]] {
+    for flags in [&[][..], &[OPT][..], &[OPT, TRUSTED][..]] {
         expect(
             run(&exe, flags),
             1,
@@ -917,6 +919,58 @@ fn companion_slots_trap_without_widening_active_cfg() {
 }
 
 #[test]
+fn trusted_offline_ignores_catalog_and_volatile_contents_but_not_guard_calls() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let mut active = companion_image(Kind::Guarded);
+    // Arbitrary opaque fields, including an offset outside the file.
+    active[file(LOAD) + 0x94..file(LOAD) + 0xa0].fill(0xff);
+    let exe = scratch.write("active.exe", &active);
+    expect(
+        run(&exe, &[TRUSTED]),
+        1,
+        "requires --experimental-static-tls",
+    );
+    expect(run(&exe, &[OPT]), 1, "CodeIntegrity load-config fields");
+    let output = run(&exe, &[OPT, TRUSTED]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stderr.matches(WARNING).count(), 1, "{stderr}");
+    assert!(stderr.contains("active.exe: warning:"), "{stderr}");
+    expect(output, 44, "Guest entry returned 44");
+    for mode in [1, 2] {
+        let mut b = active.clone();
+        w32(&mut b, file(MODE), mode);
+        scratch.write("active.exe", &b);
+        expect(
+            run(&exe, &[OPT, TRUSTED]),
+            1,
+            "child terminated by signal 4",
+        );
+    }
+    active[file(LOAD) + 0x93] = 1; // active CastGuard requirement
+    scratch.write("active.exe", &active);
+    expect(run(&exe, &[OPT, TRUSTED]), 1, "GuardFlags requirements");
+
+    let mut dormant = instrumented_terminal_image(Kind::Solo);
+    // Contents must not be decoded or used as authority for control flow.
+    dormant[file(TERMINAL_VOLATILE)..file(TERMINAL_VOLATILE) + 24].fill(0xff);
+    let exe = scratch.write("dormant.exe", &dormant);
+    expect(run(&exe, &[OPT, TRUSTED]), 43, "Guest entry returned 43");
+    dormant_call(&mut dormant, CHECK + 8);
+    scratch.write("dormant.exe", &dormant);
+    expect(
+        run(&exe, &[OPT, TRUSTED]),
+        86,
+        "called dormant linker guard slot: CFG dispatch",
+    );
+    w64(&mut dormant, file(LOAD) + 0x100, u64::MAX as usize);
+    scratch.write("dormant.exe", &dormant);
+    expect(run(&exe, &[OPT, TRUSTED]), 1, "CFG preferred VA");
+}
+
+#[test]
 fn companion_dll_is_opt_in_and_its_xfg_trap_survives_rebase() {
     if !rosetta() {
         return;
@@ -1060,6 +1114,7 @@ fn address_taken_iat_requires_an_independently_callable_static_pe_export() {
     let exe = dir.write("importer.exe", &original);
     dir.write("owned.dll", &provider);
     expect(run(&exe, &[OPT]), 47, "Guest entry returned 47");
+    expect(run(&exe, &[OPT, TRUSTED]), 47, "Guest entry returned 47");
 
     let mut b = original.clone();
     // LEA instead of MOV: CFG must still reject the IAT storage address.
@@ -1073,11 +1128,13 @@ fn address_taken_iat_requires_an_independently_callable_static_pe_export() {
         let mut dll = provider.clone();
         dll[file(COMPANION_GFIDS) + 4] = flag;
         dir.write("owned.dll", &dll);
-        expect(
-            run(&exe, &[OPT]),
-            1,
-            "not an independently permitted exact CFG entry",
-        );
+        for args in [&[OPT][..], &[OPT, TRUSTED][..]] {
+            expect(
+                run(&exe, args),
+                1,
+                "not an independently permitted exact CFG entry",
+            );
+        }
     }
     let mut dll = provider.clone();
     w32(&mut dll, file(LINK) + 0x30, AT_IAT_ENTRY + 1);
