@@ -37,6 +37,11 @@ pub(crate) fn lookup(dll: &[u8], name: &[u8]) -> Option<HostExport> {
         (b"kernelbase.dll" | b"kernel32.dll" | FILE, b"GetDriveTypeW") => {
             export!("kernelbase.dll", "GetDriveTypeW", native::GetDriveTypeW)
         }
+        (b"kernelbase.dll" | b"kernel32.dll" | FILE, b"GetFileAttributesW") => export!(
+            "kernelbase.dll",
+            "GetFileAttributesW",
+            native::GetFileAttributesW
+        ),
         (b"kernelbase.dll" | b"kernel32.dll" | FILE, b"GetFileAttributesExW") => export!(
             "kernelbase.dll",
             "GetFileAttributesExW",
@@ -1667,7 +1672,7 @@ pub(crate) mod native {
         size_hi: u32,
         size_lo: u32,
     }
-    fn attrs(m: &Metadata) -> AttrData {
+    fn attribute_bits(m: &Metadata) -> u32 {
         let mut attrs = 0;
         if m.is_dir() {
             attrs |= DIRECTORY;
@@ -1678,15 +1683,28 @@ pub(crate) mod native {
         if m.is_symlink() {
             attrs |= REPARSE;
         }
+        if attrs == 0 { NORMAL } else { attrs }
+    }
+    fn attrs(m: &Metadata) -> AttrData {
         let n = if m.is_dir() { 0 } else { m.len() };
         AttrData {
-            attrs: if attrs == 0 { NORMAL } else { attrs },
+            attrs: attribute_bits(m),
             created: FileTime::from_host(m.created()),
             accessed: FileTime::from_host(m.accessed()),
             written: FileTime::from_host(m.modified()),
             size_hi: (n >> 32) as u32,
             size_lo: n as u32,
         }
+    }
+    unsafe fn attribute_metadata(name: *const u16) -> Result<Metadata> {
+        let p = unsafe { path(name)? };
+        fs::symlink_metadata(&p).map_err(|e| path_err(e, &p))
+    }
+    pub(crate) unsafe extern "win64" fn GetFileAttributesW(name: *const u16) -> u32 {
+        ret(
+            unsafe { attribute_metadata(name) }.map(|m| attribute_bits(&m)),
+            u32::MAX, // INVALID_FILE_ATTRIBUTES
+        )
     }
     pub(super) unsafe extern "win64" fn GetFileAttributesExW(
         name: *const u16,
@@ -1697,8 +1715,7 @@ pub(crate) mod native {
             if out.is_null() || level != 0 {
                 return Err(INVALID_PARAM);
             }
-            let p = unsafe { path(name)? };
-            let m = fs::symlink_metadata(&p).map_err(|e| path_err(e, &p))?;
+            let m = unsafe { attribute_metadata(name)? };
             unsafe {
                 out.cast::<AttrData>().write_unaligned(attrs(&m));
             }
@@ -2285,6 +2302,12 @@ mod tests {
             assert_eq!(export.symbol, "CreateFileW");
             assert_eq!(export.provider, "kernelbase.dll");
         }
+        for dll in [FILE, b"kernel32.dll", b"kernelbase.dll"] {
+            let export = lookup(dll, b"GetFileAttributesW").unwrap();
+            assert_eq!(export.symbol, "GetFileAttributesW");
+            assert_eq!(export.provider, "kernelbase.dll");
+        }
+        assert!(lookup(FILE2, b"GetFileAttributesW").is_none());
         assert!(lookup(FILE2, b"CreateFileW").is_none());
         assert!(lookup(FILE, b"GetTempPathW").is_none());
         assert!(lookup(ENV, b"getstdhandle").is_none());

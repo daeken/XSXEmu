@@ -195,6 +195,8 @@ audited_bridges! {
         io::create_mutex_a, (security: *const c_void, initial_owner: i32, name: *const u8) -> usize;
     xsxemu_tls_getstdhandle, getstdhandle: b"kernelbase.dll", b"GetStdHandle",
         io::GetStdHandle, (slot: u32) -> usize;
+    xsxemu_tls_get_file_attributes_w, get_file_attributes_w: b"kernelbase.dll", b"GetFileAttributesW",
+        io::GetFileAttributesW, (name: *const u16) -> u32;
     xsxemu_tls_getfiletype, getfiletype: b"kernelbase.dll", b"GetFileType",
         io::GetFileType, (handle: usize) -> u32;
     xsxemu_tls_get_command_line_a, get_command_line_a: b"kernelbase.dll", b"GetCommandLineA",

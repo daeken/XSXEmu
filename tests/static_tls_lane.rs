@@ -2389,6 +2389,98 @@ fn exclusive_srw_bridges_record_and_clear_owner_in_guest_storage() {
     }
 }
 
+const FILE_ATTRIBUTES_CODE_CAPACITY: usize = 0x100;
+const FILE_ATTRIBUTES_CASES: usize = RO + 0x1000;
+const FILE_ATTRIBUTES_CASE_SIZE: usize = 0x300;
+const FILE_ATTRIBUTES_CASE_COUNT: usize = 9;
+
+#[repr(C)]
+struct FileAttributesFixture {
+    entry: u32,
+    code: [u8; FILE_ATTRIBUTES_CODE_CAPACITY],
+}
+
+global_asm!(include_str!("fixtures/static_tls_file_attributes.S"),
+    capacity = const FILE_ATTRIBUTES_CODE_CAPACITY,
+    iat_delta = const IAT - TEXT,
+    cases_delta = const FILE_ATTRIBUTES_CASES - TEXT,
+    case_size = const FILE_ATTRIBUTES_CASE_SIZE,
+    case_count = const FILE_ATTRIBUTES_CASE_COUNT,
+    options(att_syntax),
+);
+
+unsafe extern "C" {
+    static static_tls_file_attributes_fixture: FileAttributesFixture;
+}
+
+#[test]
+fn file_attributes_bridge_reuses_guest_paths_and_teb_last_error() {
+    if !rosetta() {
+        return;
+    }
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let scratch = Scratch::new();
+    let present = scratch.write("🧪-present.dat", b"owned data");
+    let root = present.parent().unwrap().canonicalize().unwrap();
+    let read_only = scratch.write("read-only.dat", b"owned data");
+    fs::set_permissions(&read_only, fs::Permissions::from_mode(0o444)).unwrap();
+    // A dangling symlink still has an attribute mask: don't follow the final link.
+    symlink("absent.dat", root.join("link.dat")).unwrap();
+
+    let mut exe = image(Kind::Solo);
+    let fixture = unsafe { &static_tls_file_attributes_fixture };
+    exe[file(TEXT)..file(TEXT) + RAW].fill(0xcc);
+    put(&mut exe, file(TEXT), &fixture.code);
+    w32(&mut exe, OP + 16, TEXT + fixture.entry as usize);
+    w64(&mut exe, file(ARRAY), PREFERRED + TEXT);
+    dir_import_one(
+        &mut exe,
+        b"api-ms-win-core-file-l1-1-0.dll\0",
+        b"GetFileAttributesW\0",
+    );
+
+    let base = format!("C:{}", root.to_str().unwrap().replace('/', "\\"));
+    let invalid = u32::MAX;
+    let preserved = 0x12345678;
+    let cases: [(_, u32, u32); FILE_ATTRIBUTES_CASE_COUNT] = [
+        (format!("{base}\\🧪-present.dat"), 0x80, preserved),
+        (base.clone(), 0x10, preserved),
+        (format!("{base}\\read-only.dat"), 0x01, preserved),
+        (format!("{base}\\link.dat"), 0x400, preserved),
+        (format!("{base}\\absent.dat"), invalid, 2),
+        (format!("{base}\\missing\\absent.dat"), invalid, 3),
+        (r"\\server\share\file.dat".into(), invalid, 50),
+        (format!("{base}\\*.dat"), invalid, 123),
+        (String::new(), invalid, 87), // Fixture passes NULL for an empty slot.
+    ];
+    for (i, (path, attrs, error)) in cases.into_iter().enumerate() {
+        let offset = file(FILE_ATTRIBUTES_CASES + i * FILE_ATTRIBUTES_CASE_SIZE);
+        w32(&mut exe, offset, attrs as usize);
+        w32(&mut exe, offset + 4, error as usize);
+        let wide: Vec<_> = path.encode_utf16().chain([0]).collect();
+        assert!(8 + 2 * wide.len() <= FILE_ATTRIBUTES_CASE_SIZE);
+        for (j, unit) in wide.into_iter().enumerate() {
+            w16(&mut exe, offset + 8 + j * 2, unit as usize);
+        }
+    }
+
+    let path = scratch.write("file-attributes.exe", &exe);
+    let output = launcher(&path, &[OPT, "--rust-providers"])
+        .env("XSXEMU_TRACE_STARTUP", "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr
+            .matches("bridge dispatch kernelbase.dll!GetFileAttributesW guest_return_pc=")
+            .count(),
+        FILE_ATTRIBUTES_CASE_COUNT,
+        "{stderr}"
+    );
+    expect(output, 54, "Guest entry returned 54");
+}
+
 const EXCEPTION_FILTER_CODE_CAPACITY: usize = 0x200;
 
 #[repr(C)]

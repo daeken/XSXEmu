@@ -406,6 +406,15 @@ non-owner release terminate with a diagnostic instead of waiting or
 pretending to succeed. Shared mode, try-lock, and condition-variable APIs
 remain unsupported. Do not mix this word encoding with other SRW implementations.
 
+`GetFileAttributesW` uses a one-pointer bridge returning a DWORD. At IAT RVA
+`0x6793950` the startup caller replaces the executable basename returned by
+`GetModuleFileNameW(NULL, ...)` with `xgameruntime.dll`. It tests only for
+`INVALID_FILE_ATTRIBUTES`, not individual bits. The provider shares the
+UTF-16 path rules, metadata lookup (without following the final symlink),
+and attribute bits of `GetFileAttributesExW`. It opens no file handle,
+searches no DLL roots, and adds no path mappings. Success preserves guest
+LastError; failure returns `INVALID_FILE_ATTRIBUTES` and sets guest LastError.
+
 `IsProcessorFeaturePresent` uses the ordinary provider's AMD64 baseline and
 runtime x86 feature detection, preserving `LastError`. It reports
 `PF_FASTFAIL_AVAILABLE` (23) as false: Windows `INT 29h` fast-fail handling is
