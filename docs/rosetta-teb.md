@@ -279,6 +279,11 @@ provider-managed and separate from the PE static TLS vector at `GS:[0x58]`.
 searches an intentionally empty namespace, even for DLLs in the static
 import graph. Well-formed requests return `NULL` with `ERROR_MOD_NOT_FOUND`;
 invalid or unsupported requests return their validation errors instead.
+`GetModuleHandleW` returns a borrowed PE base from the registered guest image
+graph: null selects the root EXE, and non-null names use the ordinary mapped
+module lookup. It neither loads images nor creates handles for Rust providers
+or API-set contracts. Success preserves `LastError`; an unmatched name
+returns `NULL` and sets `ERROR_MOD_NOT_FOUND` in the guest TEB.
 `GetModuleFileNameW` reads the registered UTF-16 guest path: a null handle
 selects the root EXE, and a non-null handle must exactly match a mapped image
 base. It performs no filesystem lookup. Success preserves `LastError`;

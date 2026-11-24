@@ -753,7 +753,7 @@ pub(crate) mod native {
             .map_err(|_| ERROR_INVALID_PARAMETER)
     }
 
-    pub(super) unsafe extern "win64" fn get_module_handle_w(name: *const u16) -> usize {
+    pub(crate) unsafe extern "win64" fn get_module_handle_w(name: *const u16) -> usize {
         let name = match unsafe { wide_name(name) } {
             Ok(name) => name,
             Err(error) => return fail(error),

@@ -10,6 +10,7 @@ _static_tls_fixture:
     .long Lbridge_cb-Ltext, Lbridge_entry-Ltext
     .long Ltrace_entry-Ltext, Ldisable_calls_dll_main-Ltext
     .long Lmodule_filename_dll_main-Ltext
+    .long Lmodule_handle_dll_main-Ltext, Lmodule_handle_entry-Ltext
 Ltext:
 .macro tls index
     leaq Ltext(%rip), %r11
@@ -857,5 +858,53 @@ Lmodule_filename_dll_main:
 Lmodule_filename_detach:
     movl $1, %eax
     retq
+Lmodule_handle_dll_main:
+    leaq Ltext(%rip), %r11
+    args
+    testl %edx, %edx
+    je Lmodule_handle_detach
+    cmpl $1, %edx
+    jne Lbad
+    subq $40, %rsp
+    movl $0x12345678, %gs:0x68
+    leaq Lmodule_handle_name(%rip), %rcx
+    callq *{iat_delta}(%r11)
+    leaq Ltext(%rip), %r11
+    leaq -{text_rva}(%r11), %rdx
+    cmpq %rdx, %rax
+    jne Lbad
+    cmpl $0x12345678, %gs:0x68
+    jne Lbad
+    leaq Lmodule_handle_missing(%rip), %rcx
+    callq *{iat_delta}(%r11)
+    testq %rax, %rax
+    jne Lbad
+    cmpl $126, %gs:0x68          /* ERROR_MOD_NOT_FOUND */
+    jne Lbad
+    addq $40, %rsp
+Lmodule_handle_detach:
+    movl $1, %eax
+    retq
+Lmodule_handle_entry:
+    tls 0
+    phase 1, 2
+    subq $40, %rsp
+    movl $0x87654321, %gs:0x68
+    xorl %ecx, %ecx
+    callq *{iat_delta}+16(%r11)
+    leaq Ltext(%rip), %r11
+    leaq -{text_rva}(%r11), %rdx
+    cmpq %rdx, %rax
+    jne Lbad
+    cmpl $0x87654321, %gs:0x68
+    jne Lbad
+    addq $40, %rsp
+    movl $43, %eax
+    retq
+.p2align 1
+Lmodule_handle_name:
+    .short 'O', 'w', 'N', 'e', 'D', 0  /* Case-insensitive, implicit .dll. */
+Lmodule_handle_missing:
+    .short 'k', 'e', 'r', 'n', 'e', 'l', '3', '2', '.', 'd', 'l', 'l', 0
 Lend:
     .org Ltext + {capacity}, 0xcc
