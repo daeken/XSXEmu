@@ -6,12 +6,78 @@ use std::{collections::BTreeMap, num::NonZeroU64, ops::Range};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProgramId(pub u64);
 
-/// Byte slices must already have been checked and scoped to the same exact format/profile.
-/// Launch state is the complete program-selection state for that comparison domain.
-pub struct CatalogEntry<'a> {
-    pub id: ProgramId,
+/// Caller-assigned comparison domain covering format, version and launch profile.
+/// Equal IDs must denote the same domain within one validated catalog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProfileId(pub u64);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Extent {
+    pub start: usize,
+    pub len: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CodeScope {
+    /// All stored bytes, including any non-executable prefix/suffix. None does
+    /// not assert that execution starts at byte zero.
+    Stored { executable: Option<Extent> },
+    /// Only an independently verified executable range, at this offset from
+    /// the stored span's start. Never compare directly to a stored span.
+    Executable { start: usize },
+}
+
+/// Byte slices must already have been checked, including completeness of the
+/// program-selection state. This matcher has no format parser.
+#[derive(Clone, Copy)]
+pub struct ProgramSnapshot<'a> {
+    pub profile: ProfileId,
+    pub scope: CodeScope,
     pub code: &'a [u8],
     pub launch_state: &'a [u8],
+}
+
+impl ProgramSnapshot<'_> {
+    fn stamp(self) -> Option<ProgramStamp> {
+        let code_len = self.code.len();
+        if code_len == 0 || self.launch_state.is_empty() {
+            return None;
+        }
+        match self.scope {
+            CodeScope::Stored {
+                executable: Some(extent),
+            } => {
+                if extent.len == 0 || extent.start.checked_add(extent.len)? > code_len {
+                    return None;
+                }
+            }
+            CodeScope::Executable { start } => {
+                start.checked_add(code_len)?;
+            }
+            CodeScope::Stored { executable: None } => (),
+        }
+        Some(ProgramStamp {
+            profile: self.profile,
+            scope: self.scope,
+            code_len,
+            launch_len: self.launch_state.len(),
+        })
+    }
+}
+
+/// Non-byte metadata preserved in an exact match. Offsets are relative to the
+/// stored program, not a guest pointer or GPU virtual address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProgramStamp {
+    pub profile: ProfileId,
+    pub scope: CodeScope,
+    pub code_len: usize,
+    pub launch_len: usize,
+}
+
+pub struct CatalogEntry<'a> {
+    pub id: ProgramId,
+    pub snapshot: ProgramSnapshot<'a>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20,22 +86,30 @@ pub enum ProgramEvidence {
     Opaque,
     NoExactMatch,
     Ambiguous,
-    Exact(ProgramId),
+    Exact {
+        id: ProgramId,
+        stamp: ProgramStamp,
+    },
 }
 
 /// Only for snapshots verified to have the same format/profile as the catalog.
 /// No retention of bytes or shortcut through a source digest. Multiple matching
 /// rows are ambiguous even if their labels coincide.
-pub fn identify(code: &[u8], launch_state: &[u8], catalog: &[CatalogEntry<'_>]) -> ProgramEvidence {
-    if code.is_empty() || launch_state.is_empty() {
+pub fn identify(snapshot: ProgramSnapshot<'_>, catalog: &[CatalogEntry<'_>]) -> ProgramEvidence {
+    let Some(stamp) = snapshot.stamp() else {
         return ProgramEvidence::Opaque;
-    }
-    let mut matches = catalog
-        .iter()
-        .filter(|entry| entry.code == code && entry.launch_state == launch_state);
+    };
+    let mut matches = catalog.iter().filter(|entry| {
+        entry.snapshot.stamp() == Some(stamp)
+            && entry.snapshot.code == snapshot.code
+            && entry.snapshot.launch_state == snapshot.launch_state
+    });
     match (matches.next(), matches.next()) {
         (None, _) => ProgramEvidence::NoExactMatch,
-        (Some(entry), None) => ProgramEvidence::Exact(entry.id),
+        (Some(entry), None) => ProgramEvidence::Exact {
+            id: entry.id,
+            stamp,
+        },
         _ => ProgramEvidence::Ambiguous,
     }
 }

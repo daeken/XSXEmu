@@ -4,8 +4,9 @@
 
 use std::arch::asm;
 use xsxemu::compute_capture::{
-    CatalogEntry, DispatchShape, GpuHeap, LifetimeId, ListCapture, ProgramEvidence, ProgramId,
-    RootParameter, TableEvidence, TableValue, identify,
+    CatalogEntry, CodeScope, DispatchShape, GpuHeap, LifetimeId, ListCapture, ProfileId,
+    ProgramEvidence, ProgramId, ProgramSnapshot, ProgramStamp, RootParameter, TableEvidence,
+    TableValue, identify,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -175,15 +176,15 @@ fn owned_win64_capture_joins_program_and_the_last_bound_table() {
     }
     assert!(!list.refused);
     let id = ProgramId(13);
-    let program = identify(
-        b"owned program",
-        b"owned state",
-        &[CatalogEntry {
-            id,
-            code: b"owned program",
-            launch_state: b"owned state",
-        }],
-    );
+    let profile = ProfileId(41);
+    let scope = CodeScope::Executable { start: 19 };
+    let snapshot = ProgramSnapshot {
+        profile,
+        scope,
+        code: b"owned program",
+        launch_state: b"owned state",
+    };
+    let program = identify(snapshot, &[CatalogEntry { id, snapshot }]);
     let pipelines = [(pipeline, program)].into();
     let heaps = [(
         heap,
@@ -224,7 +225,18 @@ fn owned_win64_capture_joins_program_and_the_last_bound_table() {
     }
     let dispatch = dispatch.unwrap();
     assert_eq!(dispatch.shape, DispatchShape::DirectGroups([47, 53, 59]));
-    assert_eq!(dispatch.program, ProgramEvidence::Exact(id));
+    assert_eq!(
+        dispatch.program,
+        ProgramEvidence::Exact {
+            id,
+            stamp: ProgramStamp {
+                profile,
+                scope,
+                code_len: 13,
+                launch_len: 11
+            }
+        }
+    );
     assert_eq!(dispatch.root, Some(root));
     assert_eq!(
         dispatch.table,

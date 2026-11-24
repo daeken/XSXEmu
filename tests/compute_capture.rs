@@ -2,32 +2,101 @@ use xsxemu::compute_capture::*;
 
 #[test]
 fn identification_requires_unique_complete_code_and_state() {
-    let entry = |id, launch_state| CatalogEntry {
-        id: ProgramId(id),
+    let example = |launch_state| ProgramSnapshot {
+        profile: ProfileId(3),
+        scope: CodeScope::Stored { executable: None },
         code: b"abc",
         launch_state,
     };
-    let catalog = [entry(1, b"state A"), entry(2, b"state B")];
+    let a = example(b"state A");
+    let b = example(b"state B");
+    let entry = |id, snapshot| CatalogEntry {
+        id: ProgramId(id),
+        snapshot,
+    };
+    let catalog = [entry(1, a), entry(2, b)];
+    assert!(matches!(
+        identify(b, &catalog),
+        ProgramEvidence::Exact {
+            id: ProgramId(2),
+            ..
+        }
+    ));
     assert_eq!(
-        identify(b"abc", b"state B", &catalog),
-        ProgramEvidence::Exact(ProgramId(2))
-    );
-    assert_eq!(
-        identify(b"abc", b"state", &catalog),
+        identify(example(b"state"), &catalog),
         ProgramEvidence::NoExactMatch
     );
     assert_eq!(
-        identify(b"ab", b"state A", &catalog),
+        identify(ProgramSnapshot { code: b"ab", ..a }, &catalog),
         ProgramEvidence::NoExactMatch
     );
-    assert_eq!(identify(b"abc", b"", &catalog), ProgramEvidence::Opaque);
+    assert_eq!(identify(example(b""), &catalog), ProgramEvidence::Opaque);
+    assert_eq!(
+        identify(a, &[entry(1, a), entry(1, a)]),
+        ProgramEvidence::Ambiguous
+    );
+}
+
+#[test]
+fn exact_bytes_do_not_match_across_extent_or_profile() {
+    let full = ProgramSnapshot {
+        profile: ProfileId(11),
+        scope: CodeScope::Stored { executable: None },
+        code: b"owned",
+        launch_state: b"state",
+    };
+    let exec = |start| ProgramSnapshot {
+        scope: CodeScope::Executable { start },
+        ..full
+    };
+    let catalog = [CatalogEntry {
+        id: ProgramId(7),
+        snapshot: exec(24),
+    }];
+    for mismatch in [
+        full,
+        exec(0),
+        exec(36),
+        ProgramSnapshot {
+            profile: ProfileId(12),
+            ..exec(24)
+        },
+        ProgramSnapshot {
+            scope: CodeScope::Stored {
+                executable: Some(Extent { start: 0, len: 5 }),
+            },
+            ..full
+        },
+    ] {
+        assert_eq!(identify(mismatch, &catalog), ProgramEvidence::NoExactMatch);
+    }
+    assert_eq!(
+        identify(exec(24), &catalog),
+        ProgramEvidence::Exact {
+            id: ProgramId(7),
+            stamp: ProgramStamp {
+                profile: ProfileId(11),
+                scope: CodeScope::Executable { start: 24 },
+                code_len: 5,
+                launch_len: 5
+            }
+        }
+    );
+    assert_eq!(
+        identify(exec(usize::MAX), &catalog),
+        ProgramEvidence::Opaque
+    );
     assert_eq!(
         identify(
-            b"abc",
-            b"state A",
-            &[entry(1, b"state A"), entry(1, b"state A")]
+            ProgramSnapshot {
+                scope: CodeScope::Stored {
+                    executable: Some(Extent { start: 4, len: 2 })
+                },
+                ..full
+            },
+            &catalog
         ),
-        ProgramEvidence::Ambiguous
+        ProgramEvidence::Opaque
     );
 }
 
@@ -108,7 +177,7 @@ fn a_gap_or_root_change_prevents_reusing_old_state() {
     let heap = LifetimeId(4);
     let param = Some(RootParameter { root, ordinal: 0 });
     let mut cap = ListCapture::new(list);
-    let pipelines = [(pipeline, ProgramEvidence::Exact(ProgramId(17)))].into();
+    let pipelines = [(pipeline, ProgramEvidence::NoExactMatch)].into();
     let heaps = [(heap, Some(geometry(0xabcd, 8, 9)))].into();
     cap.bind_pipeline(pipeline);
     cap.bind_root(root);
