@@ -70,6 +70,7 @@ struct Fixture {
     runtime_probe: u32,
     runtime_main: u32,
     runtime_export: u32,
+    load_optional_entry: u32,
     code: [u8; RAW],
 }
 global_asm!(include_str!("fixtures/static_tls_lane.S"),
@@ -1592,6 +1593,40 @@ fn module_handle_bridge_returns_borrowed_mapped_bases_and_sets_teb_error_on_miss
             "Guest entry returned 43",
         );
     }
+}
+
+#[test]
+fn load_library_w_reports_missing_optional_guest_dlls_through_gs() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let mut exe = image(Kind::Solo);
+    w32(
+        &mut exe,
+        OP + 16,
+        TEXT + unsafe { static_tls_fixture.load_optional_entry } as usize,
+    );
+    dir_import_one(
+        &mut exe,
+        b"api-ms-win-core-libraryloader-l1-2-1.dll\0",
+        b"LoadLibraryW\0",
+    );
+    for (offset, name) in [(0, "dbghelp.dll"), (64, "rpcrt4.dll")] {
+        for (i, unit) in name.encode_utf16().chain(Some(0)).enumerate() {
+            w16(
+                &mut exe,
+                file(MODULE_PATHS) + offset + 2 * i,
+                usize::from(unit),
+            );
+        }
+    }
+    let path = scratch.write("optional-load.exe", &exe);
+    expect(
+        run(&path, &[OPT, "--rust-providers"]),
+        43,
+        "Guest entry returned 43",
+    );
 }
 
 #[test]

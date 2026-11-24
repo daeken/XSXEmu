@@ -685,6 +685,10 @@ by the image's GuardCF metadata at mapping time. It never adds CFG targets,
 resolves forwarders or ordinals, or returns a Rust provider address. Success
 preserves `LastError`; an invalid handle gives `ERROR_INVALID_HANDLE` and an
 unavailable export gives `ERROR_PROC_NOT_FOUND`.
+`LoadLibraryW` can acquire an already mapped guest `dbghelp.dll` or
+`rpcrt4.dll` by basename. Unmapped optional modules are logged and return
+`NULL` with `ERROR_MOD_NOT_FOUND`; no filesystem search or host loading is
+performed. No minidump or UUID exports are synthesized.
 `FreeLibrary` is restricted to guest references acquired through the narrowly
 admitted startup mappings. Unbridged providers fail before entry unless
 `--trace-missing-imports` is enabled,

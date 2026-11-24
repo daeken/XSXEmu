@@ -9,6 +9,7 @@ pub(crate) const XGAMERUNTIME: &str = "xgameruntime.dll";
 
 const LIBRARY_LOADER_1_1: &[u8] = b"api-ms-win-core-libraryloader-l1-1-0.dll";
 const LIBRARY_LOADER_1_2: &[u8] = b"api-ms-win-core-libraryloader-l1-2-0.dll";
+const LIBRARY_LOADER_1_2_1: &[u8] = b"api-ms-win-core-libraryloader-l1-2-1.dll";
 const RTL_SUPPORT: &[u8] = b"api-ms-win-core-rtlsupport-l1-1-0.dll";
 
 pub(crate) fn has_dll(dll: &[u8]) -> bool {
@@ -19,12 +20,16 @@ pub(crate) fn has_dll(dll: &[u8]) -> bool {
             | b"ntdll.dll"
             | LIBRARY_LOADER_1_1
             | LIBRARY_LOADER_1_2
+            | LIBRARY_LOADER_1_2_1
             | RTL_SUPPORT
     )
 }
 
 pub(crate) fn lookup(dll: &[u8], name: &[u8]) -> Option<HostExport> {
     match (dll, name) {
+        (b"kernel32.dll" | b"kernelbase.dll" | LIBRARY_LOADER_1_2_1, b"LoadLibraryW") => {
+            export!("kernelbase.dll", "LoadLibraryW", native::load_library_w)
+        }
         (
             b"kernel32.dll" | b"kernelbase.dll" | LIBRARY_LOADER_1_1 | LIBRARY_LOADER_1_2,
             b"GetModuleHandleA",
@@ -123,7 +128,10 @@ fn registry_aliases_are_exact() {
             assert_eq!(lookup(dll, name.as_bytes()).unwrap().symbol, name);
         }
         assert!(lookup(dll, b"getprocaddress").is_none());
-        assert!(lookup(dll, b"LoadLibraryW").is_none());
+        assert_eq!(
+            lookup(dll, b"LoadLibraryW").is_some(),
+            matches!(dll, b"kernel32.dll" | b"kernelbase.dll")
+        );
         assert!(lookup(dll, b"LoadLibraryExA").is_none());
         assert!(lookup(dll, b"FreeLibraryAndExitThread").is_none());
     }
@@ -131,7 +139,15 @@ fn registry_aliases_are_exact() {
         lookup(RTL_SUPPORT, b"RtlPcToFileHeader").unwrap().provider,
         "ntdll.dll"
     );
-    assert!(!has_dll(b"api-ms-win-core-libraryloader-l1-2-1.dll"));
+    assert!(has_dll(LIBRARY_LOADER_1_2_1));
+    assert_eq!(
+        lookup(LIBRARY_LOADER_1_2_1, b"LoadLibraryW")
+            .unwrap()
+            .provider,
+        "kernelbase.dll"
+    );
+    assert!(lookup(LIBRARY_LOADER_1_2_1, b"LoadLibraryExW").is_none());
+    assert!(!has_dll(b"api-ms-win-core-libraryloader-l1-2-2.dll"));
 }
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
@@ -572,6 +588,33 @@ pub(crate) mod native {
             let get: extern "win64" fn() -> u32 =
                 unsafe { std::mem::transmute(export.address().unwrap()) };
             get()
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn child_load_library_w_is_limited_to_mapped_diagnostic_dlls() {
+            let bytes = image(None);
+            let pe = Pe::parse(&bytes).unwrap();
+            let load = |name: &str| unsafe { tls_child_load_library_w(wide(name).as_ptr()) };
+            let inputs = [
+                ("/Example.exe", &pe, MAIN as u64, None),
+                ("/owned/DBGHELP.dll", &pe, DLL as u64, None),
+                ("/owned/other.dll", &pe, DLL as u64 + 0x10000, None),
+            ];
+            let _scope = super::register(inputs, None, true, None, None).unwrap();
+            assert_eq!(load("rpcrt4.dll"), 0);
+            assert_eq!(last_error(), ERROR_MOD_NOT_FOUND);
+            assert_eq!(load("DbgHelp"), DLL);
+            assert_eq!(last_error(), ERROR_MOD_NOT_FOUND);
+            assert_eq!(tls_child_free_library(DLL), 1);
+            assert_eq!(tls_child_free_library(DLL), 0);
+            assert_eq!(last_error(), ERROR_INVALID_HANDLE);
+            assert_eq!(load("other.dll"), 0);
+            assert_eq!(last_error(), ERROR_NOT_SUPPORTED);
+            assert_eq!(load("/owned/DBGHELP.dll"), 0);
+            assert_eq!(last_error(), ERROR_NOT_SUPPORTED);
+            assert_eq!(unsafe { tls_child_load_library_w(std::ptr::null()) }, 0);
+            assert_eq!(last_error(), ERROR_INVALID_PARAMETER);
         }
 
         #[cfg(target_os = "macos")]
@@ -1020,6 +1063,41 @@ pub(crate) mod native {
         .unwrap_or_else(fail)
     }
 
+    pub(crate) unsafe extern "win64" fn load_library_w(name: *const u16) -> usize {
+        unsafe { load_library_ex_w(name, 0, 0) }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn optional_diagnostic_dll(image: &Image) -> bool {
+        matches!(basename(&image.path_key), "dbghelp.dll" | "rpcrt4.dll")
+    }
+
+    // Both observed calls probe optional diagnostics. Only borrow from the
+    // existing guest mapping graph, with normal LoadLibrary refcounting.
+    #[cfg(target_os = "macos")]
+    pub(crate) unsafe extern "win64" fn tls_child_load_library_w(name: *const u16) -> usize {
+        let key = match unsafe { load_key(name, 0, 0) } {
+            Ok(key) => key,
+            Err(error) => return fail(error),
+        };
+        let target = match key.as_str() {
+            "dbghelp.dll" => "dbghelp.dll",
+            "rpcrt4.dll" => "rpcrt4.dll",
+            _ => return fail(ERROR_NOT_SUPPORTED),
+        };
+        graph(|g| {
+            g.and_then(|g| g.images.iter().skip(1).find(|m| basename(&m.path_key) == target))
+                .ok_or(ERROR_MOD_NOT_FOUND)
+                .and_then(Image::acquire)
+        })
+        .unwrap_or_else(|error| {
+            if error == ERROR_MOD_NOT_FOUND {
+                eprintln!("xsxemu: LoadLibraryW: optional guest DLL {target} is not mapped; no dynamic loading");
+            }
+            fail(error)
+        })
+    }
+
     pub(crate) unsafe extern "win64" fn load_library_ex_w(
         name: *const u16,
         file: usize,
@@ -1082,6 +1160,14 @@ pub(crate) mod native {
             entropy_image(g)
                 .filter(|m| m.base == module)
                 .or_else(|| xgameruntime_image(g).filter(|m| m.base == module))
+                .or_else(|| {
+                    g.and_then(|g| {
+                        g.images
+                            .iter()
+                            .skip(1)
+                            .find(|m| m.base == module && optional_diagnostic_dll(m))
+                    })
+                })
                 .map_or_else(|| fail(ERROR_INVALID_HANDLE), release)
         })
     }

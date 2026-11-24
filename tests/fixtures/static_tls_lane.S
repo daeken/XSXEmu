@@ -20,6 +20,7 @@ _static_tls_fixture:
     .long Lsystem_file_time_entry-Ltext
     .long Ltick_count64_entry-Ltext
     .long Lruntime_probe-Ltext, Lruntime_main-Ltext, Lruntime_export-Ltext
+    .long Lload_optional_entry-Ltext
 Ltext:
 .macro tls index
     leaq Ltext(%rip), %r11
@@ -1444,5 +1445,25 @@ Lruntime_export_name: .asciz "OwnedProbe"
 Lruntime_forwarder: .asciz "Forwarded"
 Lruntime_unguarded: .asciz "NotGuarded"
 Lruntime_missing: .asciz "ownedprobe"
+Lload_optional_entry:
+    tls 0
+    phase 1, 2
+    subq $40, %rsp
+    leaq {module_paths_delta}(%r11), %rcx
+    callq *{iat_delta}(%r11)
+    testq %rax, %rax
+    jne Lbad
+    cmpl $126, %gs:0x68
+    jne Lbad
+    leaq Ltext(%rip), %r11
+    leaq {module_paths_delta}+64(%r11), %rcx
+    callq *{iat_delta}(%r11)
+    testq %rax, %rax
+    jne Lbad
+    cmpl $126, %gs:0x68
+    jne Lbad
+    addq $40, %rsp
+    movl $43, %eax
+    retq
 Lend:
     .org Ltext + {capacity}, 0xcc

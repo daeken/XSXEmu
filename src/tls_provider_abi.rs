@@ -176,6 +176,8 @@ audited_bridges! {
         loader::get_proc_address => loader::tls_child_get_proc_address, (module: usize, symbol: usize) -> usize;
     xsxemu_tls_get_module_file_name_w, get_module_file_name_w: b"kernelbase.dll", b"GetModuleFileNameW",
         loader::get_module_file_name_w, (module: usize, buffer: *mut u16, capacity: u32) -> u32;
+    xsxemu_tls_load_library_w, load_library_w: b"kernelbase.dll", b"LoadLibraryW",
+        loader::load_library_w => loader::tls_child_load_library_w, (name: *const u16) -> usize;
     xsxemu_tls_load_library_ex_w, load_library_ex_w: b"kernelbase.dll", b"LoadLibraryExW",
         loader::load_library_ex_w => loader::tls_child_load_library_ex_w, (name: *const u16, file: usize, flags: u32) -> usize;
     xsxemu_tls_free_library, free_library: b"kernelbase.dll", b"FreeLibrary",
