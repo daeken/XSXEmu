@@ -328,6 +328,12 @@ provider uses `ERROR_INVALID_HANDLE` for non-DLL handles and
 `ERROR_INVALID_PARAMETER` for a DLL with static TLS. Success preserves
 LastError. There are no guest thread attach/detach notifications to suppress
 in the single-thread model, and process attach/detach still run.
+`GetCurrentThreadId` returns the existing Rust provider's nonzero, process-local
+DWORD, not a macOS thread ID. The initial guest TEB's `ClientId.UniqueThread`
+(`GS:[0x48]`) is seeded from the same provider before guest execution. The
+bridge preserves `LastError`; it does not add guest thread creation or handles.
+An owned PE imports it through `api-ms-win-core-processthreads-l1-1-0.dll` and
+checks the return against the TEB and verifies `LastError` across repeated calls.
 `IsProcessorFeaturePresent` uses the ordinary provider's AMD64 baseline and
 runtime x86 feature detection, preserving `LastError`. It reports
 `PF_FASTFAIL_AVAILABLE` (23) as false: Windows `INT 29h` fast-fail handling is

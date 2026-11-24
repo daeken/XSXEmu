@@ -2,7 +2,7 @@
 //! This is an ABI experiment for trusted PE code, not confinement or SEH.
 //! The public CLI starts a fresh child before opening the image graph and
 //! kills/reaps it after ten seconds if it has not exited. Only the initial
-//! thread and three TEB fields are provided. There is no dynamic TLS, thread
+//! thread and four TEB fields are provided. There is no dynamic TLS, thread
 //! notification, or exception recovery. DLLs attach dependency-first and
 //! detach in reverse; EXE notifications bracket entry. TLS callbacks precede
 //! the same module's DllMain on both notifications. A rejected attach detaches
@@ -33,6 +33,7 @@ mod provider_abi;
 pub use provider_abi::bridge_address;
 
 const CHILD_TIMEOUT: Duration = Duration::from_secs(10);
+const UNIQUE_THREAD_OFFSET: usize = 0x48;
 const LAST_ERROR_OFFSET: usize = 0x68;
 // Private word in this minimal stub, not a supported Windows TEB field.
 const CONTEXT_OFFSET: usize = 0xf8;
@@ -450,13 +451,18 @@ pub fn run(
     }
     let thread = plan.new_thread()?;
     let vector = thread.vector_address().ok_or("missing static TLS vector")?;
-    // Minimal TEB stub: Self, ThreadLocalStoragePointer and LastErrorValue
-    // (zero initially, shared between direct guest accesses and provider bridges).
+    // Minimal TEB stub: Self, ClientId.UniqueThread, ThreadLocalStoragePointer
+    // and LastErrorValue (zero initially, shared with provider bridges).
+    // Seed the ID from the same host-side thread-local used by the provider.
+    let thread_id = crate::providers::native::current_thread_id();
     let mut teb = [0u64; 32];
     let teb_ptr = teb.as_mut_ptr();
     let guest_base = teb_ptr.addr() as u64;
     unsafe {
         teb_ptr.add(0x30 / 8).write(guest_base);
+        teb_ptr
+            .add(UNIQUE_THREAD_OFFSET / 8)
+            .write(u64::from(thread_id));
         teb_ptr.add(0x58 / 8).write(vector);
     }
     let trace = std::env::var_os("XSXEMU_TRACE_STARTUP").is_some_and(|v| v == "1");

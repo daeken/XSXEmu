@@ -322,7 +322,7 @@ pub(crate) mod native {
         std::process::id()
     }
 
-    pub(super) extern "win64" fn current_thread_id() -> u32 {
+    pub(crate) extern "win64" fn current_thread_id() -> u32 {
         // Exact IDs within this compatibility process (not truncated macOS
         // pthread IDs). Guest thread handles/control APIs are not implemented.
         THREAD_ID.with(|id| *id)

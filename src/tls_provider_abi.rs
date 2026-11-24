@@ -106,6 +106,8 @@ audited_bridges! {
         crate::xbox_d3d12_vm::configure, (config: *const u8) -> i32;
     xsxemu_tls_xmem_virtual_alloc, xmem_virtual_alloc: b"xmem.dll", b"XMemVirtualAlloc",
         crate::xbox_xmem::virtual_alloc, (base: usize, size: usize, flags: u32, attributes: u32, protect: u32) -> usize;
+    xsxemu_tls_get_current_thread_id, get_current_thread_id: b"kernelbase.dll", b"GetCurrentThreadId",
+        native::current_thread_id, () -> u32;
     xsxemu_tls_get_last_error, get_error: b"kernelbase.dll", b"GetLastError",
         native::get_last_error, () -> u32;
     xsxemu_tls_set_last_error, set_error: b"kernelbase.dll", b"SetLastError",
