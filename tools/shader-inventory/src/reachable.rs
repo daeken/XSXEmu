@@ -198,6 +198,10 @@ fn analyze(dis: &mut Disassembler, bytes: &[u8]) -> Result<ProgramCounts, Blocke
     Ok(counts)
 }
 
+pub(crate) fn complete_reference_walk(dis: &mut Disassembler, bytes: &[u8]) -> bool {
+    analyze(dis, bytes).is_ok()
+}
+
 // Deliberately only a triage filter. Does not validate operands, ABI bindings,
 // waits, floating-point mode, ordering, scalar reads or raw buffer semantics.
 fn shortlist(meta: &Metadata, p: &ProgramCounts) -> bool {

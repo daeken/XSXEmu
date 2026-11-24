@@ -325,12 +325,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     const USAGE: &str = "usage: xsx-shader-inventory [--header-only | --compute-isa <LLVM shared library> <primary CPU> <reference CPU>] <shaders.rpf> (select gfx1013 and gfx1030, in either order)";
     let first = args.next().ok_or(USAGE)?;
     if first == "--wrapped-library" {
-        let usage = "usage: xsx-shader-inventory --wrapped-library <wrapped DXBC directory> <expanded PS/0/9 library>";
+        let usage = "usage: xsx-shader-inventory --wrapped-library <wrapped DXBC directory> <expanded PS/0/9 library> [<trusted LLVM 21 library> <gfx1013|gfx1030>]";
         let wrapped = args.next().ok_or(usage)?;
-        let library = args.next().filter(|_| args.next().is_none()).ok_or(usage)?;
+        let library = args.next().ok_or(usage)?;
+        let reference = if let Some(llvm) = args.next() {
+            let cpu =
+                llvm::Cpu::parse(&args.next().filter(|_| args.next().is_none()).ok_or(usage)?)
+                    .ok_or(usage)?;
+            Some((llvm, cpu))
+        } else {
+            None
+        };
         return wrapped_library::run(
             std::path::Path::new(&wrapped),
             std::path::Path::new(&library),
+            reference.as_ref().map(|(lib, cpu)| (lib.as_os_str(), *cpu)),
         );
     }
     if first == "--wrapped-signatures" {

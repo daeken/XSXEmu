@@ -1,11 +1,18 @@
 //! Test byte-equality hypotheses inside stage/digest candidate families, not native ABI equivalence.
 use crate::{
-    ARCHIVE_LIMIT, BLOB_LIMIT, compute_sites::graphics_items, coverage::Metadata, dxbc_chunks,
+    ARCHIVE_LIMIT, BLOB_LIMIT,
+    compute_sites::graphics_items,
+    coverage::Metadata,
+    coverage::code,
+    dxbc_chunks,
+    llvm::{Cpu, Llvm},
+    reachable::complete_reference_walk,
     shader_payloads, stage_name, word,
 };
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     error::Error,
+    ffi::OsStr,
     fs::{self, File},
     io::Read,
     path::Path,
@@ -27,6 +34,9 @@ struct Program {
     disagreeing_profile: bool,
     equal_window_agreeing_profile: bool,
     equal_window_disagreeing_profile: bool,
+    graph_complete: bool,
+    graph_failed: bool,
+    graph_unchecked: bool,
 }
 
 impl Program {
@@ -98,7 +108,22 @@ fn bounded(path: &Path, limit: usize, bytes: &mut Vec<u8>) -> Result<(), Box<dyn
     Ok(())
 }
 
-pub(super) fn run(wrapped: &Path, path: &Path) -> Result<(), Box<dyn Error>> {
+pub(super) fn run(
+    wrapped: &Path,
+    path: &Path,
+    reference: Option<(&OsStr, Cpu)>,
+) -> Result<(), Box<dyn Error>> {
+    let mut graphs = if let Some((path, cpu)) = reference {
+        let llvm = Llvm::load(path)?;
+        let (major, minor, patch) = llvm.version;
+        println!(
+            "Conditional reference CFG: LLVM {major}.{minor}.{patch} amdgcn {}, wave width from matched FSSM metadata",
+            cpu.name()
+        );
+        Some([llvm.context(cpu, false)?, llvm.context(cpu, true)?])
+    } else {
+        None
+    };
     let mut library_bytes = Vec::new();
     bounded(path, ARCHIVE_LIMIT, &mut library_bytes)?;
     let library = PipelineLibrary::parse(&library_bytes)?;
@@ -234,6 +259,7 @@ pub(super) fn run(wrapped: &Path, path: &Path) -> Result<(), Box<dyn Error>> {
             };
             count.unsupported_compute_profiles +=
                 usize::from(stage == 5 && profile.is_none()) * eligible.len();
+            let mut walked = None;
             for (id, lib) in &eligible {
                 // Only length-sensitive, exact byte equality. No candidate selection.
                 let p = candidates
@@ -254,6 +280,22 @@ pub(super) fn run(wrapped: &Path, path: &Path) -> Result<(), Box<dyn Error>> {
                 }
                 if let Some(profile) = profile {
                     p.compare_profile(profile, byte_match);
+                    if byte_match
+                        && p.library_profiles.contains(&profile)
+                        && let Some(dis) = &mut graphs
+                    {
+                        if let Some((body, _)) =
+                            code(payload).filter(|(body, _)| Some(*body) == fssm_cut)
+                        {
+                            let complete = *walked.get_or_insert_with(|| {
+                                complete_reference_walk(&mut dis[usize::from(profile.1)], body)
+                            });
+                            p.graph_complete |= complete;
+                            p.graph_failed |= !complete;
+                        } else {
+                            p.graph_unchecked = true;
+                        }
+                    }
                 }
             }
         };
@@ -304,6 +346,14 @@ pub(super) fn run(wrapped: &Path, path: &Path) -> Result<(), Box<dyn Error>> {
                 values()
                     .filter(|p| p.equal_window_disagreeing_profile)
                     .count()
+            );
+        }
+        if stage == 5 && graphs.is_some() {
+            println!(
+                "  Conditional compute reference CFG: {} programs with a complete walk, {} with a failed walk, {} matching-profile programs with unvalidated FSSM span",
+                values().filter(|p| p.graph_complete).count(),
+                values().filter(|p| p.graph_failed).count(),
+                values().filter(|p| p.graph_unchecked).count()
             );
         }
     }

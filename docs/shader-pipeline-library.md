@@ -100,6 +100,8 @@ The 51 compute positives are distinct programs. These are exact byte-window corr
 
 For compute, the scanner also compares the FSSM XYZ and wave-width bit to every distinct dispatch XYZ/wave-bit pair referencing the digest-joined library program. No program has multiple such library pairs in this corpus. All 2,689 candidate payload/program comparisons have readable compute metadata. All 2,680 joined compute programs agree, including the 51 conditional byte-window positives, with no disagreeing profile. This is launch metadata agreement, not an observed dispatch or a descriptor ABI. The checker retains disagreement even when another candidate or library reference agrees.
 
+Append a trusted LLVM 21 library path and `gfx1013` or `gfx1030` to `--wrapped-library` to walk the matching compute windows under one explicit reference profile. The walker requires profile agreement and independently checks that the FSSM window matches the existing FSSM compute-span parser. It starts at byte zero of the equal window and follows supported direct control, requiring a reachable decoded end instruction. LLVM 21.1.6 completed 43 of 51 on `gfx1013` and 14 of 51 on `gfx1030`; the remaining 8 and 37 failed the respective reference walk. All 51 passed the FSSM span prerequisite. These are conditional static CFG results, not evidence that either reference CPU is the console ISA or that the library actually enters at that offset.
+
 ## Reproduce the structural census
 
 ```sh
