@@ -22,6 +22,24 @@ const ERROR_HANDLING: &[u8] = b"api-ms-win-core-errorhandling-l1-1-0.dll";
 const PROCESS_THREADS: &[u8] = b"api-ms-win-core-processthreads-l1-1-0.dll";
 const HEAP: &[u8] = b"api-ms-win-core-heap-l1-1-0.dll";
 
+#[allow(unused_macros)] // Used by the provider submodules as they are enabled.
+macro_rules! export {
+    ($provider:expr, $symbol:literal, $function:path) => {{
+        #[cfg(target_arch = "x86_64")]
+        let address = Some($function as *const () as usize);
+        #[cfg(not(target_arch = "x86_64"))]
+        let address = None;
+        Some(crate::providers::HostExport {
+            provider: $provider,
+            symbol: $symbol,
+            address,
+        })
+    }};
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) use native::set_last_error;
+
 /// Whether the registry has any exports for this exact lowercase module name.
 pub fn has_dll(dll: &[u8]) -> bool {
     matches!(
@@ -59,6 +77,9 @@ pub fn lookup(dll: &[u8], name: &[u8]) -> Option<HostExport> {
         }
         (b"kernelbase.dll" | b"kernel32.dll" | ERROR_HANDLING, b"SetLastError") => {
             export!(KERNELBASE, "SetLastError", set_last_error)
+        }
+        (b"kernelbase.dll" | b"kernel32.dll" | ERROR_HANDLING, b"SetErrorMode") => {
+            export!(KERNELBASE, "SetErrorMode", set_error_mode)
         }
         (b"ntdll.dll", b"RtlGetLastWin32Error") => {
             export!(NTDLL, "RtlGetLastWin32Error", get_last_error)
@@ -99,6 +120,15 @@ pub fn lookup(dll: &[u8], name: &[u8]) -> Option<HostExport> {
         (b"kernelbase.dll" | b"kernel32.dll" | HEAP, b"HeapFree") => {
             export!(KERNELBASE, "HeapFree", heap_free)
         }
+        (b"kernelbase.dll" | b"kernel32.dll" | HEAP, b"HeapValidate") => {
+            export!(KERNELBASE, "HeapValidate", heap_validate)
+        }
+        (b"kernelbase.dll" | b"kernel32.dll" | HEAP, b"HeapQueryInformation") => {
+            export!(KERNELBASE, "HeapQueryInformation", heap_query_information)
+        }
+        (b"kernelbase.dll" | b"kernel32.dll" | HEAP, b"HeapWalk") => {
+            export!(KERNELBASE, "HeapWalk", heap_walk)
+        }
         _ => None,
     }
 }
@@ -122,6 +152,17 @@ mod native {
     const ERROR_NO_MORE_ITEMS: u32 = 259;
     const TLS_OUT_OF_INDEXES: u32 = u32::MAX;
     const TLS_SLOTS: usize = 1088;
+
+    static ERROR_MODE: AtomicU32 = AtomicU32::new(0);
+
+    pub(super) extern "win64" fn set_error_mode(mode: u32) -> u32 {
+        const STICKY_ALIGNMENT: u32 = 0x4;
+        const VALID: u32 = 0x1 | 0x2 | STICKY_ALIGNMENT | 0x8000;
+        let updated = ERROR_MODE.try_update(Ordering::Relaxed, Ordering::Relaxed, |previous| {
+            Some(mode & VALID | previous & STICKY_ALIGNMENT)
+        });
+        updated.unwrap_or_else(|_| std::process::abort())
+    }
 
     static NEXT_THREAD_ID: AtomicU32 = AtomicU32::new(1);
     // Odd generations are allocated. Even generations are free; a slot with
@@ -161,7 +202,7 @@ mod native {
         LAST_ERROR.get()
     }
 
-    pub(super) extern "win64" fn set_last_error(error: u32) {
+    pub(crate) extern "win64" fn set_last_error(error: u32) {
         LAST_ERROR.set(error);
     }
 
@@ -375,6 +416,100 @@ mod native {
         result.cast()
     }
 
+    pub(super) extern "win64" fn heap_validate(
+        heap: *mut c_void,
+        flags: u32,
+        block: *const c_void,
+    ) -> i32 {
+        if heap != get_process_heap() || flags != 0 {
+            return 0;
+        }
+        let blocks = lock(&BLOCKS);
+        i32::from(block.is_null() || blocks.contains_key(&block.addr()))
+    }
+
+    const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+    const ERROR_INVALID_HANDLE: u32 = 6;
+    const ERROR_NO_MORE_FILES: u32 = 18;
+
+    /// HeapCompatibilityInformation/standard heap (0). Other classes are unsupported.
+    pub(super) unsafe extern "win64" fn heap_query_information(
+        heap: *mut c_void,
+        class: u32,
+        out: *mut u32,
+        size: usize,
+        written: *mut usize,
+    ) -> i32 {
+        if heap != get_process_heap() {
+            set_last_error(ERROR_INVALID_HANDLE);
+            return 0;
+        }
+        if class != 0 {
+            set_last_error(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        if !written.is_null() {
+            unsafe { written.write_unaligned(4) };
+        }
+        if out.is_null() || size < 4 {
+            set_last_error(ERROR_INSUFFICIENT_BUFFER);
+            return 0;
+        }
+        unsafe { out.write_unaligned(0) };
+        1
+    }
+
+    // PROCESS_HEAP_ENTRY on Win64, exposed read-only and only for busy blocks.
+    #[repr(C)]
+    pub(super) struct HeapEntry {
+        data: *mut c_void,
+        data_size: u32,
+        overhead: u8,
+        region_index: u8,
+        flags: u16,
+        details: [u64; 3],
+    }
+
+    pub(super) unsafe extern "win64" fn heap_walk(heap: *mut c_void, entry: *mut HeapEntry) -> i32 {
+        if heap != get_process_heap() {
+            set_last_error(ERROR_INVALID_HANDLE);
+            return 0;
+        }
+        if entry.is_null() {
+            set_last_error(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        let prior = unsafe { std::ptr::addr_of!((*entry).data).read_unaligned() };
+        let blocks = lock(&BLOCKS);
+        if !prior.is_null() && !blocks.contains_key(&prior.addr()) {
+            set_last_error(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        let Some((_, block)) = blocks
+            .iter()
+            .filter(|(key, _)| **key > prior.addr())
+            .min_by_key(|(key, _)| **key)
+        else {
+            set_last_error(ERROR_NO_MORE_FILES);
+            return 0;
+        };
+        let Ok(data_size) = u32::try_from(block.size) else {
+            set_last_error(ERROR_NOT_ENOUGH_MEMORY);
+            return 0;
+        };
+        unsafe {
+            entry.write_unaligned(HeapEntry {
+                data: block.ptr.as_ptr().cast(),
+                data_size,
+                overhead: 0,
+                region_index: 0,
+                flags: 4,
+                details: [0; 3],
+            })
+        };
+        1
+    }
+
     pub(super) extern "win64" fn heap_free(heap: *mut c_void, flags: u32, ptr: *mut c_void) -> i32 {
         if heap == get_process_heap() && flags == 0 && lock(&BLOCKS).remove(&ptr.addr()).is_some() {
             return 1;
@@ -430,6 +565,28 @@ mod tests {
                 // SAFETY: Each test uses the signature of the named Win64 export.
                 unsafe { std::mem::transmute::<usize, extern "win64" fn($($arg),*) -> $ret>(addr) }
             }};
+        }
+
+        #[test]
+        fn heap_validation_and_compatibility_information() {
+            let heap = native::get_process_heap();
+            let block = native::heap_alloc(heap, 0, 17);
+            assert!(!block.is_null());
+            assert_eq!(native::heap_validate(heap, 0, block), 1);
+            assert_eq!(native::heap_validate(heap, 0, ptr::null()), 1);
+            let (mut out, mut written) = (u32::MAX, 0);
+            assert_eq!(
+                unsafe { native::heap_query_information(heap, 0, &mut out, 0, &mut written) },
+                0
+            );
+            assert_eq!(written, 4);
+            assert_eq!(
+                unsafe { native::heap_query_information(heap, 0, &mut out, 4, &mut written) },
+                1
+            );
+            assert_eq!(out, 0);
+            assert_eq!(native::heap_free(heap, 0, block), 1);
+            assert_eq!(native::heap_validate(heap, 0, block), 0);
         }
 
         #[test]
