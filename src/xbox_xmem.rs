@@ -168,3 +168,83 @@ pub(crate) extern "win64" fn virtual_alloc(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BASIC_INFO_64: i32 = 9;
+    const KERN_INVALID_ADDRESS: i32 = 1;
+    unsafe extern "C" {
+        fn mach_vm_region(
+            task: u32,
+            address: *mut u64,
+            size: *mut u64,
+            flavor: i32,
+            info: *mut i32,
+            count: *mut u32,
+            object: *mut u32,
+        ) -> i32;
+        fn mach_port_deallocate(task: u32, name: u32) -> i32;
+    }
+
+    fn region(task: u32, address: u64) -> Option<(u64, u64, i32, i32)> {
+        let (mut base, mut len, mut object) = (address, 0, 0);
+        let mut info = [0; 1024]; // VM_REGION_INFO_MAX words
+        let mut count = info.len() as u32;
+        // SAFETY: same-task metadata query. All out pointers and info capacity
+        // are valid, and the requested address is never read or written.
+        let status = unsafe {
+            mach_vm_region(
+                task,
+                &mut base,
+                &mut len,
+                BASIC_INFO_64,
+                info.as_mut_ptr(),
+                &mut count,
+                &mut object,
+            )
+        };
+        if status == KERN_INVALID_ADDRESS {
+            return None;
+        }
+        assert_eq!(status, 0, "mach_vm_region({address:#x})");
+        if object != 0 && object != u32::MAX {
+            // SAFETY: this query owns the returned send right.
+            assert_eq!(unsafe { mach_port_deallocate(task, object) }, 0);
+        }
+        assert!(count >= 2);
+        Some((base, len, info[0], info[1]))
+    }
+
+    #[test]
+    fn production_reservations_are_no_access_and_owned() {
+        for size in [S16, S24] {
+            let len = size as u64;
+            let a = Reservation::new(size).unwrap();
+            let b = Reservation::new(size).unwrap();
+            assert!(a.base + len <= b.base || b.base + len <= a.base);
+            let check = |r: &Reservation| {
+                assert!(r.base.is_multiple_of(ALIGN as u64));
+                for address in [r.base, r.base + len - 1] {
+                    assert_eq!(
+                        region(r.task, address),
+                        Some((r.base, len, PROT_NONE, PROT_NONE))
+                    );
+                }
+            };
+            let release = |r: Reservation| {
+                let (task, base) = (r.task, r.base);
+                drop(r);
+                // A query finds the containing or next range, so confirm the
+                // next live range (if any) starts beyond the entire old span.
+                assert!(region(task, base).is_none_or(|(next, ..)| next >= base + len));
+            };
+            check(&a);
+            check(&b);
+            release(a);
+            check(&b);
+            release(b);
+        }
+    }
+}
