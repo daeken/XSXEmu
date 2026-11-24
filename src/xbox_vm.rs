@@ -251,6 +251,9 @@ impl GuestVm {
 }
 
 #[cfg(test)]
+mod backing;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
