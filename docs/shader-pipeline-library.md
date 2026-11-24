@@ -99,6 +99,17 @@ The scanner also joins each **present, stage-labelled slot in each PSO row** to 
 
 The unique two-stage cohorts are the starting point for source interface comparisons. The counts do not prove that a wrapper contains the native variant used by a PSO, that two source interfaces are compatible, or that any PSO is reconstructible. In particular, the two rows with slot 6 have both an unidentified stage reference and a missing wrapped source among the known slots.
 
+### Ordinary source interfaces in unique-candidate graphics rows
+
+For exactly PS+VS or PS+MS rows with one wrapper in each slot's candidate family, the scanner compares the producer's `OSG1` to the pixel shader's `ISG1`. A source key is the ASCII-folded semantic name plus semantic index. It excludes rows with a nonzero system-value enum or a folded `sv_` prefix; these need separate pipeline rules. For each remaining input key, it requires one input and one output row, then compares the raw source component type and the number of bits in their primary masks. Register ordinal and raw primary mask are compared separately, not used to select the match. Counts of keys and excluded system inputs are accumulated per PSO row, not deduplicated across PSOs.
+
+| Producer | Rows compared | Rows with no ordinary PS inputs | Excluded system PS input rows | Unique ordinary key pairs |
+|---|---:|---:|---:|---:|
+| VS | 13,284 | 596 | 8,226 | 49,477 |
+| MS | 8,775 | 742 | 11,963 | 72,222 |
+
+There are no missing or duplicate ordinary keys in these cohorts. All 121,699 unique ordinary pairs agree on raw component type, register ordinal, and primary mask, so none needs more components than the paired producer declares. The 20,721 rows with ordinary PS inputs pass the source-side check; the 1,338 without ordinary PS inputs are kept separate. An owned fixture checks case folding, key indices, duplicates, system-name exclusion, and comparisons with different type, width, register, or lane positions. This is a declaration-level result: no system or per-primitive linkage, interpolation behavior, native parameter indices, runtime stage variants, or verified execution is implied. Ambiguous and incomplete PSO rows are not tested here.
+
 ### Conditional marker-bounded equality
 
 The same scanner separately tests a narrower byte window. On the FSSM side it begins at `start + 40`, removes only trailing `0xbf9f0000` words, and requires the resulting aligned bytes to end in `0xbf810000`. On the library side it looks for the last aligned `0xbf810000` in the final 512 stored bytes and compares through that word from each explicit hypothesis (`+0`, `+24`, `+36`). A raw marker can be a literal or data; it is not a verified instruction or proof of entry/exit.

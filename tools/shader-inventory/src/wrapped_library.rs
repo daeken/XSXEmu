@@ -7,7 +7,9 @@ use crate::{
     dxbc_chunks,
     llvm::{Cpu, Llvm},
     reachable::reference_walk_result,
-    shader_payloads, stage_name, word,
+    shader_payloads,
+    signatures::{SourceInterface, SourceLinkage},
+    stage_name, word,
 };
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -234,6 +236,7 @@ pub(super) fn run(
     }
 
     let mut source_counts = HashMap::<SourceKey, usize>::new();
+    let mut interfaces = HashMap::<SourceKey, SourceInterface>::new();
     let mut counts = BTreeMap::<u16, Payloads>::new();
     let (mut bytes, mut inflate) = (Vec::new(), Vec::new());
     let (mut files, mut joined_wrappers, mut work) = (0, 0, 0usize);
@@ -262,7 +265,24 @@ pub(super) fn run(
             continue;
         };
         joined_wrappers += 1;
-        *source_counts.entry((stage, key)).or_default() += 1;
+        let key = (stage, key);
+        let count = source_counts.entry(key).or_default();
+        *count += 1;
+        if GRAPHICS_STAGES.contains(&stage) {
+            let tag = if stage == 0 { b"ISG1" } else { b"OSG1" };
+            let mut matches = parts.iter().filter(|(t, _)| *t == tag);
+            let (_, table) = matches.next().ok_or("missing graphics source signature")?;
+            if matches.next().is_some() {
+                return Err("duplicate graphics source signature".into());
+            }
+            let interface =
+                SourceInterface::parse(table).ok_or("invalid graphics source signature")?;
+            if *count == 1 {
+                interfaces.insert(key, interface);
+            } else {
+                interfaces.remove(&key);
+            }
+        }
         let candidates = programs.get_mut(&stage).ok_or("missing program stage")?;
         let mut eligible = Vec::with_capacity(ids.len());
         for id in ids {
@@ -357,9 +377,11 @@ pub(super) fn run(
     // A row uses the digest on its exact metadata reference, not all digests
     // ever seen for the same program. Unknown slots stay in the grouping key.
     let mut graphics_rows = BTreeMap::<Vec<usize>, GraphicsCoverage>::new();
+    let mut source_links = BTreeMap::<usize, SourceLinkage>::new();
     for pso in library.graphics() {
         let mut slots = Vec::new();
         let mut candidates = Vec::new();
+        let mut signatures = [None; 3];
         for (slot, item) in pso.slots.into_iter().enumerate() {
             let Some(item) = item else { continue };
             slots.push(slot);
@@ -371,7 +393,16 @@ pub(super) fn run(
                     .get(&(slot, id))
                     .ok_or("missing checked stage key")?;
                 candidates.push(source_counts.get(key).copied().unwrap_or(0));
+                signatures[slot] = interfaces.get(key);
             }
+        }
+        if let [0, upstream @ (1 | 2)] = slots.as_slice()
+            && let (Some(producer), Some(consumer)) = (signatures[*upstream], signatures[0])
+        {
+            source_links
+                .entry(*upstream)
+                .or_default()
+                .add(producer, consumer);
         }
         graphics_rows.entry(slots).or_default().add(candidates);
     }
@@ -379,6 +410,12 @@ pub(super) fn run(
         println!(
             "  Graphics rows with present slots {slots:?}: known slots {} all unique, {} all found with ambiguity, {} missing without ambiguity, {} missing with ambiguity, {} no known slots",
             c.complete_unique, c.complete_multi, c.missing, c.missing_and_multi, c.no_known_slots,
+        );
+    }
+    for (slot, c) in source_links {
+        println!(
+            "  Unique-source {} -> PS ordinary DXBC linkage hypotheses: {c:?}",
+            stage_name(GRAPHICS_STAGES[slot])
         );
     }
     for (stage, stage_programs) in programs {

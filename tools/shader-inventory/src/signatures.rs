@@ -29,6 +29,8 @@ struct SignatureRow {
     key: Key,
     register: usize,
     primary: u8,
+    component_type: usize,
+    system: bool,
 }
 
 fn check(bytes: &[u8]) -> Option<(Count, Vec<SignatureRow>)> {
@@ -55,9 +57,11 @@ fn check(bytes: &[u8]) -> Option<(Count, Vec<SignatureRow>)> {
         let mask = word(row, 24)?;
         let primary = mask as u8;
         let secondary = (mask >> 8) as u8;
+        let component_type = word(row, 16)?;
+        let system = word(row, 12)? != 0;
         if word(row, 0)? != 0
             || word(row, 28)? != 0
-            || !matches!(word(row, 16)?, 1 | 2 | 3 | 6)
+            || !matches!(component_type, 1 | 2 | 3 | 6)
             || mask >> 16 != 0
             || !(1..=15).contains(&primary)
             || secondary > 15
@@ -68,12 +72,93 @@ fn check(bytes: &[u8]) -> Option<(Count, Vec<SignatureRow>)> {
             key: key(&bytes[name_start..name_start + name], word(row, 8)?),
             register: word(row, 20)?,
             primary,
+            component_type,
+            system,
         });
         count.entries += 1;
-        count.system += usize::from(word(row, 12)? != 0);
+        count.system += usize::from(system);
         count.secondary_outside += usize::from(secondary & !primary != 0);
     }
     Some((count, keys))
+}
+
+#[derive(Default)]
+pub(super) struct SourceInterface {
+    ordinary: BTreeMap<Key, Vec<SignatureRow>>,
+    system_rows: usize,
+}
+
+impl SourceInterface {
+    pub(super) fn parse(bytes: &[u8]) -> Option<Self> {
+        let (_, rows) = check(bytes)?;
+        Some(Self::from_rows(rows))
+    }
+
+    fn from_rows(rows: Vec<SignatureRow>) -> Self {
+        let mut result = Self::default();
+        for row in rows {
+            if row.system || row.key.0.starts_with(b"sv_") {
+                result.system_rows += 1;
+            } else {
+                result
+                    .ordinary
+                    .entry(row.key.clone())
+                    .or_default()
+                    .push(row);
+            }
+        }
+        result
+    }
+}
+
+#[derive(Default, Debug)]
+pub(super) struct SourceLinkage {
+    pairs: usize,
+    pairs_clear: usize,
+    pairs_empty_ordinary_inputs: usize,
+    excluded_system_inputs: usize,
+    missing: usize,
+    duplicate: usize,
+    unique: usize,
+    type_different: usize,
+    producer_narrower: usize,
+    register_different: usize,
+    mask_different: usize,
+}
+
+impl SourceLinkage {
+    pub(super) fn add(&mut self, producer: &SourceInterface, consumer: &SourceInterface) {
+        self.pairs += 1;
+        self.pairs_empty_ordinary_inputs += usize::from(consumer.ordinary.is_empty());
+        self.excluded_system_inputs += consumer.system_rows;
+        let mut clear = !consumer.ordinary.is_empty();
+        for (key, inputs) in &consumer.ordinary {
+            let outputs = producer
+                .ordinary
+                .get(key)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            if outputs.is_empty() {
+                self.missing += 1;
+                clear = false;
+            }
+            if inputs.len() > 1 || outputs.len() > 1 {
+                self.duplicate += 1;
+                clear = false;
+            }
+            if let ([output], [input]) = (outputs, inputs.as_slice()) {
+                self.unique += 1;
+                let type_different = output.component_type != input.component_type;
+                let narrower = output.primary.count_ones() < input.primary.count_ones();
+                self.type_different += usize::from(type_different);
+                self.producer_narrower += usize::from(narrower);
+                self.register_different += usize::from(output.register != input.register);
+                self.mask_different += usize::from(output.primary != input.primary);
+                clear &= !type_different && !narrower;
+            }
+        }
+        self.pairs_clear += usize::from(clear);
+    }
 }
 
 fn resource_rows(psv: &[u8], stage: u16) -> Option<&[u8]> {
@@ -1213,7 +1298,66 @@ mod tests {
             key,
             register: 0,
             primary: 1,
+            component_type: 3,
+            system: false,
         }
+    }
+
+    #[test]
+    fn source_linkage_requires_a_unique_ordinary_key_and_checks_width_not_lane_position() {
+        let prod = SourceInterface::from_rows(vec![
+            SignatureRow {
+                primary: 3,
+                register: 7,
+                ..sig(key(b"TeSt", 2))
+            },
+            sig(key(b"SPLIT", 0)),
+            sig(key(b"SPLIT", 0)),
+            SignatureRow {
+                component_type: 1,
+                ..sig(key(b"NARROW", 0))
+            },
+        ]);
+        let good = SourceInterface::from_rows(vec![
+            SignatureRow {
+                primary: 12,
+                ..sig(key(b"test", 2))
+            },
+            sig(key(b"SV_fabricated", 0)),
+        ]);
+        let mut c = SourceLinkage::default();
+        c.add(&prod, &good);
+        assert_eq!(
+            (
+                c.unique,
+                c.pairs_clear,
+                c.register_different,
+                c.mask_different,
+                c.excluded_system_inputs
+            ),
+            (1, 1, 1, 1, 1)
+        );
+        let bad = SourceInterface::from_rows(vec![
+            sig(key(b"test", 3)),
+            sig(key(b"split", 0)),
+            SignatureRow {
+                primary: 3,
+                ..sig(key(b"narrow", 0))
+            },
+        ]);
+        c.add(&prod, &bad);
+        c.add(&prod, &SourceInterface::default());
+        assert_eq!(
+            (
+                c.pairs_clear,
+                c.pairs_empty_ordinary_inputs,
+                c.missing,
+                c.duplicate,
+                c.type_different,
+                c.producer_narrower
+            ),
+            (1, 1, 1, 1, 1, 1)
+        );
     }
 
     #[test]
