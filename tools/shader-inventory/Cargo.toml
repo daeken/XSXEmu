@@ -14,6 +14,7 @@ sha2 = { version = "0.10", optional = true }
 
 [features]
 metal-probe = ["dep:metal", "dep:sha2"]
+bake-planner = ["dep:sha2"]
 
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = { version = "0.33", optional = true }
@@ -32,3 +33,8 @@ required-features = ["metal-probe"]
 name = "shader-metal-mesh-probe"
 path = "src/metal_mesh_probe.rs"
 required-features = ["metal-probe"]
+
+[[bin]]
+name = "shader-bake-plan"
+path = "src/bake_plan.rs"
+required-features = ["bake-planner"]
