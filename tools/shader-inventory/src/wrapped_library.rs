@@ -121,6 +121,15 @@ impl GraphicsCoverage {
     }
 }
 
+// Observed size baselines, not verified serialized section boundaries.
+fn state_base(slots: &[usize]) -> Option<usize> {
+    match slots {
+        [0, 1] | [0, 1, 6] => Some(380),
+        [0, 2] => Some(464),
+        _ => None,
+    }
+}
+
 // Public DXGI_FORMAT byte widths, limited to the observed candidate subset.
 fn vertex_width(format: usize) -> Option<usize> {
     match format {
@@ -521,6 +530,7 @@ pub(super) fn run(
     // ever seen for the same program. Unknown slots stay in the grouping key.
     let mut graphics_rows = BTreeMap::<Vec<usize>, GraphicsCoverage>::new();
     let mut state_sizes_by_ps = HashMap::<ProgramId, HashSet<usize>>::new();
+    let mut state_residual_by_ps = HashMap::<ProgramId, HashSet<Option<usize>>>::new();
     let mut state_ps_profiles = BTreeMap::<
         Vec<usize>,
         (
@@ -600,6 +610,10 @@ pub(super) fn run(
                 .entry(pixel.program)
                 .or_default()
                 .insert(size);
+            state_residual_by_ps
+                .entry(pixel.program)
+                .or_default()
+                .insert(state_base(&slots).and_then(|base| size.checked_sub(base)));
             let (programs, metadata) = state_ps_profiles.entry(slots.clone()).or_default();
             let (sizes, states) = programs.entry(pixel.program).or_default();
             sizes.insert(size);
@@ -683,6 +697,33 @@ pub(super) fn run(
         layouts_seen.len()
     );
     for (slots, (programs, metadata)) in state_ps_profiles {
+        if let Some(base) = state_base(&slots) {
+            let mut split = [0; 4];
+            for (_, states) in programs.values().filter(|(_, states)| states.len() > 1) {
+                let mut first = None;
+                let (mut prefix_diff, mut suffix_diff, mut short) = (false, false, false);
+                for id in states {
+                    let blob = library.blob(*id).ok_or("missing graphics state span")?;
+                    let Some((prefix, suffix)) = blob.split_at_checked(base) else {
+                        short = true;
+                        break;
+                    };
+                    if let Some((a, b)) = first {
+                        prefix_diff |= prefix != a;
+                        suffix_diff |= suffix != b;
+                    } else {
+                        first = Some((prefix, suffix));
+                    }
+                }
+                split[0] += usize::from(short);
+                split[1] += usize::from(!short && prefix_diff);
+                split[2] += usize::from(!short && suffix_diff);
+                split[3] += usize::from(!short && !prefix_diff && !suffix_diff);
+            }
+            println!(
+                "  Multi-state-ID PS program byte comparison, slots {slots:?}, split at {base}: [short, differing prefix, differing suffix, fully equal] {split:?}"
+            );
+        }
         println!(
             "  Graphics state sharing, slots {slots:?}: {} PS programs ({} multi-size, {} multi-state-ID); {} PS metadata IDs ({} multi-size)",
             programs.len(),
@@ -705,6 +746,21 @@ pub(super) fn run(
             .values()
             .filter(|sizes| sizes.len() > 1)
             .count()
+    );
+    let mut residual = [0; 3];
+    for (id, sizes) in &state_sizes_by_ps {
+        if sizes.len() > 1 {
+            let values = &state_residual_by_ps[id];
+            let bucket = if values.contains(&None) {
+                2
+            } else {
+                usize::from(values.len() != 1)
+            };
+            residual[bucket] += 1;
+        }
+    }
+    println!(
+        "  Multi-size PS programs after subtracting state baselines [equal, different, unsupported]: {residual:?}"
     );
     println!("  Graphics layout D3D12 input-element field hypothesis: {vertex_fields:?}");
     for (slots, counts) in vs_layout {
