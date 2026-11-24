@@ -13,7 +13,7 @@ Both signature chunks start with a little-endian entry count and row offset 8, f
 |---|---|
 | +0 | Stream index, zero in the checked profile |
 | +4 | Byte offset from chunk start to a nonempty NUL-terminated ASCII semantic name, after the row array |
-| +8 | Semantic index, not used in this census |
+| +8 | Semantic index, used in the same-wrapper correspondence check |
 | +12 | System-value field; only zero versus nonzero counted |
 | +16 | Component-type field, observed values 1, 2, 3, 6 |
 | +20 | Register field, not mapped to native registers here |
@@ -51,4 +51,13 @@ Every lower bound equals its upper bound in the checked corpus; the parser accep
 
 After the resources, a `u32` byte length prefixes a dword-aligned NUL-terminated string table. A `u32` entry count then prefixes that many `u32` semantic indices. Payload bytes `32`, `33` and `34` count the input, output and patch/primitive element groups. If their sum is nonzero, a `u32` stride of 16 precedes those elements. If the sum is zero, there is no stride word. An element's first two words address the string table (byte offset) and semantic-index table (row index), and byte 8 gives the number of semantic indices used. Both ranges are checked. Names can be empty here, unlike `ISG1`/`OSG1`; the remaining packing and interpolation bytes are not decoded, except that byte 15 must be zero.
 
-All 26,503 files agree on `PSV0` versus `ISG1`/`OSG1` input and output **row counts** independently; none has patch/primitive rows. This does not show that corresponding rows have the same semantics, register layout or masks. 12,918 files have bytes after these tables; the scanner reports their presence but does not interpret them. The owned fixture checks scope and bounds of both references and demonstrates that tail bytes remain unparsed.
+All 26,503 files agree on `PSV0` versus `ISG1`/`OSG1` input and output **row counts** independently; none has patch/primitive rows. 12,918 files have bytes after these tables; the scanner reports their presence but does not interpret them. The owned fixture checks scope and bounds of both references and demonstrates that tail bytes remain unparsed.
+
+All 224,378 `PSV0` elements span one row in this corpus. For each named single-row element, the scanner consumes one matching signature key (ASCII case-folded name and semantic index) in the **same file and direction**. It counts ordinal disagreement separately, comparing the key at each element's original position without compacting away nameless elements. It counts and skips nameless single-row elements and multi-row elements instead of assuming a mapping for them.
+
+| Direction | Named single-row | Unmatched by key multiplicity | Different or missing key at same ordinal | Nameless single-row | Multi-row |
+|---|---:|---:|---:|---:|---:|
+| Input | 87,879 | 0 | 26,037 | 17,273 | 0 |
+| Output | 75,115 | 0 | 20,759 | 44,111 | 0 |
+
+The named keys correspond, but a positional join does not. Neither the residual unmatched DXBC rows nor ordinal position establish an identity for individual nameless elements. This comparison does not establish type or mask equivalence, producer/consumer linkage, or hardware register layout. An owned fixture covers reordered keys, duplicate consumption, missing keys, and excluded element cases.
