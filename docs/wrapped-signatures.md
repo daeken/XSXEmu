@@ -93,4 +93,13 @@ For each applicable stream with nonzero input and output vector counts, the tabl
 | MS | 0 | 0 |
 | Total | 12,918 | 373,576 |
 
-All 26,503 suffix extents match, with no mask bits set outside the declared vector extent. These tables describe source signature dependencies within one shader; the check does not tie those bits to native instructions, stage linkage or verified execution.
+All 26,503 suffix extents match, with no mask bits set outside the declared vector extent. The checker also compares the tables against actual allocated components, not just the vector bounds:
+
+| Stage | Masks | Nonzero masks | Masks for unallocated input components |
+|---|---:|---:|---:|
+| PS | 353,880 | 187,141 | 45,464 |
+| VS | 14,972 | 6,715 | 8,037 |
+| GS | 1,540 | 965 | 380 |
+| Total | 370,392 | 194,821 | 53,881 |
+
+Every mask for an unallocated input component is zero, and no bit names an unallocated output component in the corresponding stream. The owned fixture covers an allocated pair and nonzero masks outside the allocated input/output sets. These are same-shader source signature dependencies; the check does not tie those bits to native instructions, stage linkage or verified execution.

@@ -193,12 +193,17 @@ struct Dependencies {
     files: usize,
     dwords: usize,
     masks_with_high_bits: usize,
+    masks: usize,
+    nonzero: usize,
+    unpacked_inputs: usize,
+    nonzero_unpacked_inputs: usize,
+    references_unpacked_outputs: usize,
 }
 
 impl Dependencies {
     // DXC's PSVRuntimeInfo1 layout, restricted to observed stages and no ViewID.
     // One packed output-component mask per input component, separately by stream.
-    fn add(&mut self, header: &[u8], mut tail: &[u8]) -> Option<()> {
+    fn add(&mut self, header: &[u8], mut tail: &[u8], packing: &[Occupancy; 2]) -> Option<()> {
         if *header.get(29)? != 0 {
             return None;
         }
@@ -211,8 +216,8 @@ impl Dependencies {
         let inputs = usize::from(*header.get(35)?);
         let outputs = header.get(36..36 + streams)?;
         let length = tail.len();
-        let mut high = 0;
-        for &vectors in outputs {
+        let mut metrics = Dependencies::default();
+        for (stream, &vectors) in outputs.iter().enumerate() {
             let vectors = usize::from(vectors);
             if vectors == 0 || inputs == 0 {
                 continue;
@@ -220,9 +225,22 @@ impl Dependencies {
             let stride = 4 * vectors.div_ceil(8);
             let size = 4 * inputs * stride;
             let table = tail.get(..size)?;
-            if vectors % 8 != 0 {
-                for mask in table.chunks_exact(stride) {
-                    high += usize::from(word(mask, stride - 4)? >> (4 * (vectors % 8)) != 0);
+            let output = &packing[1][stream];
+            for (component, mask) in table.chunks_exact(stride).enumerate() {
+                let nonzero = mask.iter().any(|&b| b != 0);
+                let input_unpacked = packing[0][0][component / 4] & (1 << (component % 4)) == 0;
+                metrics.masks += 1;
+                metrics.nonzero += usize::from(nonzero);
+                metrics.unpacked_inputs += usize::from(input_unpacked);
+                metrics.nonzero_unpacked_inputs += usize::from(input_unpacked && nonzero);
+                metrics.references_unpacked_outputs +=
+                    usize::from(mask.iter().enumerate().any(|(i, &b)| {
+                        let packed = output[2 * i] | (output[2 * i + 1] << 4);
+                        b & !packed != 0
+                    }));
+                if vectors % 8 != 0 {
+                    metrics.masks_with_high_bits +=
+                        usize::from(word(mask, stride - 4)? >> (4 * (vectors % 8)) != 0);
                 }
             }
             tail = &tail[size..];
@@ -232,7 +250,12 @@ impl Dependencies {
         }
         self.files += usize::from(length != 0);
         self.dwords += length / 4;
-        self.masks_with_high_bits += high;
+        self.masks_with_high_bits += metrics.masks_with_high_bits;
+        self.masks += metrics.masks;
+        self.nonzero += metrics.nonzero;
+        self.unpacked_inputs += metrics.unpacked_inputs;
+        self.nonzero_unpacked_inputs += metrics.nonzero_unpacked_inputs;
+        self.references_unpacked_outputs += metrics.references_unpacked_outputs;
         Some(())
     }
 }
@@ -302,8 +325,10 @@ struct PackingTotals {
     dynamic: usize,
 }
 
+type Occupancy = [[u8; 256]; 4];
+
 impl PackingTotals {
-    fn add(&mut self, group: &[Element], limits: &[u8]) -> Option<()> {
+    fn add(&mut self, group: &[Element], limits: &[u8]) -> Option<Occupancy> {
         let mut occupancy = [[0u8; 256]; 4];
         for elem in group {
             self.dynamic += usize::from(elem.dynamic);
@@ -324,7 +349,7 @@ impl PackingTotals {
             }
             self.allocated += 1;
         }
-        Some(())
+        Some(occupancy)
     }
 }
 
@@ -390,12 +415,9 @@ pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
         patch_rows += elements[2].len();
         let totals = groups.entry(stage).or_default();
         totals.2.add(rows);
-        totals
-            .3
-            .add(psv, suffix)
-            .ok_or("unsupported PSV0 dependency profile or invalid suffix extent")?;
         totals.0 += 1;
         let mut same = true;
+        let mut occupancy = [[[0; 256]; 4]; 2];
         for (i, (tag, total)) in [b"ISG1", b"OSG1"]
             .into_iter()
             .zip(totals.1.iter_mut())
@@ -411,13 +433,17 @@ pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
                 (_, 2) => &psv[36..40],
                 _ => &psv[36..37],
             };
-            packing_totals[i]
+            occupancy[i] = packing_totals[i]
                 .add(&elements[i], limits)
                 .ok_or("overlapping or out-of-extent PSV0 input/output packing")?;
             total.entries += c.entries;
             total.system += c.system;
             total.secondary_outside += c.secondary_outside;
         }
+        totals
+            .3
+            .add(psv, suffix, &occupancy)
+            .ok_or("unsupported PSV0 dependency profile or invalid suffix extent")?;
         count_disagreements += usize::from(!same);
     }
     println!(
@@ -458,6 +484,14 @@ pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
         println!(
             "  PSV0 dependencies: {} files with tables, {} dwords, {} masks with high bits outside vector extent",
             deps.files, deps.dwords, deps.masks_with_high_bits
+        );
+        println!(
+            "    {} masks, {} nonzero; {} unallocated input masks, {} nonzero; {} masks naming unallocated output components",
+            deps.masks,
+            deps.nonzero,
+            deps.unpacked_inputs,
+            deps.nonzero_unpacked_inputs,
+            deps.references_unpacked_outputs
         );
         for (tag, c) in ["ISG1", "OSG1"].into_iter().zip(sizes) {
             println!(
@@ -513,26 +547,34 @@ mod tests {
         let mut bytes = [0; 49]; // 4 input components × (1 + 2) dwords.
         bytes[3] = 0x80; // Outside the one-vector extent.
         bytes[23] = 0x80; // Outside the nine-vector extent.
-        bytes[19] = 0x80; // Last bit of the first dword is within nine vectors.
+        bytes[27] = 0x80; // Allocated component 1 of input, vector 7 column 3 of stream 2.
+        let mut packing = [[[0; 256]; 4]; 2];
+        packing[0][0][0] = 2;
+        packing[1][2][7] = 8;
         let mut d = Dependencies::default();
-        assert!(d.add(&header, &bytes[..47]).is_none());
-        assert!(d.add(&header, &bytes[..49]).is_none());
-        d.add(&header, &bytes[..48]).unwrap();
+        assert!(d.add(&header, &bytes[..47], &packing).is_none());
+        assert!(d.add(&header, &bytes[..49], &packing).is_none());
+        d.add(&header, &bytes[..48], &packing).unwrap();
         assert_eq!(
             d,
             Dependencies {
                 files: 1,
                 dwords: 12,
-                masks_with_high_bits: 2
+                masks_with_high_bits: 2,
+                masks: 8,
+                nonzero: 3,
+                unpacked_inputs: 6,
+                nonzero_unpacked_inputs: 2,
+                references_unpacked_outputs: 2
             }
         );
         header[28] = 0;
-        assert!(d.add(&header, &bytes[..16]).is_some()); // Only stream 0.
+        assert!(d.add(&header, &bytes[..16], &packing).is_some()); // Only stream 0.
         header[28] = 13;
-        assert!(d.add(&header, &[]).is_some()); // MS has no table.
-        assert!(d.add(&header, &bytes[..16]).is_none());
+        assert!(d.add(&header, &[], &packing).is_some()); // MS has no table.
+        assert!(d.add(&header, &bytes[..16], &packing).is_none());
         header[29] = 1;
-        assert!(d.add(&header, &[]).is_none()); // Outside the checked profile.
+        assert!(d.add(&header, &[], &packing).is_none()); // Outside the checked profile.
     }
 
     fn element(semantic: Semantic) -> Element {
