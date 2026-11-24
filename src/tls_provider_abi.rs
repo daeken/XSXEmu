@@ -30,8 +30,9 @@ macro_rules! target_for_child {
 
 // These rows are limited to fixed integer/pointer arguments and one scalar
 // return (or void). A function pointer may only be an opaque registration
-// token (FlsAlloc). GetProcAddress may return only a direct mapped PE export
-// already admitted by GuardCF. Do not return host function pointers, invoke
+// token (FlsAlloc, SetUnhandledExceptionFilter), including returning a
+// previous guest token. GetProcAddress may return only a direct mapped PE
+// export already admitted by GuardCF. Do not return host function pointers, invoke
 // callbacks, re-enter guest code, unwind, or add aggregate, float or varargs.
 macro_rules! audited_bridges {
     ($($entry:ident, $adapter:ident : $dll:literal, $symbol:literal,
@@ -112,6 +113,8 @@ audited_bridges! {
         native::get_last_error, () -> u32;
     xsxemu_tls_set_last_error, set_error: b"kernelbase.dll", b"SetLastError",
         native::set_last_error, (error: u32) -> ();
+    xsxemu_tls_set_unhandled_exception_filter, set_unhandled_exception_filter: b"kernelbase.dll", b"SetUnhandledExceptionFilter",
+        proc::set_unhandled_exception_filter, (filter: usize) -> usize;
     xsxemu_tls_get_process_heap, get_process_heap: b"kernelbase.dll", b"GetProcessHeap",
         native::get_process_heap, () -> *mut c_void;
     xsxemu_tls_heap_alloc, heap_alloc: b"kernelbase.dll", b"HeapAlloc",

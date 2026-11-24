@@ -2127,6 +2127,57 @@ fn semaphore_bridge_passes_both_stack_dwords_and_round_trips_last_error() {
     expect(output, 49, "Guest entry returned 49");
 }
 
+const EXCEPTION_FILTER_CODE_CAPACITY: usize = 0x200;
+
+#[repr(C)]
+struct ExceptionFilterFixture {
+    entry: u32,
+    code: [u8; EXCEPTION_FILTER_CODE_CAPACITY],
+}
+
+global_asm!(include_str!("fixtures/static_tls_exception_filter.S"),
+    capacity = const EXCEPTION_FILTER_CODE_CAPACITY,
+    iat_delta = const IAT - TEXT,
+    options(att_syntax),
+);
+
+unsafe extern "C" {
+    static static_tls_exception_filter_fixture: ExceptionFilterFixture;
+}
+
+#[test]
+fn exception_filter_bridge_swaps_opaque_pointers_and_preserves_last_error() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let mut exe = image(Kind::Solo);
+    let fixture = unsafe { &static_tls_exception_filter_fixture };
+    exe[file(TEXT)..file(TEXT) + RAW].fill(0xcc);
+    put(&mut exe, file(TEXT), &fixture.code);
+    w32(&mut exe, OP + 16, TEXT + fixture.entry as usize);
+    w64(&mut exe, file(ARRAY), PREFERRED + TEXT);
+    let dll = b"api-ms-win-core-errorhandling-l1-1-0.dll\0";
+    dir_import_one(&mut exe, dll, b"SetUnhandledExceptionFilter\0");
+    let path = scratch.write("exception-filter-registration.exe", &exe);
+    expect(run(&path, &[OPT]), 1, "incomplete dependency graph");
+    let flags = [OPT, "--rust-providers"];
+    let output = run(&path, &flags);
+    assert!(String::from_utf8_lossy(&output.stderr).contains(
+        "kernelbase.dll!SetUnhandledExceptionFilter: registration only; Windows exception delivery is not implemented"
+    ));
+    expect(output, 50, "Guest entry returned 50");
+
+    // The explicit callback-dispatch export must not gain a TLS bridge.
+    dir_import_one(&mut exe, dll, b"UnhandledExceptionFilter\0");
+    let path = scratch.write("exception-filter-dispatch.exe", &exe);
+    expect(
+        run(&path, &flags),
+        1,
+        "no enabled audited bridge for kernelbase.dll!UnhandledExceptionFilter",
+    );
+}
+
 #[test]
 fn startup_trace_identifies_fatal_dllmain_phase_and_last_bridge() {
     if !rosetta() {

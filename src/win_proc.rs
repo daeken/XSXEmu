@@ -504,8 +504,14 @@ pub(crate) mod native {
         }
     }
 
-    pub(super) extern "win64" fn set_unhandled_exception_filter(filter: usize) -> usize {
-        TOP_LEVEL_FILTER.swap(filter, Ordering::AcqRel)
+    pub(crate) extern "win64" fn set_unhandled_exception_filter(filter: usize) -> usize {
+        // The filter is an opaque guest pointer here. Registration neither
+        // invokes it nor installs a host handler, and leaves LastError alone.
+        let previous = TOP_LEVEL_FILTER.swap(filter, Ordering::AcqRel);
+        diagnostic(format_args!(
+            "xsxemu: kernelbase.dll!SetUnhandledExceptionFilter: registration only; Windows exception delivery is not implemented\n"
+        ));
+        previous
     }
 
     pub(super) unsafe extern "win64" fn unhandled_exception_filter(info: *mut c_void) -> i32 {
