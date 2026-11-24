@@ -378,6 +378,10 @@ struct IndirectFrontier {
     windows: BTreeMap<(bool, TargetOverlap), usize>,
     windows_with_candidate_interior_entry: usize,
     candidate_targets_to_cuts: [usize; 2],
+    additional_roots: usize,
+    root_extensions: BTreeMap<&'static str, usize>,
+    extension_nodes: usize,
+    extension_cuts: usize,
 }
 
 impl IndirectFrontier {
@@ -387,7 +391,7 @@ impl IndirectFrontier {
         let mut scratch = [0; 1024];
         let mut pattern = PcPattern::default();
         let mut unsupported = "decode";
-        let graph = cfg::walk_extent(bytes.len() / 4, |pc| {
+        let mut decode = |pc: usize, pattern: &mut PcPattern, unsupported: &mut &'static str| {
             let tail = &bytes[pc * 4..];
             let (size, line) = dis.one(tail, pc * 4, &mut scratch)?;
             let first = u32::from_le_bytes(tail[..4].try_into().ok()?);
@@ -403,7 +407,7 @@ impl IndirectFrontier {
                 (Flow::Stop, Some(candidate))
             } else {
                 let Some(flow) = control(name, first, size) else {
-                    unsupported = "other control";
+                    *unsupported = "other control";
                     return None;
                 };
                 (flow, None)
@@ -414,6 +418,9 @@ impl IndirectFrontier {
                 flow,
                 op: cut,
             })
+        };
+        let graph = cfg::walk_extent(bytes.len() / 4, |pc| {
+            decode(pc, &mut pattern, &mut unsupported)
         });
         let graph = match graph {
             Ok(graph) => graph,
@@ -462,6 +469,33 @@ impl IndirectFrontier {
                         .or_default() += 1;
                 }
             }
+        }
+        let roots: Vec<_> = candidate_entries
+            .into_iter()
+            .filter(|&pc| frontier_target(&graph, pc) == TargetOverlap::Unvisited)
+            .collect();
+        if !roots.is_empty() {
+            self.additional_roots += roots.len();
+            let original = graph.len();
+            let earlier_cuts = graph.values().filter(|op| op.op.is_some()).count();
+            let mut pattern = PcPattern::default();
+            let mut unsupported = "decode";
+            let extension = cfg::extend_extent(bytes.len() / 4, graph, roots, |pc| {
+                decode(pc, &mut pattern, &mut unsupported)
+            });
+            let outcome = match extension {
+                Ok(expanded) => {
+                    self.extension_nodes += expanded.len() - original;
+                    self.extension_cuts +=
+                        expanded.values().filter(|op| op.op.is_some()).count() - earlier_cuts;
+                    "valid direct projection"
+                }
+                Err(cfg::Error::UnsupportedEncoding) => unsupported,
+                Err(cfg::Error::BadSuccessor) => "outside span",
+                Err(cfg::Error::BadWidth) => "invalid width",
+                Err(cfg::Error::OverlappingInstructions) => "overlap",
+            };
+            *self.root_extensions.entry(outcome).or_default() += 1;
         }
     }
 }
@@ -661,6 +695,13 @@ impl Report {
             "Indirect-cut candidate cross-check: windows with interior candidate entry={}; sources landing on a cut [unmatched, matched]={:?}",
             self.indirect_frontier.windows_with_candidate_interior_entry,
             self.indirect_frontier.candidate_targets_to_cuts
+        );
+        println!(
+            "Indirect-cut extra-root hypotheses: roots={} payload outcomes={:?}; added nodes={} added cuts={} in validated projections",
+            self.indirect_frontier.additional_roots,
+            self.indirect_frontier.root_extensions,
+            self.indirect_frontier.extension_nodes,
+            self.indirect_frontier.extension_cuts
         );
         println!(
             "Backend triage (not translated): small-wave32-filter={} with-execz-and-uint-gt-cmpx={} with-scc-branch={} single-raw-store-1x1x1={} smallest-single-store-nodes={:?}",

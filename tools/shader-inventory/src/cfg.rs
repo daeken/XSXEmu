@@ -46,10 +46,19 @@ pub fn walk<T>(
 /// Same graph validation for an independently bounded decoder with dword PCs.
 pub fn walk_extent<T>(
     dwords: usize,
+    decode: impl FnMut(usize) -> Option<Instruction<T>>,
+) -> Result<BTreeMap<usize, Instruction<T>>, Error> {
+    extend_extent(dwords, BTreeMap::new(), vec![0], decode)
+}
+
+// Additional roots in a projection, not edges from any existing node. The
+// input graph must already have been validated at this same dword extent.
+pub(crate) fn extend_extent<T>(
+    dwords: usize,
+    mut graph: BTreeMap<usize, Instruction<T>>,
+    mut pending: Vec<usize>,
     mut decode: impl FnMut(usize) -> Option<Instruction<T>>,
 ) -> Result<BTreeMap<usize, Instruction<T>>, Error> {
-    let mut graph: BTreeMap<usize, Instruction<T>> = BTreeMap::new();
-    let mut pending = vec![0];
     while let Some(pc) = pending.pop() {
         if pc >= dwords {
             return Err(Error::BadSuccessor);
@@ -113,6 +122,21 @@ mod tests {
         assert_eq!(graph.keys().copied().collect::<Vec<_>>(), [0, 1, 2, 3]);
         assert!(walk(&[5], mock).is_ok());
         assert!(walk(&[6, 0, 0, 3], mock).is_ok());
+    }
+
+    #[test]
+    fn added_roots_preserve_existing_extents_and_do_not_invent_edges() {
+        let code = [2, 0, 3, 3, 3];
+        let decode = |pc: usize| mock(&code[pc..]);
+        let base = walk_extent(code.len(), decode).unwrap();
+        assert_eq!(base.keys().copied().collect::<Vec<_>>(), [0, 2]);
+        let expanded = extend_extent(code.len(), base, vec![4], decode).unwrap();
+        assert_eq!(expanded.keys().copied().collect::<Vec<_>>(), [0, 2, 4]);
+        assert_eq!(expanded[&2].flow, Flow::Stop);
+        assert_eq!(
+            extend_extent(code.len(), expanded, vec![1], decode).unwrap_err(),
+            Error::OverlappingInstructions
+        );
     }
 
     #[test]
