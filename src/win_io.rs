@@ -201,6 +201,8 @@ pub(crate) mod native {
     const NO_MORE_FILES: u32 = 18;
     const SHARING: u32 = 32;
     const LOCK_VIOLATION: u32 = 33;
+    #[cfg(target_os = "macos")]
+    const HANDLE_EOF: u32 = 38;
     const UNSUPPORTED: u32 = 50;
     const FILE_EXISTS: u32 = 80;
     const INVALID_PARAM: u32 = 87;
@@ -1816,6 +1818,71 @@ pub(crate) mod native {
         boolean(unsafe { transfer(h, buf.cast(), count, done, overlapped, Transfer::Read) })
     }
     #[cfg(target_os = "macos")]
+    #[repr(C)]
+    struct ReadOverlapped {
+        internal: usize,
+        internal_high: usize,
+        offset: u64,
+        event: usize,
+    }
+
+    #[cfg(target_os = "macos")]
+    unsafe fn title_positioned_read(
+        h: usize,
+        buf: *mut u8,
+        count: u32,
+        done: *mut u32,
+        overlap: *mut ReadOverlapped,
+    ) -> Result<()> {
+        if done.is_null() {
+            return Err(INVALID_PARAM);
+        }
+        unsafe { done.write_unaligned(0) };
+        if count != 0 && buf.is_null() {
+            return Err(INVALID_PARAM);
+        }
+        let e = entry(h)?;
+        let Object::File(file) = &*e.obj else {
+            return Err(BAD_HANDLE);
+        };
+        if !file.title_data {
+            return Err(BAD_HANDLE);
+        }
+        if e.access & R == 0 {
+            return Err(ACCESS);
+        }
+        let event = unsafe { std::ptr::addr_of!((*overlap).event).read_unaligned() };
+        if event != 0 {
+            return Err(UNSUPPORTED);
+        }
+        let offset = unsafe { std::ptr::addr_of_mut!((*overlap).offset) };
+        let start = unsafe { offset.read_unaligned() };
+        if start > i64::MAX as u64 {
+            return Err(INVALID_PARAM);
+        }
+        // CreateFileW only admits a synchronous title handle. Keep the seek
+        // and read under the same lock as sequential I/O on this object.
+        let mut f = lock(&file.file);
+        f.seek(SeekFrom::Start(start)).map_err(win_err)?;
+        let n = if count == 0 {
+            0
+        } else {
+            let n = unsafe { file_read(&f, buf, count as usize)? };
+            if n == 0 {
+                return Err(HANDLE_EOF);
+            }
+            n
+        };
+        // No async status or event state is modeled. The offset and the
+        // descriptor cursor both reflect the bytes actually read.
+        unsafe {
+            offset.write_unaligned(start + n as u64);
+            done.write_unaligned(n as u32);
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
     pub(crate) unsafe extern "win64" fn tls_child_read_file(
         h: usize,
         buf: *mut c_void,
@@ -1823,7 +1890,13 @@ pub(crate) mod native {
         done: *mut u32,
         overlapped: *mut c_void,
     ) -> i32 {
-        boolean(unsafe { transfer(h, buf.cast(), count, done, overlapped, Transfer::TitleRead) })
+        boolean(unsafe {
+            if overlapped.is_null() {
+                transfer(h, buf.cast(), count, done, overlapped, Transfer::TitleRead)
+            } else {
+                title_positioned_read(h, buf.cast(), count, done, overlapped.cast())
+            }
+        })
     }
     pub(super) unsafe extern "win64" fn WriteFile(
         h: usize,
@@ -2968,6 +3041,20 @@ mod native_tests {
                 );
                 assert_eq!(get_last_error(), 6); // ERROR_INVALID_HANDLE
                 assert_eq!((n, data), (0, [0xff]));
+                let mut overlap = [0u64, 0, 1, 0];
+                n = u32::MAX;
+                assert_eq!(
+                    tls_child_read_file(
+                        h,
+                        data.as_mut_ptr().cast(),
+                        1,
+                        &mut n,
+                        overlap.as_mut_ptr().cast()
+                    ),
+                    0
+                );
+                assert_eq!(get_last_error(), 6); // ERROR_INVALID_HANDLE
+                assert_eq!((n, data, overlap), (0, [0xff], [0, 0, 1, 0]));
             }
             assert_eq!(SetFilePointerEx(copy, 1, null_mut(), 0), 1);
             let mut data = [0u8; 3];

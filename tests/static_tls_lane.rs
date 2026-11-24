@@ -1826,7 +1826,7 @@ fn title_data_mount_is_explicit_and_confines_guest_attributes() {
     }
 }
 
-const TITLE_CREATE_CAPACITY: usize = 0x600;
+const TITLE_CREATE_CAPACITY: usize = 0xa00;
 const TITLE_CREATE_ARGS: usize = MODULE_PATHS + 0x200;
 
 #[repr(C)]

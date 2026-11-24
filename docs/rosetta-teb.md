@@ -679,11 +679,16 @@ that shape on a confined title-data handle, returning the host descriptor's
 modification time in 100 ns ticks since 1601 UTC. The caller uses zero if the
 query fails. It then attempts a synchronous 4 KiB header `ReadFile` (IAT RVA
 `0x6793970`), with a conditional second read on the same handle. The audited
-read bridge accepts only readable title-data handles, requires a byte-count
-output and null `OVERLAPPED`, and does not admit pipes or consoles. Each read
-advances the descriptor cursor by the actual byte count; a short read or zero
-bytes at EOF is a success. `FILE_FLAG_NO_BUFFERING` alignment and cache policy
-remain unmodeled. The header fallback calls `GetFileSizeEx` (IAT RVA
+read bridge accepts only readable title-data handles and requires a byte-count
+output. With null `OVERLAPPED`, a read starts at the descriptor cursor and
+advances it by the actual byte count; a short read or zero bytes at EOF is a
+success. The archive retry helper (read return RVA `0x314275`) instead supplies
+an `OVERLAPPED` on a synchronous handle. With a null event, the bridge performs
+an inline read from the specified 64-bit offset, updating both the offset and
+the descriptor cursor by the actual number of bytes read. A nonzero request
+starting at or past EOF returns `ERROR_HANDLE_EOF`. Event signaling and async
+completion fields are not modeled, and handles for pipes, consoles, or ordinary
+files are not admitted. `FILE_FLAG_NO_BUFFERING` remains unmodeled. The header fallback calls `GetFileSizeEx` (IAT RVA
 `0x6793958`) with a `LARGE_INTEGER` output and uses zero if the query fails.
 The audited bridge writes the open descriptor's 64-bit byte length for
 readable title-data handles only, without changing the read cursor.
