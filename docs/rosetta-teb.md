@@ -396,6 +396,16 @@ an unowned mutex. Success preserves LastError. Non-null security or name
 returns `NULL` and `ERROR_NOT_SUPPORTED` without reading either pointer.
 This implements creation only, not release, waits, or abandoned mutexes.
 
+`AcquireSRWLockExclusive` and `ReleaseSRWLockExclusive` each use a
+one-pointer void bridge. The startup acquire through IAT RVA `0x6793aa8`
+and its paired release through `0x6793b00` address an aligned, zero-filled
+word at RVA `0x6e04e80`. The provider uses an opaque eight-byte lock word
+for modeled guest ownership and a host condition variable for contended
+acquires. Release clears ownership and wakes contenders. Both preserve
+LastError. Recursive acquisition and non-owner release are terminal misuse;
+shared mode, try-lock, and condition-variable APIs remain unsupported. Do not
+mix this word encoding with other SRW implementations.
+
 `IsProcessorFeaturePresent` uses the ordinary provider's AMD64 baseline and
 runtime x86 feature detection, preserving `LastError`. It reports
 `PF_FASTFAIL_AVAILABLE` (23) as false: Windows `INT 29h` fast-fail handling is

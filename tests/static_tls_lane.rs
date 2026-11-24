@@ -2308,6 +2308,72 @@ fn mutex_bridge_creates_distinct_unnamed_mutexes_and_rejects_pointer_inputs() {
     expect(output, 52, "Guest entry returned 52");
 }
 
+const SRW_CODE_CAPACITY: usize = 0x200;
+
+#[repr(C)]
+struct SrwFixture {
+    entry: u32,
+    code: [u8; SRW_CODE_CAPACITY],
+}
+
+global_asm!(include_str!("fixtures/static_tls_srw.S"),
+    capacity = const SRW_CODE_CAPACITY,
+    iat_delta = const IAT - TEXT,
+    lock_delta = const DATA + 0x350 - TEXT,
+    options(att_syntax),
+);
+
+unsafe extern "C" {
+    static static_tls_srw_fixture: SrwFixture;
+}
+
+#[test]
+fn exclusive_srw_bridges_record_and_clear_owner_in_guest_storage() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let mut exe = image(Kind::Solo);
+    let fixture = unsafe { &static_tls_srw_fixture };
+    exe[file(TEXT)..file(TEXT) + RAW].fill(0xcc);
+    put(&mut exe, file(TEXT), &fixture.code);
+    w32(&mut exe, OP + 16, TEXT + fixture.entry as usize);
+    w64(&mut exe, file(ARRAY), PREFERRED + TEXT);
+    dir_import_one(
+        &mut exe,
+        b"api-ms-win-core-synch-l1-1-0.dll\0",
+        b"AcquireSRWLockExclusive\0",
+    );
+    let imports = LINK + 0x780;
+    // Move the lookup table: two entries plus a terminator would overlap
+    // the DLL name in the one-import layout.
+    w32(&mut exe, file(imports), imports + 0xc0);
+    w64(&mut exe, file(imports) + 0xc0, imports + 0x70);
+    w64(&mut exe, file(imports) + 0xc8, imports + 0xa0);
+    put(&mut exe, file(imports) + 0xa2, b"ReleaseSRWLockExclusive\0");
+    let path = scratch.write("srw.exe", &exe);
+    expect(run(&path, &[OPT]), 1, "incomplete dependency graph");
+    let flags = [OPT, "--rust-providers"];
+    expect(run(&path, &flags), 53, "Guest entry returned 53");
+    let output = launcher(&path, &flags)
+        .env("XSXEMU_TRACE_STARTUP", "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for api in ["AcquireSRWLockExclusive", "ReleaseSRWLockExclusive"] {
+        assert_eq!(
+            stderr
+                .matches(&format!(
+                    "bridge dispatch kernelbase.dll!{api} guest_return_pc="
+                ))
+                .count(),
+            2,
+            "{stderr}"
+        );
+    }
+    expect(output, 53, "Guest entry returned 53");
+}
+
 const EXCEPTION_FILTER_CODE_CAPACITY: usize = 0x200;
 
 #[repr(C)]

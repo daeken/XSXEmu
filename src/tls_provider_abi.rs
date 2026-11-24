@@ -169,6 +169,10 @@ audited_bridges! {
         sync::enter_cs, (cs: *mut sync::CriticalSection) -> ();
     xsxemu_tls_leave_cs, leave_cs: b"kernelbase.dll", b"LeaveCriticalSection",
         sync::leave_cs, (cs: *mut sync::CriticalSection) -> ();
+    xsxemu_tls_acquire_srw_exclusive, acquire_srw_exclusive: b"kernelbase.dll", b"AcquireSRWLockExclusive",
+        sync::acquire_srw_exclusive, (srw: *mut sync::SrwLock) -> ();
+    xsxemu_tls_release_srw_exclusive, release_srw_exclusive: b"kernelbase.dll", b"ReleaseSRWLockExclusive",
+        sync::release_srw_exclusive, (srw: *mut sync::SrwLock) -> ();
     xsxemu_tls_delete_cs, delete_cs: b"kernelbase.dll", b"DeleteCriticalSection",
         sync::delete_cs, (cs: *mut sync::CriticalSection) -> ();
     xsxemu_tls_init_slist, init_slist: b"kernelbase.dll", b"InitializeSListHead",
