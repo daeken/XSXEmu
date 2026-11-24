@@ -313,6 +313,7 @@ pub(crate) mod native {
     }
     // SYNCHRONIZE | SEMAPHORE_MODIFY_STATE. No generic/standard rights mapping.
     const SEMAPHORE_RIGHTS: u32 = 0x0010_0002;
+    const SEMAPHORE_ALL_ACCESS: u32 = 0x001f_0003;
 
     const EVENT_ALL_ACCESS: u32 = 0x001f_0003;
     const MUTEX_ALL_ACCESS: u32 = 0x001f_0001;
@@ -764,28 +765,55 @@ pub(crate) mod native {
         flags: u32,
         desired_access: u32,
     ) -> usize {
+        if flags != 0 {
+            return ret(Err(INVALID_PARAM), 0);
+        }
         ret(
-            (|| {
-                if initial < 0 || maximum <= 0 || initial > maximum || flags != 0 {
-                    return Err(INVALID_PARAM);
-                }
-                // No namespace, security descriptor or inheritance support.
-                // Neither pointer is dereferenced, including on failure.
-                if !name.is_null() || !security.is_null() {
-                    return Err(UNSUPPORTED);
-                }
-                let access = sync_access(desired_access, SEMAPHORE_RIGHTS)?;
-                lock(&STATE).insert(Entry {
-                    obj: Arc::new(Object::Semaphore {
-                        count: initial,
-                        maximum,
-                    }),
-                    access,
-                    inheritable: false,
-                })
-            })(),
+            create_semaphore(
+                security,
+                initial,
+                maximum,
+                name,
+                sync_access(desired_access, SEMAPHORE_RIGHTS),
+            ),
             0,
         )
+    }
+
+    pub(crate) extern "win64" fn create_semaphore_w(
+        security: *const c_void,
+        initial: i32,
+        maximum: i32,
+        name: *const u16,
+    ) -> usize {
+        ret(
+            create_semaphore(security, initial, maximum, name, Ok(SEMAPHORE_ALL_ACCESS)),
+            0,
+        )
+    }
+
+    fn create_semaphore(
+        security: *const c_void,
+        initial: i32,
+        maximum: i32,
+        name: *const u16,
+        access: Result<u32>,
+    ) -> Result<usize> {
+        if initial < 0 || maximum <= 0 || initial > maximum {
+            return Err(INVALID_PARAM);
+        }
+        if !name.is_null() || !security.is_null() {
+            return Err(UNSUPPORTED);
+        }
+        let access = access?;
+        lock(&STATE).insert(Entry {
+            obj: Arc::new(Object::Semaphore {
+                count: initial,
+                maximum,
+            }),
+            access,
+            inheritable: false,
+        })
     }
 
     pub(crate) extern "win64" fn create_event_a(
@@ -885,7 +913,7 @@ pub(crate) mod native {
             }
             if options & 2 == 0 {
                 let requested = match &*e.obj {
-                    Object::Semaphore { .. } => sync_access(access, SEMAPHORE_RIGHTS)?,
+                    Object::Semaphore { .. } => sync_access(access, SEMAPHORE_ALL_ACCESS)?,
                     Object::Event { .. } => sync_access(access, EVENT_ALL_ACCESS)?,
                     Object::Mutex { .. } => sync_access(access, MUTEX_ALL_ACCESS)?,
                     _ => access_mask(access)?,
@@ -1013,6 +1041,27 @@ pub(crate) mod native {
             assert_eq!(CloseHandle(h), 1);
             assert!(entry(h).is_err());
         }
+    }
+
+    #[test]
+    fn plain_semaphore_uses_typed_state_and_full_access() {
+        use crate::providers::native::get_last_error;
+        set_last_error(0x1234);
+        let h = create_semaphore_w(ptr::null(), 0, 1, ptr::null());
+        assert_ne!(h, 0);
+        assert_eq!(get_last_error(), 0x1234);
+        let e = entry(h).unwrap();
+        assert!(matches!(
+            *e.obj,
+            Object::Semaphore {
+                count: 0,
+                maximum: 1
+            }
+        ));
+        assert_eq!(e.access, SEMAPHORE_ALL_ACCESS);
+        assert!(!e.inheritable);
+        assert_eq!(CloseHandle(h), 1);
+        assert!(entry(h).is_err());
     }
 
     fn std_slot(n: u32) -> Result<usize> {

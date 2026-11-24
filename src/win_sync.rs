@@ -6,13 +6,14 @@ use crate::providers::HostExport;
 
 const SYNCH: &[u8] = b"api-ms-win-core-synch-l1-1-0.dll";
 const SYNCH_12: &[u8] = b"api-ms-win-core-synch-l1-2-0.dll";
+const SYNCH_121: &[u8] = b"api-ms-win-core-synch-l1-2-1.dll";
 const INTERLOCKED: &[u8] = b"api-ms-win-core-interlocked-l1-1-0.dll";
 const MEMORY: &[u8] = b"api-ms-win-core-memory-l1-1-0.dll";
 
 pub(crate) fn has_dll(dll: &[u8]) -> bool {
     matches!(
         dll,
-        b"kernel32.dll" | b"kernelbase.dll" | SYNCH | SYNCH_12 | INTERLOCKED
+        b"kernel32.dll" | b"kernelbase.dll" | SYNCH | SYNCH_12 | SYNCH_121 | INTERLOCKED
     ) || (cfg!(any(
         not(target_arch = "x86_64"),
         target_os = "macos",
@@ -97,6 +98,11 @@ pub(crate) fn lookup(dll: &[u8], name: &[u8]) -> Option<HostExport> {
         (b"kernelbase.dll" | b"kernel32.dll" | MEMORY, b"VirtualFree") => {
             export!("kernelbase.dll", "VirtualFree", native::virtual_free)
         }
+        (b"kernelbase.dll" | b"kernel32.dll" | SYNCH_121, b"CreateSemaphoreW") => export!(
+            "kernelbase.dll",
+            "CreateSemaphoreW",
+            crate::providers::win_io::native::create_semaphore_w
+        ),
         (b"kernelbase.dll" | b"kernel32.dll" | SYNCH, b"CreateSemaphoreExW") => export!(
             "kernelbase.dll",
             "CreateSemaphoreExW",
@@ -209,7 +215,23 @@ mod registry_tests {
         }
         assert!(lookup(SYNCH, b"Sleep").is_none());
         assert!(lookup(SYNCH_12, b"sleep").is_none());
-        assert!(!has_dll(b"api-ms-win-core-synch-l1-2-1.dll"));
+        assert!(has_dll(SYNCH_121));
+        let plain = b"CreateSemaphoreW";
+        let entry = lookup(SYNCH_121, plain).unwrap();
+        assert_eq!(entry.provider, "kernelbase.dll");
+        assert_eq!(entry.symbol.as_bytes(), plain);
+        for dll in [b"kernelbase.dll".as_slice(), b"kernel32.dll"] {
+            assert_eq!(lookup(dll, plain), Some(entry));
+        }
+        assert!(lookup(SYNCH, plain).is_none());
+        assert!(lookup(SYNCH_12, plain).is_none());
+        for name in [
+            b"CreateSemaphoreExW".as_slice(),
+            b"ReleaseSemaphore",
+            b"WaitForSingleObject",
+        ] {
+            assert!(lookup(SYNCH_121, name).is_none());
+        }
     }
 }
 

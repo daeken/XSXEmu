@@ -434,6 +434,12 @@ security attributes, `ReleaseSemaphore`, and wait APIs remain unsupported.
 The owned PE tests both stack DWORDs with nonzero upper halves, distinct
 handles, and guest LastError on success and failure.
 
+`CreateSemaphoreW` has a separate four-argument bridge for the exact
+`synch-l1-2-1` import. Both calls through IAT RVA `0x6793ee8` pass
+`(NULL, 0, 1, NULL)`. It uses the same typed semaphore objects and count,
+pointer and LastError rules, granting `SEMAPHORE_ALL_ACCESS` to the new
+handle. Release and waits remain unsupported.
+
 `CreateEventA` uses a four-argument bridge. The direct calls and tail thunk
 referencing IAT RVA `0x6793ab0` pass null security and name, manual-reset
 `FALSE` or `TRUE`, and initial state `FALSE`. The missing-import trace does

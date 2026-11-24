@@ -2203,6 +2203,58 @@ fn semaphore_bridge_passes_both_stack_dwords_and_round_trips_last_error() {
     expect(output, 49, "Guest entry returned 49");
 }
 
+const SEMAPHORE_W_CODE_CAPACITY: usize = 0x300;
+
+#[repr(C)]
+struct SemaphoreWFixture {
+    entry: u32,
+    code: [u8; SEMAPHORE_W_CODE_CAPACITY],
+}
+
+global_asm!(include_str!("fixtures/static_tls_semaphore_w.S"),
+    capacity = const SEMAPHORE_W_CODE_CAPACITY,
+    iat_delta = const IAT - TEXT,
+    options(att_syntax),
+);
+
+unsafe extern "C" {
+    static static_tls_semaphore_w_fixture: SemaphoreWFixture;
+}
+
+#[test]
+fn plain_semaphore_bridge_creates_distinct_handles_and_checks_inputs() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let mut exe = image(Kind::Solo);
+    let fixture = unsafe { &static_tls_semaphore_w_fixture };
+    exe[file(TEXT)..file(TEXT) + RAW].fill(0xcc);
+    put(&mut exe, file(TEXT), &fixture.code);
+    w32(&mut exe, OP + 16, TEXT + fixture.entry as usize);
+    w64(&mut exe, file(ARRAY), PREFERRED + TEXT);
+    dir_import_one(
+        &mut exe,
+        b"api-ms-win-core-synch-l1-2-1.dll\0",
+        b"CreateSemaphoreW\0",
+    );
+    let path = scratch.write("semaphore-w.exe", &exe);
+    expect(run(&path, &[OPT]), 1, "incomplete dependency graph");
+    let output = launcher(&path, &[OPT, "--rust-providers"])
+        .env("XSXEMU_TRACE_STARTUP", "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr
+            .matches("bridge dispatch kernelbase.dll!CreateSemaphoreW guest_return_pc=")
+            .count(),
+        7,
+        "{stderr}"
+    );
+    expect(output, 55, "Guest entry returned 55");
+}
+
 const EVENT_CODE_CAPACITY: usize = 0x200;
 
 #[repr(C)]
