@@ -94,7 +94,7 @@ mod native {
         import_traps::{MissingImport, Traps},
         link::BindingTarget,
         pe::Pe,
-        providers::{win_loader, win_proc, win_unwind},
+        providers::{win_fls, win_loader, win_proc, win_unwind},
         win_cfg::{CfgProfile, DORMANT_CALLABLE},
         win_cfg_runtime::{SLOT_THUNKS, Targets},
     };
@@ -470,7 +470,9 @@ mod native {
             // Only exact PE GFIDs and explicitly bound bridge/trace entries are
             // registered. No loader or unwind provider is installed.
             let _cfg_registration = targets.map(Targets::install).transpose()?;
-            return tls_runtime::run(&tls, images, &pes, &memories, attach_order);
+            let outcome = tls_runtime::run(&tls, images, &pes, &memories, attach_order);
+            win_fls::native::finish_initial_thread()?;
+            return outcome;
         }
         let _loader = win_loader::register(
             images
@@ -547,9 +549,14 @@ mod native {
         }
         for i in attached.into_iter().rev() {
             // SAFETY: the same module was successfully attached in this process.
-            let _ =
-                unsafe { memories[i].call_dll_entry(pes[i].entry_rva as usize, PROCESS_DETACH) }?;
+            if let Err(error) =
+                unsafe { memories[i].call_dll_entry(pes[i].entry_rva as usize, PROCESS_DETACH) }
+            {
+                outcome = Err(error.into());
+                break;
+            }
         }
+        win_fls::native::finish_initial_thread()?;
         outcome
     }
 }

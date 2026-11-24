@@ -6,8 +6,9 @@ use crate::{
     Result,
     import_traps::called_missing_import_tls,
     providers::{
-        HostExport, native, win_io::native as io, win_loader::native as loader,
-        win_proc::native as proc, win_sync::native as sync, win_text::native as text,
+        HostExport, native, win_fls::native as fls, win_io::native as io,
+        win_loader::native as loader, win_proc::native as proc, win_sync::native as sync,
+        win_text::native as text,
     },
 };
 use std::{arch::global_asm, ffi::c_void, mem::offset_of};
@@ -28,8 +29,9 @@ macro_rules! target_for_child {
 }
 
 // These rows are limited to fixed integer/pointer arguments and one scalar
-// return (or void). Do not add callbacks, re-entry, escaping function
-// pointers, non-local exit, aggregate, floating-point or variadic ABIs here.
+// return (or void). A function pointer may only be an opaque registration
+// token (FlsAlloc). Do not invoke callbacks, re-enter guest code, return
+// function pointers, unwind, or add aggregate, floating-point or variadic ABIs.
 macro_rules! audited_bridges {
     ($($entry:ident, $adapter:ident : $dll:literal, $symbol:literal,
         $target:path $(=> $restricted:path)?, ($($arg:ident: $ty:ty),*) -> $ret:ty;)*) => {
@@ -42,7 +44,7 @@ macro_rules! audited_bridges {
             let target: unsafe extern "win64" fn($($ty),*) -> $ret = target_for_child!($target $(=> $restricted)?);
             // SAFETY: bridge assembly checked host GS, and passed the live
             // initial thread's LastError DWORD. Each target was reviewed to
-            // take only its declared arguments and to return without re-entry.
+            // take only its declared arguments and never re-enter the guest.
             unsafe { native::with_tls_child_last_error(teb_error, || target($($arg),*)) }
         })*
 
@@ -106,6 +108,14 @@ audited_bridges! {
         native::tls_get_value, (index: u32) -> *mut c_void;
     xsxemu_tls_tls_free, tls_free: b"kernelbase.dll", b"TlsFree",
         native::tls_free, (index: u32) -> i32;
+    xsxemu_tls_fls_alloc, fls_alloc: b"kernelbase.dll", b"FlsAlloc",
+        fls::fls_alloc, (callback: fls::Callback) -> u32;
+    xsxemu_tls_fls_get_value, fls_get_value: b"kernelbase.dll", b"FlsGetValue",
+        fls::fls_get_value, (index: u32) -> *mut c_void;
+    xsxemu_tls_fls_set_value, fls_set_value: b"kernelbase.dll", b"FlsSetValue",
+        fls::fls_set_value, (index: u32, value: *mut c_void) -> i32;
+    xsxemu_tls_fls_free, fls_free: b"kernelbase.dll", b"FlsFree",
+        fls::fls_free, (index: u32) -> i32;
     xsxemu_tls_init_cs_ex, init_cs_ex: b"kernelbase.dll", b"InitializeCriticalSectionEx",
         sync::init_cs_ex, (cs: *mut sync::CriticalSection, spin: u32, flags: u32) -> i32;
     xsxemu_tls_init_cs_spin, init_cs_spin: b"kernelbase.dll", b"InitializeCriticalSectionAndSpinCount",

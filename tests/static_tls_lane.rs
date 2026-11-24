@@ -13,7 +13,7 @@ const OPT: &str = "--experimental-static-tls";
 const TRUSTED: &str = "--trusted-offline";
 const WARNING: &str = "neither signature nor catalog is verified; Xbox policy is not evaluated";
 const PAGE: usize = 0x4000;
-const RAW: usize = 0x1000;
+const RAW: usize = 0x2000; // Includes the shared fixture's bridge code.
 const TEXT: usize = PAGE;
 const RO: usize = 2 * PAGE;
 const DATA: usize = 3 * PAGE;
@@ -236,7 +236,7 @@ fn image(kind: Kind) -> Vec<u8> {
     }
     if matches!(kind, Kind::Bridge) {
         let imports = LINK + 0x480;
-        dir(&mut b, 1, imports, 60);
+        dir(&mut b, 1, imports, 80);
         w32(&mut b, file(imports), LINK + 0x30);
         w32(&mut b, file(imports) + 12, LINK + 0xd0);
         w32(&mut b, file(imports) + 16, IAT);
@@ -272,16 +272,39 @@ fn image(kind: Kind) -> Vec<u8> {
         // A second descriptor exercises the exact API-set name observed by
         // the launcher. Its IAT starts after the first descriptor's null.
         let synch = imports + 20;
-        w32(&mut b, file(synch), LINK + 0x4c0);
+        w32(&mut b, file(synch), LINK + 0x520);
         w32(&mut b, file(synch) + 12, LINK + 0x4d0);
         w32(&mut b, file(synch) + 16, IAT + 152);
-        w64(&mut b, file(LINK) + 0x4c0, LINK + 0x500);
+        w64(&mut b, file(LINK) + 0x520, LINK + 0x500);
         put(
             &mut b,
             file(LINK) + 0x4d0,
             b"api-ms-win-core-synch-l1-1-0.dll\0",
         );
         put(&mut b, file(LINK) + 0x502, b"InitializeCriticalSectionEx\0");
+
+        let fibers = imports + 40;
+        w32(&mut b, file(fibers), LINK + 0x540);
+        w32(&mut b, file(fibers) + 12, LINK + 0x570);
+        w32(&mut b, file(fibers) + 16, IAT + 168);
+        put(
+            &mut b,
+            file(LINK) + 0x570,
+            b"api-ms-win-core-fibers-l1-1-0.dll\0",
+        );
+        for (i, name) in [
+            b"FlsAlloc\0".as_slice(),
+            b"FlsSetValue\0",
+            b"FlsGetValue\0",
+            b"FlsFree\0",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let off = 0x5a0 + i * 0x20;
+            w64(&mut b, file(LINK) + 0x540 + i * 8, LINK + off);
+            put(&mut b, file(LINK) + off + 2, name);
+        }
     }
     b
 }
@@ -1324,6 +1347,31 @@ fn audited_iat_bridges_share_teb_last_error_and_preserve_win64_state() {
         w32(&mut image, file(MODE), mode);
         dir.write("bridge.exe", &image);
         expect(run(&exe, &flags), 1, "child terminated by signal 4");
+    }
+}
+
+#[test]
+fn fls_stops_only_at_callback_invocation_boundaries() {
+    if !rosetta() {
+        return;
+    }
+    let dir = Scratch::new();
+    let mut b = image(Kind::Bridge);
+    let flags = [OPT, "--rust-providers"];
+    for (mode, message) in [
+        (
+            3,
+            "unsupported FLS callback: FlsFree requires invocation for slot 1",
+        ),
+        (
+            4,
+            "unsupported FLS callback: initial thread teardown requires invocation for slot 1",
+        ),
+    ] {
+        w32(&mut b, file(MODE), mode);
+        let output = run(&dir.write("fls.exe", &b), &flags);
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("Guest entry returned"));
+        expect(output, 1, message);
     }
 }
 

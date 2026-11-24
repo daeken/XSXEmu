@@ -39,6 +39,8 @@ macro_rules! export {
 #[cfg(target_os = "macos")]
 #[path = "win_console.rs"]
 mod win_console;
+#[path = "win_fls.rs"]
+pub(crate) mod win_fls;
 #[path = "win_io.rs"]
 pub(crate) mod win_io;
 #[path = "win_loader.rs"]
@@ -70,6 +72,7 @@ pub fn has_dll(dll: &[u8]) -> bool {
             | PROCESS_THREADS
             | HEAP
     ) || win_loader::has_dll(dll)
+        || win_fls::has_dll(dll)
         || win_proc::has_dll(dll)
         || win_sync::has_dll(dll)
         || win_unwind::has_dll(dll)
@@ -164,6 +167,7 @@ pub fn lookup(dll: &[u8], name: &[u8]) -> Option<HostExport> {
             export!(KERNELBASE, "HeapWalk", heap_walk)
         }
         _ => win_loader::lookup(dll, name)
+            .or_else(|| win_fls::lookup(dll, name))
             .or_else(|| win_proc::lookup(dll, name))
             .or_else(|| win_sync::lookup(dll, name))
             .or_else(|| win_unwind::lookup(dll, name))
@@ -254,8 +258,8 @@ pub(crate) mod native {
     }
 
     // Only called on checked host GS by fixed-signature adapters. The guest
-    // DWORD is authoritative between calls. No provider here may re-enter the
-    // guest or exit other than by returning to its adapter.
+    // DWORD is authoritative between calls. No provider here may re-enter
+    // the guest. A terminal diagnostic may hard-exit without returning.
     #[cfg(target_os = "macos")]
     pub(crate) unsafe fn with_tls_child_last_error<R>(
         teb_error: *mut u32,

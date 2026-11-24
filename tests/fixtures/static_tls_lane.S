@@ -192,6 +192,12 @@ Lbridge_detach:
     callq *{dispatch_delta}(%r11)
 .endm
 
+.macro fls_cfg slot
+    leaq Ltext(%rip), %r11
+    movq {iat_delta}+\slot(%r11), %rax
+    callq *{dispatch_delta}(%r11)
+.endm
+
 Lbridge_entry:
     tls 0
     phase 1, 2
@@ -360,6 +366,55 @@ Lbridge_entry:
     movq (%rax), %rax
     cmpq 72(%rsp), %rax
     jne Lbad
+    /* Non-null FLS callback registers but never runs during alloc/get/set.
+     * Lbad would fault if the provider accidentally invoked the callback. */
+    movl $1234, %gs:0x68
+    leaq Lbad(%rip), %rcx
+    fls_cfg 168                 /* FlsAlloc */
+    cmpl $-1, %eax
+    je Lbad
+    cmpl $1234, %gs:0x68
+    jne Lbad
+    movl %eax, 84(%rsp)
+    movl %eax, %ecx
+    movabsq $0x123456789abcdef0, %rdx
+    fls_cfg 176                 /* FlsSetValue */
+    cmpl $1, %eax
+    jne Lbad
+    cmpl $1234, %gs:0x68
+    jne Lbad
+    movl 84(%rsp), %ecx
+    fls_cfg 184                 /* FlsGetValue */
+    movabsq $0x123456789abcdef0, %rcx
+    cmpq %rcx, %rax
+    jne Lbad
+    cmpl $0, %gs:0x68
+    jne Lbad
+    leaq Ltext(%rip), %r11
+    cmpl $3, {mode_delta}(%r11)
+    jne 1f
+    movl 84(%rsp), %ecx
+    fls_cfg 192                 /* Must stop before invoking callback */
+    ud2
+1:
+    cmpl $4, {mode_delta}(%r11)
+    je 2f                       /* Leave callback pending for teardown */
+    movl 84(%rsp), %ecx
+    xorl %edx, %edx
+    fls_cfg 176                 /* Clearing the value needs no callback */
+    cmpl $1, %eax
+    jne Lbad
+    movl 84(%rsp), %ecx
+    fls_cfg 192
+    cmpl $1, %eax
+    jne Lbad
+    movl 84(%rsp), %ecx
+    fls_cfg 184                 /* Freed index fails and sets LastError */
+    testq %rax, %rax
+    jne Lbad
+    cmpl $87, %gs:0x68
+    jne Lbad
+2:
     /* Scalar stack arguments: one register and up to three stack slots
      * after adjusting for the adapter's extra LastError pointer. */
     movl $1252, %ecx
