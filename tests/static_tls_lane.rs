@@ -1826,7 +1826,7 @@ fn title_data_mount_is_explicit_and_confines_guest_attributes() {
     }
 }
 
-const TITLE_CREATE_CAPACITY: usize = 0x200;
+const TITLE_CREATE_CAPACITY: usize = 0x400;
 const TITLE_CREATE_ARGS: usize = MODULE_PATHS + 0x200;
 
 #[repr(C)]
@@ -1840,6 +1840,7 @@ global_asm!(include_str!("fixtures/static_tls_title_create_file.S"),
     iat_delta = const IAT - TEXT,
     path_delta = const MODULE_PATHS - TEXT,
     args_delta = const TITLE_CREATE_ARGS - TEXT,
+    buffer_delta = const MODULE_PATH_BUFFER - TEXT,
     options(att_syntax),
 );
 
@@ -1848,7 +1849,7 @@ unsafe extern "C" {
 }
 
 #[test]
-fn title_data_create_file_returns_closable_handle_and_refuses_other_opens() {
+fn title_data_file_open_metadata_read_and_close() {
     if !rosetta() {
         return;
     }
@@ -1856,7 +1857,9 @@ fn title_data_create_file_returns_closable_handle_and_refuses_other_opens() {
     let root = scratch.0.join("mounted");
     fs::create_dir(&root).unwrap();
     let host_archive = root.join("archive.rpf");
-    fs::write(&host_archive, b"owned archive").unwrap();
+    let mut archive_bytes = vec![b'A'; 4096];
+    archive_bytes.extend_from_slice(b"tail!");
+    fs::write(&host_archive, &archive_bytes).unwrap();
     fs::File::open(host_archive)
         .unwrap()
         .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_millis(1234))
@@ -1890,7 +1893,7 @@ fn title_data_create_file_returns_closable_handle_and_refuses_other_opens() {
         let hint_name = imports + 0xe0 + i * 0x20;
         w32(&mut exe, row, lookup);
         w32(&mut exe, row + 12, name);
-        w32(&mut exe, row + 16, IAT + i * 24);
+        w32(&mut exe, row + 16, IAT + i * 32);
         w64(&mut exe, file(lookup), hint_name);
         put(&mut exe, file(name), dll);
         put(&mut exe, file(hint_name) + 2, symbol);
@@ -1898,6 +1901,9 @@ fn title_data_create_file_returns_closable_handle_and_refuses_other_opens() {
             let time_hint = imports + 0x120;
             w64(&mut exe, file(lookup) + 8, time_hint);
             put(&mut exe, file(time_hint) + 2, b"GetFileTime\0");
+            let read_hint = imports + 0x140;
+            w64(&mut exe, file(lookup) + 16, read_hint);
+            put(&mut exe, file(read_hint) + 2, b"ReadFile\0");
         }
     }
     let write = |name: &str, args: [usize; 4]| {
@@ -1948,10 +1954,7 @@ fn title_data_create_file_returns_closable_handle_and_refuses_other_opens() {
             &format!("Guest entry returned {error}"),
         );
     }
-    assert_eq!(
-        fs::read(root.join("archive.rpf")).unwrap(),
-        b"owned archive"
-    );
+    assert_eq!(fs::read(root.join("archive.rpf")).unwrap(), archive_bytes);
 }
 
 const GEO_CODE_CAPACITY: usize = 0x200;

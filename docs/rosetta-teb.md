@@ -678,9 +678,13 @@ and access outputs and a last-write `FILETIME` output. The bridge accepts only
 that shape on a confined title-data handle, returning the host descriptor's
 modification time in 100 ns ticks since 1601 UTC. The caller uses zero if the
 query fails. It then attempts a synchronous 4 KiB header `ReadFile` (IAT RVA
-`0x6793970`) with a byte-count output and null `OVERLAPPED`. A separate fallback
-queries file size through `GetFileSizeEx` (IAT RVA `0x6793958`). Neither read nor
-size is added to the audited lane here.
+`0x6793970`), with a conditional second read on the same handle. The audited
+read bridge accepts only readable title-data handles, requires a byte-count
+output and null `OVERLAPPED`, and does not admit pipes or consoles. Each read
+advances the descriptor cursor by the actual byte count; a short read or zero
+bytes at EOF is a success. `FILE_FLAG_NO_BUFFERING` alignment and cache policy
+remain unmodeled. A separate fallback queries file size through `GetFileSizeEx`
+(IAT RVA `0x6793958`), which is not added to the audited lane here.
 
 **Scarlett XGameRuntime startup.** The trace at `8eb79ce` reaches
 `GetFileAttributesW`, `LoadLibraryExW`, and `ReleaseSRWLockExclusive`, then

@@ -1702,13 +1702,20 @@ pub(crate) mod native {
             Ok(n)
         }
     }
+    enum Transfer {
+        Read,
+        Write,
+        #[cfg(target_os = "macos")]
+        TitleRead,
+    }
+
     unsafe fn transfer(
         h: usize,
         buffer: *mut u8,
         count: u32,
         transferred: *mut u32,
         overlapped: *mut c_void,
-        read: bool,
+        mode: Transfer,
     ) -> Result<()> {
         if !transferred.is_null() {
             unsafe {
@@ -1722,6 +1729,15 @@ pub(crate) mod native {
             return Err(INVALID_PARAM);
         }
         let e = entry(h)?;
+        // Scope the audited child adapter before entering any blocking pipe
+        // or console path, and use this same handle entry for the transfer.
+        #[cfg(target_os = "macos")]
+        if matches!(mode, Transfer::TitleRead)
+            && !matches!(&*e.obj, Object::File(file) if file.title_data)
+        {
+            return Err(BAD_HANDLE);
+        }
+        let read = !matches!(mode, Transfer::Write);
         if e.access & (if read { R } else { W }) == 0 {
             return Err(ACCESS);
         }
@@ -1790,14 +1806,24 @@ pub(crate) mod native {
         }
         Ok(())
     }
-    pub(super) unsafe extern "win64" fn ReadFile(
+    pub(crate) unsafe extern "win64" fn ReadFile(
         h: usize,
         buf: *mut c_void,
         count: u32,
         done: *mut u32,
         overlapped: *mut c_void,
     ) -> i32 {
-        boolean(unsafe { transfer(h, buf.cast(), count, done, overlapped, true) })
+        boolean(unsafe { transfer(h, buf.cast(), count, done, overlapped, Transfer::Read) })
+    }
+    #[cfg(target_os = "macos")]
+    pub(crate) unsafe extern "win64" fn tls_child_read_file(
+        h: usize,
+        buf: *mut c_void,
+        count: u32,
+        done: *mut u32,
+        overlapped: *mut c_void,
+    ) -> i32 {
+        boolean(unsafe { transfer(h, buf.cast(), count, done, overlapped, Transfer::TitleRead) })
     }
     pub(super) unsafe extern "win64" fn WriteFile(
         h: usize,
@@ -1806,7 +1832,16 @@ pub(crate) mod native {
         done: *mut u32,
         overlapped: *mut c_void,
     ) -> i32 {
-        boolean(unsafe { transfer(h, buf.cast_mut().cast(), count, done, overlapped, false) })
+        boolean(unsafe {
+            transfer(
+                h,
+                buf.cast_mut().cast(),
+                count,
+                done,
+                overlapped,
+                Transfer::Write,
+            )
+        })
     }
     fn disk<T>(h: usize, required: u32, f: impl FnOnce(&mut File) -> Result<T>) -> Result<T> {
         let e = entry(h)?;
@@ -2860,6 +2895,7 @@ mod tests {
 #[cfg(all(test, target_arch = "x86_64", target_os = "macos"))]
 mod native_tests {
     use super::native::*;
+    use crate::providers::native::get_last_error;
     use std::{
         fs,
         path::Path,
@@ -2900,6 +2936,17 @@ mod native_tests {
             assert_eq!(size, 6);
             let mut copy = 0;
             assert_eq!(DuplicateHandle(invalid, h, invalid, &mut copy, 0, 0, 2), 1);
+            #[cfg(target_os = "macos")]
+            {
+                let mut data = [0xffu8];
+                n = u32::MAX;
+                assert_eq!(
+                    tls_child_read_file(h, data.as_mut_ptr().cast(), 1, &mut n, null_mut()),
+                    0
+                );
+                assert_eq!(get_last_error(), 6); // ERROR_INVALID_HANDLE
+                assert_eq!((n, data), (0, [0xff]));
+            }
             assert_eq!(SetFilePointerEx(copy, 1, null_mut(), 0), 1);
             let mut data = [0u8; 3];
             assert_eq!(
@@ -2942,6 +2989,15 @@ mod native_tests {
                 WriteFile(copy, b"test".as_ptr().cast(), 4, &mut n, null_mut()),
                 1
             );
+            #[cfg(target_os = "macos")]
+            {
+                assert_eq!(
+                    tls_child_read_file(r, data.as_mut_ptr().cast(), 4, &mut n, null_mut()),
+                    0
+                );
+                assert_eq!(get_last_error(), 6); // ERROR_INVALID_HANDLE
+                assert_eq!((n, data), (0, [0; 4]));
+            }
             assert_eq!(CloseHandle(copy), 1);
             assert_eq!(
                 PeekNamedPipe(
