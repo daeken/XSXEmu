@@ -75,6 +75,7 @@ enum Export {
     Color(u8, bool), // MRT ordinal and nonzero raw EN field
     Mrtz(u8),
     Position(u8, u8),
+    Primitive(u8),
     Parameter(u8, u8),
     Null,
     Other,
@@ -95,6 +96,7 @@ fn export(first: u32, len: usize, text: &str) -> Option<Export> {
         (i @ 12..=16, name) if name.as_bytes() == [b'p', b'o', b's', b'0' + i as u8 - 12] => {
             Export::Position(i as u8 - 12, (first & 15) as u8)
         }
+        (20, "prim") => Export::Primitive((first & 15) as u8),
         (i @ 32..=63, name) if name == format!("param{}", i - 32) => {
             Export::Parameter(i as u8 - 32, (first & 15) as u8)
         }
@@ -109,6 +111,7 @@ struct Exports {
     disabled_color: u8,
     mrtz_masks: u16,
     positions: [u16; 5], // bit for each raw EN value, per position target
+    primitive_en_values: u16,
     active_parameters: u32,
     parameter_en_union: [u8; 32],
     disabled_parameters: u32,
@@ -171,6 +174,7 @@ fn project_exports(
                     Export::Color(i, false) => exports.disabled_color |= 1 << i,
                     Export::Mrtz(en) => exports.mrtz_masks |= 1 << en,
                     Export::Position(i, en) => exports.positions[i as usize] |= 1 << en,
+                    Export::Primitive(en) => exports.primitive_en_values |= 1 << en,
                     Export::Parameter(i, 0) => exports.disabled_parameters |= 1 << i,
                     Export::Parameter(i, en) => {
                         exports.active_parameters |= 1 << i;
@@ -206,6 +210,7 @@ impl Exports {
     fn has_non_ps_target(self) -> bool {
         self.other
             || self.positions != [0; 5]
+            || self.primitive_en_values != 0
             || self.active_parameters != 0
             || self.disabled_parameters != 0
     }
@@ -229,10 +234,15 @@ const FILE_LIMIT: usize = 100_000;
 struct VertexExports {
     pos_payloads: [usize; 5],
     pos0_non_full_enable: usize,
+    pos0_raw_en: [usize; 16],
+    prim_raw_en: [usize; 16],
     param_payloads: usize,
     dense_enabled_params: usize,
     disabled_param_payloads: usize,
-    other_payloads: usize,
+    color_payloads: usize,
+    mrtz_payloads: usize,
+    null_payloads: usize,
+    unclassified_payloads: usize,
 }
 
 impl VertexExports {
@@ -241,15 +251,22 @@ impl VertexExports {
             *count += usize::from(masks != 0);
         }
         self.pos0_non_full_enable += usize::from(e.positions[0] & !(1 << 15) != 0);
+        for (en, tally) in self.pos0_raw_en.iter_mut().enumerate() {
+            *tally += usize::from(e.positions[0] & (1 << en) != 0);
+        }
+        for (en, tally) in self.prim_raw_en.iter_mut().enumerate() {
+            *tally += usize::from(e.primitive_en_values & (1 << en) != 0);
+        }
         self.param_payloads += usize::from(e.active_parameters != 0);
         self.dense_enabled_params += usize::from(
             e.active_parameters != 0
                 && e.active_parameters & e.active_parameters.wrapping_add(1) == 0,
         );
         self.disabled_param_payloads += usize::from(e.disabled_parameters != 0);
-        self.other_payloads += usize::from(
-            e.other || e.color != 0 || e.disabled_color != 0 || e.mrtz_masks != 0 || e.null,
-        );
+        self.color_payloads += usize::from(e.color != 0 || e.disabled_color != 0);
+        self.mrtz_payloads += usize::from(e.mrtz_masks != 0);
+        self.null_payloads += usize::from(e.null);
+        self.unclassified_payloads += usize::from(e.other);
     }
 }
 
@@ -262,6 +279,7 @@ struct Counts {
     vertex_exports: [VertexExports; 2],
     different_vertex_exports: usize,
     message_projection: [BTreeMap<ResultClass, usize>; 2],
+    mesh_exports: [VertexExports; 2],
 }
 
 pub fn run(lib: &OsStr, cpu: Cpu, root: &Path) -> Result<(), Box<dyn Error>> {
@@ -320,14 +338,21 @@ pub fn run(lib: &OsStr, cpu: Cpu, root: &Path) -> Result<(), Box<dyn Error>> {
             }
         }
         if matches!(stage, 3 | 7) {
-            for ((outcome, dis), tally) in outcomes
+            for (((outcome, dis), tally), exports) in outcomes
                 .iter()
                 .zip(&mut waves)
                 .zip(&mut c.message_projection)
+                .zip(&mut c.mesh_exports)
             {
                 if matches!(outcome, Err(ResultClass::SendMsg(class)) if *class != SendMsgClass::Unclassified)
                 {
-                    let class = result_class(project_exports(dis, bytes, true));
+                    let result = project_exports(dis, bytes, true);
+                    if stage == 7
+                        && let Ok(projected) = &result
+                    {
+                        exports.add(*projected);
+                    }
+                    let class = result_class(result);
                     *tally.entry(class).or_default() += 1;
                 }
             }
@@ -365,6 +390,11 @@ pub fn run(lib: &OsStr, cpu: Cpu, root: &Path) -> Result<(), Box<dyn Error>> {
                 println!(
                     "  wave{width} separate checked-message fallthrough projection: {counts:?}"
                 );
+            }
+        }
+        if stage == 7 {
+            for (width, exports) in [64, 32].into_iter().zip(c.mesh_exports) {
+                println!("  wave{width} separate mesh export counts: {exports:?}");
             }
         }
         if stage == 4 {
@@ -708,6 +738,10 @@ mod tests {
         assert_eq!(
             export(0xf800_03ff, 8, "exp param30 v0, v1, v2, v3"),
             Some(Export::Other)
+        );
+        assert_eq!(
+            export(0xf800_0141, 8, "exp prim v0, off, off, off"),
+            Some(Export::Primitive(1))
         );
         let mut a = VertexExports::default();
         a.add(Exports {
