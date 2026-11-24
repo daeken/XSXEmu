@@ -33,6 +33,7 @@ const MAX_FILE: usize = 512 * 1024 * 1024;
 const MAX_IMAGE: usize = 512 * 1024 * 1024;
 const USAGE: &str = "Usage: xsxemu <inspect|map|audit|run> <image.exe> [options]\n\
     inspect [--symbols]     List headers, imports, exports and startup metadata\n\
+    inspect option: --offline-catalog-metadata  Inspect CodeIntegrity and embedded certificate envelopes on a trusted PE\n\
     map [--base ADDRESS]   Materialize a non-executable image and apply relocations\n\
     audit [--dll-dir DIR] [--symbols]  Resolve the static import graph without executing\n\
     run [--dll-dir DIR]    Start a trusted image (x86-64 macOS/Rosetta only; not sandboxed)\n\
@@ -65,6 +66,7 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
     let args: Vec<_> = args.collect();
     let mut roots = Vec::new();
     let mut symbols = false;
+    let mut offline_catalog = false;
     let mut base = None;
     let mut schema = None;
     let mut rust_providers = false;
@@ -74,6 +76,7 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
     while let Some(arg) = options.next() {
         match (command, arg.to_str()) {
             ("inspect" | "audit", Some("--symbols")) => symbols = true,
+            ("inspect", Some("--offline-catalog-metadata")) => offline_catalog = true,
             ("audit" | "run", Some("--dll-dir")) => roots.push(PathBuf::from(
                 options.next().ok_or("--dll-dir requires a path")?,
             )),
@@ -114,6 +117,12 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
         })
         .transpose()?;
     match command {
+        "inspect" if offline_catalog => {
+            if symbols {
+                return Err("--offline-catalog-metadata cannot be combined with --symbols".into());
+            }
+            inspect_catalog(&image)?;
+        }
         "inspect" => inspect(&image, symbols)?,
         "map" => map(&image, base)?,
         "audit" | "run" => {
@@ -160,6 +169,25 @@ pub(crate) fn read_image(path: &Path) -> Result<Vec<u8>> {
         return Err(format!("{} exceeds file size limit", path.display()).into());
     }
     Ok(bytes)
+}
+
+fn inspect_catalog(path: &Path) -> Result<()> {
+    let bytes = read_image(path)?;
+    let catalog = Pe::parse(&bytes)
+        .and_then(|pe| win_cfg::CfgProfile::parse_offline_catalog(&pe))
+        .map_err(|e| format!("{e}; signature/catalog not verified"))?;
+    println!(
+        "CodeIntegrity: Flags=1 Catalog=0 CatalogOffset={:#x} (opaque) Reserved=0",
+        catalog.catalog_offset
+    );
+    println!(
+        "Embedded WIN_CERTIFICATE: file offset={:#x} size={:#x} revision=0x0200 type=0x0002",
+        catalog.embedded.rva, catalog.embedded.size
+    );
+    println!(
+        "Offline envelope only: signature/catalog not verified; catalog policy unknown, no startup admission"
+    );
+    Ok(())
 }
 
 fn inspect(path: &Path, symbols: bool) -> Result<()> {

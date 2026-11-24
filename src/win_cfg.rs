@@ -2,7 +2,7 @@
 //! These are image-relative facts, not a runtime CFG implementation or permission
 //! to execute a guarded image. In particular, the pointer slots are not patched here.
 
-use crate::pe::{Pe, PeError, Section};
+use crate::pe::{DataDirectory, Pe, PeError, Section};
 use std::ops::Range;
 
 const LOAD_CONFIG: usize = 10;
@@ -67,6 +67,22 @@ impl GuardFunction {
     }
 }
 
+#[derive(Debug)]
+pub struct OfflineCatalogEnvelope {
+    /// Opaque CodeIntegrity.CatalogOffset, not interpreted as a PE offset or RVA.
+    pub catalog_offset: u32,
+    /// Separate embedded WIN_CERTIFICATE envelope; the `rva` member is a file offset.
+    pub embedded: DataDirectory,
+}
+
+#[derive(Clone, Copy)]
+enum Profile {
+    Standard,
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    TlsChild,
+    OfflineCatalog,
+}
+
 /// A validated, strictly RVA-sorted GFID table borrowing the on-disk image.
 #[derive(Debug)]
 pub struct CfgMetadata<'a> {
@@ -86,6 +102,7 @@ pub struct CfgMetadata<'a> {
         allow(dead_code)
     )]
     companion: Option<CompanionSlots>,
+    offline_catalog: Option<OfflineCatalogEnvelope>,
 }
 
 #[derive(Debug)]
@@ -355,15 +372,34 @@ impl<'a> CfgProfile<'a> {
     /// image that requests enabling export suppression process-wide, because
     /// doing so involves runtime export resolution, not just table validation.
     pub fn parse(pe: &Pe<'a>) -> Result<Self> {
-        Self::parse_profile(pe, false)
+        Self::parse_profile(pe, Profile::Standard)
     }
 
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
     pub fn parse_tls_child(pe: &Pe<'a>) -> Result<Self> {
-        Self::parse_profile(pe, true)
+        Self::parse_profile(pe, Profile::TlsChild)
     }
 
-    fn parse_profile(pe: &Pe<'a>, static_tls: bool) -> Result<Self> {
+    /// Classify an envelope on a caller-trusted input, only for offline reporting.
+    /// This does not determine whether the external catalog carries policy or
+    /// authorize the image for either startup lane.
+    pub fn parse_offline_catalog(pe: &Pe<'a>) -> Result<OfflineCatalogEnvelope> {
+        if pe.dll_characteristics & 0x0080 != 0 {
+            return Err(PeError::Unsupported(
+                "FORCE_INTEGRITY requires Windows signature verification",
+            ));
+        }
+        if pe.dll_characteristics & DLL_GUARD_CF == 0 {
+            return Err(PeError::Unsupported("offline catalog requires active CFG"));
+        }
+        match Self::parse_profile(pe, Profile::OfflineCatalog)? {
+            Self::Guarded(cfg) => cfg.offline_catalog,
+            _ => None,
+        }
+        .ok_or(PeError::Unsupported("missing offline catalog envelope"))
+    }
+
+    fn parse_profile(pe: &Pe<'a>, profile: Profile) -> Result<Self> {
         let advertised = pe.dll_characteristics & DLL_GUARD_CF != 0;
         let Some(dir) = pe.directory(LOAD_CONFIG) else {
             return no_cfg(advertised);
@@ -391,7 +427,7 @@ impl<'a> CfgProfile<'a> {
         if !advertised {
             return DormantSlots::parse(pe, dir.rva, raw, size).map(Self::Dormant);
         }
-        CfgMetadata::parse_guarded(pe, dir.rva, raw, size, static_tls).map(Self::Guarded)
+        CfgMetadata::parse_guarded(pe, dir.rva, raw, size, profile).map(Self::Guarded)
     }
 }
 
@@ -457,7 +493,7 @@ impl<'a> CfgMetadata<'a> {
         rva: u32,
         raw: &[u8],
         size: usize,
-        static_tls: bool,
+        profile: Profile,
     ) -> Result<Self> {
         let flags = u32_at(raw, GUARD_FLAGS);
         if flags & !SUPPORTED_FLAGS != 0 {
@@ -507,10 +543,15 @@ impl<'a> CfgMetadata<'a> {
             }
         }
         validate_auxiliary(pe, declared, rva, flags, stride, &mut ranges)?;
+        let static_tls = match profile {
+            #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+            Profile::TlsChild => true,
+            _ => false,
+        };
         let address_taken_iat =
             AddressTakenIat::parse(pe, declared, flags, stride, static_tls, &mut ranges)?;
         let companion = if nonzero(declared.get(EH_END..).unwrap_or_default()) {
-            if !static_tls {
+            if matches!(profile, Profile::Standard) {
                 return Err(PeError::Unsupported(
                     "post-EHCONT load-config fields on CFG image",
                 ));
@@ -534,7 +575,8 @@ impl<'a> CfgMetadata<'a> {
                 "additional load-config fields on CFG image",
             ));
         }
-        if nonzero(tail_between(declared, CFG_END, CODE_INTEGRITY_END)) {
+        let ci = tail_between(declared, CFG_END, CODE_INTEGRITY_END);
+        if !matches!(profile, Profile::OfflineCatalog) && nonzero(ci) {
             return Err(PeError::Unsupported(
                 "CodeIntegrity load-config fields on CFG image",
             ));
@@ -564,6 +606,25 @@ impl<'a> CfgMetadata<'a> {
             // Do not accept an RVA in an executable zero-fill tail.
             pe.rva_slice(entry.rva, 1)?;
         }
+        let offline_catalog = if matches!(profile, Profile::OfflineCatalog) {
+            // Recognize only the observed layout, not the semantics of the
+            // catalog index or what the opaque catalog offset refers to.
+            if ci.len() != 12 || u32_at(ci, 0) != 1 || u32_at(ci, 4) == 0 || u32_at(ci, 8) != 0 {
+                return Err(PeError::Unsupported("offline CodeIntegrity tuple"));
+            }
+            let fields = range(rva + CFG_END as u32, ci.len())?;
+            for fix in pe.relocations()? {
+                if overlaps(&fields, &range(fix, 8)?) {
+                    return Err(PeError::Invalid("CodeIntegrity relocation"));
+                }
+            }
+            Some(OfflineCatalogEnvelope {
+                catalog_offset: u32_at(ci, 4),
+                embedded: pe.embedded_certificate_envelope()?,
+            })
+        } else {
+            None
+        };
         Ok(Self {
             check_slot_rva,
             dispatch_slot_rva,
@@ -573,6 +634,7 @@ impl<'a> CfgMetadata<'a> {
             table,
             companion,
             address_taken_iat,
+            offline_catalog,
         })
     }
 
@@ -1182,6 +1244,146 @@ pub(super) mod tests {
             f[TABLE + offset] = bits;
             assert!(parse(&f).is_err());
         }
+    }
+
+    const CERT_DIR: usize = OPT + 112 + 4 * 8;
+    const CERT_OFFSET: usize = 0xa00;
+    const CERT_SIZE: usize = 0x10;
+
+    fn catalog_fixture() -> Vec<u8> {
+        let mut file = fixture(1, ES);
+        // Deliberately out of the PE file: the catalog offset is opaque.
+        put16(&mut file, LC + CFG_END, 1);
+        put32(&mut file, LC + CFG_END + 4, u32::MAX);
+        put32(&mut file, CERT_DIR, CERT_OFFSET as u32);
+        put32(&mut file, CERT_DIR + 4, CERT_SIZE as u32);
+        file.resize(CERT_OFFSET + CERT_SIZE, 0);
+        put32(&mut file, CERT_OFFSET, CERT_SIZE as u32);
+        put16(&mut file, CERT_OFFSET + 4, 0x0200);
+        put16(&mut file, CERT_OFFSET + 6, 2);
+        file[CERT_OFFSET + 8..].fill(0x5a); // not a signature, intentionally opaque
+        file
+    }
+
+    fn parse_catalog(file: &[u8]) -> Result<OfflineCatalogEnvelope> {
+        CfgProfile::parse_offline_catalog(&Pe::parse(file)?)
+    }
+
+    #[test]
+    fn offline_catalog_does_not_admit_to_startup() {
+        let f = catalog_fixture();
+        let envelope = parse_catalog(&f).unwrap();
+        assert_eq!(envelope.catalog_offset, u32::MAX);
+        assert_eq!(envelope.embedded.rva, CERT_OFFSET as u32);
+        assert_eq!(envelope.embedded.size, CERT_SIZE as u32);
+        assert!(matches!(
+            parse(&f),
+            Err(PeError::Unsupported(
+                "CodeIntegrity load-config fields on CFG image"
+            ))
+        ));
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        assert!(matches!(
+            CfgProfile::parse_tls_child(&Pe::parse(&f).unwrap()),
+            Err(PeError::Unsupported(
+                "CodeIntegrity load-config fields on CFG image"
+            ))
+        ));
+        let pe = Pe::parse(&f).unwrap();
+        let CfgProfile::Guarded(cfg) =
+            CfgProfile::parse_profile(&pe, Profile::OfflineCatalog).unwrap()
+        else {
+            panic!("expected guarded metadata");
+        };
+        let control = fixture(1, ES);
+        let standard = parse(&control).unwrap().unwrap();
+        assert_eq!(cfg.flags(), standard.flags());
+        assert!(cfg.entries().eq(standard.entries()));
+        for lane in ["run", "__static-tls-child", "audit", "map"] {
+            let err = crate::cli(
+                [lane, "never-opened.exe", "--offline-catalog-metadata"]
+                    .into_iter()
+                    .map(Into::into),
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("unexpected option"),
+                "{lane}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn offline_catalog_refuses_unknown_or_policy_load_config() {
+        for (at, value, diagnostic) in [
+            (OPT + 70, 0x80, "FORCE_INTEGRITY"),
+            (OPT + 71, 0, "requires active CFG"),
+            (LC + CFG_END, 2, "offline CodeIntegrity tuple"),
+            (LC + CFG_END + 2, 1, "offline CodeIntegrity tuple"),
+            (LC + CFG_END + 8, 1, "offline CodeIntegrity tuple"),
+            (LC + CODE_INTEGRITY_END, 1, "address-taken IAT"),
+            (LC + GUARD_FLAGS + 1, 0x85, "GuardFlags requirements"),
+            (LC + GUARD_FLAGS + 3, 0, "without GFID flag byte"),
+            (TABLE + 4, 0x80, "GFID flags"),
+        ] {
+            let mut f = catalog_fixture();
+            f[at] = value;
+            let err = parse_catalog(&f).unwrap_err();
+            assert!(err.to_string().contains(diagnostic), "{at:#x}: {err}");
+        }
+        let mut f = catalog_fixture();
+        put32(&mut f, LC + CFG_END + 4, 0);
+        assert!(parse_catalog(&f).is_err());
+        // A relocation that starts before the tuple still overlaps it.
+        put32(&mut f, LC + CFG_END + 4, 1);
+        put32(&mut f, OPT + 112 + 5 * 8, 0x2300);
+        put32(&mut f, OPT + 112 + 5 * 8 + 4, 12);
+        put32(&mut f, LC + 0x300, 0x2000);
+        put32(&mut f, LC + 0x304, 12);
+        put16(&mut f, LC + 0x308, 0xa090);
+        assert_eq!(
+            parse_catalog(&f).unwrap_err(),
+            PeError::Invalid("CodeIntegrity relocation")
+        );
+    }
+
+    #[test]
+    fn offline_catalog_refuses_unbounded_or_unknown_certificate_layout() {
+        for (at, value) in [
+            (CERT_DIR, 0),
+            (CERT_DIR, 0x800), // overlaps a section
+            (CERT_DIR, 0xa01), // unaligned
+            (CERT_DIR, 0xa08), // unrelated overlay before certificate
+            (CERT_DIR, u32::MAX),
+            (CERT_DIR + 4, 0),
+            (CERT_DIR + 4, 8),
+            (CERT_DIR + 4, 15),
+            (CERT_DIR + 4, 24),
+            (CERT_DIR + 4, u32::MAX),
+            (CERT_OFFSET, 0),
+            (CERT_OFFSET, 8),
+            (CERT_OFFSET, 15),
+            (CERT_OFFSET, 24),
+            (CERT_OFFSET, u32::MAX),
+            (CERT_OFFSET + 4, 0x0002_0100), // wrong revision
+            (CERT_OFFSET + 4, 0x0001_0200), // wrong type
+        ] {
+            let mut f = catalog_fixture();
+            put32(&mut f, at, value);
+            assert!(parse_catalog(&f).is_err(), "{at:#x}={value:#x}");
+        }
+        let mut f = catalog_fixture();
+        f.pop();
+        assert!(parse_catalog(&f).is_err());
+        let mut f = catalog_fixture();
+        f.extend_from_slice(&f[CERT_OFFSET..].to_vec());
+        put32(&mut f, CERT_DIR + 4, (2 * CERT_SIZE) as u32);
+        assert!(parse_catalog(&f).is_err()); // second record not in the profile
+        let mut f = catalog_fixture();
+        put32(&mut f, RDATA + 16, 0x3ff); // 1 byte of zero alignment padding
+        assert!(parse_catalog(&f).is_ok());
+        f[CERT_OFFSET - 1] = 1;
+        assert!(parse_catalog(&f).is_err());
     }
 
     #[test]

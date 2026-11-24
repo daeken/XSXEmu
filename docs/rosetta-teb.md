@@ -412,6 +412,39 @@ and the real address-taken IAT table in `vcruntime140.dll` remain independent
 pre-entry blockers. Other unsupported guard metadata is not normalized. Only
 owned fixtures are executed for this profile.
 
+## Offline CodeIntegrity and embedded certificate envelopes
+
+For an independently trusted file, `xsxemu inspect FILE --offline-catalog-metadata`
+checks and prints only the signing-metadata envelopes. It requires the guarded
+load-config profile (including the same checks on any inactive XFG/CastGuard
+fields as in the child), refuses `FORCE_INTEGRITY`, and recognizes exactly
+`(Flags=1, Catalog=0, CatalogOffset=nonzero, Reserved=0)` with no relocation
+covering the tuple. `CatalogOffset` is opaque: it is not followed as a PE file
+offset, RVA or external catalog reference. No catalog is opened.
+
+[PE directory #4][pe-format] separately supplies a file offset and size for an
+embedded certificate table. This profile accepts only a single nonempty
+`WIN_CERTIFICATE` with revision `0x0200` and type `0x0002`, whose length matches
+the aligned directory size. The table must start at the aligned end of the
+headers/section data (zero alignment padding) and end exactly at EOF. The
+payload is not decoded. Read-only inspection of `msvcp140.dll` found the opaque
+catalog offset `0xc0ce0` and, separately, the embedded table at file offset
+`0x87800`, size `0x27f0`. Nothing from either payload is used to admit targets.
+The address-taken IAT table in `vcruntime140.dll` and the inconsistent export
+suppression stride in `msvcp140_codecvt_ids.dll` still fail the guard profile.
+
+The [Windows SDK][ci-sdk] identifies these as CodeIntegrity information fields;
+it does not establish Xbox catalog policy for this tuple. Microsoft's
+[`/INTEGRITYCHECK`][integritycheck] explicitly requires load-time signature
+checking; both run lanes still reject `FORCE_INTEGRITY`. A clear bit is not
+proof of trust or of the catalog's purpose. This option reports
+**signature/catalog not verified** and is unavailable in either run lane.
+No OS policy, startup profile, or exact GFID policy changes.
+
+[pe-format]: https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#the-attribute-certificate-table-image-only
+[ci-sdk]: https://github.com/microsoft/win32metadata/blob/main/generation/WinSDK/RecompiledIdlHeaders/um/winnt.h
+[integritycheck]: https://learn.microsoft.com/en-us/cpp/build/reference/integritycheck-require-signature-check
+
 ## Controlled execution plan
 
 1. Separate loading from execution. Reuse PE static TLS metadata but check

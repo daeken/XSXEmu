@@ -295,6 +295,55 @@ impl<'a> Pe<'a> {
             .filter(|d| d.rva != 0 || d.size != 0)
     }
 
+    /// Validate the narrow layout used by the offline catalog inspection
+    /// profile: a single WIN_CERTIFICATE at the aligned end of the image file.
+    /// This checks the record header and bounds, not its opaque payload.
+    pub(crate) fn embedded_certificate_envelope(&self) -> Result<DataDirectory> {
+        let dir = self.directory(4).ok_or(PeError::Invalid(
+            "missing embedded attribute certificate directory",
+        ))?;
+        // Despite the DataDirectory field name, directory #4 is a file offset.
+        let start = u64::from(dir.rva);
+        let size = u64::from(dir.size);
+        let raw_end = self
+            .sections
+            .iter()
+            .filter(|s| s.raw_size != 0)
+            .fold(u64::from(self.size_of_headers), |end, s| {
+                end.max(u64::from(s.raw_offset) + u64::from(s.raw_size))
+            });
+        if start != raw_end.next_multiple_of(8) || size <= 8 || size % 8 != 0 {
+            return Err(PeError::Invalid(
+                "embedded attribute certificate range/alignment",
+            ));
+        }
+        if start + size != self.file.len() as u64 {
+            return Err(PeError::Invalid(
+                "embedded attribute certificate must end at EOF",
+            ));
+        }
+        if self.file[raw_end as usize..start as usize]
+            .iter()
+            .any(|&b| b != 0)
+        {
+            return Err(PeError::Invalid(
+                "embedded attribute certificate alignment padding",
+            ));
+        }
+        let record = &self.file[start as usize..];
+        if u32_at(record, 0)? != dir.size {
+            return Err(PeError::Invalid(
+                "embedded attribute certificate record length",
+            ));
+        }
+        if u16_at(record, 4)? != 0x0200 || u16_at(record, 6)? != 0x0002 {
+            return Err(PeError::Unsupported(
+                "embedded attribute certificate revision/type",
+            ));
+        }
+        Ok(dir)
+    }
+
     /// Return file-backed bytes at the given RVA (not bytes from a zero-fill tail).
     pub fn rva_slice(&self, rva: u32, size: usize) -> Result<&'a [u8]> {
         slice(self.raw_tail(rva)?, 0, size)
