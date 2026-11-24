@@ -14,6 +14,7 @@ enum Stage {
     TriplePackedPixel,
     TriplePackedRgPixel,
     DepthPixel,
+    EarlyDepthPixel,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -107,6 +108,8 @@ const DEPTH_PS: &[u32] = &[
     0xbf81_0000,
 ];
 
+const EARLY_DEPTH_PS: &[u32] = &[0xf800_0081, 2, 0xf800_1c0f, 1, 0xbf81_0000];
+
 impl Stage {
     fn input_registers(self) -> usize {
         match self {
@@ -116,7 +119,7 @@ impl Stage {
             Stage::PackedPixel => 2,
             Stage::PackedRgPixel => 2,
             Stage::DualPackedPixel | Stage::TriplePackedPixel | Stage::TriplePackedRgPixel => 2,
-            Stage::DepthPixel => 3,
+            Stage::DepthPixel | Stage::EarlyDepthPixel => 3,
         }
     }
 
@@ -137,6 +140,7 @@ impl Stage {
             Stage::PackedPixel
             | Stage::PackedRgPixel
             | Stage::DepthPixel
+            | Stage::EarlyDepthPixel
             | Stage::DualPackedPixel
             | Stage::TriplePackedPixel
             | Stage::TriplePackedRgPixel => &[],
@@ -147,7 +151,7 @@ impl Stage {
         match self {
             Stage::PackedPixel | Stage::PackedRgPixel => 1,
             Stage::TriplePackedPixel | Stage::TriplePackedRgPixel => 3,
-            Stage::DepthPixel | Stage::DualPackedPixel => 2,
+            Stage::DepthPixel | Stage::EarlyDepthPixel | Stage::DualPackedPixel => 2,
             _ => self.exports().len(),
         }
     }
@@ -232,6 +236,7 @@ fn lift(stage: Stage, words: &[u32]) -> Result<Vec<Op>, Reject> {
                 let valid = match stage {
                     Stage::PackedPixel => exported == 0 && slot == 0 && done && vm,
                     Stage::DepthPixel => exported == 0 && slot == 0 && !done && !vm,
+                    Stage::EarlyDepthPixel => exported == 1 && slot == 0 && done && vm,
                     Stage::DualPackedPixel => matches!(
                         (exported, slot, done, vm),
                         (0, 0, false, false) | (1, 1, true, true)
@@ -264,8 +269,11 @@ fn lift(stage: Stage, words: &[u32]) -> Result<Vec<Op>, Reject> {
                 require(src)?;
                 exported += 1;
             }
-            Op::FinalPixelDepth { src } => {
-                if stage != Stage::DepthPixel || exported != 1 {
+            Op::PixelDepth { src, final_export } => {
+                if !matches!(
+                    (stage, exported, final_export),
+                    (Stage::DepthPixel, 1, true) | (Stage::EarlyDepthPixel, 0, false)
+                ) {
                     return Err(Reject::BadExports(pc));
                 }
                 require(src)?;
@@ -396,7 +404,7 @@ fn emit_body(out: &mut String, ops: &[Op], packed_color_lvalue: &str, multi: boo
                 // B/A placeholders are never written by the owned RG-only descriptor.
                 writeln!(out, "  {packed_color_lvalue} = float4(float(as_type<half>(ushort(r[{rg}]))), float(as_type<half>(ushort(r[{rg}] >> 16))), 0.0f, 0.0f);").unwrap();
             }
-            Op::FinalPixelDepth { src: Vgpr(r) } => {
+            Op::PixelDepth { src: Vgpr(r), .. } => {
                 writeln!(out, "  out.depth = as_type<float>(r[{r}]);").unwrap();
             }
             Op::PackHalfRtz {
@@ -541,15 +549,25 @@ pub fn translate_packed_color_fixture(partial: bool) -> Result<String, Reject> {
 }
 
 #[allow(dead_code)] // Separate owned depth probe, not the keyed graphics fixture.
-pub fn translate_depth_fixture() -> Result<String, Reject> {
+pub fn translate_depth_fixture(early: bool) -> Result<String, Reject> {
     let vs = lift(Stage::Vertex, VS)?;
-    let ps = lift(Stage::DepthPixel, DEPTH_PS)?;
+    let (stage, native, entry) = if early {
+        (Stage::EarlyDepthPixel, EARLY_DEPTH_PS, "early_depth_ps")
+    } else {
+        (Stage::DepthPixel, DEPTH_PS, "depth_ps")
+    };
+    let ps = lift(stage, native)?;
     let mut msl = vertex_module(&vs);
     msl.push_str(
-        "struct DepthOutputs { float4 color [[color(0)]]; float depth [[depth(any)]]; };\n\
-fragment DepthOutputs depth_ps(constant uint4 &input [[buffer(0)]]) {\n\
-  uint r[256]; DepthOutputs out;\n\
-  r[0] = input.x; r[1] = input.y; r[2] = input.z;\n",
+        "struct DepthOutputs { float4 color [[color(0)]]; float depth [[depth(any)]]; };\n",
+    );
+    writeln!(
+        msl,
+        "fragment DepthOutputs {entry}(constant uint4 &input [[buffer(0)]]) {{"
+    )
+    .unwrap();
+    msl.push_str(
+        "  uint r[256]; DepthOutputs out;\n  r[0] = input.x; r[1] = input.y; r[2] = input.z;\n",
     );
     emit_body(&mut msl, &ps, "out.color", false);
     Ok(msl)
@@ -656,7 +674,7 @@ mod tests {
             io::Write,
             process::{Command, Stdio},
         };
-        let asm = "v_mov_b32_e32 v8, v4\nexp param0 v8, v5, v6, v7\nexp pos0 v0, v1, v2, v3 done\ns_endpgm\nv_add_f32_e32 v4, 0.25, v0\nv_fma_f32 v5, v1, v2, v3\nv_mul_legacy_f32_e32 v6, v5, v4\nv_mul_legacy_f32_e32 v6, 0.5, v6\nv_mul_legacy_f32_e32 v7, 0, v3\nexp mrt0 v4, v5, v6, v7 done\ns_endpgm\nv_mul_legacy_f32_e32 v2, v0, v1\nv_mul_legacy_f32_e32 v3, 0.25, v1\nv_fmac_f32_e32 v4, v0, v1\nv_cvt_pkrtz_f16_f32_e32 v5, v0, v1\ns_inst_prefetch 3\nv_mov_b32_e32 v6, 0\ns_nop 0\nv_mov_b32_e32 v7, 0.5\nv_mov_b32_e32 v8, 1.0\nv_mov_b32_e32 v9, 0x7fc12345\nv_cmp_ne_u32_e32 vcc_lo, 0, v0\nv_cndmask_b32_e32 v10, 0x7fc12345, v1, vcc_lo\nv_cmp_ne_u32_e32 vcc_lo, 0, v1\nv_cndmask_b32_e32 v11, 0x80000000, v0, vcc_lo\nexp mrt0 v1, v1, v0, v0 done compr vm\ns_endpgm\nexp mrt0 v1, v1, off, off done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrtz v2, off, off, off done vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrt1 v0, v0, v1, v1 done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrt1 v0, v0, v1, v1 compr\nexp mrt2 v1, v1, v1, v1 done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrt1 v0, v0, off, off compr\nexp mrt2 v1, v1, v1, v1 done compr vm\ns_endpgm\n";
+        let asm = "v_mov_b32_e32 v8, v4\nexp param0 v8, v5, v6, v7\nexp pos0 v0, v1, v2, v3 done\ns_endpgm\nv_add_f32_e32 v4, 0.25, v0\nv_fma_f32 v5, v1, v2, v3\nv_mul_legacy_f32_e32 v6, v5, v4\nv_mul_legacy_f32_e32 v6, 0.5, v6\nv_mul_legacy_f32_e32 v7, 0, v3\nexp mrt0 v4, v5, v6, v7 done\ns_endpgm\nv_mul_legacy_f32_e32 v2, v0, v1\nv_mul_legacy_f32_e32 v3, 0.25, v1\nv_fmac_f32_e32 v4, v0, v1\nv_cvt_pkrtz_f16_f32_e32 v5, v0, v1\ns_inst_prefetch 3\nv_mov_b32_e32 v6, 0\ns_nop 0\nv_mov_b32_e32 v7, 0.5\nv_mov_b32_e32 v8, 1.0\nv_mov_b32_e32 v9, 0x7fc12345\nv_cmp_ne_u32_e32 vcc_lo, 0, v0\nv_cndmask_b32_e32 v10, 0x7fc12345, v1, vcc_lo\nv_cmp_ne_u32_e32 vcc_lo, 0, v1\nv_cndmask_b32_e32 v11, 0x80000000, v0, vcc_lo\nexp mrt0 v1, v1, v0, v0 done compr vm\ns_endpgm\nexp mrt0 v1, v1, off, off done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrtz v2, off, off, off done vm\ns_endpgm\nexp mrtz v2, off, off, off\nexp mrt0 v1, v1, v0, v0 done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrt1 v0, v0, v1, v1 done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrt1 v0, v0, v1, v1 compr\nexp mrt2 v1, v1, v1, v1 done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrt1 v0, v0, off, off compr\nexp mrt2 v1, v1, v1, v1 done compr vm\ns_endpgm\n";
         let mut asm = asm.to_owned();
         for n in 0..7 {
             let r = 4 + 4 * n;
@@ -675,6 +693,7 @@ mod tests {
             .chain(PACKED_PS)
             .chain(PACKED_RG_PS)
             .chain(DEPTH_PS)
+            .chain(EARLY_DEPTH_PS)
             .chain(DUAL_PS)
             .chain(TRIPLE_PS)
             .chain(TRIPLE_RG_PS)
@@ -888,6 +907,45 @@ mod tests {
     }
 
     #[test]
+    fn early_depth_requires_nonfinal_mrtz_then_final_color_and_rejects_wait() {
+        assert_eq!(
+            lift(Stage::EarlyDepthPixel, EARLY_DEPTH_PS).unwrap().len(),
+            3
+        );
+        assert_eq!(
+            lift(Stage::DepthPixel, EARLY_DEPTH_PS),
+            Err(Reject::BadExports(0))
+        );
+        assert_eq!(
+            lift(Stage::EarlyDepthPixel, DEPTH_PS),
+            Err(Reject::BadExports(0))
+        );
+        let mut ps = EARLY_DEPTH_PS.to_vec();
+        ps[1] = 0x102;
+        assert_eq!(
+            lift(Stage::EarlyDepthPixel, &ps),
+            Err(Reject::Unsupported(0))
+        );
+        ps[1] = 3;
+        assert_eq!(
+            lift(Stage::EarlyDepthPixel, &ps),
+            Err(Reject::Uninitialized(0, 3))
+        );
+        ps[1] = 2;
+        ps[2] = DEPTH_PS[0];
+        assert_eq!(
+            lift(Stage::EarlyDepthPixel, &ps),
+            Err(Reject::BadExports(2))
+        );
+        let mut ps = EARLY_DEPTH_PS.to_vec();
+        ps.insert(2, 0xbf8c_ff0f);
+        assert_eq!(
+            lift(Stage::EarlyDepthPixel, &ps),
+            Err(Reject::Unsupported(2))
+        );
+    }
+
+    #[test]
     fn depth_profile_requires_color_then_depth_and_a_real_end() {
         assert_eq!(lift(Stage::DepthPixel, DEPTH_PS).unwrap().len(), 3);
         assert_eq!(
@@ -908,7 +966,7 @@ mod tests {
             Err(Reject::BadExports(0))
         );
         for header in [
-            0xf800_0081,
+            0xf800_0481,
             0xf800_0881,
             0xf800_1081,
             0xf800_1883,

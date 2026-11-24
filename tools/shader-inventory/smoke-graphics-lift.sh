@@ -79,6 +79,12 @@ compile packed-rg
 compile depth
 "$p" --load-depth-metallib "$d/depth.metallib"
 
+# Nonfinal depth must still control the overlap and allow a later color write.
+"$p" --early-depth-source
+"$p" --emit-early-depth-msl > "$d/early-depth.metal"
+compile early-depth
+"$p" --load-early-depth-metallib "$d/early-depth.metallib"
+
 # Seven explicit native PARAM outputs linked by name with a synthetic consumer.
 "$p" --multi-source
 "$p" --emit-multi-msl > "$d/multi.metal"

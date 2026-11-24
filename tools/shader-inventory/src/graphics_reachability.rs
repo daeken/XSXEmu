@@ -417,6 +417,9 @@ fn nearest_form(name: &str, w: u32, len: usize, text: &str) -> String {
             }
         }
         "s_nop" | "s_inst_prefetch" if len == 4 => format!("{name}/simm16-{}", w & 0xffff),
+        "s_waitcnt" if len == 4 && w == WAIT_EXPORT_ZERO => {
+            "s_waitcnt/expcnt-0/vmcnt-63/lgkmcnt-63".into()
+        }
         "exp" => match export_shape(w, len, text) {
             Some(s) => format!(
                 "exp/target-{}/en-{}/flags-{}{}{}",
@@ -431,6 +434,8 @@ fn nearest_form(name: &str, w: u32, len: usize, text: &str) -> String {
         _ => format!("{name}/{len}B/operands-unclassified"),
     }
 }
+
+const WAIT_EXPORT_ZERO: u32 = 0xbf8c_ff0f;
 
 const NEAREST_DISTANCES: usize = 3;
 const NEAREST_ROWS: usize = 6;
@@ -492,6 +497,8 @@ impl NearestGaps {
 #[derive(Default)]
 struct LiftGaps {
     complete: usize,
+    sole_export_wait: usize,
+    sole_export_wait_with_depth_reuse: usize,
     no_encoding_gap: usize,
     no_exp_gap: usize,
     only_exp_gap: usize,
@@ -510,6 +517,12 @@ impl LiftGaps {
         let mut forms = BTreeMap::new();
         let mut legacy_shapes = BTreeMap::new();
         let mut export_shapes = BTreeMap::new();
+        let mut previous_depth = None;
+        let mut wait_depth = None;
+        let mut saw_export_wait = false;
+        let mut depth_reused = false;
+        let mut next_tail_len = bytes.len();
+        let mut linear = true;
         let (mut sites, mut accepted) = (0, 0);
         let result = project_exports_observe(dis, bytes, false, |tail, len, text| {
             let name = text.split_ascii_whitespace().next().unwrap_or_default();
@@ -523,7 +536,33 @@ impl LiftGaps {
             } else {
                 1
             };
-            let matches = decode(&words[..count], 0).is_ok_and(|(width, op)| {
+            linear &= tail.len() == next_tail_len;
+            next_tail_len = tail.len() - len;
+            let decoded = decode(&words[..count], 0).ok();
+            if name == "s_waitcnt" && len == 4 && words[0] == WAIT_EXPORT_ZERO {
+                saw_export_wait = true;
+                wait_depth = previous_depth;
+            }
+            previous_depth = match (name, len, decoded) {
+                (
+                    "exp",
+                    8,
+                    Some((
+                        2,
+                        Op::PixelDepth {
+                            src,
+                            final_export: false,
+                        },
+                    )),
+                ) => Some(src),
+                _ => None,
+            };
+            if let ("v_cvt_pkrtz_f16_f32_e32", 4, Some((1, Op::PackHalfRtz { dst, .. }))) =
+                (name, len, decoded)
+            {
+                depth_reused |= wait_depth == Some(dst);
+            }
+            let matches = decoded.is_some_and(|(width, op)| {
                 width * 4 == len
                     && match op {
                         Op::Move { .. } | Op::MoveBits { .. } => name == "v_mov_b32_e32",
@@ -540,7 +579,7 @@ impl LiftGaps {
                         Op::Export { .. }
                         | Op::PackedColor { .. }
                         | Op::PackedRg { .. }
-                        | Op::FinalPixelDepth { .. } => name == "exp",
+                        | Op::PixelDepth { .. } => name == "exp",
                         Op::PackHalfRtz { .. } => name == "v_cvt_pkrtz_f16_f32_e32",
                         Op::CompareNonzero { .. } => name == "v_cmp_ne_u32_e32",
                         Op::SelectBits { .. } => name == "v_cndmask_b32_e32",
@@ -572,6 +611,10 @@ impl LiftGaps {
         });
         if result.is_ok() {
             self.complete += 1;
+            if sites - accepted == 1 && saw_export_wait {
+                self.sole_export_wait += 1;
+                self.sole_export_wait_with_depth_reuse += usize::from(linear && depth_reused);
+            }
             self.no_encoding_gap += usize::from(missing.is_empty());
             self.no_exp_gap += usize::from(export_shapes.is_empty());
             self.only_exp_gap += usize::from(!export_shapes.is_empty() && missing.len() == 1);
@@ -606,6 +649,12 @@ impl LiftGaps {
             "    EXP encoding gate: {}/{} complete graphs without an EXP encoding gap; {} with only EXP encoding gaps",
             self.no_exp_gap, self.complete, self.only_exp_gap
         );
+        if self.sole_export_wait != 0 {
+            println!(
+                "    sole exact EXPCNT(0) gap: {} complete graphs; {} linear paths with adjacent nonfinal scalar MRTZ and later packed RTZ reusing its source VGPR",
+                self.sole_export_wait, self.sole_export_wait_with_depth_reuse
+            );
+        }
         self.nearest.report();
         for ((shape, supported), (payloads, sites)) in self.legacy_shapes {
             println!(
@@ -1398,6 +1447,46 @@ mod tests {
         assert_eq!((gaps.no_exp_gap, gaps.only_exp_gap), (1, 0));
         assert!(gaps.observe(&mut dis, &bytes).is_ok());
         assert_eq!((gaps.no_exp_gap, gaps.only_exp_gap), (1, 1));
+    }
+
+    #[test]
+    fn sole_export_wait_requires_adjacent_depth_and_same_vgpr_reuse() {
+        let Some(path) = std::env::var_os("LLVM_DISASM_LIB") else {
+            return;
+        };
+        let _serial_llvm = crate::llvm::test_lock();
+        let llvm = Llvm::load(&path).unwrap();
+        for cpu in [Cpu::Gfx1013, Cpu::Gfx1030] {
+            for wave32 in [false, true] {
+                let mut dis = llvm.context(cpu, wave32).unwrap();
+                let exact = [
+                    0xf800_0081u32,
+                    5,
+                    WAIT_EXPORT_ZERO,
+                    0x5e0a_0300,
+                    0xf800_1c0f,
+                    5,
+                    0xbf81_0000,
+                ];
+                let mut gaps = LiftGaps::default();
+                let mut different_vgpr = exact;
+                different_vgpr[1] = 6;
+                let mut no_adjacency = exact.to_vec();
+                no_adjacency.insert(2, 0xbf80_0000);
+                for words in [exact.as_slice(), different_vgpr.as_slice(), &no_adjacency] {
+                    let bytes: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+                    assert!(gaps.observe(&mut dis, &bytes).is_ok());
+                }
+                assert_eq!(
+                    (
+                        gaps.no_encoding_gap,
+                        gaps.sole_export_wait,
+                        gaps.sole_export_wait_with_depth_reuse
+                    ),
+                    (0, 3, 1)
+                );
+            }
+        }
     }
 
     #[test]

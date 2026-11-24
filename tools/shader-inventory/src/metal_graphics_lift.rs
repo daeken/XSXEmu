@@ -76,8 +76,8 @@ mod gpu {
         MrtLoad(&'a Path, MrtFixture),
         MultiSource,
         MultiLoad(&'a Path),
-        DepthSource,
-        DepthLoad(&'a Path),
+        DepthSource(bool),
+        DepthLoad(&'a Path, bool),
         Load(&'a Path, bool),
         Archive(&'a Path, &'a Path, bool, bool, [u8; 32]),
         ExpectStrictMiss(&'a Path, &'a Path),
@@ -123,10 +123,10 @@ mod gpu {
                 print!("{}", graphics_lift::translate_multi_vertex_fixture().map_err(|e| format!("multi lift rejected: {e:?}"))?);
                 return Ok(());
             }
-            [mode] if mode == "--depth-source" => Mode::DepthSource,
-            [mode, lib] if mode == "--load-depth-metallib" => Mode::DepthLoad(Path::new(lib)),
-            [mode] if mode == "--emit-depth-msl" => {
-                print!("{}", graphics_lift::translate_depth_fixture().map_err(|e| format!("depth lift rejected: {e:?}"))?);
+            [mode] if mode == "--depth-source" || mode == "--early-depth-source" => Mode::DepthSource(mode == "--early-depth-source"),
+            [mode, lib] if mode == "--load-depth-metallib" || mode == "--load-early-depth-metallib" => Mode::DepthLoad(Path::new(lib), mode == "--load-early-depth-metallib"),
+            [mode] if mode == "--emit-depth-msl" || mode == "--emit-early-depth-msl" => {
+                print!("{}", graphics_lift::translate_depth_fixture(mode == "--emit-early-depth-msl").map_err(|e| format!("depth lift rejected: {e:?}"))?);
                 return Ok(());
             }
             [mode] if mode == "--packed-source" || mode == "--packed-rg-source" => Mode::PackedSource(mode == "--packed-rg-source"),
@@ -143,7 +143,7 @@ mod gpu {
             [mode, lib] if mode == "--load-metallib" || mode == "--load-mutated-metallib" => Mode::Load(Path::new(lib), mode == "--load-mutated-metallib"),
             [mode, lib, archive] if mode == "--expect-owned-metal-miss" => Mode::ExpectStrictMiss(Path::new(lib), Path::new(archive)),
             [mode, lib, archive, compiler] if mode == "--bake-archive" || mode == "--replay-archive" || mode == "--replay-mutated-archive" => Mode::Archive(Path::new(lib), Path::new(archive), mode == "--bake-archive", mode == "--replay-mutated-archive", owned_graphics_artifact::compiler_profile(compiler)?),
-            _ => return Err("usage: shader-metal-graphics-lift [--expect-swapped-triple | --triple-rg-source | --emit-triple-rg-msl | --load-triple-rg-metallib LIB | --triple-source | --emit-triple-msl | --load-triple-metallib LIB | --dual-source | --emit-dual-msl | --load-dual-metallib LIB | --multi-source | --emit-multi-msl | --load-multi-metallib LIB | --packed-rg-source | --emit-packed-rg-msl | --load-packed-rg-metallib LIB | --depth-source | --emit-depth-msl | --load-depth-metallib LIB | --packed-source | --emit-packed-msl | --load-packed-metallib LIB | --emit-msl | --emit-mutated-msl | --load-metallib LIB | --load-mutated-metallib LIB | {--bake-archive|--replay-archive|--replay-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-owned-metal-miss MUTATED_LIB ARCHIVE]".into()),
+            _ => return Err("usage: shader-metal-graphics-lift [--expect-swapped-triple | --triple-rg-source | --emit-triple-rg-msl | --load-triple-rg-metallib LIB | --triple-source | --emit-triple-msl | --load-triple-metallib LIB | --dual-source | --emit-dual-msl | --load-dual-metallib LIB | --multi-source | --emit-multi-msl | --load-multi-metallib LIB | --packed-rg-source | --emit-packed-rg-msl | --load-packed-rg-metallib LIB | --early-depth-source | --emit-early-depth-msl | --load-early-depth-metallib LIB | --depth-source | --emit-depth-msl | --load-depth-metallib LIB | --packed-source | --emit-packed-msl | --load-packed-metallib LIB | --emit-msl | --emit-mutated-msl | --load-metallib LIB | --load-mutated-metallib LIB | {--bake-archive|--replay-archive|--replay-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-owned-metal-miss MUTATED_LIB ARCHIVE]".into()),
         };
         if matches!(mode, Mode::Archive(..) | Mode::ExpectStrictMiss(..))
             && std::env::var_os("MTL_SHADER_VALIDATION").is_some()
@@ -167,7 +167,8 @@ mod gpu {
         };
         let packed = matches!(mode, Mode::PackedSource(_) | Mode::PackedLoad(..));
         let partial = matches!(mode, Mode::PackedSource(true) | Mode::PackedLoad(_, true));
-        let depth = matches!(mode, Mode::DepthSource | Mode::DepthLoad(_));
+        let depth = matches!(mode, Mode::DepthSource(_) | Mode::DepthLoad(..));
+        let early_depth = matches!(mode, Mode::DepthSource(true) | Mode::DepthLoad(_, true));
         let multi = matches!(mode, Mode::MultiSource | Mode::MultiLoad(_));
         let fixture = match mode {
             Mode::MrtSource(f) | Mode::MrtLoad(_, f) => Some(f),
@@ -185,7 +186,7 @@ mod gpu {
         let lib = match mode {
             Mode::Source
             | Mode::PackedSource(_)
-            | Mode::DepthSource
+            | Mode::DepthSource(_)
             | Mode::MultiSource
             | Mode::MrtSource(_)
             | Mode::SwappedTripleSource => {
@@ -194,7 +195,7 @@ mod gpu {
                 } else if multi {
                     graphics_lift::translate_multi_vertex_fixture()
                 } else if depth {
-                    graphics_lift::translate_depth_fixture()
+                    graphics_lift::translate_depth_fixture(early_depth)
                 } else if packed {
                     graphics_lift::translate_packed_color_fixture(partial)
                 } else {
@@ -208,7 +209,7 @@ mod gpu {
             Mode::PackedLoad(path, _)
             | Mode::MultiLoad(path)
             | Mode::MrtLoad(path, _)
-            | Mode::DepthLoad(path)
+            | Mode::DepthLoad(path, _)
             | Mode::Load(path, _)
             | Mode::Archive(path, _, _, _, _)
             | Mode::ExpectStrictMiss(path, _) => {
@@ -224,7 +225,15 @@ mod gpu {
             (MTLPixelFormat::RGBA32Float, 16, "multi_ps")
         } else if depth {
             desc.set_depth_attachment_pixel_format(DEPTH_FORMAT);
-            (MTLPixelFormat::RGBA32Float, 16, "depth_ps")
+            (
+                MTLPixelFormat::RGBA32Float,
+                16,
+                if early_depth {
+                    "early_depth_ps"
+                } else {
+                    "depth_ps"
+                },
+            )
         } else if packed {
             (
                 MTLPixelFormat::RGBA32Float,
@@ -573,7 +582,7 @@ mod gpu {
             println!("published owned graphics artifact identity");
         }
         println!(
-            "{} translated GFX10 VS+PS (mutated={mutated}, packed={packed}, partial={partial}, depth={depth}, multi={multi}, partial_mrt={partial_mrt}, colors={attachment_count}): {n}/{n} attachment pixels matched",
+            "{} translated GFX10 VS+PS (mutated={mutated}, packed={packed}, partial={partial}, depth={depth}, early_depth={early_depth}, multi={multi}, partial_mrt={partial_mrt}, colors={attachment_count}): {n}/{n} attachment pixels matched",
             dev.name(),
             n = SIDE * SIDE * attachment_count
         );

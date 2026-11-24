@@ -58,8 +58,9 @@ pub(crate) enum Op {
         slot: u8,
         src: Vgpr,
     },
-    FinalPixelDepth {
+    PixelDepth {
         src: Vgpr,
+        final_export: bool,
     },
     PackHalfRtz {
         dst: Vgpr,
@@ -227,17 +228,18 @@ pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeErro
             },
         ));
     }
-    // MRTZ, scalar float Z only, DONE+VM, no reserved bits. Off operands
+    // Scalar MRTZ, either nonfinal or DONE+VM, with no reserved bits. Off operands
     // must have the canonical zero source bytes for this subset.
-    if w == 0xf800_1881 {
+    if matches!(w, 0xf800_0081 | 0xf800_1881) {
         let fields = ext()?;
         if fields >> 8 != 0 {
             return Err(DecodeError::Unsupported(pc));
         }
         return Ok((
             2,
-            Op::FinalPixelDepth {
+            Op::PixelDepth {
                 src: Vgpr(fields as u8),
+                final_export: w == 0xf800_1881,
             },
         ));
     }
