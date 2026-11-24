@@ -22,7 +22,15 @@ The source-based archive replay above still compiles the owned MSL in memory. Th
 
 ## Offline library and strict PSO replay
 
-Requires `xcrun -sdk macosx metal --version` and `xcrun -sdk macosx --find metallib` to succeed. Xcode may ship a `metal` stub before its optional component is installed; check `xcodebuild -showComponent MetalToolchain -json`. Install via `xcodebuild -downloadComponent MetalToolchain` if needed.
+Requires `xcrun -sdk macosx metal --version` and `xcrun -sdk macosx --find metallib` to succeed. Xcode may ship a `metal` stub before its optional component is installed; check `xcodebuild -showComponent MetalToolchain -json`. If needed, check scratch free space first and install with `DEVELOPER_DIR="$XCODE/Contents/Developer" xcodebuild -downloadComponent MetalToolchain`, where `XCODE` is the chosen app bundle. No global `xcode-select` change is needed.
+
+Run the repeatable positive and negative smoke checks in scratch:
+
+```sh
+DEVELOPER_DIR="$XCODE/Contents/Developer" sh tools/shader-inventory/smoke-metallib.sh
+```
+
+Equivalent manual steps for the positive path (using the same command-scoped Xcode selection):
 
 ```sh
 set -e
