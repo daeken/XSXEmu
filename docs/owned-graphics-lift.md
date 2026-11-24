@@ -16,3 +16,22 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
 ```
 
 On Apple M4/macOS 27.0.1, generated-source execution, standalone offline metallib, and strict archive replay in a fresh process each match 64/64 pixels. The empty archive misses. An independent offline rebuild changes only the pixel shader's native literal from `1/4` to `1/2`: the translated standalone pipeline matches the modified oracle at all 64 pixels, while strict replay against the original archive misses specifically at `translated_ps`. All artifacts are trusted-local scratch; the probe is not a general cache or a title bake.
+
+## Measured instruction gaps
+
+```sh
+cargo run --locked --release --manifest-path tools/shader-inventory/Cargo.toml -- \
+  --graphics-lift-gaps "$TRUSTED_LLVM_21_DYLIB" gfx1013 "$NATIVE_FSSM_DIRECTORY"
+# Repeat with gfx1030.
+```
+
+The command compares the same Rust decoder against each instruction start in a complete strict reference CFG from the stored `+40` hypothesis. Matching requires width and LLVM mnemonic agreement; it does not apply the synthetic stage ABI or validate register provenance, control lowering, exports as a sequence, or pipeline linkage. It lists every unmodeled mnemonic with separate distinct-payload and static-site counts; repeated sites and already supported forms of the same mnemonic are not counted as new payloads. Both wave settings reproduce the aggregate counts below.
+
+| Reference | Stage | Framed inputs | Complete reference graphs | Graphs with no encoding gap | Matching / checked sites |
+|---|---|---:|---:|---:|---:|
+| `gfx1013` | VS | 2,236 | 1,448 | 0 | 27,902 / 950,624 |
+| `gfx1013` | PS | 12,101 | 12,091 | 0 | 640,029 / 18,916,461 |
+| `gfx1030` | VS | 2,236 | 1,242 | 0 | 18,580 / 636,957 |
+| `gfx1030` | PS | 12,101 | 6,188 | 0 | 71,690 / 2,027,022 |
+
+In the initial `gfx1013` pass, unsupported MOV forms occur in all complete VS graphs (21,368 sites), and unmodeled `v_fma_f32` appears in 1,359 (32,515 sites). Every complete PS graph contains unsupported EXP forms; `v_mul_legacy_f32_e32` occurs in 11,197 (2,474,543 sites). Scalar loads and waits also occur in most graphs. These are independent co-occurring blockers, not disjoint categories. Standalone opcode matches cannot be counted as title conversion or extrapolated to the rejected graphs, absent stages, library programs or runtime variants.

@@ -160,6 +160,15 @@ fn project_exports(
     bytes: &[u8],
     allow_checked_message_fallthrough: bool,
 ) -> Result<Exports, ResultClass> {
+    project_exports_observe(dis, bytes, allow_checked_message_fallthrough, |_, _, _| ())
+}
+
+fn project_exports_observe(
+    dis: &mut Disassembler,
+    bytes: &[u8],
+    allow_checked_message_fallthrough: bool,
+    mut observe: impl FnMut(&[u8], usize, &str),
+) -> Result<Exports, ResultClass> {
     let mut scratch = [0; 1024];
     let mut unsupported = ResultClass::Decode;
     let mut pattern = PcPattern::default();
@@ -190,6 +199,7 @@ fn project_exports(
             };
             return None;
         };
+        observe(tail, len, name);
         pattern.observe(pc, len, name, first, tail, flow);
         Some(Instruction {
             width: len / 4,
@@ -343,6 +353,75 @@ impl PrimitiveCensus {
 }
 
 #[derive(Default)]
+struct LiftGaps {
+    complete: usize,
+    no_encoding_gap: usize,
+    sites: usize,
+    accepted_sites: usize,
+    missing: BTreeMap<String, (usize, usize)>, // payloads, checked sites
+}
+
+impl LiftGaps {
+    fn observe(&mut self, dis: &mut Disassembler, bytes: &[u8]) -> Result<Exports, ResultClass> {
+        use crate::graphics_decode::{Op, decode};
+        let mut missing = BTreeMap::<String, usize>::new();
+        let (mut sites, mut accepted) = (0, 0);
+        let result = project_exports_observe(dis, bytes, false, |tail, len, name| {
+            sites += 1;
+            let mut words = [word(tail, 0).unwrap_or_default() as u32, 0];
+            let count = if len == 8
+                && let Some(ext) = word(tail, 4)
+            {
+                words[1] = ext as u32;
+                2
+            } else {
+                1
+            };
+            let matches = decode(&words[..count], 0).is_ok_and(|(width, op)| {
+                width * 4 == len
+                    && match op {
+                        Op::Move { .. } => name == "v_mov_b32_e32",
+                        Op::AddF32Literal { .. } => name == "v_add_f32_e32",
+                        Op::Export { .. } => name == "exp",
+                        Op::End => name == "s_endpgm",
+                    }
+            });
+            if matches {
+                accepted += 1;
+            } else if let Some(n) = missing.get_mut(name) {
+                *n += 1;
+            } else {
+                missing.insert(name.to_owned(), 1);
+            }
+        });
+        if result.is_ok() {
+            self.complete += 1;
+            self.no_encoding_gap += usize::from(missing.is_empty());
+            self.sites += sites;
+            self.accepted_sites += accepted;
+            for (name, count) in missing {
+                let total = self.missing.entry(name).or_default();
+                total.0 += 1;
+                total.1 += count;
+            }
+        }
+        result
+    }
+
+    fn report(self, width: u8) {
+        println!(
+            "  wave{width} lift encoding surface (not translations): {}/{} complete graphs without encoding gap; {}/{} checked sites match Rust width and mnemonic",
+            self.no_encoding_gap, self.complete, self.accepted_sites, self.sites
+        );
+        let mut rows: Vec<_> = self.missing.into_iter().collect();
+        rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        for (mnemonic, (payloads, sites)) in rows {
+            println!("    {mnemonic}: {payloads} payloads, {sites} unsupported sites");
+        }
+    }
+}
+
+#[derive(Default)]
 struct Counts {
     payloads: usize,
     bad_span: usize,
@@ -353,9 +432,10 @@ struct Counts {
     message_projection: [BTreeMap<ResultClass, usize>; 2],
     mesh_exports: [VertexExports; 2],
     mesh_prim: [PrimitiveCensus; 2],
+    lift_gaps: [LiftGaps; 2],
 }
 
-pub fn run(lib: &OsStr, cpu: Cpu, root: &Path) -> Result<(), Box<dyn Error>> {
+pub fn run(lib: &OsStr, cpu: Cpu, root: &Path, lift_gaps: bool) -> Result<(), Box<dyn Error>> {
     let llvm = Llvm::load(lib)?;
     let mut waves = [llvm.context(cpu, false)?, llvm.context(cpu, true)?];
     let mut stages = BTreeMap::<u8, Counts>::new();
@@ -391,6 +471,10 @@ pub fn run(lib: &OsStr, cpu: Cpu, root: &Path) -> Result<(), Box<dyn Error>> {
             *excluded_stages.entry(stage).or_default() += 1;
             continue;
         }
+        if lift_gaps && !matches!(stage, 4 | 5) {
+            *excluded_stages.entry(stage).or_default() += 1;
+            continue;
+        }
         let c = stages.entry(stage).or_default();
         c.payloads += 1;
         file.take((BLOB_LIMIT - HEADER + 1) as u64)
@@ -399,7 +483,18 @@ pub fn run(lib: &OsStr, cpu: Cpu, root: &Path) -> Result<(), Box<dyn Error>> {
             c.bad_span += 1;
             continue;
         };
-        let outcomes = waves.each_mut().map(|dis| checked_exports(dis, bytes));
+        let [wave64, wave32] = waves.each_mut();
+        let outcomes = if lift_gaps {
+            [
+                c.lift_gaps[0].observe(wave64, bytes),
+                c.lift_gaps[1].observe(wave32, bytes),
+            ]
+        } else {
+            [
+                checked_exports(wave64, bytes),
+                checked_exports(wave32, bytes),
+            ]
+        };
         if stage == 4 {
             if let [Ok(a), Ok(b)] = &outcomes {
                 c.different_vertex_exports += usize::from(a != b);
@@ -459,6 +554,11 @@ pub fn run(lib: &OsStr, cpu: Cpu, root: &Path) -> Result<(), Box<dyn Error>> {
         );
         for (width, counts) in [64, 32].into_iter().zip(c.waves) {
             println!("  wave{width}: {counts:?}");
+        }
+        if lift_gaps {
+            for (width, gaps) in [64, 32].into_iter().zip(c.lift_gaps) {
+                gaps.report(width);
+            }
         }
         if matches!(stage, 3 | 7) {
             for (width, counts) in [64, 32].into_iter().zip(c.message_projection) {
@@ -1012,6 +1112,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn lift_gaps_distinguish_operand_forms_and_discard_rejected_graphs() {
+        let Some(path) = std::env::var_os("LLVM_DISASM_LIB") else {
+            return;
+        };
+        let _serial_llvm = crate::llvm::test_lock();
+        let llvm = Llvm::load(&path).unwrap();
+        let mut dis = llvm.context(Cpu::Gfx1013, false).unwrap();
+        let words = [0x7e10_0304u32, 0x7e00_0200, 0xbf81_0000]; // VGPR move, then SGPR-source move.
+        let bytes: Vec<_> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let mut gaps = LiftGaps::default();
+        assert!(gaps.observe(&mut dis, &bytes[..8]).is_err());
+        assert_eq!((gaps.complete, gaps.sites, gaps.missing.len()), (0, 0, 0));
+        assert!(gaps.observe(&mut dis, &bytes).is_ok());
+        assert_eq!(
+            (
+                gaps.complete,
+                gaps.no_encoding_gap,
+                gaps.sites,
+                gaps.accepted_sites
+            ),
+            (1, 0, 3, 2)
+        );
+        assert_eq!(gaps.missing.get("v_mov_b32_e32"), Some(&(1, 1)));
     }
 
     #[test]

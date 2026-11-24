@@ -1,5 +1,7 @@
 //! Execution and archive verification for the owned native graphics lift.
 #[cfg(any(test, target_os = "macos"))]
+mod graphics_decode;
+#[cfg(any(test, target_os = "macos"))]
 mod graphics_lift;
 #[cfg(target_os = "macos")]
 mod metal_artifact;

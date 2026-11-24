@@ -1,34 +1,7 @@
 //! Strict, synthetic VS+PS contract for a small public GFX10 instruction subset.
 use std::fmt::Write;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Vgpr(u8);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Target {
-    Position,
-    Parameter,
-    Color,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Op {
-    Move {
-        dst: Vgpr,
-        src: Vgpr,
-    },
-    AddF32Literal {
-        dst: Vgpr,
-        src: Vgpr,
-        literal_bits: u32,
-    },
-    Export {
-        target: Target,
-        src: [Vgpr; 4],
-        done: bool,
-    },
-    End,
-}
+use crate::graphics_decode::{DecodeError, Op, Target, Vgpr, decode};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Stage {
@@ -65,58 +38,6 @@ const PS: &[u32] = &[
     0xbf81_0000, // s_endpgm
 ];
 
-fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), Reject> {
-    let w = words[pc];
-    let ext = || words.get(pc + 1).copied().ok_or(Reject::Truncated(pc));
-    if w == 0xbf81_0000 {
-        return Ok((1, Op::End));
-    }
-    // VOP1 opcode 1, SRC0 in 256..511 (ordinary VGPRs). No modifiers.
-    if w & 0xfe01_ff00 == 0x7e00_0300 {
-        return Ok((
-            1,
-            Op::Move {
-                dst: Vgpr((w >> 17) as u8),
-                src: Vgpr(w as u8),
-            },
-        ));
-    }
-    // VOP2 opcode 3, SRC0=255 (one literal dword), VSRC1 an ordinary VGPR.
-    if w & 0xfe00_01ff == 0x0600_00ff {
-        let literal_bits = ext()?;
-        // Scope the fixture to ordinary finite constants; no fp mode recovery.
-        if !f32::from_bits(literal_bits).is_normal() {
-            return Err(Reject::Unsupported(pc));
-        }
-        return Ok((
-            2,
-            Op::AddF32Literal {
-                dst: Vgpr((w >> 17) as u8),
-                src: Vgpr((w >> 9) as u8),
-                literal_bits,
-            },
-        ));
-    }
-    // EXP with EN=15, exact opcode, no COMPR/VM/reserved bits; DONE is explicit.
-    if w & 0xffff_f40f == 0xf800_000f {
-        let target = match (w >> 4) & 63 {
-            0 => Target::Color,
-            12 => Target::Position,
-            32 => Target::Parameter,
-            _ => return Err(Reject::Unsupported(pc)),
-        };
-        return Ok((
-            2,
-            Op::Export {
-                target,
-                src: ext()?.to_le_bytes().map(Vgpr),
-                done: w & 0x800 != 0,
-            },
-        ));
-    }
-    Err(Reject::Unsupported(pc))
-}
-
 impl Stage {
     fn input_registers(self) -> usize {
         match self {
@@ -143,7 +64,10 @@ fn lift(stage: Stage, words: &[u32]) -> Result<Vec<Op>, Reject> {
     let mut pc = 0;
     let mut exported = 0;
     while pc < words.len() {
-        let (width, op) = decode(words, pc)?;
+        let (width, op) = decode(words, pc).map_err(|err| match err {
+            DecodeError::Unsupported(pc) => Reject::Unsupported(pc),
+            DecodeError::Truncated(pc) => Reject::Truncated(pc),
+        })?;
         let require = |Vgpr(r)| {
             live[usize::from(r)]
                 .then_some(())

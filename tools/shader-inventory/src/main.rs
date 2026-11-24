@@ -3,6 +3,7 @@ mod cfg;
 mod compute_sites;
 mod coverage;
 mod embedded;
+mod graphics_decode;
 mod graphics_reachability;
 mod library_index;
 mod llvm;
@@ -371,16 +372,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return library_index::run(&path, first == "--compute-blobs");
     }
     if first == "--reachable-graphics"
+        || first == "--graphics-lift-gaps"
         || first == "--wrapped-ps-exports"
         || first == "--wrapped-vs-exports"
         || first == "--wrapped-ms-exports"
     {
         use graphics_reachability::WrappedStage;
-        let usage = "usage: xsx-shader-inventory <--reachable-graphics|--wrapped-ps-exports|--wrapped-vs-exports|--wrapped-ms-exports> <trusted LLVM 21 shared library> <gfx1013|gfx1030> <native FSSM or wrapped DXBC directory>";
+        let usage = "usage: xsx-shader-inventory <--reachable-graphics|--graphics-lift-gaps|--wrapped-ps-exports|--wrapped-vs-exports|--wrapped-ms-exports> <trusted LLVM 21 shared library> <gfx1013|gfx1030> <native FSSM or wrapped DXBC directory>";
         let lib = args.next().ok_or(usage)?;
         let cpu = llvm::Cpu::parse(&args.next().ok_or(usage)?).ok_or(usage)?;
         let path = args.next().filter(|_| args.next().is_none()).ok_or(usage)?;
-        if first != "--reachable-graphics" {
+        if first != "--reachable-graphics" && first != "--graphics-lift-gaps" {
             return graphics_reachability::run_wrapped(
                 &lib,
                 cpu,
@@ -394,7 +396,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 },
             );
         }
-        return graphics_reachability::run(&lib, cpu, std::path::Path::new(&path));
+        return graphics_reachability::run(
+            &lib,
+            cpu,
+            std::path::Path::new(&path),
+            first == "--graphics-lift-gaps",
+        );
     }
     if first == "--reachable-compute" || first == "--compute-source-join" {
         const REACHABLE_USAGE: &str = "usage: xsx-shader-inventory --reachable-compute <trusted LLVM 21 shared library> <gfx1013|gfx1030> <native FSSM directory>";
