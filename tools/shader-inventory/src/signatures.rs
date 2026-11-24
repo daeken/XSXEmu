@@ -1,7 +1,7 @@
 //! Count-only checks for the wrapped DXBC signature profile, not native ABI.
 use crate::{
     BLOB_LIMIT,
-    coverage::{Metadata, code},
+    coverage::{Metadata, code_and_tail},
     dxbc_chunks, shader_payloads, stage_name, word,
 };
 use std::{
@@ -314,6 +314,9 @@ struct NativeSpans {
     valid: usize,
     unsupported: usize,
     unset_end: usize,
+    nonempty_tail: usize,
+    nonzero_tail: usize,
+    unaligned_tail: usize,
 }
 
 fn native_stages(
@@ -337,9 +340,12 @@ fn native_stages(
             let stage_byte = payload.get(0x100).copied();
             stages.push(stage_byte);
             let totals = spans.entry(stage_byte).or_default();
-            if let Some((_, unset)) = code(payload) {
+            if let Some((_, tail, unset)) = code_and_tail(payload) {
                 totals.valid += 1;
                 totals.unset_end += usize::from(unset);
+                totals.nonempty_tail += usize::from(!tail.is_empty());
+                totals.nonzero_tail += usize::from(tail.iter().any(|&b| b != 0));
+                totals.unaligned_tail += usize::from(!tail.len().is_multiple_of(4));
             } else {
                 totals.unsupported += 1;
             }
@@ -787,8 +793,8 @@ pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
     );
     for (stage, s) in spans {
         println!(
-            "FSSM stage byte {stage:?}: {} matching raw span and suffix, {} unsupported, {} unset end words",
-            s.valid, s.unsupported, s.unset_end
+            "FSSM stage byte {stage:?}: {} matching raw span and suffix, {} unsupported, {} unset end words; {} nonempty, {} nonzero and {} non-dword-multiple post-span tails",
+            s.valid, s.unsupported, s.unset_end, s.nonempty_tail, s.nonzero_tail, s.unaligned_tail
         );
     }
     for (stage, totals) in groups {

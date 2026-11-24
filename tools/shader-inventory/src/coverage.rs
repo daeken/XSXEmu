@@ -18,6 +18,11 @@ fn qword(blob: &[u8], at: usize) -> Option<u64> {
 }
 
 pub(crate) fn code(blob: &[u8]) -> Option<(&[u8], bool)> {
+    let (code, _, unset) = code_and_tail(blob)?;
+    Some((code, unset))
+}
+
+pub(crate) fn code_and_tail(blob: &[u8]) -> Option<(&[u8], &[u8], bool)> {
     let start = usize::try_from(qword(blob, 0xc0)?).ok()?;
     let len = usize::try_from(qword(blob, 0xc8)?).ok()?;
     let recorded_end = qword(blob, 0xe8)?;
@@ -38,7 +43,7 @@ pub(crate) fn code(blob: &[u8]) -> Option<(&[u8], bool)> {
     // decoded boundary. The census separately checks the decoded last name.
     bytes
         .ends_with(&END_PGM)
-        .then_some((bytes, recorded_end == UNSET))
+        .then(|| (bytes, &blob[end..], recorded_end == UNSET))
 }
 
 pub(crate) struct Metadata {

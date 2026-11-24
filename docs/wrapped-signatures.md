@@ -65,6 +65,8 @@ The byte is present on every validated payload. The VS dual-payload case is orde
 
 The scanner also applies the existing compute raw-span checker to every wrapped native payload, **without** making a graphics entry assumption. All 26,698 satisfy its structural rules: aligned u64 start/length at `+0xc0/+0xc8`, checked stored extent, and `+0xe8` equal to the extent end or the unset sentinel. After the hypothesized `start + 40`, trimming only trailing `0xbf9f0000` leaves raw final word `0xbf810000` in every case. There are 17 unset end words: eight with stage byte `4`, five with `5`, four with `6`. This extends evidence for common framing, not for a decoded graphics entry, final instruction boundary, or equivalent execution.
 
+All 26,698 payloads contain nonempty, nonzero bytes **after** the checked stored extent. For 19,548 payloads, this tail length is not a multiple of a dword. These counts distinguish post-span data from the fill words inside the stored extent; they do not identify the post-span data's format or semantics.
+
 ## PSV0 resource declarations
 
 After the 52-byte runtime-info block, the payload has a `u32` row count at `+56`. If nonzero, a `u32` stride at `+60` is 24 in every checked file, with rows starting at `+64`. If zero, no stride word is consumed. The six little-endian row words are resource type, register space, lower bound, upper bound, kind and flags. The checker verifies type in 1–8, ordered bounds, and complete table extent. The resource checker stops at the end of this table; the element checker starts there.
