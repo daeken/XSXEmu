@@ -1104,6 +1104,61 @@ mod tests {
     }
 
     #[test]
+    fn llvm_closes_owned_signed_pc_windows_without_changing_strict_walk() {
+        let Some(path) = std::env::var_os("LLVM_DISASM_LIB") else {
+            return;
+        };
+        let _serial_llvm = crate::llvm::test_lock();
+        let llvm = Llvm::load(&path).unwrap();
+        // Public GFX10 encodings generated for these two owned programs. The
+        // add chain jumps over an invalid word; the subtract chain jumps back
+        // to the skipped s_endpgm, not into the omitted prefix.
+        let forward: [u32; 7] = [
+            0xbe94_1f00,
+            0x8014_ff14,
+            20,
+            0x8215_8015,
+            0xbe80_2014,
+            0xffff_ffff,
+            0xbf81_0000,
+        ];
+        let backward: [u32; 8] = [
+            0xbf82_0002,
+            0xbf81_0000,
+            0xffff_ffff,
+            0xbe94_1f00,
+            0x8094_ff14,
+            12,
+            0x8295_8015,
+            0xbe80_2014,
+        ];
+        let mut before_entry = backward;
+        before_entry[5] = 20;
+        let bytes = |words: &[u32]| {
+            words
+                .iter()
+                .flat_map(|n| n.to_le_bytes())
+                .collect::<Vec<_>>()
+        };
+        for cpu in [Cpu::Gfx1013, Cpu::Gfx1030] {
+            let mut dis = llvm.context(cpu, true).unwrap();
+            for words in [&forward[..], &backward] {
+                let body = bytes(words);
+                assert_eq!(
+                    reference_walk_result(&mut dis, &body),
+                    ("indirect PC", true)
+                );
+                assert!(indirect_reference_closure(&mut dis, &body, 36));
+            }
+            assert!(!indirect_reference_closure(
+                &mut dis,
+                &bytes(&before_entry),
+                36
+            ));
+        }
+    }
+
+    #[test]
     fn llvm_walks_owned_paths_and_does_not_resynchronize_when_reached_decode_fails() {
         let Some(path) = std::env::var_os("LLVM_DISASM_LIB") else {
             return;
