@@ -35,6 +35,8 @@ struct Program {
     marker_present: bool,
     conditional_equal: [bool; 3],
     conditional_same_length: [bool; 3],
+    graphics_suffix_eligible: bool,
+    graphics_suffix_exact: bool,
     nonzero_site_word: bool,
     library_profiles: HashSet<([usize; 3], bool)>,
     agreeing_profile: bool,
@@ -349,6 +351,13 @@ pub(crate) fn library_to_final_marker(span: &[u8]) -> Option<&[u8]> {
     span.get(..span.len() - 4 * from_end)
 }
 
+// Once both ends have been chosen, equal length implies exactly one start.
+fn graphics_suffix_start(library_cut: &[u8], fssm: &[u8]) -> Option<usize> {
+    let start = library_cut.len().checked_sub(fssm.len())?;
+    (start <= 512 && start.is_multiple_of(4) && fssm.len().is_multiple_of(4) && !fssm.is_empty())
+        .then_some(start)
+}
+
 fn bounded(path: &Path, limit: usize, bytes: &mut Vec<u8>) -> Result<(), Box<dyn Error>> {
     bytes.clear();
     File::open(path)?
@@ -554,6 +563,12 @@ pub(super) fn run(
             };
             count.compared += eligible.len();
             let fssm_cut = fssm_to_marker(&raw[40..]);
+            let graphics_body = GRAPHICS_STAGES
+                .contains(&stage)
+                .then(|| code(payload))
+                .flatten()
+                .map(|(body, _)| body)
+                .filter(|&body| Some(body) == fssm_cut);
             let profile = if stage == 5 && payload.get(0x100) == Some(&6) {
                 Metadata::parse(payload).map(|m| (m.group, m.wave32))
             } else {
@@ -572,6 +587,12 @@ pub(super) fn run(
                 let mut byte_match = false;
                 if let Some(library_cut) = library_to_final_marker(lib) {
                     p.marker_present = true;
+                    if let Some(body) = graphics_body
+                        && let Some(start) = graphics_suffix_start(library_cut, body)
+                    {
+                        p.graphics_suffix_eligible = true;
+                        p.graphics_suffix_exact |= library_cut.get(start..) == Some(body);
+                    }
                     if let Some(fssm_cut) = fssm_cut {
                         for (k, start) in STARTS.into_iter().enumerate() {
                             let lib = library_cut.get(start..);
@@ -1088,6 +1109,13 @@ pub(super) fn run(
                 .count(),
             offsets
         );
+        if GRAPHICS_STAGES.contains(&stage) {
+            println!(
+                "  Graphics length-derived bounded marker comparison: {} eligible programs, {} with exact suffix",
+                values().filter(|p| p.graphics_suffix_eligible).count(),
+                values().filter(|p| p.graphics_suffix_exact).count()
+            );
+        }
         if stage == 5 {
             let site_windows: Vec<_> = STARTS
                 .into_iter()
@@ -1171,6 +1199,17 @@ mod tests {
         assert_eq!(residual_occupancy(&[]), Some((0, 0)));
         assert_eq!(residual_occupancy(&residual[..23]), None);
         assert_eq!(residual_occupancy(&[0; 72]), None);
+    }
+
+    #[test]
+    fn graphics_marker_candidate_has_one_aligned_bounded_start() {
+        let fssm = [0; 8];
+        assert_eq!(graphics_suffix_start(&[0; 8], &fssm), Some(0));
+        assert_eq!(graphics_suffix_start(&[0; 68], &fssm), Some(60));
+        assert_eq!(graphics_suffix_start(&[0; 69], &fssm), None);
+        assert_eq!(graphics_suffix_start(&[0; 4], &fssm), None);
+        assert_eq!(graphics_suffix_start(&[0; 520], &fssm), Some(512));
+        assert_eq!(graphics_suffix_start(&[0; 524], &fssm), None);
     }
 
     #[test]
