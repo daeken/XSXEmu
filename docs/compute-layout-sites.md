@@ -26,3 +26,15 @@ For the 50 pairs with nonzero sites, the same command also tests **conditional**
 For both entry assumptions, the first blockers under `gfx1013` were 8 indirect PC transfers and 1 other unmodeled control instruction, with no decode rejects. Under `gfx1030` there were 29 decode rejects, 8 indirect PC transfers and 1 other unmodeled control instruction. Neither profile reported an out-of-bounds edge or overlap. This comparison disfavors assuming byte 36 for these layouts but does not authenticate byte 24 as the hardware entry. The fixture checks a site at entry, a word inside its extension, and a rejected edge back into the omitted prefix.
 
 This supplies strong offset-base and unit evidence for **nonzero** `0x42` word 1 in PS/0/9 compute. It does not establish why the loads are named, what role zero plays, whether any load is reached from an authenticated entry PC, whether the loader patches it, or how the loaded data is bound. The two tested decoder profiles are independent encoding references with no fallback; neither decode proves Xbox execution semantics. An owned unit fixture checks alignment, truncation, overflow, and the accepted words. No title shader was executed or modified.
+
+## Graphics cross-check
+
+The command also validates the 16-byte graphics stage metadata header, item tags and footer for **18,837** distinct `(slot, program, metadata)` tuples in graphics slots 0–2. For each nonzero `0x42` word 1 it checks the same span-relative byte offset and 8-byte scalar-load encoding under both CPUs and both wave settings independently. The wave settings are decoder checks, not recovered launch profiles. The unidentified slot 6 is not part of this comparison.
+
+| Stage | Zero | `s_load_dwordx4` | `s_load_dwordx8` | Other nonzero |
+|---|---:|---:|---:|---:|
+| PS | 185,092 | 2 | 2 | 0 |
+| VS | 10,180 | 2 | 0 | 0 |
+| MS | 101,762 | 0 | 0 | 0 |
+
+All six nonzero values agree under all four decoder configurations. This supports the offset interpretation in the checked PS and VS examples; the MS rows supply no nonzero example. The graphics check does not assume an entry, reachability, or a patch operation.

@@ -106,6 +106,81 @@ impl Hypothesis {
     }
 }
 
+fn graphics_items(blob: &[u8]) -> Option<&[u8]> {
+    let end = blob.len().checked_sub(32)?;
+    let items = blob.get(16..end)?;
+    (items.len() % 32 == 0
+        && word(blob, 0)? == 2
+        && word(blob, 12)? & 255 == 0x40
+        && word(blob, end)? == 0x43
+        && blob[end + 20..].iter().all(|&b| b == 0)
+        && items
+            .chunks_exact(32)
+            .all(|item| matches!(word(item, 0), Some(0x41 | 0x42))))
+    .then_some(items)
+}
+
+fn graphics(
+    library: &PipelineLibrary<'_>,
+    refs: &mut [[Disassembler; 2]; 2],
+) -> Result<(), Box<dyn Error>> {
+    let mut pairs = HashSet::new();
+    let mut counts = [[0usize; 4]; 3];
+    let mut text = [0; 1024];
+    for row in library.graphics() {
+        for (slot, item) in row.slots[..3].iter().enumerate() {
+            let Some(item) = item else {
+                continue;
+            };
+            let id = item.metadata.ok_or("missing graphics slot 0–2 metadata")?;
+            if !pairs.insert((slot, item.program, id)) {
+                continue;
+            }
+            let layout = library
+                .blob(id)
+                .and_then(graphics_items)
+                .ok_or("invalid graphics metadata framing")?;
+            let code = library
+                .program(item.program)
+                .ok_or("missing graphics program")?;
+            for item in layout.chunks_exact(32).filter(|i| word(i, 0) == Some(0x42)) {
+                let offset = word(item, 4).unwrap();
+                let class = if offset == 0 {
+                    0
+                } else if let Some((bytes, dwords)) = candidate(code, offset) {
+                    let (index, mnemonic) = if dwords == 4 {
+                        (1, "s_load_dwordx4")
+                    } else {
+                        (2, "s_load_dwordx8")
+                    };
+                    if refs.iter_mut().flatten().all(|d| {
+                        d.one(bytes, offset, &mut text).is_some_and(|(n, line)| {
+                            n == 8 && line.split_ascii_whitespace().next() == Some(mnemonic)
+                        })
+                    }) {
+                        index
+                    } else {
+                        3
+                    }
+                } else {
+                    3
+                };
+                counts[slot][class] += 1;
+            }
+        }
+    }
+    println!(
+        "Graphics comparison: {} slot/program/metadata tuples; both CPUs and both wave settings (not launch profiles)",
+        pairs.len()
+    );
+    for (slot, [zero, x4, x8, other]) in counts.into_iter().enumerate() {
+        println!(
+            "  slot {slot}: {zero} zero fields, {x4} s_load_dwordx4, {x8} s_load_dwordx8, {other} nonzero unconfirmed"
+        );
+    }
+    Ok(())
+}
+
 pub fn run(lib: &OsStr, path: &Path) -> Result<(), Box<dyn Error>> {
     let input = File::open(path)?;
     if input.metadata()?.len() > MAX_INFLATED_SIZE as u64 {
@@ -266,6 +341,7 @@ pub fn run(lib: &OsStr, path: &Path) -> Result<(), Box<dyn Error>> {
             );
         }
     }
+    graphics(&library, &mut refs)?;
     println!(
         "Entry assumptions are counterfactual, not validated launch PCs; no patch, descriptor or root binding inferred"
     );
@@ -275,6 +351,21 @@ pub fn run(lib: &OsStr, path: &Path) -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn checks_graphics_layout_framing_without_compute_header() {
+        let mut blob = [0; 80];
+        for (at, value) in [(0, 2), (12, 0x40), (16, 0x42), (48, 0x43)] {
+            blob[at] = value;
+        }
+        assert_eq!(graphics_items(&blob), Some(&blob[16..48]));
+        assert!(graphics_items(&blob[..79]).is_none());
+        for at in [0, 12, 16, 48, 79] {
+            blob[at] ^= 4;
+            assert!(graphics_items(&blob).is_none());
+            blob[at] ^= 4;
+        }
+    }
+
     #[test]
     fn conditional_entry_tracks_absolute_site_boundaries() {
         let Some(path) = std::env::var_os("LLVM_DISASM_LIB") else {
