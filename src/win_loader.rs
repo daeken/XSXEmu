@@ -1,6 +1,6 @@
 //! Win64 lookups over startup's already mapped PE graph, on the startup thread.
-//! No filesystem search, image loading/unloading, or synthetic system DLL
-//! handles. Function addresses from Rust providers may be reached through PE
+//! Can acquire/release references to startup-mapped DLLs. No filesystem
+//! search, new image loading/unloading, or synthetic system DLL handles. Function addresses from Rust providers may be reached through PE
 //! forwarders, but they never identify a PE image.
 
 use crate::providers::HostExport;
@@ -59,6 +59,18 @@ pub(crate) fn lookup(dll: &[u8], name: &[u8]) -> Option<HostExport> {
         ) => {
             export!("kernelbase.dll", "GetProcAddress", native::get_proc_address)
         }
+        (
+            b"kernel32.dll" | b"kernelbase.dll" | LIBRARY_LOADER_1_1 | LIBRARY_LOADER_1_2,
+            b"LoadLibraryExW",
+        ) => export!(
+            "kernelbase.dll",
+            "LoadLibraryExW",
+            native::load_library_ex_w
+        ),
+        (
+            b"kernel32.dll" | b"kernelbase.dll" | LIBRARY_LOADER_1_1 | LIBRARY_LOADER_1_2,
+            b"FreeLibrary",
+        ) => export!("kernelbase.dll", "FreeLibrary", native::free_library),
         (b"ntdll.dll" | b"kernel32.dll" | RTL_SUPPORT, b"RtlPcToFileHeader") => {
             export!(
                 "ntdll.dll",
@@ -72,7 +84,7 @@ pub(crate) fn lookup(dll: &[u8], name: &[u8]) -> Option<HostExport> {
 
 #[cfg(test)]
 #[test]
-fn registry_aliases_are_exact_and_do_not_advertise_dynamic_loading() {
+fn registry_aliases_are_exact() {
     for dll in [
         b"kernel32.dll".as_slice(),
         b"kernelbase.dll",
@@ -85,12 +97,15 @@ fn registry_aliases_are_exact_and_do_not_advertise_dynamic_loading() {
             "GetModuleHandleExW",
             "GetModuleFileNameW",
             "GetProcAddress",
+            "LoadLibraryExW",
+            "FreeLibrary",
         ] {
             assert_eq!(lookup(dll, name.as_bytes()).unwrap().symbol, name);
         }
         assert!(lookup(dll, b"getprocaddress").is_none());
-        assert!(lookup(dll, b"LoadLibraryExW").is_none());
-        assert!(lookup(dll, b"FreeLibrary").is_none());
+        assert!(lookup(dll, b"LoadLibraryW").is_none());
+        assert!(lookup(dll, b"LoadLibraryExA").is_none());
+        assert!(lookup(dll, b"FreeLibraryAndExitThread").is_none());
     }
     assert_eq!(
         lookup(RTL_SUPPORT, b"RtlPcToFileHeader").unwrap().provider,
@@ -106,11 +121,13 @@ pub(crate) use native::register;
 mod native {
     use crate::{link::Symbol, providers};
     use std::{
-        cell::RefCell,
+        cell::{Cell, RefCell},
         collections::{HashMap, HashSet},
     };
 
     const ERROR_INVALID_HANDLE: u32 = 6;
+    const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
+    const ERROR_NOT_SUPPORTED: u32 = 50;
     const ERROR_INVALID_PARAMETER: u32 = 87;
     const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
     const ERROR_MOD_NOT_FOUND: u32 = 126;
@@ -119,6 +136,8 @@ mod native {
     const PIN: u32 = 1;
     const UNCHANGED_REFCOUNT: u32 = 2;
     const FROM_ADDRESS: u32 = 4;
+    const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x800;
+    const GUEST_SYSTEM32: &str = "c:/windows/system32/";
     const MAX_WIDE_NAME: usize = 32_768;
     const MAX_EXPORT_NAME: usize = 65_536;
 
@@ -138,6 +157,8 @@ mod native {
         filename: Vec<u16>,
         path_key: String,
         link_name: String,
+        // Startup's ownership is independent of these guest acquisitions.
+        references: Cell<u32>,
         names: HashMap<Vec<u8>, usize>,
         ordinals: HashMap<u32, usize>,
         targets: Vec<Target>,
@@ -164,6 +185,32 @@ mod native {
         key
     }
 
+    fn module_key(name: &str) -> Option<String> {
+        let mut key = path_key(name);
+        let leaf = basename(&key);
+        if leaf.is_empty() {
+            return None;
+        }
+        if leaf.ends_with('.') {
+            key.pop(); // A trailing dot suppresses the default extension.
+        } else if !leaf.contains('.') {
+            key.push_str(".dll");
+        }
+        Some(key)
+    }
+
+    impl Image {
+        fn acquire(&self) -> Result<usize, u32> {
+            let next = self
+                .references
+                .get()
+                .checked_add(1)
+                .ok_or(ERROR_NOT_ENOUGH_MEMORY)?;
+            self.references.set(next);
+            Ok(self.base)
+        }
+    }
+
     impl Graph {
         fn containing(&self, pc: usize) -> Option<&Image> {
             self.images.iter().find(|m| (m.base..m.end).contains(&pc))
@@ -177,16 +224,7 @@ mod native {
             let Some(name) = name else {
                 return self.images.first();
             };
-            let mut key = path_key(name);
-            let leaf = basename(&key);
-            if leaf.is_empty() {
-                return None;
-            }
-            if leaf.ends_with('.') {
-                key.pop(); // A trailing dot suppresses the default extension.
-            } else if !leaf.contains('.') {
-                key.push_str(".dll");
-            }
+            let key = module_key(name)?;
             if key.contains(['/', ':']) {
                 self.images.iter().find(|m| m.path_key == key)
             } else {
@@ -339,6 +377,7 @@ mod native {
                     filename: guest_path.encode_utf16().collect(),
                     path_key: path_key(&guest_path),
                     link_name: basename(path).to_owned(),
+                    references: Default::default(),
                     names: Default::default(),
                     ordinals: Default::default(),
                     targets: Vec::new(),
@@ -447,6 +486,113 @@ mod native {
             let get: extern "win64" fn() -> u32 =
                 unsafe { std::mem::transmute(export.address().unwrap()) };
             get()
+        }
+
+        #[test]
+        fn load_library_reuses_only_mapped_guest_dlls_and_balances_references() {
+            let exe = image(None);
+            let mut dll = image(None);
+            dll[0x96..0x98].copy_from_slice(&0x2000u16.to_le_bytes());
+            let exe = Pe::parse(&exe).unwrap();
+            let dll = Pe::parse(&dll).unwrap();
+            let inputs = [
+                ("/app/Example.exe", &exe, MAIN as u64),
+                ("/app/Helper.dll", &dll, DLL as u64),
+                ("/Windows/System32/HELPER.DLL", &dll, FWD as u64),
+                ("/Windows/System32/nested/Nested.dll", &dll, CYCLE as u64),
+                ("/app/Plain", &dll, HOST as u64),
+            ];
+            let scope = register(inputs, None, true).unwrap();
+            let load = providers::lookup(super::super::LIBRARY_LOADER_1_2, b"LoadLibraryExW")
+                .unwrap()
+                .address()
+                .unwrap();
+            let free = providers::lookup(b"kernelbase.dll", b"FreeLibrary")
+                .unwrap()
+                .address()
+                .unwrap();
+            let load: unsafe extern "win64" fn(*const u16, usize, u32) -> usize =
+                unsafe { std::mem::transmute(load) };
+            let free: extern "win64" fn(usize) -> i32 = unsafe { std::mem::transmute(free) };
+            let load_name = |name: &str, flags| unsafe { load(wide(name).as_ptr(), 0, flags) };
+            assert_eq!(free(0), 0);
+            assert_eq!(free(DLL + 1), 0);
+            assert_eq!(free(DLL), 0); // Startup's reference cannot be freed.
+            assert_eq!(last_error(), ERROR_INVALID_HANDLE);
+
+            for name in [
+                "Missing.dll",
+                "kernelbase.dll",
+                "api-ms-win-core-synch-l1-2-0",
+                "Example.exe",
+            ] {
+                for flags in [0, LOAD_LIBRARY_SEARCH_SYSTEM32] {
+                    assert_eq!(load_name(name, flags), 0, "{name} with {flags:#x}");
+                    assert_eq!(last_error(), ERROR_MOD_NOT_FOUND);
+                }
+            }
+            assert_eq!(load_name("Nested", LOAD_LIBRARY_SEARCH_SYSTEM32), 0);
+            assert_eq!(last_error(), ERROR_MOD_NOT_FOUND);
+            assert_eq!(load_name("Nested", 0), CYCLE);
+            assert_eq!(free(CYCLE), 1);
+
+            assert_eq!(load_name("Helper", 0x802), 0); // No datafile or combined flags.
+            assert_eq!(last_error(), ERROR_NOT_SUPPORTED);
+            for path in [
+                r"C:\Windows\System32\Helper.dll",
+                r".\Helper.dll",
+                "/app/Helper.dll",
+            ] {
+                assert_eq!(load_name(path, 0), 0);
+                assert_eq!(last_error(), ERROR_NOT_SUPPORTED);
+            }
+            assert_eq!(load_name("", 0), 0);
+            assert_eq!(last_error(), ERROR_INVALID_PARAMETER);
+            unsafe {
+                let malformed = [0xd800u16, 0];
+                for name in [ptr::null(), malformed.as_ptr()] {
+                    assert_eq!(load(name, 0, 0), 0);
+                    assert_eq!(last_error(), ERROR_INVALID_PARAMETER);
+                }
+                assert_eq!(load(wide("Helper").as_ptr(), 1, 0), 0);
+                assert_eq!(last_error(), ERROR_INVALID_PARAMETER);
+            }
+
+            providers::set_last_error(333);
+            assert_eq!(load_name("hELPer", 0), DLL);
+            assert_eq!(load_name("HELPER.dll", 0), DLL);
+            assert_eq!(load_name("Helper", LOAD_LIBRARY_SEARCH_SYSTEM32), FWD);
+            assert_eq!(load_name("Plain.", 0), HOST);
+            assert_eq!(free(HOST), 1);
+            assert_eq!(free(FWD), 1);
+            unsafe {
+                assert_eq!(get_proc_address(DLL, 7), DLL + PROC_RVA);
+                let mut out = 0;
+                assert_eq!(
+                    get_module_handle_ex_w(FROM_ADDRESS, (DLL + 1) as _, &mut out),
+                    1
+                );
+                assert_eq!(out, DLL);
+                assert_eq!(
+                    get_module_handle_ex_w(UNCHANGED_REFCOUNT, wide("Helper").as_ptr(), &mut out),
+                    1
+                );
+                assert_eq!(get_module_handle_w(wide("Helper").as_ptr()), DLL);
+            }
+            for _ in 0..3 {
+                assert_eq!(free(DLL), 1);
+            }
+            assert_eq!(last_error(), 333);
+            assert_eq!(free(DLL), 0);
+            assert_eq!(last_error(), ERROR_INVALID_HANDLE);
+            assert_eq!(unsafe { get_proc_address(DLL, 7) }, DLL + PROC_RVA);
+            assert_eq!(load_name("Helper.dll", 0), DLL);
+            drop(scope);
+            assert_eq!(free(DLL), 0);
+            assert_eq!(load_name("Helper.dll", 0), 0);
+            assert_eq!(last_error(), ERROR_MOD_NOT_FOUND);
+            let _scope = register(inputs, None, true).unwrap();
+            assert_eq!(free(DLL), 0); // New startup did not inherit guest references.
         }
 
         #[test]
@@ -573,20 +719,75 @@ mod native {
         (0..max).find(|&i| unsafe { ptr.add(i).read() } == T::default())
     }
 
-    unsafe fn module_handle(name: *const u16) -> Result<usize, u32> {
-        let name = if name.is_null() {
-            None
-        } else {
-            let len = unsafe { terminated(name, MAX_WIDE_NAME) }.ok_or(ERROR_INVALID_PARAMETER)?;
-            let units = unsafe { std::slice::from_raw_parts(name, len) };
-            Some(String::from_utf16(units).map_err(|_| ERROR_INVALID_PARAMETER)?)
-        };
-        graph(|g| g.and_then(|g| g.by_name(name.as_deref())).map(|m| m.base))
-            .ok_or(ERROR_MOD_NOT_FOUND)
+    unsafe fn wide_name(name: *const u16) -> Result<Option<String>, u32> {
+        if name.is_null() {
+            return Ok(None);
+        }
+        let len = unsafe { terminated(name, MAX_WIDE_NAME) }.ok_or(ERROR_INVALID_PARAMETER)?;
+        let units = unsafe { std::slice::from_raw_parts(name, len) };
+        String::from_utf16(units)
+            .map(Some)
+            .map_err(|_| ERROR_INVALID_PARAMETER)
     }
 
     pub(super) unsafe extern "win64" fn get_module_handle_w(name: *const u16) -> usize {
-        unsafe { module_handle(name) }.unwrap_or_else(fail)
+        let name = match unsafe { wide_name(name) } {
+            Ok(name) => name,
+            Err(error) => return fail(error),
+        };
+        graph(|g| g.and_then(|g| g.by_name(name.as_deref())).map(|m| m.base))
+            .unwrap_or_else(|| fail(ERROR_MOD_NOT_FOUND))
+    }
+
+    pub(super) unsafe extern "win64" fn load_library_ex_w(
+        name: *const u16,
+        file: usize,
+        flags: u32,
+    ) -> usize {
+        if file != 0 || name.is_null() {
+            return fail(ERROR_INVALID_PARAMETER);
+        }
+        if !matches!(flags, 0 | LOAD_LIBRARY_SEARCH_SYSTEM32) {
+            return fail(ERROR_NOT_SUPPORTED);
+        }
+        let name = match unsafe { wide_name(name) } {
+            Ok(Some(name)) if !name.is_empty() => name,
+            _ => return fail(ERROR_INVALID_PARAMETER),
+        };
+        if name.contains(['/', '\\', ':']) {
+            return fail(ERROR_NOT_SUPPORTED);
+        }
+        let Some(key) = module_key(&name).filter(|key| !key.is_empty()) else {
+            return fail(ERROR_INVALID_PARAMETER);
+        };
+        // This search never leaves the graph. In particular API-set routes
+        // and statically bound Rust providers do not stand for mapped DLLs.
+        graph(|g| {
+            let image = g.and_then(|g| {
+                g.images.iter().skip(1).find(|m| {
+                    if flags == LOAD_LIBRARY_SEARCH_SYSTEM32 {
+                        m.path_key.strip_prefix(GUEST_SYSTEM32) == Some(key.as_str())
+                    } else {
+                        basename(&m.path_key) == key
+                    }
+                })
+            });
+            image.ok_or(ERROR_MOD_NOT_FOUND).and_then(Image::acquire)
+        })
+        .unwrap_or_else(fail)
+    }
+
+    pub(super) extern "win64" fn free_library(module: usize) -> i32 {
+        graph(|g| {
+            let Some(image) = g.and_then(|g| g.by_handle(module)) else {
+                return fail(ERROR_INVALID_HANDLE);
+            };
+            let Some(next) = image.references.get().checked_sub(1) else {
+                return fail(ERROR_INVALID_HANDLE);
+            };
+            image.references.set(next);
+            1
+        })
     }
 
     pub(super) unsafe extern "win64" fn get_module_handle_ex_w(
@@ -604,14 +805,29 @@ mod native {
             unsafe { out.write(0) };
             return fail(ERROR_INVALID_PARAMETER);
         }
-        // All images are already retained through process detach. PIN and the
-        // default refcount operation cannot extend that fixed lifetime.
-        let result = if flags & FROM_ADDRESS != 0 {
-            graph(|g| g.and_then(|g| g.containing(name as usize)).map(|m| m.base))
-                .ok_or(ERROR_MOD_NOT_FOUND)
-        } else {
-            unsafe { module_handle(name) }
-        };
+        let result = (|| {
+            let by_address = flags & FROM_ADDRESS != 0;
+            let module_name = if by_address {
+                None
+            } else {
+                unsafe { wide_name(name) }?
+            };
+            graph(|g| {
+                let g = g.ok_or(ERROR_MOD_NOT_FOUND)?;
+                let image = if by_address {
+                    g.containing(name as usize)
+                } else {
+                    g.by_name(module_name.as_deref())
+                }
+                .ok_or(ERROR_MOD_NOT_FOUND)?;
+                if flags & UNCHANGED_REFCOUNT != 0 {
+                    Ok(image.base)
+                } else {
+                    // The graph already pins every image through process detach.
+                    image.acquire()
+                }
+            })
+        })();
         match result {
             Ok(base) => {
                 unsafe { out.write(base) };

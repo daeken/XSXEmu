@@ -31,7 +31,9 @@ cargo run --offline -- audit /path/to/title.exe --dll-dir /path/to/x64-dlls \
 
 The bounded AMD64 GuardCF profile installs enforcing check and dispatch thunks before entry. Targets are limited to exact validated entries from guarded images, statically bound Rust functions, and the exact entry addresses of any bound missing-import traps; suppressed entries are denied. Other mitigation configurations can still be rejected.
 
-A Windows TEB, full exception dispatch, dynamic library loading, and Xbox graphics are still unimplemented. Static AMD64 unwind primitives are available but do not provide exception dispatch. Don't substitute desktop D3D12 for `d3d12_xs.dll`: the Xbox device, memory and layout contracts need an explicit adapter.
+With `--rust-providers`, `LoadLibraryExW` and `FreeLibrary` can acquire and release references to startup-mapped guest DLLs on the startup thread. `LoadLibraryExW` takes a bare case-insensitive DLL name (default `.dll` extension) and a null file handle. Flags `0` select the first mapped DLL with that name; `LOAD_LIBRARY_SEARCH_SYSTEM32` (`0x800`) limits matches to DLLs already registered as direct children of guest `C:\Windows\System32`. Paths and other flags are unsupported. Neither mode opens files, uses the static DLL roots as a dynamic search path, redirects API-set names, nor turns Rust providers into `HMODULE`s. A missing match returns `NULL` and `ERROR_MOD_NOT_FOUND`. A successful acquisition returns the actual PE base. `FreeLibrary` releases an acquired reference, not startup's ownership; images remain mapped through process detach. Borrowed `GetModuleHandleW` handles do not acquire a reference.
+
+A Windows TEB, full exception dispatch, dynamic mapping of new libraries, and Xbox graphics are still unimplemented. Static AMD64 unwind primitives are available but do not provide exception dispatch. Don't substitute desktop D3D12 for `d3d12_xs.dll`: the Xbox device, memory and layout contracts need an explicit adapter.
 
 ## Verification
 
@@ -56,9 +58,9 @@ The script builds an original freestanding Rust `no_std` PE using `rustc` and it
 
 The script requires `/Volumes/External2/windlls/ucrtbase.dll` with SHA-256 `7ee229626b22799faa28cd7c22d4ff2ad0603c17e5f5ee9086fa7cf6483331fb`. It symlinks that file into an otherwise empty DLL root and uses Rust Win32 providers; sibling Windows DLLs are not searched. The default schema is `/Volumes/External2/gta6/win11-arm64-reference/apisetschema.dll` (only its API-set data is read); set `UCRT_API_SET` to an absolute path to use another local schema. Neither DLL is copied or redistributed.
 
-The default invocation builds a native-host auditor, inspects the EXE, and runs `audit --dll-dir <isolated-root> --api-set <schema> --rust-providers --symbols`. On the fixture's baseline with the default schema, both EXE imports bind, but 20 of the UCRT's 134 IAT slots remain unresolved (for example `HeapCompact` and `RaiseException`): **116/136 resolved, 114 Rust, 0 descriptor failures**. The underlying audit exits nonzero; the script treats the confirmed unresolved-import report as a successful diagnostic. Provider or schema changes can change those counts. No guest code runs in the default mode.
+The default invocation builds a native-host auditor, inspects the EXE, and runs `audit --dll-dir <isolated-root> --api-set <schema> --rust-providers --symbols`. With the default schema, both EXE imports bind, but 18 of the UCRT's 134 IAT slots remain unresolved (for example `HeapCompact` and `RaiseException`): **118/136 resolved, 116 Rust, 0 descriptor failures**. The underlying audit exits nonzero; the script treats the confirmed unresolved-import report as a successful diagnostic. Provider or schema changes can change those counts. No guest code runs in the default mode.
 
-**Runtime probe:** use an x86-64 macOS Rust target (and Rosetta on Apple Silicon). The first run against this DLL reached `LoadLibraryExW` during UCRT process attach and stopped at the missing-import diagnostic; attach and the heap round-trip have not yet completed.
+**Verified opt-in:** use an x86-64 macOS Rust target (and Rosetta on Apple Silicon):
 
 ```sh
 rustup target add x86_64-apple-darwin
@@ -66,3 +68,5 @@ sh tools/ucrt-fixture.sh --run
 ```
 
 This audits first, then invokes `run <fixture.exe> --dll-dir <isolated-root> --api-set <schema> --rust-providers --trace-missing-imports`. The static import makes the loader map UCRT and call its `DLL_PROCESS_ATTACH` before the EXE entry. The EXE allocates four bytes with `malloc`, writes and reads a marker, calls `free`, and returns 42 on success (1 for a null allocation, 2 for a marker mismatch). Startup or a called missing import can stop the run before a guest result. A static audit does not establish that attach, the heap calls, or detach work. Execution is not sandboxed; this opt-in is for the trusted fixture and pinned local DLL only, never a game title.
+
+The pinned UCRT's first attach-time dynamic probe calls `LoadLibraryExW(L"api-ms-win-core-synch-l1-2-0", NULL, 0x800)` from RVA `0x45fcb` (return RVA `0x45fd1`, IAT RVA `0xb62a8`). The UCRT helper starts at RVA `0x45f28` and uses the load to try optional exports: it caches misses and moves on to the next candidate. The isolated guest has no mapped match; a real module-not-found result lets UCRT continue without fabricating a handle. On Rosetta the fixture completes process attach and the `malloc`/`free` round trip and returns 42 without calling any unresolved static import.
