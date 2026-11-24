@@ -264,8 +264,35 @@ no signals and tests no fault handling. Only the private setter, assembly and
 owned PE execute with guest GS. Unexpected exits and timeouts fail the probe.
 Detach is an explicit normal-return step, not process teardown emulation.
 There are no external PE inputs, extra guest threads, or Wine dependency.
-Production startup still rejects static TLS. This is neither a general import
-bridge nor a sandbox for other images.
+Default startup still rejects static TLS. This standalone proof is neither a
+general import bridge nor a sandbox for other images.
+
+## Opt-in child: audited LastError pair
+
+`run <trusted-fixture.exe> --experimental-static-tls --rust-providers` permits
+only the exact Rust `GetLastError` and `SetLastError` export identities,
+including registry aliases that resolve to those same entries. The ntdll
+`Rtl*LastWin32Error` aliases are not accepted, even though their raw Rust
+addresses match. Unbridged provider bindings fail before entry, and
+`--trace-missing-imports` is not supported in this child.
+
+The startup binder patches and registers the actual Win64 bridge entries,
+not the raw Rust exports. Using the `c800404` frame/GS proof, the thunks
+preserve Win64 nonvolatiles across SysV calls, check host GS before Rust, and
+check guest GS before returning. Only the fixed `DWORD(void)` and
+`void(DWORD)` signatures are supported. The guest DWORD at `GS:[0x68]` is
+initially zero and authoritative: the adapters transfer it to/from the
+ordinary provider's thread-local cell as needed and restore the previous
+host value. The guest signal mask remains in place throughout. There are
+no nested guest calls, dynamic lookup, unwind, or additional guest threads
+in this bridge lane.
+
+`cargo test --target x86_64-apple-darwin --test static_tls_lane` runs an
+original no-CRT PE that uses the static TLS vector and imports the pair
+through its IAT. The callback uses direct calls and the entry uses both
+GuardCF thunks. The fixture checks direct TEB stores against API reads,
+API writes against direct reads, persistence through detach, and Win64
+nonvolatile register sentinels. It does not execute a game or UCRT.
 
 ## Controlled execution plan
 

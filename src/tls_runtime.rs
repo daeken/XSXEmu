@@ -2,7 +2,7 @@
 //! This is an ABI experiment for trusted PE code, not confinement or SEH.
 //! The public CLI starts a fresh child before opening the image graph and
 //! kills/reaps it after ten seconds if it has not exited. Only the initial
-//! thread and two TEB fields are provided. There is no dynamic TLS, thread
+//! thread and three TEB fields are provided. There is no dynamic TLS, thread
 //! notification, or exception recovery. DLLs attach dependency-first and
 //! detach in reverse; EXE notifications bracket entry. TLS callbacks precede
 //! the same module's DllMain on both notifications. A rejected attach detaches
@@ -12,6 +12,7 @@ use crate::{
     guest::GuestMemory,
     link::BindingTarget,
     pe::Pe,
+    providers::{self, HostExport},
     static_tls::{self, Image, ImageId, Limits, PatchSites, Plan},
     win_cfg::CfgMetadata,
 };
@@ -28,6 +29,9 @@ use std::{
 };
 
 const CHILD_TIMEOUT: Duration = Duration::from_secs(10);
+const LAST_ERROR_OFFSET: usize = 0x68;
+// Private word in this minimal stub, not a supported Windows TEB field.
+const CONTEXT_OFFSET: usize = 0xf8;
 
 pub fn spawn_child(image: &Path, args: &[OsString]) -> Result<ExitCode> {
     let mut child = Command::new(std::env::current_exe()?)
@@ -86,6 +90,11 @@ unsafe extern "C" {
     fn xsxemu_tls_call(ctx: *const Context, target: u64, image: u64, reason: u32) -> u32;
 }
 
+unsafe extern "win64" {
+    fn xsxemu_tls_get_last_error() -> u32;
+    fn xsxemu_tls_set_last_error(error: u32);
+}
+
 pub fn require_rosetta() -> Result<()> {
     let mut translated: c_int = 0;
     let mut len = size_of::<c_int>();
@@ -121,6 +130,10 @@ global_asm!(include_str!("tls_runtime.S"),
     host30 = const offset_of!(Context, host30),
     vector = const offset_of!(Context, vector),
     setter = const offset_of!(Context, setter),
+    context_slot = const CONTEXT_OFFSET,
+    last_error = const LAST_ERROR_OFFSET,
+    get_error = sym providers::tls_child_get_last_error,
+    set_error = sym providers::tls_child_set_last_error,
     options(att_syntax),
 );
 
@@ -157,6 +170,25 @@ impl Context {
     }
 }
 
+// Compare the complete registry identity, not just a name or address. In
+// particular, the Rtl* aliases share raw code but are not audited bridge rows.
+pub fn bridge_address(export: HostExport, opt_in: bool) -> Result<u64> {
+    if opt_in {
+        let lookup = |name| providers::lookup(b"kernelbase.dll", name);
+        if lookup(b"GetLastError") == Some(export) {
+            return Ok(xsxemu_tls_get_last_error as *const () as u64);
+        }
+        if lookup(b"SetLastError") == Some(export) {
+            return Ok(xsxemu_tls_set_last_error as *const () as u64);
+        }
+    }
+    Err(format!(
+        "experimental static TLS has no enabled audited bridge for {}!{}",
+        export.provider, export.symbol
+    )
+    .into())
+}
+
 pub struct PatchWrites(Vec<Vec<u32>>);
 
 fn slot_hits(slots: &[u32], range: &Range<u32>) -> bool {
@@ -171,6 +203,7 @@ impl PatchWrites {
         pes: &[Pe<'_>],
         bindings: &[(usize, u32, BindingTarget)],
         cfgs: &[Option<CfgMetadata<'_>>],
+        rust_providers: bool,
     ) -> Result<Self> {
         if pes.is_empty() || pes.len() > Limits::default().images {
             return Err("experimental static TLS image count outside profile".into());
@@ -182,8 +215,8 @@ impl PatchWrites {
             }
         }
         for &(i, rva, target) in bindings {
-            if !matches!(target, BindingTarget::Pe(_)) {
-                return Err("experimental static TLS accepts only PE import targets".into());
+            if let BindingTarget::Rust(export) = target {
+                bridge_address(export, rust_providers)?;
             }
             writes[i].push(rva);
         }
@@ -375,7 +408,8 @@ pub fn run(
     }
     let thread = plan.new_thread()?;
     let vector = thread.vector_address().ok_or("missing static TLS vector")?;
-    // Minimal TEB stub: only Self and ThreadLocalStoragePointer are supplied.
+    // Minimal TEB stub: Self, ThreadLocalStoragePointer and LastErrorValue
+    // (zero initially, shared by direct guest accesses and the two bridges).
     let mut teb = [0u64; 32];
     let teb_ptr = teb.as_mut_ptr();
     let guest_base = teb_ptr.addr() as u64;
@@ -384,6 +418,13 @@ pub fn run(
         teb_ptr.add(0x58 / 8).write(vector);
     }
     let ctx = Context::capture(guest_base, vector)?;
+    // Keep this pointer and the stub live through all notifications and entry.
+    unsafe {
+        teb_ptr
+            .add(CONTEXT_OFFSET / 8)
+            .cast::<*const Context>()
+            .write(&raw const ctx)
+    };
     let call = |target, image, reason| {
         // All targets are in sealed executable sections, and the caller opted
         // into running trusted Win64 code that returns without unwinding.

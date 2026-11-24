@@ -158,8 +158,17 @@ mod native {
         images: &[(&str, &[u8])],
         bindings: &[(usize, u32, BindingTarget)],
         attach_order: &[usize],
+        rust_providers: bool,
     ) -> Result<u32> {
-        run_impl(images, bindings, &[], attach_order, None, false, true)
+        run_impl(
+            images,
+            bindings,
+            &[],
+            attach_order,
+            None,
+            rust_providers,
+            true,
+        )
     }
 
     fn run_impl(
@@ -187,8 +196,11 @@ mod native {
             .collect::<Result<Vec<_>>>()?
             .into_iter()
             .unzip();
+        if static_tls && !missing.is_empty() {
+            return Err("experimental static TLS does not support trace thunks".into());
+        }
         let tls_writes = static_tls
-            .then(|| tls_runtime::PatchWrites::validate(&pes, bindings, &cfgs))
+            .then(|| tls_runtime::PatchWrites::validate(&pes, bindings, &cfgs, rust_providers))
             .transpose()?;
         validate_trap_slots(&pes, bindings, missing)?;
         let mut targets = cfgs.iter().any(Option::is_some).then(Targets::default);
@@ -216,10 +228,16 @@ mod native {
                     .checked_add(u64::from(export.export_rva))
                     .ok_or("export address overflow")?,
                 BindingTarget::Rust(export) => {
-                    let addr = export
-                        .address()
-                        .ok_or("Rust provider has no executable address on this host")?
-                        as u64;
+                    let addr = if static_tls {
+                        tls_runtime::bridge_address(export, rust_providers)?
+                    } else {
+                        export
+                            .address()
+                            .ok_or("Rust provider has no executable address on this host")?
+                            as u64
+                    };
+                    // Register the exact IAT entry. In the TLS child that is
+                    // only the bridge, never the raw Rust export or adapter.
                     if let Some(targets) = &mut targets {
                         targets.add_bound_host_target(addr)?;
                     }
@@ -283,8 +301,8 @@ mod native {
         }
         if let Some(tls) = tls {
             // The existing check/dispatch thunks are GS-neutral leaf assembly.
-            // The registry has only PE GFIDs: Rust targets and trace thunks are
-            // already refused. No loader or unwind provider is installed.
+            // The registry has only PE GFIDs and bound audited bridge
+            // entries. No loader or unwind provider is installed.
             let _cfg_registration = targets.map(Targets::install).transpose()?;
             return tls_runtime::run(&tls, images, &pes, &memories, attach_order);
         }

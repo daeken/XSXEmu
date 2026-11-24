@@ -7,6 +7,7 @@ _static_tls_fixture:
     .long Ldll_cb-Ltext, Ldll_main-Ltext, Lstep-Ltext
     .long Lsolo_cb-Ltext, Lsolo_entry-Ltext
     .long Lcfg_entry-Ltext, Lcfg_target-Ltext
+    .long Lbridge_cb-Ltext, Lbridge_entry-Ltext
 Ltext:
 .macro tls index
     leaq Ltext(%rip), %r11
@@ -142,6 +143,93 @@ Lcfg_target:
     tls 0
     phase 1, 2
     movl $44, %eax
+    retq
+/* The TLS callback uses direct IAT calls; entry uses both CFG thunks. */
+Lbridge_cb:
+    tls 0
+    args
+    testl %edx, %edx
+    je Lbridge_detach
+    cmpl $1, %edx
+    jne Lbad
+    phase 0, 1
+    subq $40, %rsp
+    callq *{iat_delta}(%r11)
+    testl %eax, %eax             /* new guest TEB is zero-initialized */
+    jne Lbad
+    movl $0x89345678, %gs:0x68   /* direct guest store, observed at entry */
+    addq $40, %rsp
+    retq
+Lbridge_detach:
+    phase 2, 3
+    cmpl $0xfedcba98, %gs:0x68
+    jne Lbad
+    subq $40, %rsp
+    callq *{iat_delta}(%r11)
+    cmpl $0xfedcba98, %eax
+    jne Lbad
+    addq $40, %rsp
+    retq
+
+.set BRIDGE_REJECT_CHECK, 1
+.set BRIDGE_REJECT_DISPATCH, 2
+.set BRIDGE_SET_VALUE, 0xfedcba98
+.macro bridge_cfg slot
+    leaq Ltext(%rip), %r11
+    movq {iat_delta}+\slot(%r11), %rcx
+    cmpl $BRIDGE_REJECT_CHECK, {mode_delta}(%r11)
+    jne 1f
+    incq %rcx
+1:
+    callq *{check_delta}(%r11)   /* RCX is exact target, checked and preserved */
+    movq %rcx, %rax
+    cmpl $BRIDGE_REJECT_DISPATCH, {mode_delta}(%r11)
+    jne 2f
+    incq %rax
+2:
+    movl $BRIDGE_SET_VALUE, %ecx  /* first Win64 argument for SetLastError */
+    callq *{dispatch_delta}(%r11)
+.endm
+
+Lbridge_entry:
+    tls 0
+    phase 1, 2
+    pushq %rdi
+    pushq %rsi
+    pushq %r12
+    subq $192, %rsp             /* home space and Win64 XMM saves */
+    .irp n,6,7,8,9,10,11,12,13,14,15
+        movaps %xmm\n, 32+16*(\n-6)(%rsp)
+        pcmpeqb %xmm\n, %xmm\n
+    .endr
+    movl $0x11111111, %edi
+    movl $0x22222222, %esi
+    movl $0x33333333, %r12d
+    bridge_cfg 0                /* GetLastError reads the callback's store */
+    cmpl $0x89345678, %eax
+    jne Lbad
+    bridge_cfg 8                /* SetLastError writes the guest TEB DWORD */
+    cmpl $0xfedcba98, %gs:0x68
+    jne Lbad
+    cmpq $0x11111111, %rdi
+    jne Lbad
+    cmpq $0x22222222, %rsi
+    jne Lbad
+    cmpq $0x33333333, %r12
+    jne Lbad
+    .irp n,6,7,8,9,10,11,12,13,14,15
+        pcmpeqb %xmm0, %xmm0
+        pcmpeqb %xmm\n, %xmm0
+        pmovmskb %xmm0, %eax
+        cmpl $0xffff, %eax
+        jne Lbad
+        movaps 32+16*(\n-6)(%rsp), %xmm\n
+    .endr
+    addq $192, %rsp
+    popq %r12
+    popq %rsi
+    popq %rdi
+    movl $45, %eax
     retq
 Lbad:
     ud2

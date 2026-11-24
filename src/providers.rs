@@ -55,6 +55,9 @@ pub(crate) mod win_unwind;
 #[cfg(target_arch = "x86_64")]
 pub(crate) use native::set_last_error;
 
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+pub(crate) use native::{tls_child_get_last_error, tls_child_set_last_error};
+
 /// Whether the registry has any exports for this exact lowercase module name.
 pub fn has_dll(dll: &[u8]) -> bool {
     #[cfg(target_os = "macos")]
@@ -251,6 +254,29 @@ mod native {
 
     pub(crate) extern "win64" fn set_last_error(error: u32) {
         LAST_ERROR.set(error);
+    }
+
+    // These two fixed-signature adapters run with checked host GS, on the
+    // signal-masked initial thread. No callback, unwind, or other provider
+    // is permitted in this scope. The guest DWORD is authoritative between
+    // calls; the ordinary provider's host-thread state is not leaked to it.
+    #[cfg(target_os = "macos")]
+    pub(crate) unsafe extern "C" fn tls_child_get_last_error(teb_error: *mut u32) -> u32 {
+        LAST_ERROR.with(|cell| {
+            let saved = cell.replace(unsafe { teb_error.read() });
+            let result = get_last_error();
+            cell.set(saved);
+            result
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) unsafe extern "C" fn tls_child_set_last_error(teb_error: *mut u32, error: u32) {
+        LAST_ERROR.with(|cell| {
+            let saved = cell.get();
+            set_last_error(error);
+            unsafe { teb_error.write(cell.replace(saved)) };
+        });
     }
 
     pub(super) extern "win64" fn current_process_id() -> u32 {
@@ -634,6 +660,21 @@ mod tests {
             assert_eq!(out, 0);
             assert_eq!(native::heap_free(heap, 0, block), 1);
             assert_eq!(native::heap_validate(heap, 0, block), 0);
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn tls_child_adapters_restore_provider_thread_state() {
+            let mut teb = [0x8000_1234, 0x5a5a_4321];
+            native::set_last_error(500);
+            // SAFETY: teb[0] is the live, writable guest LastError DWORD.
+            unsafe {
+                assert_eq!(tls_child_get_last_error(teb.as_mut_ptr()), 0x8000_1234);
+                assert_eq!(native::get_last_error(), 500);
+                tls_child_set_last_error(teb.as_mut_ptr(), 0xfedc_ba98);
+            }
+            assert_eq!(native::get_last_error(), 500);
+            assert_eq!(teb, [0xfedc_ba98, 0x5a5a_4321]);
         }
 
         #[test]

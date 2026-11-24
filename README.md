@@ -20,6 +20,8 @@ cargo build --offline --target x86_64-apple-darwin
 
 For trusted loader bring-up, `run <image.exe> --trace-missing-imports` binds static IAT slots whose provider or export is absent to diagnostic thunks. Unused slots do not prevent startup. The first call to a thunk reports the original importer path, module, name or ordinal, and IAT RVA on stderr, then exits with status 1 without returning to the guest. This is for function-call diagnostics, not missing data imports. Unresolved descriptors without slots, rejected files, malformed bindings, and unsupported startup features (including static TLS) still prevent execution. `audit` remains strict.
 
+On Apple Silicon under Rosetta, `run <trusted-fixture.exe> --experimental-static-tls` starts an isolated, time-bounded child for the initial thread's static TLS. Adding `--rust-providers` in this lane permits only the audited `GetLastError`/`SetLastError` pair, coherent with the guest's `GS:[0x68]`. Other Rust providers and missing-import trace thunks are refused. This is not a sandbox; see [the Rosetta ABI notes](docs/rosetta-teb.md#opt-in-child-audited-lasterror-pair).
+
 App-local MSVC CRT DLLs and an AMD64 `ucrtbase.dll` can be supplied as ordinary PE libraries. Nothing in this project redistributes them. Resolving an import to a CRT export does **not** mean its dependencies or startup work yet.
 
 ```sh

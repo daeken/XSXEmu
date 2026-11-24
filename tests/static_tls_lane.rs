@@ -11,14 +11,14 @@ use std::{
 
 const OPT: &str = "--experimental-static-tls";
 const PAGE: usize = 0x4000;
-const RAW: usize = 0x800;
+const RAW: usize = 0x1000;
 const TEXT: usize = PAGE;
 const RO: usize = 2 * PAGE;
 const DATA: usize = 3 * PAGE;
 const INDEX: usize = DATA;
 const IAT: usize = DATA + 8;
-const COOKIE: usize = DATA + 24;
-const MODE: usize = DATA + 32;
+const COOKIE: usize = DATA + 32;
+const MODE: usize = DATA + 40;
 const CHECK: usize = RO + 0x200;
 const DISPATCH: usize = CHECK + 8;
 const GFIDS: usize = CHECK + 0x10;
@@ -26,7 +26,7 @@ const ARRAY: usize = RO + 0x30;
 const TEMPLATE: usize = RO + 0x40;
 const RELOC: usize = RO + 0x50;
 const LOAD: usize = RO + 0x80;
-const LINK: usize = RO + 0x100;
+const LINK: usize = RO + 0x300;
 const PREFERRED: usize = 0x1_a000_0000; // DLL and EXE collide: at least one must rebase.
 const OP: usize = 0x80 + 24;
 
@@ -42,6 +42,8 @@ struct Fixture {
     solo_entry: u32,
     cfg_entry: u32,
     cfg_target: u32,
+    bridge_cb: u32,
+    bridge_entry: u32,
     code: [u8; RAW],
 }
 global_asm!(include_str!("fixtures/static_tls_lane.S"),
@@ -106,6 +108,7 @@ enum Kind {
     Dll,
     Solo,
     Guarded,
+    Bridge,
 }
 fn image(kind: Kind) -> Vec<u8> {
     let code = unsafe { &static_tls_fixture };
@@ -114,6 +117,7 @@ fn image(kind: Kind) -> Vec<u8> {
         Kind::Dll => (code.dll_main, code.dll_cb),
         Kind::Solo => (code.solo_entry, code.solo_cb),
         Kind::Guarded => (code.cfg_entry, code.solo_cb),
+        Kind::Bridge => (code.bridge_entry, code.bridge_cb),
     };
     let mut b = vec![0; 4 * RAW];
     put(&mut b, 0, b"MZ");
@@ -178,7 +182,7 @@ fn image(kind: Kind) -> Vec<u8> {
     w64(&mut b, file(COOKIE), 0x12131415);
 
     let mut fix = vec![RO, RO + 8, RO + 16, RO + 24, ARRAY, TEMPLATE, LOAD + 88];
-    if matches!(kind, Kind::Guarded) {
+    if matches!(kind, Kind::Guarded | Kind::Bridge) {
         fix.extend([LOAD + 0x70, LOAD + 0x78, LOAD + 0x80]);
     }
     let size = 8 + 2 * fix.len();
@@ -213,7 +217,7 @@ fn image(kind: Kind) -> Vec<u8> {
             put(&mut b, file(LINK) + 0x50, b"owned.dll\0");
             put(&mut b, file(LINK) + 0x60, b"Step\0");
         }
-        Kind::Guarded => {
+        Kind::Guarded | Kind::Bridge => {
             w16(&mut b, OP + 70, 0x4000); // GUARD_CF
             dir(&mut b, 10, LOAD, 0x94);
             w32(&mut b, file(LOAD), 0x94);
@@ -227,10 +231,28 @@ fn image(kind: Kind) -> Vec<u8> {
         }
         Kind::Solo => (),
     }
+    if matches!(kind, Kind::Bridge) {
+        dir(&mut b, 1, LINK, 40);
+        w32(&mut b, file(LINK), LINK + 0x30);
+        w32(&mut b, file(LINK) + 12, LINK + 0x50);
+        w32(&mut b, file(LINK) + 16, IAT);
+        put(&mut b, file(LINK) + 0x50, b"kernel32.dll\0");
+        for (i, (off, name)) in [
+            (0xa0, &b"GetLastError\0"[..]),
+            (0xc0, &b"SetLastError\0"[..]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            w64(&mut b, file(LINK) + 0x30 + i * 8, LINK + off);
+            put(&mut b, file(LINK) + off + 2, name);
+        }
+    }
     b
 }
 
 struct Scratch(PathBuf);
+
 impl Scratch {
     fn new() -> Self {
         static SEQ: AtomicUsize = AtomicUsize::new(0);
@@ -280,14 +302,9 @@ fn opt_in_and_pe_only_lifecycle() {
     let solo = dir.write("solo.exe", &image(Kind::Solo));
     expect(run(&solo, &[]), 1, "static TLS requires a Windows TEB");
     expect(
-        run(&solo, &[OPT, "--rust-providers"]),
+        run(&solo, &[OPT, "--rust-providers", "--trace-missing-imports"]),
         1,
-        "does not support Rust providers or trace thunks",
-    );
-    expect(
-        run(&solo, &[OPT, "--trace-missing-imports"]),
-        1,
-        "does not support Rust providers or trace thunks",
+        "does not support trace thunks",
     );
     expect(run(&solo, &[OPT]), 43, "Guest entry returned 43");
 
@@ -295,6 +312,59 @@ fn opt_in_and_pe_only_lifecycle() {
     expect(run(&exe, &[OPT]), 1, "incomplete dependency graph");
     dir.write("owned.dll", &image(Kind::Dll));
     expect(run(&exe, &[OPT]), 42, "Guest entry returned 42");
+}
+
+#[test]
+fn audited_iat_bridges_share_teb_last_error_and_preserve_win64_state() {
+    if !rosetta() {
+        return;
+    }
+    let dir = Scratch::new();
+    let mut image = image(Kind::Bridge);
+    let exe = dir.write("bridge.exe", &image);
+    expect(run(&exe, &[OPT]), 1, "incomplete dependency graph");
+    expect(
+        run(&exe, &["--rust-providers"]),
+        1,
+        "static TLS requires a Windows TEB",
+    );
+    let flags = [OPT, "--rust-providers"];
+    expect(run(&exe, &flags), 45, "Guest entry returned 45");
+
+    // CFG refuses non-exact addresses even adjacent to a registered bridge.
+    for mode in [1, 2] {
+        w32(&mut image, file(MODE), mode);
+        dir.write("bridge.exe", &image);
+        expect(run(&exe, &flags), 1, "child terminated by signal 4");
+    }
+}
+
+#[test]
+fn unaudited_exports_and_raw_address_aliases_are_refused_before_entry() {
+    if !rosetta() {
+        return;
+    }
+    let dir = Scratch::new();
+    let flags = [OPT, "--rust-providers"];
+    let mut unsupported = image(Kind::Bridge);
+    put(&mut unsupported, file(LINK) + 0xc2, b"SetErrorMode\0");
+    let exe = dir.write("unsupported.exe", &unsupported);
+    expect(
+        run(&exe, &flags),
+        1,
+        "no enabled audited bridge for kernelbase.dll!SetErrorMode",
+    );
+
+    let mut aliased = image(Kind::Bridge);
+    put(&mut aliased, file(LINK) + 0x50, b"ntdll.dll\0");
+    put(&mut aliased, file(LINK) + 0xa2, b"RtlGetLastWin32Error\0");
+    put(&mut aliased, file(LINK) + 0xc2, b"RtlSetLastWin32Error\0");
+    let exe = dir.write("aliased.exe", &aliased);
+    expect(
+        run(&exe, &flags),
+        1,
+        "no enabled audited bridge for ntdll.dll!RtlGetLastWin32Error",
+    );
 }
 
 #[test]

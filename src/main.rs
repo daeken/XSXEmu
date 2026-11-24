@@ -97,10 +97,8 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
         return Err("static TLS child requires --experimental-static-tls".into());
     }
     if experimental_tls {
-        if rust_providers || trace_missing_imports {
-            return Err(
-                "experimental static TLS does not support Rust providers or trace thunks".into(),
-            );
+        if trace_missing_imports {
+            return Err("experimental static TLS does not support trace thunks".into());
         }
         #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
         return Err("experimental static TLS requires an x86-64 macOS build under Rosetta".into());
@@ -403,7 +401,7 @@ fn resolve(
         }
         let order = attach_order(&plan)?;
         let status = if tls_child {
-            startup::run_tls_child(&images, &bindings, &order)?
+            startup::run_tls_child(&images, &bindings, &order, startup_options.1)?
         } else {
             startup::run(
                 &images,
