@@ -117,6 +117,9 @@ mod native {
 
     fn reject_slot_overlap(cfg: &CfgProfile<'_>, rva: u32) -> Result<()> {
         let hits_slot = |slot: &u32| slot.abs_diff(rva) < 8;
+        if cfg.guard_memcpy_slot().as_ref().is_some_and(hits_slot) {
+            return Err("security cookie or IAT patch overlaps GuardMemcpy slot".into());
+        }
         let overlap = match cfg {
             CfgProfile::None => false,
             CfgProfile::Guarded(cfg) => {
@@ -407,6 +410,10 @@ mod native {
                 }
             }
             let slot_range = |rva: u32| rva as usize..rva as usize + 8;
+            let memcpy = cfg.guard_memcpy_slot();
+            if let Some(rva) = memcpy {
+                patch(mem, rva, tls_runtime::guard_memcpy_entry())?;
+            }
             match cfg {
                 CfgProfile::Guarded(cfg) => {
                     let slots = cfg.slots();
@@ -417,6 +424,7 @@ mod native {
                     }
                     let mut readonly = slots.map(slot_range).to_vec();
                     readonly.extend(cfg.companion_config_range());
+                    readonly.extend(memcpy.map(slot_range));
                     readonly.extend(cfg.address_taken_iat_readonly_ranges());
                     // XFG is not implemented; route attempts to a terminal gate,
                     // never to the active CFG thunk or the candidate target.
@@ -444,7 +452,9 @@ mod native {
                     {
                         patch(mem, rva, trap)?;
                     }
-                    mem.seal_with_readonly(&regions, &cfg.readonly_ranges())?;
+                    let mut readonly = cfg.readonly_ranges();
+                    readonly.extend(memcpy.map(slot_range));
+                    mem.seal_with_readonly(&regions, &readonly)?;
                 }
                 CfgProfile::None => mem.seal(&regions)?,
             }

@@ -530,9 +530,14 @@ contents or follow annotation tables. It does not perform the optimizations
 those hints describe. Normal startup and `--experimental-static-tls` without
 `--trusted-offline` retain their old checks. `FORCE_INTEGRITY` remains fatal;
 active CFG and address-taken IAT enforcement are unchanged and unsupported
-dormant calls still terminate. Unknown guard requirements and load-config
-extensions (including GuardMemcpy layouts) are still refused. No host policy
-or PE file is modified.
+dormant calls still terminate. No host policy or PE file is modified.
+
+The diagnostic child also recognizes the `0x140` GuardMemcpy layouts with
+instrumented dormant direct guard stubs or active CFG and one-hop companion
+stubs. It validates the GuardMemcpy cell's bounds, permissions, separation,
+and exact relocations, seals the cell, and installs an exit-86 diagnostic if
+called. It does not follow the original pointer or report a successful copy.
+Unknown guard requirements and other load-config extensions are still refused.
 
 ## Controlled execution plan
 

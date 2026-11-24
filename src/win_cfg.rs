@@ -112,6 +112,7 @@ pub struct CfgMetadata<'a> {
     )]
     companion: Option<CompanionSlots>,
     offline_catalog: Option<OfflineCatalogEnvelope>,
+    guard_memcpy: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -157,6 +158,7 @@ pub struct DormantSlots {
     config: Range<u32>,
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
     zero_fill_cast: bool,
+    guard_memcpy: Option<u32>,
 }
 
 impl DormantSlots {
@@ -206,7 +208,7 @@ impl DormantSlots {
         } else {
             DormantLayout::Legacy
         };
-        let (slots, config) = validate_dormant(pe, rva, raw, size, layout)?;
+        let (slots, config, guard_memcpy) = validate_dormant(pe, rva, raw, size, layout)?;
         if matches!(
             layout,
             DormantLayout::InstrumentedNoPolicy | DormantLayout::TrustedOfflineInstrumented
@@ -219,7 +221,8 @@ impl DormantSlots {
             #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
             config,
             #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-            zero_fill_cast: instrumented,
+            zero_fill_cast: instrumented && guard_memcpy.is_none(),
+            guard_memcpy,
         })
     }
 }
@@ -240,7 +243,7 @@ pub fn inspect_instrumented_slots(pe: &Pe<'_>) -> Result<Option<[u32; DORMANT_FI
     if u32_at(raw, GUARD_FLAGS) != CF_INSTRUMENTED {
         return Ok(None);
     }
-    let (slots, _) = validate_dormant(
+    let (slots, _, _) = validate_dormant(
         pe,
         dir.rva,
         raw,
@@ -279,9 +282,10 @@ fn validate_dormant(
     raw: &[u8],
     size: usize,
     layout: DormantLayout,
-) -> Result<([u32; DORMANT_FIELDS.len()], Range<u32>)> {
+) -> Result<([u32; DORMANT_FIELDS.len()], Range<u32>, Option<u32>)> {
     let instrumented = layout != DormantLayout::Legacy;
     let trusted_offline = layout == DormantLayout::TrustedOfflineInstrumented;
+    let extended = trusted_offline && size == GUARD_MEMCPY_END;
     let volatile_version = match layout {
         DormantLayout::Legacy | DormantLayout::TrustedOfflineInstrumented => None,
         DormantLayout::InstrumentedNoPolicy => Some(SUPPORTED_VOLATILE_VERSION),
@@ -294,7 +298,7 @@ fn validate_dormant(
         DormantLayout::TrustedOfflineInstrumented => (0, 0), // fields ignored
         DormantLayout::BinkInspection => (1, INSTRUMENTED_CATALOG_OFFSET),
     };
-    if size != DORMANT_SIZE
+    if (!extended && size != DORMANT_SIZE)
         || raw.len() != size
         || nonzero(&raw[4..0x58])
         || (instrumented && u64_at(raw, 0x58) == 0)
@@ -319,7 +323,7 @@ fn validate_dormant(
     let mut values = [0; DORMANT_FIELDS.len()];
     for (i, field) in DORMANT_FIELDS.into_iter().enumerate() {
         let rva = preferred_rva(pe, u64_at(raw, field))?;
-        let zero_fill_cast = instrumented && i == DORMANT_CALLABLE;
+        let zero_fill_cast = instrumented && !extended && i == DORMANT_CALLABLE;
         let slot = if zero_fill_cast {
             zero_fill_castguard_data(pe, rva)?
         } else {
@@ -387,6 +391,14 @@ fn validate_dormant(
             remaining.push(rva + VOLATILE_METADATA as u32);
         }
     }
+    let guard_memcpy = if extended {
+        let slot = validate_guard_memcpy_slot(pe, raw, &metadata)?;
+        metadata.push(range(slot, 8)?);
+        remaining.extend([rva + COMPANION_END as u32, slot]);
+        Some(slot)
+    } else {
+        None
+    };
     for fix in pe.relocations()? {
         let fix_range = range(fix, 8)?;
         if metadata.iter().any(|r| overlaps(r, &fix_range))
@@ -403,7 +415,7 @@ fn validate_dormant(
     if !remaining.is_empty() {
         return Err(PeError::Invalid("missing dormant guard relocation"));
     }
-    Ok((slots, config))
+    Ok((slots, config, guard_memcpy))
 }
 
 fn zero_fill_castguard_data(pe: &Pe<'_>, rva: u32) -> Result<Range<u32>> {
@@ -463,6 +475,18 @@ fn companion_terminal(
     Ok(terminal)
 }
 
+// Only the slot address is used. Startup replaces the slot with a terminal
+// gate; the original target is not followed or registered with CFG.
+fn validate_guard_memcpy_slot(pe: &Pe<'_>, raw: &[u8], ranges: &[Range<u32>]) -> Result<u32> {
+    let rva = preferred_rva(pe, u64_at(raw, COMPANION_END))?;
+    let span = slot_range(pe, rva)?;
+    pe.rva_slice(rva, 8)?;
+    if ranges.iter().any(|r| overlaps(r, &span)) {
+        return Err(PeError::Invalid("overlapping GuardMemcpy slot or metadata"));
+    }
+    Ok(rva)
+}
+
 /// Flag-clear XFG linker defaults and a null CastGuard failure-mode data cell
 /// in an otherwise actively CFG-guarded image. Never a source of CFG targets.
 #[derive(Debug)]
@@ -485,6 +509,7 @@ impl CompanionSlots {
         check: u32,
         dispatch: u32,
         form: CompanionForm,
+        guard_memcpy: Option<u32>,
     ) -> Result<Self> {
         let size = match form {
             CompanionForm::Direct => COMPANION_END,
@@ -516,6 +541,11 @@ impl CompanionSlots {
                 ));
             }
             slots[i] = rva;
+        }
+        if guard_memcpy.is_some_and(|rva| slots.iter().any(|&s| s.abs_diff(rva) < 8)) {
+            return Err(PeError::Invalid(
+                "overlapping GuardMemcpy and companion slots",
+            ));
         }
         let value = |rva| -> Result<u64> { Ok(u64_at(pe.rva_slice(rva, 8)?, 0)) };
         let [xcheck, xdispatch, xtable, _cast] = slots;
@@ -565,14 +595,20 @@ impl CompanionSlots {
         }
         expected.extend([check, dispatch]);
         expected.extend(&slots[..COMPANION_CALLABLE]);
-        // Keep the trailing GuardMemcpy field opaque. Check the CFG/XFG/
-        // CastGuard prefix, including relocations that straddle its end.
-        let prefix = config.start..config.start + COMPANION_END as u32;
+        // Inspection leaves the trailing field opaque; startup accounts for
+        // both exact GuardMemcpy relocations as well as the guard prefix.
+        let prefix = if let Some(slot) = guard_memcpy {
+            expected.extend([config.start + COMPANION_END as u32, slot]);
+            config.clone()
+        } else {
+            config.start..config.start + COMPANION_END as u32
+        };
         for fix in pe.relocations()? {
             let fix_range = range(fix, 8)?;
             if overlaps(&prefix, &fix_range)
                 || ranges[1..].iter().any(|r| overlaps(r, &fix_range))
                 || slots.iter().any(|&s| s.abs_diff(fix) < 8)
+                || guard_memcpy.is_some_and(|s| s.abs_diff(fix) < 8)
                 || code.iter().any(|r| overlaps(r, &fix_range))
             {
                 let Some(i) = expected.iter().position(|&r| r == fix) else {
@@ -610,6 +646,15 @@ fn null_castguard_data(pe: &Pe<'_>, rva: u32) -> Result<Range<u32>> {
 }
 
 impl<'a> CfgProfile<'a> {
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    pub fn guard_memcpy_slot(&self) -> Option<u32> {
+        match self {
+            Self::None => None,
+            Self::Dormant(cfg) => cfg.guard_memcpy,
+            Self::Guarded(cfg) => cfg.guard_memcpy,
+        }
+    }
+
     /// Inspect preferred-base load-config data. A guarded image outside this
     /// profile is an error, not an image with no CFG. This profile rejects an
     /// image that requests enabling export suppression process-wide, because
@@ -831,7 +876,13 @@ impl<'a> CfgMetadata<'a> {
         let static_tls = trusted_offline || matches!(profile, Profile::TlsChild);
         let address_taken_iat =
             AddressTakenIat::parse(pe, declared, flags, stride, static_tls, &mut ranges)?;
-        let one_hop = matches!(profile, Profile::OfflineGuardSlots);
+        let extended = trusted_offline && size == GUARD_MEMCPY_END;
+        let guard_memcpy = if extended {
+            Some(validate_guard_memcpy_slot(pe, declared, &ranges)?)
+        } else {
+            None
+        };
+        let one_hop = extended || matches!(profile, Profile::OfflineGuardSlots);
         let companion = if one_hop || nonzero(declared.get(EH_END..).unwrap_or_default()) {
             if matches!(profile, Profile::Standard) {
                 return Err(PeError::Unsupported(
@@ -851,6 +902,7 @@ impl<'a> CfgMetadata<'a> {
                 } else {
                     CompanionForm::Direct
                 },
+                guard_memcpy,
             )?)
         } else {
             None
@@ -928,6 +980,7 @@ impl<'a> CfgMetadata<'a> {
             companion,
             address_taken_iat,
             offline_catalog,
+            guard_memcpy,
         })
     }
 

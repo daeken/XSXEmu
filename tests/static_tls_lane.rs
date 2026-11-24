@@ -918,6 +918,112 @@ fn companion_slots_trap_without_widening_active_cfg() {
     expect(run(&exe, &[OPT]), 44, "Guest entry returned 44");
 }
 
+const MEMCPY_SLOT: usize = CHECK + 0x40;
+const MEMCPY_RELOC: usize = RO + 0x780;
+
+fn memcpy_slot_image(active: bool) -> Vec<u8> {
+    let mut b = if active {
+        let mut b = companion_image(Kind::Guarded);
+        // One rel32 hop to each existing direct linker default.
+        for (i, target) in [0x800, 0x810, 0x820].into_iter().enumerate() {
+            let veneer = TEXT + 0xa00 + i * 0x10;
+            b[file(veneer)] = 0xe9;
+            w32(
+                &mut b,
+                file(veneer) + 1,
+                (TEXT + target).wrapping_sub(veneer + 5),
+            );
+            let slots: &[usize] = match i {
+                0 => &[CHECK, CHECK + 0x10],
+                1 => &[DISPATCH],
+                _ => &[CHECK + 0x18, CHECK + 0x20],
+            };
+            for &slot in slots {
+                w64(&mut b, file(slot), PREFERRED + veneer);
+            }
+        }
+        b
+    } else {
+        instrumented_terminal_image(Kind::Solo)
+    };
+    w64(&mut b, file(LOAD) + 0x130, PREFERRED + CHECK + 0x38);
+    w32(&mut b, file(LOAD), 0x140);
+    dir(&mut b, 10, LOAD, 0x140);
+    w64(&mut b, file(LOAD) + 0x138, PREFERRED + MEMCPY_SLOT);
+    // This existing return stub is deliberately not installed as memcpy.
+    w64(&mut b, file(MEMCPY_SLOT), PREFERRED + TEXT + 0x800);
+    b.copy_within(file(RELOC)..file(RELOC) + 48, file(MEMCPY_RELOC));
+    dir(&mut b, 5, MEMCPY_RELOC, 52);
+    w32(&mut b, file(MEMCPY_RELOC) + 4, 52);
+    w16(
+        &mut b,
+        file(MEMCPY_RELOC) + 48,
+        0xa000 | (LOAD + 0x138 - RO),
+    );
+    w16(&mut b, file(MEMCPY_RELOC) + 50, 0xa000 | (MEMCPY_SLOT - RO));
+    b
+}
+
+#[test]
+fn trusted_offline_guard_memcpy_stops_only_if_called_and_keeps_cfg_exact() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    for active in [false, true] {
+        let original = memcpy_slot_image(active);
+        let exe = scratch.write("guard-memcpy.exe", &original);
+        let strict = if active {
+            "companion guard load-config size"
+        } else {
+            "CodeIntegrity on instrumented dormant image"
+        };
+        expect(run(&exe, &[OPT]), 1, strict);
+        let status = if active { 44 } else { 43 };
+        expect(
+            run(&exe, &[OPT, TRUSTED]),
+            status,
+            &format!("Guest entry returned {status}"),
+        );
+        let mut b = original.clone();
+        dormant_call(&mut b, MEMCPY_SLOT);
+        scratch.write("guard-memcpy.exe", &b);
+        expect(
+            run(&exe, &[OPT, TRUSTED]),
+            86,
+            "GuardMemcpy (unsupported; copy not performed)",
+        );
+        if active {
+            for mode in [1, 2] {
+                let mut b = original.clone();
+                w32(&mut b, file(MODE), mode);
+                scratch.write("guard-memcpy.exe", &b);
+                expect(
+                    run(&exe, &[OPT, TRUSTED]),
+                    1,
+                    "child terminated by signal 4",
+                );
+            }
+        }
+        let mut b = original.clone();
+        w64(&mut b, file(LOAD) + 0x138, PREFERRED + CHECK);
+        scratch.write("guard-memcpy.exe", &b);
+        expect(run(&exe, &[OPT, TRUSTED]), 1, "overlapping GuardMemcpy");
+        let mut b = original.clone();
+        w16(&mut b, file(MEMCPY_RELOC) + 50, 0);
+        scratch.write("guard-memcpy.exe", &b);
+        expect(run(&exe, &[OPT, TRUSTED]), 1, "guard relocation");
+        let mut b = original;
+        w64(&mut b, file(LOAD) + 0x58, PREFERRED + MEMCPY_SLOT);
+        scratch.write("guard-memcpy.exe", &b);
+        expect(
+            run(&exe, &[OPT, TRUSTED]),
+            1,
+            "relocation overlaps an IAT or security-cookie slot",
+        );
+    }
+}
+
 #[test]
 fn trusted_offline_ignores_catalog_and_volatile_contents_but_not_guard_calls() {
     if !rosetta() {

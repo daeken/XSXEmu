@@ -90,6 +90,7 @@ dormant_guard_entry _xsxemu_tls_dormant_cfg_dispatch, 1
 dormant_guard_entry _xsxemu_tls_dormant_xfg_check, 2
 dormant_guard_entry _xsxemu_tls_dormant_xfg_dispatch, 3
 dormant_guard_entry _xsxemu_tls_dormant_xfg_table_dispatch, 4
+dormant_guard_entry _xsxemu_tls_guard_memcpy, 5
 
 Ldormant_guard:
     movq %gs:{context_slot}, %r12

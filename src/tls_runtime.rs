@@ -102,6 +102,7 @@ unsafe extern "win64" {
     fn xsxemu_tls_dormant_xfg_check();
     fn xsxemu_tls_dormant_xfg_dispatch();
     fn xsxemu_tls_dormant_xfg_table_dispatch();
+    fn xsxemu_tls_guard_memcpy();
 }
 
 pub fn import_trap_entry() -> u64 {
@@ -119,6 +120,10 @@ pub fn dormant_guard_entries() -> [u64; DORMANT_CALLABLE] {
     .map(|entry| entry as *const () as u64)
 }
 
+pub fn guard_memcpy_entry() -> u64 {
+    xsxemu_tls_guard_memcpy as *const () as u64
+}
+
 pub fn inactive_xfg_entries() -> [u64; 3] {
     let [_, _, check, dispatch, table_dispatch] = dormant_guard_entries();
     [check, dispatch, table_dispatch]
@@ -128,12 +133,13 @@ pub fn inactive_xfg_entries() -> [u64; 3] {
 // or run guest detach, even when the attempted call came from a callback.
 extern "C" fn called_dormant_guard(slot: usize) -> ! {
     use std::io::Write;
-    const NAMES: [&str; DORMANT_CALLABLE] = [
+    const NAMES: [&str; DORMANT_CALLABLE + 1] = [
         "CFG check",
         "CFG dispatch",
         "XFG check",
         "XFG dispatch",
         "XFG table dispatch",
+        "GuardMemcpy (unsupported; copy not performed)",
     ];
     let _ = writeln!(
         std::io::stderr().lock(),
@@ -287,6 +293,7 @@ impl PatchWrites {
                 }
                 CfgProfile::Dormant(cfg) => slots.extend(cfg.slots()),
             }
+            slots.extend(cfg.guard_memcpy_slot());
             slots.sort_unstable();
         }
         Ok(Self(writes))
