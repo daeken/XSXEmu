@@ -212,7 +212,7 @@ pub(crate) mod native {
         m.lock().unwrap_or_else(|_| std::process::abort())
     }
 
-    pub(super) extern "win64" fn get_current_process() -> usize {
+    pub(crate) extern "win64" fn get_current_process() -> usize {
         CURRENT_PROCESS
     }
 

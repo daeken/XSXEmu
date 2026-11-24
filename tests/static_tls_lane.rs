@@ -2205,6 +2205,7 @@ const THREAD_ID_CODE_CAPACITY: usize = 0x100;
 #[repr(C)]
 struct ThreadIdFixture {
     entry: u32,
+    process_entry: u32,
     code: [u8; THREAD_ID_CODE_CAPACITY],
 }
 
@@ -2224,19 +2225,8 @@ fn thread_id_bridge_matches_guest_teb_and_preserves_last_error() {
         return;
     }
     let scratch = Scratch::new();
-    let mut exe = image(Kind::Solo);
-    let fixture = unsafe { &static_tls_thread_id_fixture };
-    // Keep the existing PE layout; replace only this fixture's .text and
-    // point its existing TLS callback relocation at the new no-op callback.
-    exe[file(TEXT)..file(TEXT) + RAW].fill(0xcc);
-    put(&mut exe, file(TEXT), &fixture.code);
-    w32(&mut exe, OP + 16, TEXT + fixture.entry as usize);
-    w64(&mut exe, file(ARRAY), PREFERRED + TEXT);
-    dir_import_one(
-        &mut exe,
-        b"api-ms-win-core-processthreads-l1-1-0.dll\0",
-        b"GetCurrentThreadId\0",
-    );
+    let entry = unsafe { static_tls_thread_id_fixture.entry };
+    let exe = thread_api_image(entry, b"GetCurrentThreadId\0");
     let path = scratch.write("thread-id.exe", &exe);
     expect(run(&path, &[OPT]), 1, "incomplete dependency graph");
     let output = launcher(&path, &[OPT, "--rust-providers"])
@@ -2252,6 +2242,39 @@ fn thread_id_bridge_matches_guest_teb_and_preserves_last_error() {
         "{stderr}"
     );
     expect(output, 48, "Guest entry returned 48");
+}
+
+fn thread_api_image(entry: u32, symbol: &[u8]) -> Vec<u8> {
+    let fixture = unsafe { &static_tls_thread_id_fixture };
+    let mut exe = image(Kind::Solo);
+    // Keep the existing PE layout; replace only this fixture's .text and
+    // point its existing TLS callback relocation at the new no-op callback.
+    exe[file(TEXT)..file(TEXT) + RAW].fill(0xcc);
+    put(&mut exe, file(TEXT), &fixture.code);
+    w32(&mut exe, OP + 16, TEXT + entry as usize);
+    w64(&mut exe, file(ARRAY), PREFERRED + TEXT);
+    dir_import_one(
+        &mut exe,
+        b"api-ms-win-core-processthreads-l1-1-0.dll\0",
+        symbol,
+    );
+    exe
+}
+
+#[test]
+fn get_current_process_bridge_preserves_last_error_and_returns_full_width_pseudohandle() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let entry = unsafe { static_tls_thread_id_fixture.process_entry };
+    let exe = thread_api_image(entry, b"GetCurrentProcess\0");
+    let path = scratch.write("current-process.exe", &exe);
+    expect(
+        run(&path, &[OPT, "--rust-providers"]),
+        48,
+        "Guest entry returned 48",
+    );
 }
 
 const SEMAPHORE_CODE_CAPACITY: usize = 0x300;
