@@ -274,6 +274,10 @@ impl Request {
     }
 }
 
+#[path = "bake_ready.rs"]
+mod ready;
+pub use ready::{Insertion, ReadyJob, ReadyJobs};
+
 #[cfg(test)]
 #[path = "bake_keys_tests.rs"]
 mod tests;

@@ -17,7 +17,7 @@ fn stage(stage: Stage, name: &str) -> Evidence<StageIdentity> {
     })
 }
 
-fn owned() -> Request {
+pub(super) fn owned() -> Request {
     Request {
         namespace: Evidence::Validated(hash("owned build")),
         target: Evidence::Validated(Target {
