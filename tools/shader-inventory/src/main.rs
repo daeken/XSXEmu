@@ -77,7 +77,7 @@ impl PublicHeader {
     }
 }
 
-fn dxil_chunk(data: &[u8]) -> Option<&[u8]> {
+fn dxbc_chunks(data: &[u8]) -> Option<Vec<(&[u8], &[u8])>> {
     if !data.starts_with(b"DXBC") || word(data, 24)? != data.len() {
         return None;
     }
@@ -86,7 +86,7 @@ fn dxil_chunk(data: &[u8]) -> Option<&[u8]> {
         return None;
     }
     let table_end = 32 + count * 4;
-    let mut dxil = None;
+    let mut chunks = Vec::with_capacity(count);
     let mut occupied = Vec::<Range<usize>>::with_capacity(count);
     for at in (32..table_end).step_by(4) {
         let chunk = word(data, at)?;
@@ -102,11 +102,17 @@ fn dxil_chunk(data: &[u8]) -> Option<&[u8]> {
         }
         let bytes = data.get(payload.clone())?;
         occupied.push(chunk..payload.end);
-        if &data[chunk..chunk + 4] == b"DXIL" && dxil.replace(bytes).is_some() {
-            return None;
-        }
+        chunks.push((&data[chunk..chunk + 4], bytes));
     }
-    dxil
+    Some(chunks)
+}
+
+fn dxil_chunk(data: &[u8]) -> Option<&[u8]> {
+    let mut dxil = dxbc_chunks(data)?
+        .into_iter()
+        .filter(|(tag, _)| *tag == b"DXIL");
+    let (_, payload) = dxil.next()?;
+    dxil.next().is_none().then_some(payload)
 }
 
 type ComputeSink<'a> = Option<&'a mut dyn FnMut(&[u8])>;
@@ -312,15 +318,28 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .ok_or("usage: xsx-shader-inventory <--pipeline-index|--compute-blobs> <expanded PS/0/9 library>")?;
         return library_index::run(&path, first == "--compute-blobs");
     }
-    if first == "--reachable-compute" {
+    if first == "--reachable-compute" || first == "--compute-source-join" {
         const REACHABLE_USAGE: &str = "usage: xsx-shader-inventory --reachable-compute <trusted LLVM 21 shared library> <gfx1013|gfx1030> <native FSSM directory>";
         let lib = args.next().ok_or(REACHABLE_USAGE)?;
         let cpu = llvm::Cpu::parse(&args.next().ok_or(REACHABLE_USAGE)?).ok_or(REACHABLE_USAGE)?;
-        let dir = args
-            .next()
-            .filter(|_| args.next().is_none())
-            .ok_or(REACHABLE_USAGE)?;
-        return reachable::run(&lib, cpu, std::path::Path::new(&dir));
+        let dir = args.next().ok_or(REACHABLE_USAGE)?;
+        let source_inputs = if first == "--compute-source-join" {
+            let usage = "usage: xsx-shader-inventory --compute-source-join <LLVM shared library> <gfx1013|gfx1030> <native directory> <wrapped directory> <expanded library>";
+            Some((args.next().ok_or(usage)?, args.next().ok_or(usage)?))
+        } else {
+            None
+        };
+        if args.next().is_some() {
+            return Err(REACHABLE_USAGE.into());
+        }
+        return reachable::run(
+            &lib,
+            cpu,
+            std::path::Path::new(&dir),
+            source_inputs
+                .as_ref()
+                .map(|(d, l)| (std::path::Path::new(d), std::path::Path::new(l))),
+        );
     }
     let header_only = first == "--header-only";
     let (path, mut coverage) = if first == "--compute-isa" {

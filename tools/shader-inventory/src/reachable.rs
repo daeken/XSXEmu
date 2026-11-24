@@ -1,6 +1,8 @@
 //! Local, count-only reachability with one explicit LLVM profile, not an Xbox decoder.
 #[path = "provenance.rs"]
 mod provenance;
+#[path = "source_join.rs"]
+mod source_join;
 
 use crate::{
     BLOB_LIMIT,
@@ -278,11 +280,12 @@ struct Report {
 }
 
 impl Report {
-    fn add(&mut self, blob: &[u8], waves: &mut [Disassembler; 2]) {
+    fn add(&mut self, blob: &[u8], waves: &mut [Disassembler; 2]) -> bool {
         let (Some((bytes, _)), Some(meta)) = (code(blob), Metadata::parse(blob)) else {
             self.invalid_span_or_metadata += 1;
-            return;
+            return false;
         };
+        let mut candidate = false;
         match analyze(&mut waves[usize::from(meta.wave32)], bytes) {
             Ok(p) => {
                 self.complete += 1;
@@ -323,6 +326,10 @@ impl Report {
                     if meta.group == [1, 1, 1] && stores == 1 && raw {
                         self.small_single_raw_store += 1;
                         let origin = provenance::classify(&mut waves[1], bytes, p.steps, launch.0);
+                        candidate = origin
+                            == provenance::ResultClass::Known(
+                                provenance::Source::ZeroExtendedUserData,
+                            );
                         *self.raw_store_provenance.entry(origin).or_default() += 1;
                         *self.raw_store_launch_fields.entry(launch).or_default() += 1;
                         if self.smallest_store_steps.is_none_or(|n| p.steps < n) {
@@ -341,6 +348,7 @@ impl Report {
             }
             Err(reason) => *self.blockers.entry(reason).or_default() += 1,
         }
+        candidate
     }
 
     fn print(self) {
@@ -414,11 +422,17 @@ fn read_compute(mut file: File, blob: &mut Vec<u8>) -> Option<bool> {
     (blob.len() <= BLOB_LIMIT).then_some(true)
 }
 
-pub fn run(lib: &OsStr, cpu: Cpu, root: &Path) -> Result<(), Box<dyn Error>> {
+pub fn run(
+    lib: &OsStr,
+    cpu: Cpu,
+    root: &Path,
+    inputs: Option<(&Path, &Path)>,
+) -> Result<(), Box<dyn Error>> {
     let llvm = Llvm::load(lib)?;
     let mut waves = [llvm.context(cpu, false)?, llvm.context(cpu, true)?];
     let mut report = Report::default();
     let mut blob = Vec::new();
+    let mut candidates = Vec::new();
     for item in fs::read_dir(root)? {
         let entry = item?;
         let path = entry.path();
@@ -435,7 +449,13 @@ pub fn run(lib: &OsStr, cpu: Cpu, root: &Path) -> Result<(), Box<dyn Error>> {
         {
             Some(true) => {
                 report.compute += 1;
-                report.add(&blob, &mut waves);
+                if report.add(&blob, &mut waves) && inputs.is_some() && !candidates.contains(&blob)
+                {
+                    if candidates.len() == 64 || blob.len() > (256 << 10) {
+                        return Err("source join shortlist exceeds its retained-byte limit".into());
+                    }
+                    candidates.push(blob.clone());
+                }
             }
             Some(false) => report.non_compute += 1,
             None => report.bad_header_or_read += 1,
@@ -453,6 +473,9 @@ pub fn run(lib: &OsStr, cpu: Cpu, root: &Path) -> Result<(), Box<dyn Error>> {
         "Complete = all statically reachable edges decoded under modeled PC effects, with an exit; not proof of termination or translation"
     );
     report.print();
+    if let Some((wrapped, library)) = inputs {
+        source_join::run(wrapped, library, &candidates)?;
+    }
     Ok(())
 }
 
