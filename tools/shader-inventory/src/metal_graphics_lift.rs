@@ -5,6 +5,10 @@ mod graphics_decode;
 mod graphics_lift;
 #[cfg(target_os = "macos")]
 mod metal_artifact;
+#[cfg(target_os = "macos")]
+mod owned_graphics_artifact;
+#[cfg(any(test, target_os = "macos"))]
+mod owned_graphics_job;
 
 // Integer oracle for the chosen fullscreen triangle and no-perspective varying.
 // Blue is half red. Alpha is legacy zero times a negative finite number.
@@ -26,7 +30,7 @@ mod gpu {
     enum Mode<'a> {
         Source,
         Load(&'a Path, bool),
-        Archive(&'a Path, &'a Path, bool),
+        Archive(&'a Path, &'a Path, bool, bool, [u8; 32]),
     }
 
     fn strict(
@@ -52,15 +56,34 @@ mod gpu {
         let mode = match args.as_slice() {
             [] => Mode::Source,
             [mode] if mode == "--emit-msl" || mode == "--emit-mutated-msl" => {
-                let literal = (mode == "--emit-mutated-msl").then_some(0x3f00_0000);
+                let literal = (mode == "--emit-mutated-msl").then_some(owned_graphics_job::MUTATED_LITERAL);
                 print!("{}", graphics_lift::translate_fixture(literal).map_err(|e| format!("lift rejected: {e:?}"))?);
                 return Ok(());
             }
             [mode, lib] if mode == "--load-metallib" || mode == "--load-mutated-metallib" => Mode::Load(Path::new(lib), mode == "--load-mutated-metallib"),
-            [mode, lib, archive] if mode == "--bake-archive" || mode == "--replay-archive" => Mode::Archive(Path::new(lib), Path::new(archive), mode == "--bake-archive"),
-            _ => return Err("usage: shader-metal-graphics-lift [--emit-msl | --emit-mutated-msl | --load-metallib LIB | --load-mutated-metallib LIB | --bake-archive LIB ARCHIVE | --replay-archive LIB ARCHIVE]".into()),
+            [mode, lib, archive, compiler] if mode == "--bake-archive" || mode == "--replay-archive" || mode == "--replay-mutated-archive" => Mode::Archive(Path::new(lib), Path::new(archive), mode == "--bake-archive", mode == "--replay-mutated-archive", owned_graphics_artifact::compiler_profile(compiler)?),
+            _ => return Err("usage: shader-metal-graphics-lift [--emit-msl | --emit-mutated-msl | --load-metallib LIB | --load-mutated-metallib LIB | {--bake-archive|--replay-archive|--replay-mutated-archive} LIB ARCHIVE COMPILER_SHA256]".into()),
         };
         let dev = Device::system_default().ok_or("no Metal device")?;
+        let admitted = if let Mode::Archive(lib, path, bake, mutated, compiler) = mode {
+            if std::env::var_os("MTL_SHADER_VALIDATION").is_some() {
+                return Err(
+                    "translated archive fixture requires MTL_SHADER_VALIDATION unset".into(),
+                );
+            }
+            let profile = owned_graphics_artifact::device_profile(&dev)?;
+            let job = owned_graphics_job::ready(mutated, compiler, profile)?;
+            let lib = owned_graphics_artifact::artifact_digest(lib)?;
+            if bake {
+                owned_graphics_artifact::require_new_identity(path)?;
+            } else {
+                owned_graphics_artifact::verify(&job, lib, path)?;
+                println!("owned graphics artifact identity matched");
+            }
+            Some((job, lib))
+        } else {
+            None
+        };
         let lib = match mode {
             Mode::Source => {
                 let msl = graphics_lift::translate_fixture(None)
@@ -69,29 +92,35 @@ mod gpu {
                 options.set_fast_math_enabled(false);
                 dev.new_library_with_source(&msl, &options)?
             }
-            Mode::Load(path, _) | Mode::Archive(path, _, _) => {
+            Mode::Load(path, _) | Mode::Archive(path, _, _, _, _) => {
                 metal_artifact::file_url(path, false).map_err(|e| e.to_string())?;
                 dev.new_library_with_file(path)?
             }
         };
         let desc = RenderPipelineDescriptor::new();
         let format = MTLPixelFormat::RGBA8Unorm;
-        let vs = lib.get_function("translated_vs", None)?;
-        let ps = lib.get_function("translated_ps", None)?;
+        let (vs, ps) = admitted
+            .as_ref()
+            .map_or(("translated_vs", "translated_ps"), |(job, _)| {
+                (
+                    job.stages()[0].translated_entry.as_str(),
+                    job.stages()[1].translated_entry.as_str(),
+                )
+            });
+        let vs = lib.get_function(vs, None)?;
+        let ps = lib.get_function(ps, None)?;
         desc.set_vertex_function(Some(&vs));
         desc.set_fragment_function(Some(&ps));
         desc.set_raster_sample_count(1);
-        desc.color_attachments()
+        let color_attachment = desc
+            .color_attachments()
             .object_at(0)
-            .ok_or("no color slot")?
-            .set_pixel_format(format);
+            .ok_or("no color slot")?;
+        color_attachment.set_pixel_format(format);
+        color_attachment.set_write_mask(MTLColorWriteMask::All);
+        color_attachment.set_blending_enabled(false);
         let pipeline = match mode {
-            Mode::Archive(_, path, bake) => {
-                if std::env::var_os("MTL_SHADER_VALIDATION").is_some() {
-                    return Err(
-                        "translated archive fixture requires MTL_SHADER_VALIDATION unset".into(),
-                    );
-                }
+            Mode::Archive(_, path, bake, _, _) => {
                 let url = metal_artifact::file_url(path, bake).map_err(|e| e.to_string())?;
                 let descriptor = BinaryArchiveDescriptor::new();
                 if !bake {
@@ -183,7 +212,7 @@ mod gpu {
         }
         // The GPU writes have completed and the owned buffer remains alive through the last read.
         let pixels = unsafe { std::slice::from_raw_parts(ptr, BYTES) };
-        let mutated = matches!(mode, Mode::Load(_, true));
+        let mutated = matches!(mode, Mode::Load(_, true) | Mode::Archive(_, _, _, true, _));
         for y in 0..SIDE {
             for x in 0..SIDE {
                 let expected = expected(x, mutated);
@@ -195,6 +224,10 @@ mod gpu {
                     ));
                 }
             }
+        }
+        if let (Mode::Archive(_, path, true, _, _), Some((job, lib))) = (mode, admitted) {
+            owned_graphics_artifact::publish(&job, lib, path)?;
+            println!("published owned graphics artifact identity");
         }
         println!(
             "{} translated GFX10 VS+PS (mutated={mutated}): {n}/{n} pixels matched",

@@ -10,6 +10,19 @@ unset MTL_SHADER_VALIDATION
 cargo build --locked --manifest-path "$root/Cargo.toml" --target-dir "$d/target" \
     --features metal-probe --bin shader-metal-graphics-lift
 p=$d/target/debug/shader-metal-graphics-lift
+# Fingerprint the trusted tools, SDK version and exact offline flags.
+{
+    xcrun -sdk macosx metal --version
+    xcrun -sdk macosx --show-sdk-version
+    xcrun -sdk macosx --show-sdk-build-version
+    for tool in metal metallib; do
+        path=$(xcrun -sdk macosx --find "$tool")
+        printf '%s\n' "$tool"
+        shasum -a 256 < "$path"
+    done
+    printf '%s\n' 'metal -std=metal3.1 -fno-fast-math -c; metallib'
+} > "$d/compiler-profile"
+compiler=$(shasum -a 256 "$d/compiler-profile" | cut -d ' ' -f 1)
 compile() {
     xcrun -sdk macosx metal -std=metal3.1 -fno-fast-math -c "$d/$1.metal" -o "$d/$1.air"
     xcrun -sdk macosx metallib "$d/$1.air" -o "$d/$1.metallib"
@@ -17,13 +30,30 @@ compile() {
 "$p" --emit-msl > "$d/owned.metal"
 compile owned
 "$p" --load-metallib "$d/owned.metallib"
-"$p" --bake-archive "$d/owned.metallib" "$d/owned.metalar"
-"$p" --replay-archive "$d/owned.metallib" "$d/owned.metalar"
+"$p" --bake-archive "$d/owned.metallib" "$d/owned.metalar" "$compiler"
+"$p" --replay-archive "$d/owned.metallib" "$d/owned.metalar" "$compiler"
 "$p" --emit-mutated-msl > "$d/mutated.metal"
 compile mutated
 "$p" --load-mutated-metallib "$d/mutated.metallib"
-if "$p" --replay-archive "$d/mutated.metallib" "$d/owned.metalar" > "$d/miss.log" 2>&1; then
-    echo 'unexpected strict replay hit after changing the native pixel literal' >&2
+expect_mismatch() {
+    if "$p" "$@" > "$d/miss.log" 2>&1; then
+        echo 'unexpected replay for changed owned identity' >&2
+        exit 1
+    fi
+    grep -F 'owned graphics artifact identity mismatch' "$d/miss.log"
+}
+expect_mismatch --replay-mutated-archive "$d/owned.metallib" "$d/owned.metalar" "$compiler"
+expect_mismatch --replay-archive "$d/mutated.metallib" "$d/owned.metalar" "$compiler"
+changed_compiler=$(printf '%s\n' "$compiler changed options" | shasum -a 256 | cut -d ' ' -f 1)
+expect_mismatch --replay-archive "$d/owned.metallib" "$d/owned.metalar" "$changed_compiler"
+MTL_DEBUG_LAYER=0 expect_mismatch --replay-archive "$d/owned.metallib" "$d/owned.metalar" "$compiler"
+cp "$d/owned.metalar.identity" "$d/original.identity"
+printf x >> "$d/owned.metalar.identity"
+if "$p" --replay-archive "$d/owned.metallib" "$d/owned.metalar" "$compiler" > "$d/miss.log" 2>&1; then
+    echo 'unexpected replay for an oversized identity record' >&2
     exit 1
 fi
-grep -F 'Unable to find function "translated_ps"' "$d/miss.log" | grep -F 'in binary archives'
+grep -F 'expected a bounded regular owned artifact' "$d/miss.log"
+mv "$d/original.identity" "$d/owned.metalar.identity"
+printf x >> "$d/owned.metalar"
+expect_mismatch --replay-archive "$d/owned.metallib" "$d/owned.metalar" "$compiler"

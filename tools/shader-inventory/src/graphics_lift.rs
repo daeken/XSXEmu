@@ -175,12 +175,17 @@ fn body(out: &mut String, ops: &[Op]) {
     }
 }
 
-pub fn translate_fixture(literal_bits: Option<u32>) -> Result<String, Reject> {
+pub fn fixture_programs(literal_bits: Option<u32>) -> (&'static [u32], Vec<u32>) {
     let mut ps = PS.to_vec();
     if let Some(bits) = literal_bits {
         ps[1] = bits;
     }
-    let vs = lift(Stage::Vertex, VS)?;
+    (VS, ps)
+}
+
+pub fn translate_fixture(literal_bits: Option<u32>) -> Result<String, Reject> {
+    let (vs, ps) = fixture_programs(literal_bits);
+    let vs = lift(Stage::Vertex, vs)?;
     let ps = lift(Stage::Pixel, &ps)?;
     // Only the entry/binding convention and one interpolation rule are authored
     // here. All moves, arithmetic, output operands and returns come from the lift.
