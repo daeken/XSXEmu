@@ -107,6 +107,11 @@ pub(crate) fn lookup(dll: &[u8], name: &[u8]) -> Option<HostExport> {
             "CreateEventA",
             crate::providers::win_io::native::create_event_a
         ),
+        (b"kernelbase.dll" | b"kernel32.dll" | SYNCH, b"CreateMutexA") => export!(
+            "kernelbase.dll",
+            "CreateMutexA",
+            crate::providers::win_io::native::create_mutex_a
+        ),
         // Creation does not implement release, signaling, or waits.
         _ => None,
     }
@@ -146,7 +151,11 @@ mod registry_tests {
         }
         assert!(crate::providers::lookup(SYNCH, init).is_none());
         assert!(crate::providers::lookup(INTERLOCKED, b"initializeSListHead").is_none());
-        for create in [b"CreateSemaphoreExW".as_slice(), b"CreateEventA"] {
+        for create in [
+            b"CreateSemaphoreExW".as_slice(),
+            b"CreateEventA",
+            b"CreateMutexA",
+        ] {
             let entry = crate::providers::lookup(SYNCH, create).unwrap();
             assert_eq!(entry.provider, "kernelbase.dll");
             assert_eq!(entry.symbol.as_bytes(), create);
@@ -157,6 +166,7 @@ mod registry_tests {
         }
         for name in [
             b"ReleaseSemaphore".as_slice(),
+            b"ReleaseMutex",
             b"SetEvent",
             b"ResetEvent",
             b"WaitForSingleObject",

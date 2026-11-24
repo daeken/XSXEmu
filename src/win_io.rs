@@ -310,6 +310,7 @@ pub(crate) mod native {
     const SEMAPHORE_RIGHTS: u32 = 0x0010_0002;
 
     const EVENT_ALL_ACCESS: u32 = 0x001f_0003;
+    const MUTEX_ALL_ACCESS: u32 = 0x001f_0001;
 
     fn sync_access(access: u32, supported: u32) -> Result<u32> {
         if access & !supported != 0 {
@@ -337,6 +338,11 @@ pub(crate) mod native {
         Event {
             manual_reset: bool,
             signaled: bool,
+        },
+        #[allow(dead_code, reason = "mutex release and waits are not implemented yet")]
+        Mutex {
+            // An initially owned mutex is acquired once by the creator.
+            owner: Option<u32>,
         },
     }
     #[derive(Clone)]
@@ -802,6 +808,28 @@ pub(crate) mod native {
         )
     }
 
+    pub(crate) extern "win64" fn create_mutex_a(
+        security: *const c_void,
+        initial_owner: i32,
+        name: *const u8,
+    ) -> usize {
+        ret(
+            (|| {
+                if !security.is_null() || !name.is_null() {
+                    return Err(UNSUPPORTED);
+                }
+                let owner =
+                    (initial_owner != 0).then(|| crate::providers::native::current_thread_id());
+                lock(&STATE).insert(Entry {
+                    obj: Arc::new(Object::Mutex { owner }),
+                    access: MUTEX_ALL_ACCESS,
+                    inheritable: false,
+                })
+            })(),
+            0,
+        )
+    }
+
     pub(super) extern "win64" fn CloseHandle(h: usize) -> i32 {
         boolean((|| {
             let mut st = lock(&STATE);
@@ -854,6 +882,7 @@ pub(crate) mod native {
                 let requested = match &*e.obj {
                     Object::Semaphore { .. } => sync_access(access, SEMAPHORE_RIGHTS)?,
                     Object::Event { .. } => sync_access(access, EVENT_ALL_ACCESS)?,
+                    Object::Mutex { .. } => sync_access(access, MUTEX_ALL_ACCESS)?,
                     _ => access_mask(access)?,
                 };
                 if requested & !e.access != 0 {
@@ -950,6 +979,32 @@ pub(crate) mod native {
             );
             assert_eq!(GetFileType(h), 0);
             assert_eq!(get_last_error(), BAD_HANDLE);
+            assert_eq!(CloseHandle(h), 1);
+            assert!(entry(h).is_err());
+        }
+    }
+
+    #[test]
+    fn mutex_handles_keep_the_initial_guest_owner() {
+        use crate::providers::native::{current_thread_id, get_last_error};
+
+        let mut live = Vec::new();
+        for initial_owner in [0, 1, -1] {
+            set_last_error(0x1234);
+            let h = create_mutex_a(ptr::null(), initial_owner, ptr::null());
+            assert_ne!(h, 0);
+            assert!(!live.contains(&h));
+            live.push(h);
+            assert_eq!(get_last_error(), 0x1234);
+            let e = entry(h).unwrap();
+            assert_eq!(e.access, MUTEX_ALL_ACCESS);
+            assert!(!e.inheritable);
+            assert!(matches!(*e.obj, Object::Mutex { owner }
+                if owner == (initial_owner != 0).then(|| current_thread_id())));
+            assert_eq!(GetFileType(h), 0);
+            assert_eq!(get_last_error(), BAD_HANDLE);
+        }
+        for h in live {
             assert_eq!(CloseHandle(h), 1);
             assert!(entry(h).is_err());
         }
@@ -1327,9 +1382,10 @@ pub(crate) mod native {
                 #[cfg(target_os = "macos")]
                 Object::Console(_) => Ok(2),
                 Object::Pipe(_) => Ok(3),
-                Object::Search(_) | Object::Semaphore { .. } | Object::Event { .. } => {
-                    Err(BAD_HANDLE)
-                }
+                Object::Search(_)
+                | Object::Semaphore { .. }
+                | Object::Event { .. }
+                | Object::Mutex { .. } => Err(BAD_HANDLE),
             }),
             0,
         )

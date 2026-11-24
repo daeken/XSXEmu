@@ -384,6 +384,14 @@ either pointer. Ordinary handle closure and duplication use the same object
 lifetime rules as for semaphores. This implements creation only: event
 signaling, reset, and wait APIs remain unbound.
 
+`CreateMutexA` uses a three-argument bridge. The tail thunk targeting IAT
+RVA `0x6793ac0` passes `(NULL, FALSE, NULL)`. The provider creates a typed,
+noninheritable guest mutex with `MUTEX_ALL_ACCESS`. A nonzero initial-owner
+BOOL records the current modeled guest thread ID as the owner; zero creates
+an unowned mutex. Success preserves LastError. Non-null security or name
+returns `NULL` and `ERROR_NOT_SUPPORTED` without reading either pointer.
+This implements creation only, not release, waits, or abandoned mutexes.
+
 `IsProcessorFeaturePresent` uses the ordinary provider's AMD64 baseline and
 runtime x86 feature detection, preserving `LastError`. It reports
 `PF_FASTFAIL_AVAILABLE` (23) as false: Windows `INT 29h` fast-fail handling is

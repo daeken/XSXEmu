@@ -183,6 +183,8 @@ audited_bridges! {
         io::create_semaphore_ex_w, (security: *const c_void, initial: i32, maximum: i32, name: *const u16, flags: u32, desired_access: u32) -> usize;
     xsxemu_tls_create_event_a, create_event_a: b"kernelbase.dll", b"CreateEventA",
         io::create_event_a, (security: *const c_void, manual_reset: i32, initial_state: i32, name: *const u8) -> usize;
+    xsxemu_tls_create_mutex_a, create_mutex_a: b"kernelbase.dll", b"CreateMutexA",
+        io::create_mutex_a, (security: *const c_void, initial_owner: i32, name: *const u8) -> usize;
     xsxemu_tls_getstdhandle, getstdhandle: b"kernelbase.dll", b"GetStdHandle",
         io::GetStdHandle, (slot: u32) -> usize;
     xsxemu_tls_getfiletype, getfiletype: b"kernelbase.dll", b"GetFileType",
