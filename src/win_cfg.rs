@@ -1518,17 +1518,23 @@ pub(super) mod tests {
     }
 
     /// Original non-CFG EXE calls a guarded DLL through a bound IAT. The DLL
-    /// reads an initializer pointer from RCX and uses its own dispatch slot.
+    /// walks the EXE's [RCX, RDX) initializer array through its dispatch slot.
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
     pub(crate) fn mixed_cfg_fixture(case: &str) -> (Vec<u8>, Vec<u8>) {
         let mut dll = executable_fixture(true, 0x1003, 0);
         put16(&mut dll, NT + 22, 0x2002);
         put32(&mut dll, OPT + 16, 0);
-        // sub rsp,40; mov rax,[rcx]; call [rip+dispatch]; add rsp,40; ret
-        dll[0x480..0x492].copy_from_slice(&[
-            0x48, 0x83, 0xec, 0x28, 0x48, 0x8b, 0x01, 0xff, 0x15, 0x8b, 0x10, 0, 0, 0x48, 0x83,
-            0xc4, 0x28, 0xc3,
-        ]);
+        #[rustfmt::skip]
+        let walker = [
+            0x53, 0x56, 0x48, 0x83, 0xec, 0x28, // save RBX/RSI; align and reserve home area
+            0x48, 0x8b, 0xd9, 0x48, 0x8b, 0xf2, 0x31, 0xc0, // RBX=first, RSI=end, EAX=0
+            0x48, 0x3b, 0xde, 0x73, 0x15, // loop: cmp rbx,rsi; jae done
+            0x48, 0x83, 0x3b, 0, 0x74, 9, // cmp qword [rbx],0; je next
+            0x48, 0x8b, 0x03, 0xff, 0x15, 0x76, 0x10, 0, 0, // mov rax,[rbx]; call [dispatch]
+            0x48, 0x83, 0xc3, 8, 0xeb, 0xe6, // next: add rbx,8; jmp loop
+            0x48, 0x83, 0xc4, 0x28, 0x5e, 0x5b, 0xc3, // done: restore and return
+        ];
+        dll[0x480..0x480 + walker.len()].copy_from_slice(&walker);
 
         let mut exe = executable_fixture(true, 0x1003, 0);
         exe[LC..LC + 0x400].fill(0);
@@ -1568,13 +1574,14 @@ pub(super) mod tests {
         fixes.push(0xa270);
         let target = if case == "interior" { 0x1041 } else { 0x1040 };
         exe[0x440..0x447].copy_from_slice(&[0x90, 0xb8, 42, 0, 0, 0, 0xc3]);
-        let pointer_rva = if case == "writable" {
-            put64(&mut exe, 0xa08, BASE + target);
+        // A null first entry forces the DLL to walk to the real callback.
+        let array_rva = if case == "writable" {
+            put64(&mut exe, 0xa10, BASE + target);
             0x3008_u32
         } else {
-            put64(&mut exe, 0x800, BASE + target);
+            put64(&mut exe, 0x808, BASE + target);
             if case != "no-fixup" {
-                fixes.push(0xa200);
+                fixes.push(0xa208);
             }
             0x2200_u32
         };
@@ -1602,19 +1609,21 @@ pub(super) mod tests {
             let off = LC + 0x300 + size as usize;
             put32(&mut exe, off, 0x3000);
             put32(&mut exe, off + 4, extra_block);
-            put16(&mut exe, off + 8, 0xa008);
+            put16(&mut exe, off + 8, 0xa010);
         }
         let mut code = vec![0x48, 0x83, 0xec, 0x38]; // align, home, and local
         if case == "no-fixup" {
             // Still exercise a callable pointer after rebasing, but manufacture
             // it at runtime; the identical preferred VA on disk lacks DIR64.
             code.extend([0x48, 0x8d, 0x05, 0xb5, 0xff, 0xff, 0xff]);
-            code.extend([0x48, 0x89, 0x44, 0x24, 0x20]);
+            code.extend([0x48, 0x89, 0x44, 0x24, 0x28]); // second entry
+            code.extend([0x48, 0xc7, 0x44, 0x24, 0x20, 0, 0, 0, 0]); // null first entry
             code.extend([0x48, 0x8d, 0x4c, 0x24, 0x20]);
         } else {
             code.extend([0x48, 0x8d, 0x0d]);
-            code.extend((pointer_rva - 0x108b).to_le_bytes());
+            code.extend((array_rva - 0x108b).to_le_bytes());
         }
+        code.extend([0x48, 0x8d, 0x51, 16]); // lea rdx,[rcx+16]
         code.extend([0xff, 0x15]);
         code.extend((0x2250_u32 - (0x1080 + code.len() as u32 + 4)).to_le_bytes());
         code.extend([0x48, 0x83, 0xc4, 0x38, 0xc3]);

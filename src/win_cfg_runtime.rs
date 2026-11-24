@@ -260,6 +260,14 @@ mod tests {
         let (form, value) = case.split_once(':').unwrap();
         if form == "legacy" {
             let (exe, dll) = mixed_cfg_fixture(value);
+            let _reserve_preferred_base = (value == "rebased").then(|| {
+                let pe = Pe::parse(&exe).unwrap();
+                let len = pe.size_of_image as usize;
+                let reserve = GuestMemory::allocate(len, Some(pe.image_base)).unwrap();
+                let probe = GuestMemory::allocate(len, Some(pe.image_base)).unwrap();
+                assert_ne!(probe.base(), pe.image_base);
+                reserve
+            });
             let profile = if value == "strict" {
                 startup::Profile::StaticTlsChild
             } else {
@@ -350,6 +358,7 @@ mod tests {
     #[test]
     fn mixed_image_dispatch_requires_exact_legacy_root_evidence_and_opt_in() {
         assert_case("legacy:exact", true);
+        assert_case("legacy:rebased", true);
         for case in ["interior", "no-pdata", "no-fixup", "writable", "strict"] {
             assert_case(&format!("legacy:{case}"), false);
         }
