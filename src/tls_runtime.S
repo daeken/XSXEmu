@@ -1,7 +1,8 @@
 /* Fixed SysV -> Win64 boundary (EXE entry, TLS callback or DllMain).
  * From the first switch to the checked restore, only this assembly, trusted
- * PE code, and the pre-resolved Rosetta TSD setter may execute. Never call a
- * dyld stub, Rust function, or signal-mask operation with guest GS. */
+ * PE code, the GS-neutral GuardCF leaf checks/dispatch and the pre-resolved
+ * Rosetta TSD setter may execute. Never call a dyld stub, Rust function, or
+ * signal-mask operation with guest GS. */
 .text
 .macro check_guest ctx
     movq %gs:0x30, %r10

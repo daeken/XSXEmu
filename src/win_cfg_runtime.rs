@@ -86,6 +86,8 @@ impl Drop for Registration {
 // Handwritten leaf thunks: no host ABI calls, no SIMD instructions (including
 // implicit upper-lane clearing), and no use of caller home space. All GPRs and
 // flags are preserved. Binary search the half-open suffix [r10, r10 + r11*8).
+// The static TLS lane also calls these with guest GS. Keep them free of GS,
+// host TLS, instrumentation and any host calls (even on denial).
 // x86-64's aligned load of ACTIVE has acquire semantics.
 macro_rules! guard {
     ($target:literal, $finish:literal) => {

@@ -13,6 +13,7 @@ use crate::{
     link::BindingTarget,
     pe::Pe,
     static_tls::{self, Image, ImageId, Limits, PatchSites, Plan},
+    win_cfg::CfgMetadata,
 };
 use std::{
     arch::{asm, global_asm},
@@ -166,7 +167,11 @@ fn slot_hits(slots: &[u32], range: &Range<u32>) -> bool {
 }
 
 impl PatchWrites {
-    pub fn validate(pes: &[Pe<'_>], bindings: &[(usize, u32, BindingTarget)]) -> Result<Self> {
+    pub fn validate(
+        pes: &[Pe<'_>],
+        bindings: &[(usize, u32, BindingTarget)],
+        cfgs: &[Option<CfgMetadata<'_>>],
+    ) -> Result<Self> {
         if pes.is_empty() || pes.len() > Limits::default().images {
             return Err("experimental static TLS image count outside profile".into());
         }
@@ -214,6 +219,15 @@ impl PatchWrites {
                     "image {i}: relocation overlaps an IAT or security-cookie slot"
                 )
                 .into());
+            }
+        }
+        for (slots, cfg) in writes.iter_mut().zip(cfgs) {
+            if let Some(cfg) = cfg {
+                // The shared binder checks guard-vs-IAT/cookie conflicts. A
+                // DIR64 at a guard slot is valid (e.g. a default check stub);
+                // the slot is deliberately overwritten after relocation.
+                slots.extend([cfg.check_slot_rva(), cfg.dispatch_slot_rva()]);
+                slots.sort_unstable();
             }
         }
         Ok(Self(writes))
@@ -279,7 +293,7 @@ fn check_sites(
     .flatten()
     {
         if slot_hits(slots, range) {
-            return Err(invalid("IAT or security-cookie write conflict"));
+            return Err(invalid("IAT, security-cookie, or GuardCF write conflict"));
         }
     }
     if image

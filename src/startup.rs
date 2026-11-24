@@ -43,12 +43,6 @@ mod native {
             }
         }
         let cfg = CfgMetadata::parse(pe).map_err(|e| format!("{name}: {e}"))?;
-        if static_tls && cfg.is_some() {
-            return Err(format!(
-                "{name}: experimental static TLS does not support GuardCF host thunks"
-            )
-            .into());
-        }
         if cfg.is_none()
             && let Some(dir) = pe.directory(10)
         {
@@ -194,7 +188,7 @@ mod native {
             .into_iter()
             .unzip();
         let tls_writes = static_tls
-            .then(|| tls_runtime::PatchWrites::validate(&pes, bindings))
+            .then(|| tls_runtime::PatchWrites::validate(&pes, bindings, &cfgs))
             .transpose()?;
         validate_trap_slots(&pes, bindings, missing)?;
         let mut targets = cfgs.iter().any(Option::is_some).then(Targets::default);
@@ -288,8 +282,10 @@ mod native {
             }
         }
         if let Some(tls) = tls {
-            // Neither the host loader, the unwind provider, nor CFG is installed
-            // on this path. No thunk can lead from guest GS into host Rust.
+            // The existing check/dispatch thunks are GS-neutral leaf assembly.
+            // The registry has only PE GFIDs: Rust targets and trace thunks are
+            // already refused. No loader or unwind provider is installed.
+            let _cfg_registration = targets.map(Targets::install).transpose()?;
             return tls_runtime::run(&tls, images, &pes, &memories, attach_order);
         }
         let _loader = win_loader::register(

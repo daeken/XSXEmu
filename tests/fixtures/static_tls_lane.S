@@ -6,6 +6,7 @@ _static_tls_fixture:
     .long Lend-Ltext, Lroot_cb-Ltext, Lroot_entry-Ltext
     .long Ldll_cb-Ltext, Ldll_main-Ltext, Lstep-Ltext
     .long Lsolo_cb-Ltext, Lsolo_entry-Ltext
+    .long Lcfg_entry-Ltext, Lcfg_target-Ltext
 Ltext:
 .macro tls index
     leaq Ltext(%rip), %r11
@@ -114,6 +115,33 @@ Lsolo_entry:
     tls 0
     phase 1, 2
     movl $43, %eax
+    retq
+Lcfg_entry:
+    tls 0
+    leaq Lcfg_target(%rip), %rcx
+    cmpl $1, {mode_delta}(%r11)
+    jne Lcfg_check
+    decq %rcx
+Lcfg_check:
+    subq $40, %rsp
+    callq *{check_delta}(%r11)
+    movq %rcx, %rax
+    cmpl $2, {mode_delta}(%r11)
+    jne Lcfg_dispatch
+    decq %rax
+Lcfg_dispatch:
+    cmpl $3, {mode_delta}(%r11)
+    jne Lcfg_do_call
+    movq $0, {dispatch_delta}(%r11) /* write must fault on a sealed slot */
+Lcfg_do_call:
+    callq *{dispatch_delta}(%r11)
+    addq $40, %rsp
+    retq
+    nop                      /* callable, but not listed in the GFID table */
+Lcfg_target:
+    tls 0
+    phase 1, 2
+    movl $44, %eax
     retq
 Lbad:
     ud2

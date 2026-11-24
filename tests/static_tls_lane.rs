@@ -18,6 +18,10 @@ const DATA: usize = 3 * PAGE;
 const INDEX: usize = DATA;
 const IAT: usize = DATA + 8;
 const COOKIE: usize = DATA + 24;
+const MODE: usize = DATA + 32;
+const CHECK: usize = RO + 0x200;
+const DISPATCH: usize = CHECK + 8;
+const GFIDS: usize = CHECK + 0x10;
 const ARRAY: usize = RO + 0x30;
 const TEMPLATE: usize = RO + 0x40;
 const RELOC: usize = RO + 0x50;
@@ -36,11 +40,14 @@ struct Fixture {
     step: u32,
     solo_cb: u32,
     solo_entry: u32,
+    cfg_entry: u32,
+    cfg_target: u32,
     code: [u8; RAW],
 }
 global_asm!(include_str!("fixtures/static_tls_lane.S"),
     capacity = const RAW, text_rva = const TEXT,
     index_delta = const INDEX - TEXT, cookie_delta = const COOKIE - TEXT, iat_delta = const IAT - TEXT,
+    mode_delta = const MODE - TEXT, check_delta = const CHECK - TEXT, dispatch_delta = const DISPATCH - TEXT,
     options(att_syntax),
 );
 unsafe extern "C" {
@@ -98,6 +105,7 @@ enum Kind {
     Exe,
     Dll,
     Solo,
+    Guarded,
 }
 fn image(kind: Kind) -> Vec<u8> {
     let code = unsafe { &static_tls_fixture };
@@ -105,6 +113,7 @@ fn image(kind: Kind) -> Vec<u8> {
         Kind::Exe => (code.root_entry, code.root_cb),
         Kind::Dll => (code.dll_main, code.dll_cb),
         Kind::Solo => (code.solo_entry, code.solo_cb),
+        Kind::Guarded => (code.cfg_entry, code.solo_cb),
     };
     let mut b = vec![0; 4 * RAW];
     put(&mut b, 0, b"MZ");
@@ -168,7 +177,10 @@ fn image(kind: Kind) -> Vec<u8> {
     w64(&mut b, file(LOAD) + 88, PREFERRED + COOKIE);
     w64(&mut b, file(COOKIE), 0x12131415);
 
-    let fix = [RO, RO + 8, RO + 16, RO + 24, ARRAY, TEMPLATE, LOAD + 88];
+    let mut fix = vec![RO, RO + 8, RO + 16, RO + 24, ARRAY, TEMPLATE, LOAD + 88];
+    if matches!(kind, Kind::Guarded) {
+        fix.extend([LOAD + 0x70, LOAD + 0x78, LOAD + 0x80]);
+    }
     let size = 8 + 2 * fix.len();
     dir(&mut b, 5, RELOC, size);
     w32(&mut b, file(RELOC), RO);
@@ -200,6 +212,18 @@ fn image(kind: Kind) -> Vec<u8> {
             w32(&mut b, file(LINK) + 0x38, LINK + 0x60);
             put(&mut b, file(LINK) + 0x50, b"owned.dll\0");
             put(&mut b, file(LINK) + 0x60, b"Step\0");
+        }
+        Kind::Guarded => {
+            w16(&mut b, OP + 70, 0x4000); // GUARD_CF
+            dir(&mut b, 10, LOAD, 0x94);
+            w32(&mut b, file(LOAD), 0x94);
+            for (off, rva) in [(0x70, CHECK), (0x78, DISPATCH), (0x80, GFIDS)] {
+                w64(&mut b, file(LOAD) + off, PREFERRED + rva);
+            }
+            // Fresh slots are zero; the launcher must overwrite both.
+            w64(&mut b, file(LOAD) + 0x88, 1);
+            w32(&mut b, file(LOAD) + 0x90, 0x500);
+            w32(&mut b, file(GFIDS), TEXT + code.cfg_target as usize);
         }
         Kind::Solo => (),
     }
@@ -285,7 +309,7 @@ fn rejects_patch_conflicts_and_non_executable_callbacks() {
     expect(
         run(&exe, &[OPT]),
         1,
-        "IAT or security-cookie write conflict",
+        "IAT, security-cookie, or GuardCF write conflict",
     );
     let mut invalid = image(Kind::Solo);
     w64(&mut invalid, file(ARRAY), PREFERRED + INDEX);
@@ -298,7 +322,7 @@ fn rejects_patch_conflicts_and_non_executable_callbacks() {
     expect(
         run(&exe, &[OPT]),
         1,
-        "IAT or security-cookie write conflict",
+        "IAT, security-cookie, or GuardCF write conflict",
     );
 }
 
@@ -366,5 +390,55 @@ fn launcher_kills_nonreturning_child_at_deadline() {
         run(&exe, &[OPT]),
         1,
         "experimental static TLS child timed out",
+    );
+}
+
+#[test]
+fn guardcf_under_guest_gs_checks_exact_targets_and_seals_slots() {
+    if !rosetta() {
+        return;
+    }
+    let dir = Scratch::new();
+    let mut guarded = image(Kind::Guarded);
+    let exe = dir.write("guarded.exe", &guarded);
+    expect(run(&exe, &[OPT]), 44, "Guest entry returned 44");
+    // Same executable function but one byte before its exact GFID. Exercise
+    // both leaf paths separately; neither may fall through to that NOP.
+    for mode in [1, 2] {
+        w32(&mut guarded, file(MODE), mode);
+        dir.write("guarded.exe", &guarded);
+        expect(run(&exe, &[OPT]), 1, "child terminated by signal 4");
+    }
+    w32(&mut guarded, file(MODE), 3);
+    dir.write("guarded.exe", &guarded);
+    let out = run(&exe, &[OPT]);
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("child terminated by signal 10")
+            || err.contains("child terminated by signal 11"),
+        "{err}"
+    );
+}
+
+#[test]
+fn unsupported_guardcf_policy_and_guard_tls_overlap_fail_preentry() {
+    if !rosetta() {
+        return;
+    }
+    let dir = Scratch::new();
+    let mut guarded = image(Kind::Guarded);
+    w32(&mut guarded, file(LOAD) + 0x90, 0x0080_0500); // XFG
+    let exe = dir.write("guarded.exe", &guarded);
+    expect(run(&exe, &[OPT]), 1, "GuardFlags requirements");
+    let mut guarded = image(Kind::Guarded);
+    // A slot would overwrite the TLS callback terminator, even though it is
+    // otherwise aligned writable-at-load-time data in a readable section.
+    w64(&mut guarded, file(LOAD) + 0x70, PREFERRED + ARRAY + 8);
+    dir.write("guarded.exe", &guarded);
+    expect(
+        run(&exe, &[OPT]),
+        1,
+        "IAT, security-cookie, or GuardCF write conflict",
     );
 }
