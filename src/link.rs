@@ -448,16 +448,17 @@ impl Builder<'_> {
             if has_separator(&dll) {
                 return Err(Unresolved::InvalidModuleName { dll });
             }
-            // Only the direct named import may use this offline Xbox shim,
+            // Only direct named imports can use these offline Xbox shims,
             // never a different provider routed here or a PE forwarder.
-            let vm = providers::D3D12_VM_CONFIGURE;
-            if seen.is_empty()
-                && self.options.rust_providers
-                && self.options.trusted_offline
-                && dll.eq_ignore_ascii_case(vm.provider.as_bytes())
-                && matches!(&symbol, Symbol::Name(name) if name == vm.symbol.as_bytes())
-            {
-                return Ok(BindingTarget::Rust(vm));
+            if seen.is_empty() && self.options.rust_providers && self.options.trusted_offline {
+                for shim in [providers::D3D12_VM_CONFIGURE, providers::XMEM_VIRTUAL_ALLOC] {
+                    if (shim != providers::XMEM_VIRTUAL_ALLOC || importer == 0)
+                        && dll.eq_ignore_ascii_case(shim.provider.as_bytes())
+                        && matches!(&symbol, Symbol::Name(name) if name == shim.symbol.as_bytes())
+                    {
+                        return Ok(BindingTarget::Rust(shim));
+                    }
+                }
             }
             if let Some(host) = self.rust_export(&dll, &symbol) {
                 return Ok(BindingTarget::Rust(host));

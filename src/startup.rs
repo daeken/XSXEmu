@@ -320,12 +320,16 @@ mod native {
     ) -> Result<u32> {
         use crate::tls_runtime;
         let static_tls = profile.uses_static_tls();
-        if !matches!(profile, Profile::TrustedOfflineTlsChild)
-            && bindings.iter().any(|&(_, _, target)| {
-                matches!(target, BindingTarget::Rust(export) if export == crate::providers::D3D12_VM_CONFIGURE)
-            })
-        {
-            return Err("D3D12ConfigureVirtualMemoryX requires the trusted offline static TLS child".into());
+        for &(importer, _, target) in bindings {
+            if let BindingTarget::Rust(export) = target {
+                use crate::providers::{D3D12_VM_CONFIGURE, XMEM_VIRTUAL_ALLOC};
+                if [D3D12_VM_CONFIGURE, XMEM_VIRTUAL_ALLOC].contains(&export)
+                    && (!matches!(profile, Profile::TrustedOfflineTlsChild)
+                        || (export == XMEM_VIRTUAL_ALLOC && importer != 0))
+                {
+                    return Err(format!("{}!{} not available for this importer/profile; requires the trusted offline static TLS child", export.provider, export.symbol).into());
+                }
+            }
         }
         let slot_thunks = if no_guest_cfg {
             UNCHECKED_SLOT_THUNKS

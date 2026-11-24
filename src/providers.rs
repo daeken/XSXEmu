@@ -16,12 +16,17 @@ impl HostExport {
     }
 }
 
-// This export has no raw callable address and is intentionally absent from
+// These exports have no raw callable address and are intentionally absent from
 // the ordinary and dynamic provider registries. Only the offline IAT planner
 // can select it, and startup binds it to the audited static-TLS bridge.
 pub const D3D12_VM_CONFIGURE: HostExport = HostExport {
     provider: "d3d12_xs.dll",
     symbol: "D3D12ConfigureVirtualMemoryX",
+    address: None,
+};
+pub const XMEM_VIRTUAL_ALLOC: HostExport = HostExport {
+    provider: "xmem.dll",
+    symbol: "XMemVirtualAlloc",
     address: None,
 };
 const KERNELBASE: &str = "kernelbase.dll";

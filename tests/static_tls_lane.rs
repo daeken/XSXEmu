@@ -16,7 +16,7 @@ const OPT: &str = "--experimental-static-tls";
 const TRUSTED: &str = "--trusted-offline";
 const WARNING: &str = "neither signature nor catalog is verified; Xbox policy is not evaluated";
 const PAGE: usize = 0x4000;
-const RAW: usize = 0x2400; // Includes the shared fixture's bridge code.
+const RAW: usize = 0x2600; // Includes the shared fixture's bridge code.
 const TEXT: usize = PAGE;
 const RO: usize = 2 * PAGE;
 const DATA: usize = 3 * PAGE;
@@ -63,6 +63,7 @@ struct Fixture {
     sync_wake: u32,
     registry_entry: u32,
     configure_d3d12_vm_entry: u32,
+    xmem_entry: u32,
     code: [u8; RAW],
 }
 global_asm!(include_str!("fixtures/static_tls_lane.S"),
@@ -1919,6 +1920,39 @@ fn xbox_d3d12_vm_bridge_accepts_only_observed_offline_input() {
     assert_eq!(stderr.matches("unsupported 32-byte input shape").count(), 2);
     expect(output, 44, "Guest entry returned 44");
 }
+#[test]
+fn xmem_bridge_owns_only_the_two_observed_reservations() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let mut exe = image(Kind::Solo);
+    w32(
+        &mut exe,
+        OP + 16,
+        TEXT + unsafe { static_tls_fixture.xmem_entry } as usize,
+    );
+    dir_import_one(&mut exe, b"XMEM.dll\0", b"XMemVirtualAlloc\0");
+    for gib in [16, 24] {
+        w32(&mut exe, file(MODE), gib);
+        let path = scratch.write(&format!("xmem-{gib}.exe"), &exe);
+        for flags in [&[OPT, "--rust-providers"][..], &[OPT, TRUSTED][..]] {
+            expect(run(&path, flags), 1, "incomplete dependency graph");
+        }
+        let output = run(&path, &[OPT, TRUSTED, "--rust-providers"]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            stderr.matches("reserved CPU no-access VA").count(),
+            2,
+            "{stderr}"
+        );
+        assert!(stderr.contains(&format!("size={:#x} flags=0x20402000", gib << 30)));
+        assert!(stderr.contains("tuple already held"));
+        assert!(stderr.contains("unsupported reservation tuple"));
+        expect(output, 45, "Guest entry returned 45");
+    }
+}
+
 #[test]
 fn startup_trace_identifies_fatal_dllmain_phase_and_last_bridge() {
     if !rosetta() {

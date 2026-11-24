@@ -21,6 +21,8 @@ mod win_cfg_runtime;
 mod xbox_d3d12_vm;
 #[cfg(test)]
 mod xbox_vm;
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+mod xbox_xmem;
 
 use pe::{ExportTarget, ImportSymbol, Pe};
 use std::{

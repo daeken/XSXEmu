@@ -15,6 +15,7 @@ _static_tls_fixture:
     .long Lsync_entry-Ltext, Lsync_sleep-Ltext, Lsync_wake-Ltext
     .long Lregistry_entry-Ltext
     .long Lconfigure_d3d12_vm_entry-Ltext
+    .long Lxmem_entry-Ltext
 Ltext:
 .macro tls index
     leaq Ltext(%rip), %r11
@@ -1117,6 +1118,58 @@ Lconfigure_d3d12_vm_entry:
     configure_d3d12_vm 0x80070057
     movl $44, %eax
     addq $72, %rsp
+    retq
+/* Original ABI exercise: no loads/stores to the resulting reservations. */
+.macro xmem attr, prot, flags=0x20402000
+    xorl %ecx, %ecx
+    movq %rbx, %rdx
+    movl $\flags, %r8d
+    movl $\attr, %r9d
+    movl $\prot, 32(%rsp)
+    movl $0xfeedface, 36(%rsp)
+    leaq Ltext(%rip), %r11
+    callq *{iat_delta}(%r11)
+.endm
+Lxmem_entry:
+    tls 0
+    phase 1, 2
+    pushq %rbx
+    subq $48, %rsp
+    leaq Ltext(%rip), %r11
+    movl {mode_delta}(%r11), %ebx
+    shlq $30, %rbx
+    movl $0xbeef, %gs:0x68
+    xmem 0x21, 4
+    testq %rax, %rax
+    jz Lbad
+    testl $0xffff, %eax
+    jnz Lbad
+    movq %rax, 40(%rsp)
+    xmem 3, 0x801
+    testq %rax, %rax
+    jz Lbad
+    testl $0xffff, %eax
+    jnz Lbad
+    subq 40(%rsp), %rax
+    jns 1f
+    negq %rax
+1:  cmpq %rbx, %rax
+    jb Lbad
+    cmpl $0xbeef, %gs:0x68
+    jne Lbad
+    xmem 0x21, 4
+    testq %rax, %rax
+    jnz Lbad
+    cmpl $8, %gs:0x68
+    jne Lbad
+    xmem 0x183, 0x22004, 0x20003000
+    testq %rax, %rax
+    jnz Lbad
+    cmpl $50, %gs:0x68
+    jne Lbad
+    movl $45, %eax
+    addq $48, %rsp
+    popq %rbx
     retq
 Lend:
     .org Ltext + {capacity}, 0xcc
