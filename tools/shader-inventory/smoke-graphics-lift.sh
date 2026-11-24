@@ -60,3 +60,9 @@ cp "$d/owned.metalar" "$d/diagnostic.metalar"
 "$p" --expect-owned-metal-miss "$d/mutated.metallib" "$d/diagnostic.metalar"
 printf x >> "$d/owned.metalar"
 expect_mismatch --replay-archive "$d/owned.metallib" "$d/owned.metalar" "$compiler"
+
+# The packed FP16_ABGR variant has its own ABI and is not an archive job.
+"$p" --packed-source
+"$p" --emit-packed-msl > "$d/packed.metal"
+compile packed
+"$p" --load-packed-metallib "$d/packed.metallib"

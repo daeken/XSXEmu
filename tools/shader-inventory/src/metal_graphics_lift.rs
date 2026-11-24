@@ -33,6 +33,8 @@ mod gpu {
 
     enum Mode<'a> {
         Source,
+        PackedSource,
+        PackedLoad(&'a Path),
         Load(&'a Path, bool),
         Archive(&'a Path, &'a Path, bool, bool, [u8; 32]),
         ExpectStrictMiss(&'a Path, &'a Path),
@@ -60,6 +62,12 @@ mod gpu {
         let args: Vec<_> = std::env::args_os().skip(1).collect();
         let mode = match args.as_slice() {
             [] => Mode::Source,
+            [mode] if mode == "--packed-source" => Mode::PackedSource,
+            [mode, lib] if mode == "--load-packed-metallib" => Mode::PackedLoad(Path::new(lib)),
+            [mode] if mode == "--emit-packed-msl" => {
+                print!("{}", graphics_lift::translate_packed_color_fixture().map_err(|e| format!("packed lift rejected: {e:?}"))?);
+                return Ok(());
+            }
             [mode] if mode == "--emit-msl" || mode == "--emit-mutated-msl" => {
                 let literal = (mode == "--emit-mutated-msl").then_some(owned_graphics_job::MUTATED_LITERAL);
                 print!("{}", graphics_lift::translate_fixture(literal).map_err(|e| format!("lift rejected: {e:?}"))?);
@@ -68,7 +76,7 @@ mod gpu {
             [mode, lib] if mode == "--load-metallib" || mode == "--load-mutated-metallib" => Mode::Load(Path::new(lib), mode == "--load-mutated-metallib"),
             [mode, lib, archive] if mode == "--expect-owned-metal-miss" => Mode::ExpectStrictMiss(Path::new(lib), Path::new(archive)),
             [mode, lib, archive, compiler] if mode == "--bake-archive" || mode == "--replay-archive" || mode == "--replay-mutated-archive" => Mode::Archive(Path::new(lib), Path::new(archive), mode == "--bake-archive", mode == "--replay-mutated-archive", owned_graphics_artifact::compiler_profile(compiler)?),
-            _ => return Err("usage: shader-metal-graphics-lift [--emit-msl | --emit-mutated-msl | --load-metallib LIB | --load-mutated-metallib LIB | {--bake-archive|--replay-archive|--replay-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-owned-metal-miss MUTATED_LIB ARCHIVE]".into()),
+            _ => return Err("usage: shader-metal-graphics-lift [--packed-source | --emit-packed-msl | --load-packed-metallib LIB | --emit-msl | --emit-mutated-msl | --load-metallib LIB | --load-mutated-metallib LIB | {--bake-archive|--replay-archive|--replay-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-owned-metal-miss MUTATED_LIB ARCHIVE]".into()),
         };
         if matches!(mode, Mode::Archive(..) | Mode::ExpectStrictMiss(..))
             && std::env::var_os("MTL_SHADER_VALIDATION").is_some()
@@ -90,15 +98,21 @@ mod gpu {
         } else {
             None
         };
+        let packed = matches!(mode, Mode::PackedSource | Mode::PackedLoad(_));
         let lib = match mode {
-            Mode::Source => {
-                let msl = graphics_lift::translate_fixture(None)
-                    .map_err(|e| format!("lift rejected: {e:?}"))?;
+            Mode::Source | Mode::PackedSource => {
+                let msl = if packed {
+                    graphics_lift::translate_packed_color_fixture()
+                } else {
+                    graphics_lift::translate_fixture(None)
+                }
+                .map_err(|e| format!("lift rejected: {e:?}"))?;
                 let options = CompileOptions::new();
                 options.set_fast_math_enabled(false);
                 dev.new_library_with_source(&msl, &options)?
             }
-            Mode::Load(path, _)
+            Mode::PackedLoad(path)
+            | Mode::Load(path, _)
             | Mode::Archive(path, _, _, _, _)
             | Mode::ExpectStrictMiss(path, _) => {
                 metal_artifact::file_url(path, false).map_err(|e| e.to_string())?;
@@ -106,10 +120,14 @@ mod gpu {
             }
         };
         let desc = RenderPipelineDescriptor::new();
-        let format = MTLPixelFormat::RGBA8Unorm;
+        let (format, pixel_bytes, default_ps) = if packed {
+            (MTLPixelFormat::RGBA32Float, 16, "packed_ps")
+        } else {
+            (MTLPixelFormat::RGBA8Unorm, 4, "translated_ps")
+        };
         let (vs, ps) = admitted
             .as_ref()
-            .map_or(("translated_vs", "translated_ps"), |(job, _)| {
+            .map_or(("translated_vs", default_ps), |(job, _)| {
                 (
                     job.stages()[0].translated_entry.as_str(),
                     job.stages()[1].translated_entry.as_str(),
@@ -210,6 +228,20 @@ mod gpu {
             std::mem::size_of_val(&vertices) as u64,
             vertices.as_ptr().cast(),
         );
+        if packed {
+            enc.set_scissor_rect(MTLScissorRect {
+                x: 2,
+                y: 1,
+                width: 4,
+                height: 5,
+            });
+            let inputs = [0xb800_3e00u32, 0x3400_c000u32];
+            enc.set_fragment_bytes(
+                0,
+                std::mem::size_of_val(&inputs) as u64,
+                inputs.as_ptr().cast(),
+            );
+        }
         enc.draw_primitives(MTLPrimitiveType::Triangle, 0, 3);
         enc.end_encoding();
         let readback = dev.new_buffer(BYTES as u64, MTLResourceOptions::StorageModeShared);
@@ -243,9 +275,23 @@ mod gpu {
         let mutated = matches!(mode, Mode::Load(_, true) | Mode::Archive(_, _, _, true, _));
         for y in 0..SIDE {
             for x in 0..SIDE {
-                let expected = expected(x, mutated);
-                let at = y * STRIDE + x * 4;
-                let got = &pixels[at..at + 4];
+                let at = y * STRIDE + x * pixel_bytes;
+                let got = &pixels[at..at + pixel_bytes];
+                let ordinary;
+                let fp32;
+                let expected: &[u8] = if packed {
+                    // Independent numeric oracle; this does not unpack input dwords.
+                    let rgba: [f32; 4] = if (2..6).contains(&x) && (1..6).contains(&y) {
+                        [-2., 0.25, 1.5, -0.5]
+                    } else {
+                        [1., 0., 1., 0.]
+                    };
+                    fp32 = rgba.map(f32::to_le_bytes).as_flattened().to_owned();
+                    &fp32
+                } else {
+                    ordinary = expected(x, mutated);
+                    &ordinary
+                };
                 if got != expected {
                     return Err(format!(
                         "pixel ({x},{y}): expected {expected:?}, got {got:?}"
@@ -258,7 +304,7 @@ mod gpu {
             println!("published owned graphics artifact identity");
         }
         println!(
-            "{} translated GFX10 VS+PS (mutated={mutated}): {n}/{n} pixels matched",
+            "{} translated GFX10 VS+PS (mutated={mutated}, packed={packed}): {n}/{n} pixels matched",
             dev.name(),
             n = SIDE * SIDE
         );

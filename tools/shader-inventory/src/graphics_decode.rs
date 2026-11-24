@@ -42,6 +42,11 @@ pub(crate) enum Op {
         src: [Vgpr; 4],
         done: bool,
     },
+    PackedColor0 {
+        src: [Vgpr; 2],
+        done: bool,
+        vm: bool,
+    },
     End,
 }
 
@@ -139,6 +144,22 @@ pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeErro
                     Vgpr((fields >> 18) as u8),
                 ],
                 accumulate: false,
+            },
+        ));
+    }
+    // Full-mask compressed MRT0, with no reserved bits. The no-flags and
+    // DONE+VM forms are distinguished from the stage-level export contract.
+    if matches!(w, 0xf800_040f | 0xf800_1c0f) {
+        let [rg, ba, unused2, unused3] = ext()?.to_le_bytes();
+        if unused2 != 0 || unused3 != 0 {
+            return Err(DecodeError::Unsupported(pc));
+        }
+        return Ok((
+            2,
+            Op::PackedColor0 {
+                src: [Vgpr(rg), Vgpr(ba)],
+                done: w & 0x800 != 0,
+                vm: w & 0x1000 != 0,
             },
         ));
     }

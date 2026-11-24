@@ -7,6 +7,7 @@ use crate::graphics_decode::{DecodeError, FloatSource, Op, Target, Vgpr, decode}
 enum Stage {
     Vertex,
     Pixel,
+    PackedPixel,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -42,18 +43,25 @@ const PS: &[u32] = &[
     0xbf81_0000, // s_endpgm
 ];
 
+const PACKED_PS: &[u32] = &[
+    0xf800_1c0f,
+    0x0000_0001, // exp mrt0 v1, v1, v0, v0 done compr vm
+    0xbf81_0000,
+];
+
 impl Stage {
     fn input_registers(self) -> usize {
         match self {
             Stage::Vertex => 8,
             Stage::Pixel => 4,
+            Stage::PackedPixel => 2,
         }
     }
 
     fn exports(self) -> &'static [(Target, bool)] {
         match self {
             Stage::Vertex => &[(Target::Parameter, false), (Target::Position, true)],
-            Stage::Pixel => &[(Target::Color, true)],
+            Stage::Pixel | Stage::PackedPixel => &[(Target::Color, true)],
         }
     }
 }
@@ -99,7 +107,20 @@ fn lift(stage: Stage, words: &[u32]) -> Result<Vec<Op>, Reject> {
                 live[usize::from(dst.0)] = true;
             }
             Op::Export { target, src, done } => {
-                if stage.exports().get(exported) != Some(&(target, done)) {
+                if stage == Stage::PackedPixel
+                    || stage.exports().get(exported) != Some(&(target, done))
+                {
+                    return Err(Reject::BadExports(pc));
+                }
+                for r in src {
+                    require(r)?;
+                }
+                exported += 1;
+            }
+            Op::PackedColor0 { src, done, vm } => {
+                // Owned contract: one final FP16_ABGR export, no EXEC changes,
+                // no discard or other writes. Metal raster coverage is the valid mask.
+                if stage != Stage::PackedPixel || !done || !vm || exported != 0 {
                     return Err(Reject::BadExports(pc));
                 }
                 for r in src {
@@ -173,6 +194,12 @@ fn body(out: &mut String, ops: &[Op]) {
                 )
                 .unwrap();
             }
+            Op::PackedColor0 {
+                src: [Vgpr(rg), Vgpr(ba)],
+                ..
+            } => {
+                writeln!(out, "  out = float4(float(as_type<half>(ushort(r[{rg}]))), float(as_type<half>(ushort(r[{rg}] >> 16))), float(as_type<half>(ushort(r[{ba}]))), float(as_type<half>(ushort(r[{ba}] >> 16))));").unwrap();
+            }
             Op::End => out.push_str("  return out;\n}\n"),
         }
     }
@@ -225,6 +252,32 @@ pub fn translate_fixture(literal_bits: Option<u32>) -> Result<String, Reject> {
     let (vs, ps) = fixture_programs(literal_bits);
     let vs = lift(Stage::Vertex, vs)?;
     let ps = lift(Stage::Pixel, &ps)?;
+    let mut msl = vertex_module(&vs);
+    msl.push_str(
+        "fragment float4 translated_ps(Varyings in [[stage_in]]) {\n\
+  uint r[256]; float4 out;\n\
+  const uint4 a = as_type<uint4>(in.parameter);\n\
+  r[0] = a.x; r[1] = a.y; r[2] = a.z; r[3] = a.w;\n",
+    );
+    body(&mut msl, &ps);
+    Ok(msl)
+}
+
+#[allow(dead_code)] // Separate owned render probe, not the keyed graphics fixture.
+pub fn translate_packed_color_fixture() -> Result<String, Reject> {
+    let vs = lift(Stage::Vertex, VS)?;
+    let ps = lift(Stage::PackedPixel, PACKED_PS)?;
+    let mut msl = vertex_module(&vs);
+    msl.push_str(
+        "fragment float4 packed_ps(constant uint2 &input [[buffer(0)]]) {\n\
+  uint r[256]; float4 out;\n\
+  r[0] = input.x; r[1] = input.y;\n",
+    );
+    body(&mut msl, &ps);
+    Ok(msl)
+}
+
+fn vertex_module(vs: &[Op]) -> String {
     // Only the entry/binding convention and one interpolation rule are authored
     // here. All moves, arithmetic, output operands and returns come from the lift.
     let mut msl = MSL_HEADER.to_owned();
@@ -238,15 +291,8 @@ vertex Varyings translated_vs(uint vid [[vertex_id]], const device VertexInput *
   r[0] = p.x; r[1] = p.y; r[2] = p.z; r[3] = p.w;\n\
   r[4] = a.x; r[5] = a.y; r[6] = a.z; r[7] = a.w;\n",
     );
-    body(&mut msl, &vs);
-    msl.push_str(
-        "fragment float4 translated_ps(Varyings in [[stage_in]]) {\n\
-  uint r[256]; float4 out;\n\
-  const uint4 a = as_type<uint4>(in.parameter);\n\
-  r[0] = a.x; r[1] = a.y; r[2] = a.z; r[3] = a.w;\n",
-    );
-    body(&mut msl, &ps);
-    Ok(msl)
+    body(&mut msl, vs);
+    msl
 }
 
 #[cfg(test)]
@@ -262,13 +308,15 @@ mod tests {
             io::Write,
             process::{Command, Stdio},
         };
-        let asm = "v_mov_b32_e32 v8, v4\nexp param0 v8, v5, v6, v7\nexp pos0 v0, v1, v2, v3 done\ns_endpgm\nv_add_f32_e32 v4, 0.25, v0\nv_fma_f32 v5, v1, v2, v3\nv_mul_legacy_f32_e32 v6, v5, v4\nv_mul_legacy_f32_e32 v6, 0.5, v6\nv_mul_legacy_f32_e32 v7, 0, v3\nexp mrt0 v4, v5, v6, v7 done\ns_endpgm\nv_mul_legacy_f32_e32 v2, v0, v1\nv_mul_legacy_f32_e32 v3, 0.25, v1\nv_fmac_f32_e32 v4, v0, v1\n";
+        let asm = "v_mov_b32_e32 v8, v4\nexp param0 v8, v5, v6, v7\nexp pos0 v0, v1, v2, v3 done\ns_endpgm\nv_add_f32_e32 v4, 0.25, v0\nv_fma_f32 v5, v1, v2, v3\nv_mul_legacy_f32_e32 v6, v5, v4\nv_mul_legacy_f32_e32 v6, 0.5, v6\nv_mul_legacy_f32_e32 v7, 0, v3\nexp mrt0 v4, v5, v6, v7 done\ns_endpgm\nv_mul_legacy_f32_e32 v2, v0, v1\nv_mul_legacy_f32_e32 v3, 0.25, v1\nv_fmac_f32_e32 v4, v0, v1\nexp mrt0 v1, v1, v0, v0 done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\n";
         let expected: Vec<u8> = VS
             .iter()
             .chain(PS)
             .chain(EDGE_VGPR)
             .chain(EDGE_LITERAL)
             .chain(EDGE_FMAC)
+            .chain(PACKED_PS)
+            .chain(&[0xf800_040f, 0x0000_0001])
             .flat_map(|w| w.to_le_bytes())
             .collect();
         for cpu in ["gfx1013", "gfx1030"] {
@@ -295,6 +343,38 @@ mod tests {
                 .collect();
             assert_eq!(bytes, expected, "{cpu}");
         }
+    }
+
+    #[test]
+    fn packed_color_requires_its_own_format_live_sources_and_complete_mask() {
+        assert_eq!(lift(Stage::PackedPixel, PACKED_PS).unwrap().len(), 2);
+        assert_eq!(lift(Stage::Pixel, PACKED_PS), Err(Reject::BadExports(0)));
+        assert_eq!(
+            lift(Stage::PackedPixel, &PACKED_PS[..2]),
+            Err(Reject::BadEnd(2))
+        );
+        let mut ps = PACKED_PS.to_vec();
+        ps[1] = 0x0801;
+        assert_eq!(
+            lift(Stage::PackedPixel, &ps),
+            Err(Reject::Uninitialized(0, 8))
+        );
+        ps[1] = PACKED_PS[1];
+        ps[0] &= !0x1800;
+        assert_eq!(lift(Stage::PackedPixel, &ps), Err(Reject::BadExports(0)));
+        for header in [
+            0xf800_0c0f,
+            0xf800_140f,
+            0xf800_1c03,
+            0xf800_1c1f,
+            0xf800_3c0f,
+        ] {
+            assert_eq!(decode(&[header, 1], 0), Err(DecodeError::Unsupported(0)));
+        }
+        assert_eq!(
+            decode(&[PACKED_PS[0], 0x10001], 0),
+            Err(DecodeError::Unsupported(0))
+        );
     }
 
     #[test]
