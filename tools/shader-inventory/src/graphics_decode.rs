@@ -10,6 +10,12 @@ pub(crate) enum Target {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FloatSource {
+    Vgpr(Vgpr),
+    InlineBits(u32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Op {
     Move {
         dst: Vgpr,
@@ -19,6 +25,11 @@ pub(crate) enum Op {
         dst: Vgpr,
         src: Vgpr,
         literal_bits: u32,
+    },
+    MulLegacyF32 {
+        dst: Vgpr,
+        lhs: FloatSource,
+        rhs: Vgpr,
     },
     FmaF32 {
         dst: Vgpr,
@@ -67,6 +78,23 @@ pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeErro
                 dst: Vgpr((w >> 17) as u8),
                 src: Vgpr((w >> 9) as u8),
                 literal_bits,
+            },
+        ));
+    }
+    // VOP2 legacy multiply, unmodified VGPR src1. Admit only exact owned inline forms and VGPR src0.
+    if w & 0xfe00_0000 == 0x0e00_0000 {
+        let lhs = match w & 0x1ff {
+            128 => FloatSource::InlineBits(0),
+            240 => FloatSource::InlineBits(0x3f00_0000),
+            r @ 256..=511 => FloatSource::Vgpr(Vgpr(r as u8)),
+            _ => return Err(DecodeError::Unsupported(pc)),
+        };
+        return Ok((
+            1,
+            Op::MulLegacyF32 {
+                dst: Vgpr((w >> 17) as u8),
+                lhs,
+                rhs: Vgpr((w >> 9) as u8),
             },
         ));
     }

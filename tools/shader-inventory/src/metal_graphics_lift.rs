@@ -7,13 +7,14 @@ mod graphics_lift;
 mod metal_artifact;
 
 // Integer oracle for the chosen fullscreen triangle and no-perspective varying.
-// Red/blue share a gradient. Green/alpha use the exact fused integer result
+// Blue is half red. Alpha is legacy zero times a negative finite number.
+// Green uses the exact fused integer result
 // 4097*4097 - 16785408 = 1. Separate float32 multiply rounds to 16785408.
 #[cfg(any(test, target_os = "macos"))]
 fn expected(x: usize, mutated: bool) -> [u8; 4] {
     let red_numerator = 2 * x + 1 + if mutated { 16 } else { 8 };
     let gradient = ((red_numerator * 255 + 16) / 32) as u8;
-    [gradient, 255, gradient, 255]
+    [gradient, 255, ((red_numerator * 255 + 32) / 64) as u8, 0]
 }
 
 #[cfg(target_os = "macos")]
@@ -222,8 +223,8 @@ fn main() {
 fn oracle_endpoints_and_gradient() {
     assert_eq!(4097_i64 * 4097 - 16785408, 1);
     assert_eq!(4097_f32 * 4097. - 16785408., 0.);
-    assert_eq!(expected(0, false), [72, 255, 72, 255]);
-    assert_eq!(expected(7, false), [183, 255, 183, 255]);
-    assert_eq!(expected(0, true), [135, 255, 135, 255]);
-    assert_eq!(expected(7, true), [247, 255, 247, 255]);
+    assert_eq!(expected(0, false), [72, 255, 36, 0]);
+    assert_eq!(expected(7, false), [183, 255, 92, 0]);
+    assert_eq!(expected(0, true), [135, 255, 68, 0]);
+    assert_eq!(expected(7, true), [247, 255, 124, 0]);
 }

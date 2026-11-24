@@ -1,7 +1,7 @@
 //! Strict, synthetic VS+PS contract for a small public GFX10 instruction subset.
 use std::fmt::Write;
 
-use crate::graphics_decode::{DecodeError, Op, Target, Vgpr, decode};
+use crate::graphics_decode::{DecodeError, FloatSource, Op, Target, Vgpr, decode};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Stage {
@@ -34,8 +34,11 @@ const PS: &[u32] = &[
     0x3e80_0000, // v_add_f32_e32 v4, 0.25, v0
     0xd54b_0005,
     0x040e_0501, // v_fma_f32 v5, v1, v2, v3
+    0x0e0c_0905, // v_mul_legacy_f32_e32 v6, v5, v4
+    0x0e0c_0cf0, // v_mul_legacy_f32_e32 v6, 0.5, v6
+    0x0e0e_0680, // v_mul_legacy_f32_e32 v7, 0, v3
     0xf800_080f,
-    0x0504_0504, // exp mrt0 v4, v5, v4, v5 done
+    0x0706_0504, // exp mrt0 v4, v5, v6, v7 done
     0xbf81_0000, // s_endpgm
 ];
 
@@ -80,6 +83,13 @@ fn lift(stage: Stage, words: &[u32]) -> Result<Vec<Op>, Reject> {
         match op {
             Op::Move { dst, src } | Op::AddF32Literal { dst, src, .. } => {
                 require(src)?;
+                live[usize::from(dst.0)] = true;
+            }
+            Op::MulLegacyF32 { dst, lhs, rhs } => {
+                if let FloatSource::Vgpr(r) = lhs {
+                    require(r)?;
+                }
+                require(rhs)?;
                 live[usize::from(dst.0)] = true;
             }
             Op::FmaF32 { dst, src } => {
@@ -127,6 +137,17 @@ fn body(out: &mut String, ops: &[Op]) {
             } => {
                 writeln!(out, "  r[{dst}] = as_type<uint>(as_type<float>(0x{literal_bits:08x}u) + as_type<float>(r[{src}]));").unwrap();
             }
+            Op::MulLegacyF32 {
+                dst: Vgpr(dst),
+                lhs,
+                rhs: Vgpr(rhs),
+            } => {
+                let lhs = match lhs {
+                    FloatSource::Vgpr(Vgpr(r)) => format!("r[{r}]"),
+                    FloatSource::InlineBits(bits) => format!("0x{bits:08x}u"),
+                };
+                writeln!(out, "  r[{dst}] = mul_legacy_f32_bits({lhs}, r[{rhs}]);").unwrap();
+            }
             Op::FmaF32 {
                 dst: Vgpr(dst),
                 src: [Vgpr(a), Vgpr(b), Vgpr(c)],
@@ -165,6 +186,10 @@ pub fn translate_fixture(literal_bits: Option<u32>) -> Result<String, Reject> {
     // here. All moves, arithmetic, output operands and returns come from the lift.
     let mut msl = String::from(
         "#include <metal_stdlib>\nusing namespace metal;\n\
+static uint mul_legacy_f32_bits(uint a, uint b) {\n\
+  if ((a & 0x7fffffffu) == 0 || (b & 0x7fffffffu) == 0) return 0u;\n\
+  return as_type<uint>(as_type<float>(a) * as_type<float>(b));\n\
+}\n\
 struct VertexInput { float4 position; float4 parameter; };\n\
 struct Varyings { float4 position [[position]]; float4 parameter [[center_no_perspective]]; };\n\
 vertex Varyings translated_vs(uint vid [[vertex_id]], const device VertexInput *input [[buffer(0)]]) {\n\
@@ -198,7 +223,7 @@ mod tests {
             io::Write,
             process::{Command, Stdio},
         };
-        let asm = "v_mov_b32_e32 v8, v4\nexp param0 v8, v5, v6, v7\nexp pos0 v0, v1, v2, v3 done\ns_endpgm\nv_add_f32_e32 v4, 0.25, v0\nv_fma_f32 v5, v1, v2, v3\nexp mrt0 v4, v5, v4, v5 done\ns_endpgm\n";
+        let asm = "v_mov_b32_e32 v8, v4\nexp param0 v8, v5, v6, v7\nexp pos0 v0, v1, v2, v3 done\ns_endpgm\nv_add_f32_e32 v4, 0.25, v0\nv_fma_f32 v5, v1, v2, v3\nv_mul_legacy_f32_e32 v6, v5, v4\nv_mul_legacy_f32_e32 v6, 0.5, v6\nv_mul_legacy_f32_e32 v7, 0, v3\nexp mrt0 v4, v5, v6, v7 done\ns_endpgm\n";
         let expected: Vec<u8> = VS.iter().chain(PS).flat_map(|w| w.to_le_bytes()).collect();
         for cpu in ["gfx1013", "gfx1030"] {
             let mut child = Command::new(&mc)
@@ -229,25 +254,28 @@ mod tests {
     #[test]
     fn strict_graphics_lift_rejects_bad_operand_export_and_extent() {
         assert_eq!(lift(Stage::Vertex, VS).unwrap().len(), 4);
-        assert_eq!(lift(Stage::Pixel, PS).unwrap().len(), 4);
+        assert_eq!(lift(Stage::Pixel, PS).unwrap().len(), 7);
         let mut vs = VS.to_vec();
         vs[0] |= 128;
         assert_eq!(lift(Stage::Vertex, &vs), Err(Reject::Uninitialized(0, 132)));
         assert_eq!(lift(Stage::Pixel, &PS[..1]), Err(Reject::Truncated(0)));
-        assert_eq!(lift(Stage::Pixel, &PS[..6]), Err(Reject::BadEnd(6)));
+        assert_eq!(lift(Stage::Pixel, &PS[..9]), Err(Reject::BadEnd(9)));
         let mut ps = PS.to_vec();
         ps[3] ^= 1 << 29; // Unmodeled negative modifier.
         assert_eq!(lift(Stage::Pixel, &ps), Err(Reject::Unsupported(2)));
         ps[3] = PS[3] & !(1 << 17); // SGPR instead of ordinary VGPR.
         assert_eq!(lift(Stage::Pixel, &ps), Err(Reject::Unsupported(2)));
         ps[3] = PS[3];
-        ps[4] |= 0x400; // compressed export is unsupported, not lowered as four lanes
+        ps[4] &= !(1 << 8); // SGPR source is outside the legacy multiply subset.
         assert_eq!(lift(Stage::Pixel, &ps), Err(Reject::Unsupported(4)));
-        ps[4] = 0xf800_000f; // missing DONE
-        assert_eq!(lift(Stage::Pixel, &ps), Err(Reject::BadExports(4)));
         ps[4] = PS[4];
+        ps[7] |= 0x400; // compressed export is unsupported, not lowered as four lanes
+        assert_eq!(lift(Stage::Pixel, &ps), Err(Reject::Unsupported(7)));
+        ps[7] = 0xf800_000f; // missing DONE
+        assert_eq!(lift(Stage::Pixel, &ps), Err(Reject::BadExports(7)));
+        ps[7] = PS[7];
         ps.push(0);
-        assert_eq!(lift(Stage::Pixel, &ps), Err(Reject::BadEnd(6)));
+        assert_eq!(lift(Stage::Pixel, &ps), Err(Reject::BadEnd(9)));
     }
 
     #[test]
