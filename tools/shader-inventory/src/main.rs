@@ -1,4 +1,7 @@
 //! Counts only; never exports assets or interprets the RPF9 TOC.
+mod coverage;
+mod llvm;
+
 use flate2::{Decompress, FlushDecompress, Status};
 use std::{
     collections::BTreeMap,
@@ -103,7 +106,13 @@ fn dxil_chunk(data: &[u8]) -> Option<&[u8]> {
     dxil
 }
 
-fn shader(data: &[u8], unwrapped: &mut Vec<u8>) -> Option<(u16, u16, usize)> {
+type ComputeSink<'a> = Option<&'a mut dyn FnMut(&[u8])>;
+
+fn shader(
+    data: &[u8],
+    unwrapped: &mut Vec<u8>,
+    on_compute: ComputeSink<'_>,
+) -> Option<(u16, u16, usize)> {
     let dxil = dxil_chunk(data)?;
     // Specific to this console envelope: the nominal DXIL bitcode field points to NOBC.
     if dxil.get(8..12)? != b"DXIL" || dxil.get(24..28)? != b"XDAT" {
@@ -132,27 +141,42 @@ fn shader(data: &[u8], unwrapped: &mut Vec<u8>) -> Option<(u16, u16, usize)> {
             return None;
         }
         let xbch = dxil.get(range.clone())?;
-        if !xbch.starts_with(b"XBCH")
-            || word(xbch, 4)? != 3
-            || word(xbch, 12)? != 0
-            || word(xbch, 20)? != 0
-        {
-            return None;
-        }
-        let compressed = xbch.get(24..)?;
-        let expected = word(xbch, 16)?;
-        if word(xbch, 8)? != compressed.len()
-            || inflate(compressed, true, expected, unwrapped)? != compressed.len()
-            || unwrapped.len() != expected
-            || !unwrapped.starts_with(b"FSSM")
-            || word(unwrapped, 4)? != 0x101
-        {
-            return None;
-        }
+        xbch_payload(xbch, unwrapped)?;
         native.push(range);
     }
     let key = word(dxil, 0)?;
+    // Publish only after every entry in this record passed validation. Keep only
+    // the one reusable inflate buffer even for multi-payload envelopes.
+    if key >> 16 == 5
+        && let Some(sink) = on_compute
+    {
+        for range in &native {
+            xbch_payload(&dxil[range.clone()], unwrapped)?;
+            sink(unwrapped);
+        }
+    }
     (!native.is_empty()).then_some(((key >> 16) as u16, key as u16, native.len()))
+}
+
+fn xbch_payload(xbch: &[u8], unwrapped: &mut Vec<u8>) -> Option<()> {
+    if !xbch.starts_with(b"XBCH")
+        || word(xbch, 4)? != 3
+        || word(xbch, 12)? != 0
+        || word(xbch, 20)? != 0
+    {
+        return None;
+    }
+    let compressed = xbch.get(24..)?;
+    let expected = word(xbch, 16)?;
+    if word(xbch, 8)? != compressed.len()
+        || inflate(compressed, true, expected, unwrapped)? != compressed.len()
+        || unwrapped.len() != expected
+        || !unwrapped.starts_with(b"FSSM")
+        || word(unwrapped, 4)? != 0x101
+    {
+        return None;
+    }
+    Some(())
 }
 
 fn wrapped_record(
@@ -160,6 +184,7 @@ fn wrapped_record(
     after_suffix: usize,
     out: &mut Vec<u8>,
     native: &mut Vec<u8>,
+    on_compute: ComputeSink<'_>,
 ) -> Option<(usize, u16, u16, usize)> {
     let header = data.get(span(after_suffix, 17)?)?;
     let stored = word(header, 1)?;
@@ -173,7 +198,7 @@ fn wrapped_record(
     if consumed.checked_add(12)? != stored || out.len() != expected {
         return None;
     }
-    let (stage, model, payloads) = shader(out, native)?;
+    let (stage, model, payloads) = shader(out, native, on_compute)?;
     Some((range.end, stage, model, payloads))
 }
 
@@ -274,12 +299,30 @@ fn stage_name(stage: u16) -> &'static str {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let mut args = std::env::args_os().skip(1).peekable();
-    let header_only = args.next_if(|arg| arg == "--header-only").is_some();
-    let path = args
-        .next()
-        .filter(|_| args.next().is_none())
-        .ok_or("usage: xsx-shader-inventory [--header-only] <shaders.rpf>")?;
+    let mut args = std::env::args_os().skip(1);
+    const USAGE: &str = "usage: xsx-shader-inventory [--header-only | --compute-isa <LLVM shared library> <primary CPU> <reference CPU>] <shaders.rpf> (select gfx1013 and gfx1030, in either order)";
+    let first = args.next().ok_or(USAGE)?;
+    let header_only = first == "--header-only";
+    let (path, mut coverage) = if first == "--compute-isa" {
+        let lib = args.next().ok_or(USAGE)?;
+        let primary = llvm::Cpu::parse(&args.next().ok_or(USAGE)?).ok_or(USAGE)?;
+        let reference = llvm::Cpu::parse(&args.next().ok_or(USAGE)?).ok_or(USAGE)?;
+        let path = args.next().filter(|_| args.next().is_none()).ok_or(USAGE)?;
+        (
+            path,
+            Some(coverage::Coverage::new(&lib, primary, reference)?),
+        )
+    } else {
+        let path = if header_only {
+            args.next().ok_or(USAGE)?
+        } else {
+            first
+        };
+        if args.next().is_some() {
+            return Err(USAGE.into());
+        }
+        (path, None)
+    };
     let mut file = File::open(path)?;
     let len = usize::try_from(file.metadata()?.len())?;
     if !header_only && len > ARCHIVE_LIMIT {
@@ -313,6 +356,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "RPF9: {len} bytes; inspected data window {:#x}..{:#x}; TOC not read/decoded",
         area.start, area.end
     );
+    let isa_enabled = coverage.is_some();
     let mut out = Vec::new();
     let mut native = Vec::new();
     let mut stages = BTreeMap::new();
@@ -325,9 +369,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     {
         offset += candidate;
         if archive[offset..].starts_with(SHADER_SUFFIX) {
-            if let Some((end, stage, model, count)) =
-                wrapped_record(archive, offset + SHADER_SUFFIX.len(), &mut out, &mut native)
-            {
+            let mut count = |payload: &[u8]| coverage.as_mut().unwrap().add(payload);
+            let enabled = isa_enabled.then_some(&mut count as &mut dyn FnMut(&[u8]));
+            if let Some((end, stage, model, count)) = wrapped_record(
+                archive,
+                offset + SHADER_SUFFIX.len(),
+                &mut out,
+                &mut native,
+                enabled,
+            ) {
                 let entry = stages.entry((stage, model)).or_insert((0usize, 0usize));
                 entry.0 += 1;
                 entry.1 += count;
@@ -353,6 +403,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "Total: {records} records, {programs} payloads; {rejected} rejected suffix candidates"
     );
+    if let Some(report) = coverage {
+        report.print();
+        return Ok(()); // Separately compiled pipeline-library programs are out of scope.
+    }
     // Only the observed layout: zlib library starts at a 4 KiB boundary after the shaders.
     let library = ((last_record_end + area.start).next_multiple_of(4096)..area.end)
         .step_by(4096)

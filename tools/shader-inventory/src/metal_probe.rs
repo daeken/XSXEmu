@@ -1,16 +1,20 @@
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 mod alu;
 #[cfg(any(target_os = "macos", test))]
 mod buffer;
+#[cfg(any(target_os = "macos", test))]
+mod cfg;
 
 #[cfg(target_os = "macos")]
 fn run_alu(
     dev: &metal::DeviceRef,
     queue: &metal::CommandQueueRef,
+    label: &str,
+    code: &[u32],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use alu::{FIXTURE, LANES, MASK, SENTINEL};
+    use alu::{LANES, MASK, SENTINEL};
     use metal::{CompileOptions, MTLCommandBufferStatus, MTLResourceOptions, MTLSize};
-    let source = alu::msl(&FIXTURE)?;
+    let source = alu::msl(code)?;
     let lib = dev.new_library_with_source(&source, &CompileOptions::new())?;
     let function = lib.get_function("fixture", None)?;
     let pipeline = dev.new_compute_pipeline_state_with_function(&function)?;
@@ -26,7 +30,7 @@ fn run_alu(
     let opts = MTLResourceOptions::StorageModeShared;
     let bytes = size_of_val(&input) as u64;
     for mask in [MASK, u32::MAX, 0] {
-        let expected = alu::cpu(&FIXTURE, &input, mask)?;
+        let expected = alu::cpu(code, &input, mask)?;
         let ins = dev.new_buffer_with_data(input.as_ptr().cast(), bytes, opts);
         let outs = dev.new_buffer_with_data(initialized.as_ptr().cast(), bytes, opts);
         let exec =
@@ -55,7 +59,7 @@ fn run_alu(
         }
     }
     println!(
-        "{}: {}-lane fixture, 96/96 CPU/Metal readback words match",
+        "{}: {}-lane {label} fixture, 96/96 CPU/Metal readback words match",
         dev.name(),
         pipeline.thread_execution_width()
     );
@@ -144,7 +148,8 @@ fn run_buffer(
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let dev = metal::Device::system_default().ok_or("unsupported: no Metal device")?;
     let queue = dev.new_command_queue();
-    run_alu(&dev, &queue)?;
+    run_alu(&dev, &queue, "ALU", &alu::FIXTURE)?;
+    run_alu(&dev, &queue, "branch/literal", &alu::BRANCH_FIXTURE)?;
     run_buffer(&dev, &queue)
 }
 

@@ -56,14 +56,18 @@ fn sample_shader() -> Vec<u8> {
 fn validates_both_native_payloads_and_console_stage() {
     let sample = sample_shader();
     let mut out = Vec::new();
-    assert_eq!(shader(&sample, &mut out), Some((5, 0x66, 2)));
+    assert_eq!(shader(&sample, &mut out, None), Some((5, 0x66, 2)));
     for at in [24, 28, 32, 40, 44 + 52, 44 + 60 + 16] {
         let mut bad = sample.clone();
         put(&mut bad, at, u32::MAX as usize);
-        assert_eq!(shader(&bad, &mut out), None, "bad length/offset at {at}");
+        assert_eq!(
+            shader(&bad, &mut out, None),
+            None,
+            "bad length/offset at {at}"
+        );
     }
     for end in 0..sample.len() {
-        assert!(shader(&sample[..end], &mut out).is_none());
+        assert!(shader(&sample[..end], &mut out, None).is_none());
     }
 }
 
@@ -82,14 +86,14 @@ fn verifies_inflated_len_and_record_suffix_size() {
     let mut out = Vec::new();
     let mut inner = Vec::new();
     assert_eq!(
-        wrapped_record(&record, 0, &mut out, &mut inner),
+        wrapped_record(&record, 0, &mut out, &mut inner, None),
         Some((record.len(), 5, 0x66, 2))
     );
     put(&mut record, 13, sample.len() - 1);
-    assert!(wrapped_record(&record, 0, &mut out, &mut inner).is_none());
+    assert!(wrapped_record(&record, 0, &mut out, &mut inner, None).is_none());
     put(&mut record, 13, sample.len());
     record.pop();
-    assert!(wrapped_record(&record, 0, &mut out, &mut inner).is_none());
+    assert!(wrapped_record(&record, 0, &mut out, &mut inner, None).is_none());
 }
 
 #[test]
@@ -155,4 +159,31 @@ fn checks_multistream_library_sizes() {
         })
     );
     assert_eq!(pipeline_library(&data[..data.len() - 1], 0), None);
+}
+
+#[test]
+fn compute_sink_sees_only_fully_validated_compute_envelopes() {
+    let sample = sample_shader();
+    let mut out = Vec::new();
+    let mut count = 0;
+    {
+        let mut sink = |payload: &[u8]| {
+            assert!(payload.starts_with(b"FSSM"));
+            count += 1;
+        };
+        let mut bad = sample.clone();
+        put(&mut bad, 44 + 52, u32::MAX as usize); // second XBCH fails
+        assert!(shader(&bad, &mut out, Some(&mut sink)).is_none());
+        let mut pixel = sample.clone();
+        put(&mut pixel, 44, 0x66);
+        assert_eq!(
+            shader(&pixel, &mut out, Some(&mut sink)),
+            Some((0, 0x66, 2))
+        );
+        assert_eq!(
+            shader(&sample, &mut out, Some(&mut sink)),
+            Some((5, 0x66, 2))
+        );
+    }
+    assert_eq!(count, 2);
 }
