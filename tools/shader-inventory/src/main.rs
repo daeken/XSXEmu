@@ -1,5 +1,6 @@
 //! Counts only; never exports assets or interprets the RPF9 TOC.
 mod cfg;
+mod compute_sites;
 mod coverage;
 mod embedded;
 mod library_index;
@@ -318,6 +319,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .filter(|_| args.next().is_none())
             .ok_or("usage: xsx-shader-inventory --embedded-shaders <local PE32+ image>")?;
         return embedded::run(std::path::Path::new(&path));
+    }
+    if first == "--compute-layout-sites" {
+        let usage = "usage: xsx-shader-inventory --compute-layout-sites <trusted LLVM 21 library> <expanded PS/0/9 library>";
+        let llvm = args.next().ok_or(usage)?;
+        let path = args.next().filter(|_| args.next().is_none()).ok_or(usage)?;
+        return compute_sites::run(&llvm, std::path::Path::new(&path));
     }
     if first == "--pipeline-index" || first == "--compute-blobs" {
         let path = args
