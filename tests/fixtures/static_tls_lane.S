@@ -9,6 +9,7 @@ _static_tls_fixture:
     .long Lcfg_entry-Ltext, Lcfg_target-Ltext
     .long Lbridge_cb-Ltext, Lbridge_entry-Ltext
     .long Ltrace_entry-Ltext, Ldisable_calls_dll_main-Ltext
+    .long Lmodule_filename_dll_main-Ltext
 Ltext:
 .macro tls index
     leaq Ltext(%rip), %r11
@@ -786,5 +787,75 @@ Lkernelbase:
     .short 107,101,114,110,101,108,98,97,115,101,46,100,108,108,0
 Lbad:
     ud2
+/* A path slot contains full length, truncation capacity, then UTF-16 units. */
+.macro check_module_path offset, truncated=0
+    leaq Ltext(%rip), %r11
+    leaq {module_path_buffer_delta}(%r11), %rdx
+    .if \truncated
+        movl {module_paths_delta}+\offset+4(%r11), %r8d
+    .else
+        movl {module_paths_delta}+\offset(%r11), %r8d
+        incl %r8d
+    .endif
+    movw $0xffff, -2(%rdx,%r8,2) /* NUL must be written, not already present. */
+    movw $0xffff, (%rdx,%r8,2)
+    movl $0x12345678, %gs:0x68
+    callq *{iat_delta}(%r11)
+    leaq Ltext(%rip), %r11
+    leaq {module_paths_delta}+\offset(%r11), %r10
+    .if \truncated
+        movl 4(%r10), %r8d
+        cmpl %r8d, %eax
+        jne Lbad
+        decl %r8d
+        cmpl $122, %gs:0x68       /* ERROR_INSUFFICIENT_BUFFER */
+    .else
+        movl (%r10), %r8d
+        cmpl %r8d, %eax
+        jne Lbad
+        cmpl $0x12345678, %gs:0x68
+    .endif
+    jne Lbad
+    leaq {module_path_buffer_delta}(%r11), %rdx
+    cmpw $0, (%rdx,%r8,2)
+    jne Lbad
+    cmpw $0xffff, 2(%rdx,%r8,2)
+    jne Lbad
+1:
+    decl %r8d
+    movw 8(%r10,%r8,2), %ax
+    cmpw %ax, (%rdx,%r8,2)
+    jne Lbad
+    testl %r8d, %r8d
+    jnz 1b
+.endm
+Lmodule_filename_dll_main:
+    leaq Ltext(%rip), %r11
+    args                          /* RCX is the actual mapped self handle. */
+    testl %edx, %edx
+    je Lmodule_filename_detach
+    cmpl $1, %edx
+    jne Lbad
+    subq $40, %rsp
+    check_module_path {module_path_slot}
+    xorl %ecx, %ecx
+    check_module_path 0
+    xorl %ecx, %ecx
+    check_module_path 0, 1
+    leaq 1-{text_rva}(%r11), %rcx  /* Interior pointer is not a handle. */
+    movl $1, %r8d
+    movw $0xffff, (%rdx)
+    callq *{iat_delta}(%r11)
+    testl %eax, %eax
+    jne Lbad
+    cmpl $6, %gs:0x68             /* ERROR_INVALID_HANDLE */
+    jne Lbad
+    leaq Ltext(%rip), %r11
+    cmpw $0xffff, {module_path_buffer_delta}(%r11)
+    jne Lbad
+    addq $40, %rsp
+Lmodule_filename_detach:
+    movl $1, %eax
+    retq
 Lend:
     .org Ltext + {capacity}, 0xcc

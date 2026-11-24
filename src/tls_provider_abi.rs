@@ -115,6 +115,8 @@ audited_bridges! {
         native::heap_size, (heap: *mut c_void, flags: u32, block: *const c_void) -> usize;
     xsxemu_tls_heap_free, heap_free: b"kernelbase.dll", b"HeapFree",
         native::heap_free, (heap: *mut c_void, flags: u32, block: *mut c_void) -> i32;
+    xsxemu_tls_get_module_file_name_w, get_module_file_name_w: b"kernelbase.dll", b"GetModuleFileNameW",
+        loader::get_module_file_name_w, (module: usize, buffer: *mut u16, capacity: u32) -> u32;
     xsxemu_tls_load_library_ex_w, load_library_ex_w: b"kernelbase.dll", b"LoadLibraryExW",
         loader::load_library_ex_w => loader::tls_child_load_library_ex_w, (name: *const u16, file: usize, flags: u32) -> usize;
     xsxemu_tls_disable_thread_library_calls, disable_thread_library_calls: b"kernelbase.dll", b"DisableThreadLibraryCalls",

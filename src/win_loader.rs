@@ -898,7 +898,7 @@ pub(crate) mod native {
         }
     }
 
-    pub(super) unsafe extern "win64" fn get_module_file_name_w(
+    pub(crate) unsafe extern "win64" fn get_module_file_name_w(
         module: usize,
         buffer: *mut u16,
         capacity: u32,

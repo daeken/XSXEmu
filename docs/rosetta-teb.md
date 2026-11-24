@@ -279,6 +279,11 @@ provider-managed and separate from the PE static TLS vector at `GS:[0x58]`.
 searches an intentionally empty namespace, even for DLLs in the static
 import graph. Well-formed requests return `NULL` with `ERROR_MOD_NOT_FOUND`;
 invalid or unsupported requests return their validation errors instead.
+`GetModuleFileNameW` reads the registered UTF-16 guest path: a null handle
+selects the root EXE, and a non-null handle must exactly match a mapped image
+base. It performs no filesystem lookup. Success preserves `LastError`;
+truncation NUL-terminates, returns the buffer capacity in UTF-16 code units,
+and sets `ERROR_INSUFFICIENT_BUFFER` in the guest TEB.
 `RtlPcToFileHeader` looks up PCs only in the mapped guest image graph, which
 is registered before process attach. It returns and writes the image base
 (or null for an unknown PC), without changing LastError.

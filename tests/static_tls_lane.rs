@@ -21,6 +21,9 @@ const INDEX: usize = DATA;
 const IAT: usize = DATA + 8;
 const COOKIE: usize = DATA + 0x300;
 const MODE: usize = DATA + 0x308;
+const MODULE_PATHS: usize = RO + 0x1000;
+const MODULE_PATH_SLOT: usize = 0x400;
+const MODULE_PATH_BUFFER: usize = DATA + 0x1000;
 const CHECK: usize = RO + 0x200;
 const DISPATCH: usize = CHECK + 8;
 const GFIDS: usize = CHECK + 0x10;
@@ -48,12 +51,15 @@ struct Fixture {
     bridge_entry: u32,
     trace_entry: u32,
     disable_calls_dll_main: u32,
+    module_filename_dll_main: u32,
     code: [u8; RAW],
 }
 global_asm!(include_str!("fixtures/static_tls_lane.S"),
     capacity = const RAW, text_rva = const TEXT,
     index_delta = const INDEX - TEXT, cookie_delta = const COOKIE - TEXT, iat_delta = const IAT - TEXT,
     mode_delta = const MODE - TEXT, check_delta = const CHECK - TEXT, dispatch_delta = const DISPATCH - TEXT,
+    module_paths_delta = const MODULE_PATHS - TEXT, module_path_slot = const MODULE_PATH_SLOT,
+    module_path_buffer_delta = const MODULE_PATH_BUFFER - TEXT,
     options(att_syntax),
 );
 unsafe extern "C" {
@@ -1418,6 +1424,53 @@ fn disable_thread_library_calls_checks_dllmain_handle_and_static_tls() {
             "Guest entry returned 43",
         );
     }
+}
+
+#[test]
+fn module_filename_bridge_uses_mapped_paths_and_teb_last_error() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let mut exe = image(Kind::Solo);
+    dir_import_one(&mut exe, b"owned.dll\0", b"Step\0");
+    let exe = scratch.write("🧪-module.exe", &exe);
+    let mut dll = image(Kind::Dll);
+    dir(&mut dll, 9, 0, 0); // This DLL fixture needs no static TLS of its own.
+    w32(
+        &mut dll,
+        OP + 16,
+        TEXT + unsafe { static_tls_fixture.module_filename_dll_main } as usize,
+    );
+    dir_import_one(
+        &mut dll,
+        b"api-ms-win-core-libraryloader-l1-1-0.dll\0",
+        b"GetModuleFileNameW\0",
+    );
+    let dll_path = scratch.write("owned.dll", &dll);
+    for (i, path) in [&exe, &dll_path].into_iter().enumerate() {
+        let canonical = path.canonicalize().unwrap();
+        let guest = format!("C:{}", canonical.to_str().unwrap().replace('/', "\\"));
+        let wide: Vec<_> = guest.encode_utf16().collect();
+        assert!(8 + 2 * (wide.len() + 2) <= MODULE_PATH_SLOT);
+        let offset = file(MODULE_PATHS + i * MODULE_PATH_SLOT);
+        w32(&mut dll, offset, wide.len());
+        if i == 0 {
+            // End the truncated prefix between the two surrogate code units.
+            let high = wide.len() - "🧪-module.exe".encode_utf16().count();
+            assert_eq!(&wide[high..high + 2], &[0xd83e, 0xddea]);
+            w32(&mut dll, offset + 4, high + 2);
+        }
+        for (j, unit) in wide.into_iter().enumerate() {
+            w16(&mut dll, offset + 8 + j * 2, unit as usize);
+        }
+    }
+    scratch.write("owned.dll", &dll);
+    expect(
+        run(&exe, &[OPT, "--rust-providers"]),
+        43,
+        "Guest entry returned 43",
+    );
 }
 
 #[test]
