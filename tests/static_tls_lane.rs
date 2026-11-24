@@ -235,10 +235,11 @@ fn image(kind: Kind) -> Vec<u8> {
         Kind::Solo => (),
     }
     if matches!(kind, Kind::Bridge) {
-        dir(&mut b, 1, LINK, 40);
-        w32(&mut b, file(LINK), LINK + 0x30);
-        w32(&mut b, file(LINK) + 12, LINK + 0xd0);
-        w32(&mut b, file(LINK) + 16, IAT);
+        let imports = LINK + 0x480;
+        dir(&mut b, 1, imports, 60);
+        w32(&mut b, file(imports), LINK + 0x30);
+        w32(&mut b, file(imports) + 12, LINK + 0xd0);
+        w32(&mut b, file(imports) + 16, IAT);
         put(&mut b, file(LINK) + 0xd0, b"kernel32.dll\0");
         for (i, name) in [
             &b"GetLastError\0"[..],
@@ -267,6 +268,20 @@ fn image(kind: Kind) -> Vec<u8> {
             w64(&mut b, file(LINK) + 0x30 + i * 8, LINK + off);
             put(&mut b, file(LINK) + off + 2, name);
         }
+
+        // A second descriptor exercises the exact API-set name observed by
+        // the launcher. Its IAT starts after the first descriptor's null.
+        let synch = imports + 20;
+        w32(&mut b, file(synch), LINK + 0x4c0);
+        w32(&mut b, file(synch) + 12, LINK + 0x4d0);
+        w32(&mut b, file(synch) + 16, IAT + 152);
+        w64(&mut b, file(LINK) + 0x4c0, LINK + 0x500);
+        put(
+            &mut b,
+            file(LINK) + 0x4d0,
+            b"api-ms-win-core-synch-l1-1-0.dll\0",
+        );
+        put(&mut b, file(LINK) + 0x502, b"InitializeCriticalSectionEx\0");
     }
     b
 }

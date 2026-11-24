@@ -285,6 +285,46 @@ Lbridge_entry:
         callq *{iat_delta}+\slot(%r11)
     .endr
 
+    /* Exercise the API-set IAT bridge through exact CFG dispatch. Check the
+     * third argument is validated before initialization, and LastError
+     * survives success after being set on failure. */
+    movl $0x1234, %gs:0x68
+    movq $-1, 120(%rsp)
+    leaq 88(%rsp), %rcx
+    movl $17, %edx
+    movl $0x01000001, %r8d      /* NO_DEBUG_INFO plus an invalid flag */
+    leaq Ltext(%rip), %r11
+    movq {iat_delta}+152(%r11), %rax
+    callq *{dispatch_delta}(%r11)
+    testl %eax, %eax
+    jne Lbad
+    cmpl $87, %gs:0x68
+    jne Lbad
+    cmpq $-1, 120(%rsp)
+    jne Lbad
+
+    leaq 88(%rsp), %rcx
+    movl $17, %edx
+    movl $0x01000000, %r8d      /* CRITICAL_SECTION_NO_DEBUG_INFO */
+    leaq Ltext(%rip), %r11
+    movq {iat_delta}+152(%r11), %rax
+    callq *{dispatch_delta}(%r11)
+    cmpl $1, %eax
+    jne Lbad
+    cmpq $17, 120(%rsp)        /* Rosetta runs on multiprocessor hosts */
+    jne Lbad
+    cmpl $-1, 96(%rsp)         /* lock count in a newly initialized CS */
+    jne Lbad
+    cmpl $87, %gs:0x68
+    jne Lbad
+    .irp slot,56,56,64,64,72
+        leaq 88(%rsp), %rcx
+        leaq Ltext(%rip), %r11
+        callq *{iat_delta}+\slot(%r11)
+        cmpl $87, %gs:0x68
+        jne Lbad
+    .endr
+
     /* Win32 dynamic TLS slots are a provider table, not GS:[0x58]. */
     movq %gs:0x58, %rax
     movq %rax, 64(%rsp)

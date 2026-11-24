@@ -106,6 +106,8 @@ audited_bridges! {
         native::tls_get_value, (index: u32) -> *mut c_void;
     xsxemu_tls_tls_free, tls_free: b"kernelbase.dll", b"TlsFree",
         native::tls_free, (index: u32) -> i32;
+    xsxemu_tls_init_cs_ex, init_cs_ex: b"kernelbase.dll", b"InitializeCriticalSectionEx",
+        sync::init_cs_ex, (cs: *mut sync::CriticalSection, spin: u32, flags: u32) -> i32;
     xsxemu_tls_init_cs_spin, init_cs_spin: b"kernelbase.dll", b"InitializeCriticalSectionAndSpinCount",
         sync::init_cs_spin, (cs: *mut sync::CriticalSection, spin: u32) -> i32;
     xsxemu_tls_enter_cs, enter_cs: b"kernelbase.dll", b"EnterCriticalSection",

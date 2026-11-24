@@ -22,6 +22,13 @@ pub(crate) fn has_dll(dll: &[u8]) -> bool {
 
 pub(crate) fn lookup(dll: &[u8], name: &[u8]) -> Option<HostExport> {
     match (dll, name) {
+        (b"kernelbase.dll" | b"kernel32.dll" | SYNCH, b"InitializeCriticalSectionEx") => {
+            export!(
+                "kernelbase.dll",
+                "InitializeCriticalSectionEx",
+                native::init_cs_ex
+            )
+        }
         (b"kernelbase.dll" | b"kernel32.dll" | SYNCH, b"InitializeCriticalSectionAndSpinCount") => {
             export!(
                 "kernelbase.dll",
@@ -111,6 +118,14 @@ mod registry_tests {
             assert_eq!(Some(entry), lookup(b"kernel32.dll", name));
             assert!(lookup(b"ntdll.dll", name).is_none());
         }
+        let ex = b"InitializeCriticalSectionEx";
+        let entry = crate::providers::lookup(SYNCH, ex).unwrap();
+        assert_eq!(entry.provider, "kernelbase.dll");
+        assert_eq!(entry.symbol.as_bytes(), ex);
+        assert_eq!(Some(entry), crate::providers::lookup(b"kernelbase.dll", ex));
+        assert_eq!(Some(entry), crate::providers::lookup(b"kernel32.dll", ex));
+        assert!(crate::providers::lookup(SYNCH_12, ex).is_none());
+        assert!(crate::providers::lookup(SYNCH, b"initializeCriticalSectionEx").is_none());
         assert!(lookup(SYNCH, b"WaitForSingleObject").is_none());
         assert!(lookup(SYNCH, b"Sleep").is_none());
         assert!(lookup(SYNCH_12, b"sleep").is_none());
@@ -133,6 +148,7 @@ pub(crate) mod native {
     const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
     const ERROR_NOT_OWNER: u32 = 288;
     const ERROR_BUSY: u32 = 170;
+    const CRITICAL_SECTION_NO_DEBUG_INFO: u32 = 0x0100_0000;
 
     fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         mutex.lock().unwrap_or_else(|e| e.into_inner())
@@ -194,6 +210,29 @@ pub(crate) mod native {
             },
         );
         1
+    }
+
+    pub(crate) unsafe extern "win64" fn init_cs_ex(
+        cs: *mut CriticalSection,
+        spin: u32,
+        flags: u32,
+    ) -> i32 {
+        // Win32 documents only zero or CRITICAL_SECTION_NO_DEBUG_INFO. The
+        // shared implementation doesn't expose a Windows debug record in
+        // either mode; the guest critical section is opaque.
+        if !matches!(flags, 0 | CRITICAL_SECTION_NO_DEBUG_INFO) {
+            set_last_error(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        // Match the single-processor case in the guest SYSTEM_INFO profile.
+        let spin = if thread::available_parallelism().map_or(1, |n| n.get()) == 1 {
+            0
+        } else {
+            spin
+        };
+        // SAFETY: shared initializer checks null/alignment before writing; the
+        // caller must provide valid writable storage as with the other APIs.
+        unsafe { init_cs_spin(cs, spin) }
     }
 
     pub(super) unsafe extern "win64" fn init_cs(cs: *mut CriticalSection) {
@@ -411,7 +450,10 @@ pub(crate) mod native {
             let mut cs = MaybeUninit::<CriticalSection>::uninit();
             assert_eq!(size_of::<CriticalSection>(), 40);
             let cs = cs.as_mut_ptr();
-            assert_eq!(unsafe { init_cs_spin(cs, 64) }, 1);
+            assert_eq!(
+                unsafe { init_cs_ex(cs, 64, CRITICAL_SECTION_NO_DEBUG_INFO) },
+                1
+            );
             enter_cs(cs);
             assert_eq!(try_enter_cs(cs), 1);
             // Transfer just the identity; the input critical section remains
@@ -438,6 +480,48 @@ pub(crate) mod native {
             delete_cs(cs);
             assert_eq!(unsafe { init_cs_spin(cs, 0) }, 1);
             delete_cs(cs);
+        }
+
+        #[test]
+        fn critical_section_ex_checks_flags_and_storage_before_initializing() {
+            use crate::providers::native::get_last_error;
+
+            let mut storage = [usize::MAX; 5];
+            let cs = storage.as_mut_ptr().cast::<CriticalSection>();
+            unsafe {
+                assert_eq!(init_cs_ex(ptr::null_mut(), 0, 0), 0);
+                assert_eq!(get_last_error(), ERROR_INVALID_PARAMETER);
+                let misaligned = cs.cast::<u8>().add(1).cast::<CriticalSection>();
+                set_last_error(0);
+                assert_eq!(init_cs_ex(misaligned, 0, 0), 0);
+                assert_eq!(get_last_error(), ERROR_INVALID_PARAMETER);
+                for flags in [1, CRITICAL_SECTION_NO_DEBUG_INFO | 1] {
+                    set_last_error(0);
+                    assert_eq!(init_cs_ex(cs, 0, flags), 0);
+                    assert_eq!(get_last_error(), ERROR_INVALID_PARAMETER);
+                }
+                assert_eq!(storage, [usize::MAX; 5]);
+
+                set_last_error(0x1234);
+                assert_eq!(init_cs_ex(cs, 32, 0), 1);
+                assert_eq!(get_last_error(), 0x1234);
+                let section = &*cs;
+                assert_eq!(section.lock_count, -1);
+                let spin = if thread::available_parallelism().map_or(1, |n| n.get()) == 1 {
+                    0
+                } else {
+                    32
+                };
+                assert_eq!(section.spin_count, spin);
+                assert_eq!(init_cs_ex(cs, 9, CRITICAL_SECTION_NO_DEBUG_INFO), 0);
+                assert_eq!(get_last_error(), ERROR_INVALID_PARAMETER);
+                assert_eq!((*cs).spin_count, spin);
+                delete_cs(cs);
+                assert_eq!(init_cs_ex(cs, 0, CRITICAL_SECTION_NO_DEBUG_INFO), 1);
+                assert_eq!((*cs).debug_info, 0);
+                assert_eq!((*cs).spin_count, 0);
+                delete_cs(cs);
+            }
         }
 
         #[test]
