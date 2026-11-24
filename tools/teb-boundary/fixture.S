@@ -27,6 +27,19 @@
     jne \fail
 .endm
 
+/* Disabled outside the masked mode. Each request follows a guest GS check;
+ * the host-GS sender ACKs only after pthread_kill succeeds. */
+.macro masked_checkpoint phase
+    cmpl $0, _POLICY_SAMPLE+{REQUEST}(%rip)
+    je Lcheckpoint_done\@
+    movl $\phase, _POLICY_SAMPLE+{REQUEST}(%rip)
+Lcheckpoint_wait\@:
+    pause
+    cmpl $\phase, _POLICY_SAMPLE+{ACK}(%rip)
+    jne Lcheckpoint_wait\@
+Lcheckpoint_done\@:
+.endm
+
 /* Fixed-arity Win64 wrapper frame, aligned at each call. The setter has
  * SysV ABI: preserve Win64's extra nonvolatiles (RDI, RSI, XMM6..15) and
  * spill the position-dependent argument registers before crossing ABIs.
@@ -165,6 +178,7 @@ Lguest_entry:
     check_guest %r12, {ERROR_IN}, {TLS_IN}, Lbefore_failed
     cmpq %gs:0x80, %r12
     jne Lbefore_failed
+    masked_checkpoint 1
     movl $0x21212121, %edi
     movl $0x42424242, %esi
     pcmpeqd %xmm6, %xmm6
@@ -186,6 +200,7 @@ Lguest_entry:
     cmpq %r10, %rax
     jne Lguest_done
     check_guest %r12, {ERROR_OUT}, {TLS_OUT}, Lafter_failed
+    masked_checkpoint 3
     cmpq $0x21212121, %rdi
     jne Lnonvolatile_failed
     cmpq $0x42424242, %rsi
@@ -245,6 +260,7 @@ Lguest_callback:
     movabsq ${C_STACK_INT}, %r11
     cmpq %r11, 48(%rsp)
     jne Lcallback_failed
+    masked_checkpoint 2
     movabsq ${TLS_OUT}, %r11
     movq %r11, (%r10)
     movl ${ERROR_OUT}, %gs:0x68
@@ -300,5 +316,63 @@ Lwait_signal:
     check_host %r12
     addq $8, %rsp
     popq %r13
+    popq %r12
+    retq
+
+/* SysV: ctx, fault selector, shared marker, PROT_NONE page. Mark the exact
+ * fault site only after checking guest GS. Unexpected fallthrough restores
+ * host GS; the parent rejects a normal exit. */
+.globl _fault_window
+_fault_window:
+    pushq %r12
+    subq $32, %rsp
+    movq %rdi, %r12
+    movl %esi, 0(%rsp)
+    movq %rdx, 8(%rsp)
+    movq %rcx, 16(%rsp)
+    movq {GUEST_BASE}(%r12), %rdi
+    callq __thread_set_tsd_base
+    movq %gs:0x30, %rax
+    cmpq {GUEST_BASE}(%r12), %rax
+    jne Lbad_switch
+    movl 0(%rsp), %eax
+    movq 8(%rsp), %r8
+    cmpl $1, %eax
+    je Lfault_ill
+    cmpl $2, %eax
+    je Lfault_access
+    cmpl $3, %eax
+    je Lfault_trap
+    cmpl $4, %eax
+    je Lfault_div
+    cmpl $5, %eax
+    jne Lbad_switch
+    xorl %eax, %eax
+    movb $5, (%r8)
+    movb (%rax), %al
+    jmp Lfault_return
+Lfault_div:
+    xorl %ecx, %ecx
+    xorl %edx, %edx
+    movb $4, (%r8)
+    divl %ecx
+    jmp Lfault_return
+Lfault_ill:
+    movb $1, (%r8)
+    ud2
+    jmp Lfault_return
+Lfault_access:
+    movq 16(%rsp), %rax
+    movb $2, (%r8)
+    movb (%rax), %al
+    jmp Lfault_return
+Lfault_trap:
+    movb $3, (%r8)
+    int3
+Lfault_return:
+    movq {HOST_BASE}(%r12), %rdi
+    callq __thread_set_tsd_base
+    check_host %r12
+    addq $32, %rsp
     popq %r12
     retq

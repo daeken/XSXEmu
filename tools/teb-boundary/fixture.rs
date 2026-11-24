@@ -6,6 +6,8 @@ use std::mem::{offset_of, size_of};
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod signal_policy;
+
 const PROVIDER_INT: u64 = 0x13ae_0011_f0e1_d2c3;
 const PROVIDER_DOUBLE: u64 = (-2.75f64).to_bits();
 const PROVIDER_INT3: u64 = 0x35ae_2233_f4e5_d6c7;
@@ -62,6 +64,8 @@ global_asm!(include_str!("fixture.S"),
     SEEN = const offset_of!(SignalSample, seen),
     HANDLER0 = const offset_of!(SignalSample, handler0),
     HANDLER30 = const offset_of!(SignalSample, handler30),
+    REQUEST = const offset_of!(signal_policy::Sample, request),
+    ACK = const offset_of!(signal_policy::Sample, ack),
     P_INT = const PROVIDER_INT, P_DOUBLE = const PROVIDER_DOUBLE,
     P_INT3 = const PROVIDER_INT3, P_FLOAT = const PROVIDER_FLOAT,
     P_STACK_INT = const PROVIDER_STACK_INT, P_STACK_DOUBLE = const PROVIDER_STACK_DOUBLE,
@@ -103,7 +107,7 @@ unsafe extern "C" {
     fn __error() -> *mut c_int;
     fn pthread_self() -> usize;
     fn pthread_kill(thread: usize, sig: c_int) -> c_int;
-    fn signal(sig: c_int, handler: unsafe extern "C" fn(c_int)) -> usize;
+    fn signal(sig: c_int, handler: Option<unsafe extern "C" fn(c_int)>) -> usize;
     fn run_boundary(ctx: *const Context) -> u64;
     fn signal_handler(sig: c_int);
     fn signal_window(ctx: *const Context, guest: u64, resumed: *mut Slots);
@@ -161,6 +165,9 @@ extern "win64" fn rust_provider(
     {
         return 0x102;
     }
+    if !signal_policy::provider_checkpoint(1) {
+        return 0x105;
+    }
     write_host(HOST_OUT);
     let result = unsafe {
         enter_callback(
@@ -178,6 +185,9 @@ extern "win64" fn rust_provider(
     }
     if read_host() != HOST_OUT {
         return 0x104;
+    }
+    if !signal_policy::provider_checkpoint(2) {
+        return 0x106;
     }
     PROVIDER_OK
 }
@@ -209,7 +219,7 @@ fn host_base() -> Result<u64, String> {
 
 fn run_signal(ctx: &Context, guest: bool) -> Result<(), String> {
     const SIGUSR1: c_int = 30; // Darwin
-    if unsafe { signal(SIGUSR1, signal_handler) } == usize::MAX {
+    if unsafe { signal(SIGUSR1, Some(signal_handler)) } == usize::MAX {
         return Err(format!("signal: {}", std::io::Error::last_os_error()));
     }
     let target = unsafe { pthread_self() };
@@ -311,6 +321,10 @@ fn run() -> Result<(), String> {
         }
         "signal-host" => run_signal(&ctx, false),
         "signal-guest" => run_signal(&ctx, true),
+        "masked" => signal_policy::run_masked(&ctx),
+        "fault-ill" | "fault-access" | "fault-trap" | "fault-div" | "fault-unmapped" => {
+            signal_policy::run_fault(&ctx, &mode)
+        }
         _ => Err("unknown probe mode".into()),
     }
 }

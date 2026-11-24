@@ -111,8 +111,9 @@ not returning to the signal or syscall stack. Its assembly dispatcher
 [switches to host GS and reconstructs the `%rcx` frame pointer after `syscall`](https://github.com/wine-mirror/wine/blob/db11d0fe6a169c457e23d007e20404643d067aa8/dlls/ntdll/unix/signal_x86_64.c#L3113-L3135)
 and [switches back to guest GS, saving and restoring `%rax` and `%rcx`](https://github.com/wine-mirror/wine/blob/db11d0fe6a169c457e23d007e20404643d067aa8/dlls/ntdll/unix/signal_x86_64.c#L3181-L3190).
 The original `tools/teb-probe` private test proves only one synchronous
-leaf interval on one worker. The standalone follow-up below tests a nested
-boundary and one signal case; neither is a production hook.
+leaf interval on one worker. The standalone follow-ups below exercise nested
+boundaries, directed signals, and default termination on guest faults. No
+production hooks are installed.
 
 ## Standalone boundary fixture
 
@@ -148,12 +149,78 @@ same mechanism tested by `tools/teb-probe`, not a supported macOS interface.
   GS** when the interrupted leaf held guest GS. The handler did not call
   Rust, access host TLS, or switch GS.
 
-This covers fixed signatures, one thread's boundary, one nested callback,
-normal returns, and one directed signal at a stable point. It does not
-establish a safe host handler, reentrant signals or delivery during a switch,
-Mach exceptions, synchronous traps, unwinding, cancellation, profiling,
-thread lifecycle, or other Rosetta versions. Masking signals would not settle
-synchronous traps or Mach exceptions. No title or UCRT was run.
+## Fail-closed signal experiment
+
+```sh
+tools/probe_rosetta_teb_boundary.sh masked fault-ill fault-access fault-unmapped fault-trap fault-div
+```
+
+On the same host, `masked` passed with **one guest execution thread** and a
+host-only test sender. The target installed and verified an asynchronous
+signal mask with host GS, before the first switch, then kept it unchanged
+through the entire call tree, including the host-GS provider and nested
+callback. It did not unmask between guest windows. The sender used
+`pthread_kill` only after each assembly checkpoint validated guest GS, and
+acknowledged only after a successful send. `SIGUSR1`, `SIGUSR2`, and `SIGALRM`
+were sent during outer guest entry, nested guest callback, and resumed outer
+guest, respectively. The provider checked the effective mask and cumulative
+pending bits on both sides of the nested call. After the outer return all
+three signals were pending and the assembly observer had not run. Restoring
+the exact saved mask **after verifying restored host GS** delivered only
+`SIGUSR1` and `SIGALRM`; `SIGUSR2`, intentionally blocked in the saved mask,
+stayed pending until the test separately unblocked it. The observer counted
+exactly one of each and sampled host GS at every delivery. Distinct signal
+numbers avoid assuming standard signals queue multiple instances.
+
+The Darwin probe mask blocks maskable signals except the fault/abort-like
+set (`SIGILL`, `SIGTRAP`, `SIGABRT`, `SIGEMT`, `SIGFPE`, `SIGBUS`, `SIGSEGV`,
+`SIGSYS`). Those dispositions are reset to `SIG_DFL` **only in the disposable
+child**, including any Rust stack-overflow signal handler. Entry is refused
+if a fault-like signal was already blocked, if setup fails, or if effective
+mask readback does not match. A mask selects signal numbers, not sources:
+even an asynchronously sent fault-like number remains unblocked. Do not
+block hardware-generated `SIGILL`, `SIGFPE`, `SIGBUS`, or `SIGSEGV` and rely on
+POSIX behavior; the result is undefined. `SIGKILL` and `SIGSTOP` cannot be
+masked, and `SIGCONT` can continue a stopped process even while blocked.
+
+Each fault mode uses the same mask and no fault handler, with a private
+scratch marker shared with the runner. Assembly marks the selected fault
+site only after seeing the expected guest GS. The runner requires both the
+marker and the exact negative child status; a normal return, early death,
+wrong signal, or timeout fails. On macOS 27.0.1 (26A434):
+
+| Guest instruction | Observed child status |
+| --- | --- |
+| `ud2` | `-4` (`SIGILL`) |
+| Read from a private `PROT_NONE` mapping | `-10` (`SIGBUS`) |
+| Read from unmapped address zero | `-11` (`SIGSEGV`) |
+| `int3` | `-5` (`SIGTRAP`) |
+| Integer divide by zero | `-8` (`SIGFPE`) |
+
+These statuses describe BSD signal termination, not the underlying Mach
+exception type or its dispatch order. BSD thread masks do not disable Mach
+exception delivery to thread/task/host exception ports (including debugger
+handling); no Mach exception ports were installed or exercised by this
+probe. Other faults, stack exhaustion, and SEH/unwind or recovery across a
+GS switch are not covered. This is not evidence that an unmasked host
+handler can safely run on guest GS. Only three thread-directed signals were
+tested, at stable points, not process-directed routing, reentrant handlers,
+profilers, cancellation, or attachment by a debugger. A per-thread mask
+is not a process-wide barrier. All findings are specific to the tested
+Rosetta build/private setter; no PE, UCRT, or title was run.
+
+**Policy implication:** keep direct Rosetta static TLS rejected by default.
+If an opt-in experiment is built, restrict it to a trusted, original,
+single-thread PE fixture in a dedicated, time-bounded child. With host GS,
+verify mask/disposition setup before entering; span the entire guest/provider
+call tree with the mask, and restore the caller's exact mask only after
+verifying host GS on normal return. Keep guest code on normal-return paths
+through owned thunks (no guest-created threads, direct host syscalls, or
+unwind/nonlocal exits across the boundary). On any setup mismatch, fault,
+unexpected exit or timeout, treat the child run as failed; do not try to
+continue, resume guest execution, or run cleanup in-process with unknown GS.
+This is containment by child failure, not a guest security sandbox or a
+replacement for a controlled execution engine.
 
 ## Controlled execution plan
 
