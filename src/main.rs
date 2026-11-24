@@ -384,12 +384,26 @@ fn resolve(
         for (i, module) in plan.modules.iter().enumerate() {
             for binding in &module.iat {
                 match &binding.target {
+                    Ok(link::BindingTarget::Rust(export))
+                        if tls_child
+                            && trace
+                            && startup_options.1
+                            && tls_runtime::bridge_address(*export, true).is_err() =>
+                    {
+                        traps.push(import_traps::MissingImport {
+                            importer: i,
+                            path: &module.path,
+                            binding,
+                            unaudited_provider: true,
+                        });
+                    }
                     Ok(target) => bindings.push((i, binding.iat_rva, *target)),
                     Err(err) if trace && err.traceable() => {
                         traps.push(import_traps::MissingImport {
                             importer: i,
                             path: &module.path,
                             binding,
+                            unaudited_provider: false,
                         });
                     }
                     Err(err) => return Err(err.to_string().into()),

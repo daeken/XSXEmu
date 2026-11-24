@@ -14,6 +14,7 @@ pub struct MissingImport<'a> {
     pub importer: usize,
     pub path: &'a Path,
     pub binding: &'a IatBinding,
+    pub unaudited_provider: bool,
 }
 
 // Quote raw bytes reversibly, including non-UTF-8 names and control bytes.
@@ -44,7 +45,11 @@ impl fmt::Display for MissingImport<'_> {
             Symbol::Name(name) => write!(f, "{}", Quoted(name))?,
             Symbol::Ordinal(ordinal) => write!(f, "#{ordinal}")?,
         }
-        write!(f, " IAT RVA={:#010x}", self.binding.iat_rva)
+        write!(f, " IAT RVA={:#010x}", self.binding.iat_rva)?;
+        if self.unaudited_provider {
+            f.write_str(" (no audited static TLS provider bridge)")?;
+        }
+        Ok(())
     }
 }
 

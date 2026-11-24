@@ -373,6 +373,17 @@ fn unaudited_exports_and_raw_address_aliases_are_refused_before_entry() {
         "no enabled audited bridge for kernelbase.dll!GetProcAddress",
     );
 
+    expect(
+        run(&exe, &[OPT, "--rust-providers", "--trace-missing-imports"]),
+        1,
+        "symbol=\"GetProcAddress\" IAT RVA=",
+    );
+    expect(
+        run(&exe, &[OPT, "--rust-providers", "--trace-missing-imports"]),
+        1,
+        "(no audited static TLS provider bridge)",
+    );
+
     let mut aliased = image(Kind::Bridge);
     put(&mut aliased, file(LINK) + 0xb0, b"ntdll.dll\0");
     put(&mut aliased, file(LINK) + 0xe2, b"RtlGetLastWin32Error\0");
