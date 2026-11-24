@@ -906,6 +906,28 @@ and exact relocations, seals the cell, and installs an exit-86 diagnostic if
 called. It does not follow the original pointer or report a successful copy.
 Unknown guard requirements and other load-config extensions are still refused.
 
+### Offline Winsock initialization
+
+With `--rust-providers`, the trusted offline child accepts only a direct
+root-image ordinal import `WS2_32.dll!#115` (case-insensitive DLL basename).
+The private IAT bridge does not match name imports, DLL importers, API-set
+aliases, or PE forwarders. The local Windows 11 ARM64X `ws2_32.dll` reference
+(SHA-256 `e1266872f796f68b4be9c20640ca940a7a96e1ba98c741d472ae305fccf87ca9`)
+exports ordinal 115 as `WSAStartup` in both its native and hybrid export
+views. Read-only Scarlett inspection confirms IAT RVA `0x6793ca8` and a call
+at RVA `0x5a61172` passing `CX=0x0002` (Winsock 2.0), `RDX=&stack_buffer`,
+and testing the result in `EAX`.
+
+The Win64 signature is `int WSAStartup(WORD, WSADATA *)`. The shim negotiates
+versions through 2.2 and fills a 408-byte Win64 `WSADATA` on success, including
+both version words, NUL-terminated offline description/status, and a null
+vendor pointer. Errors are returned directly; the output and TEB last-error
+are unchanged on failure. Each successful call is counted for the lifetime
+of the child. This is initialization bookkeeping only: there is no host
+networking, name resolution, socket API or `WSACleanup` shim. The owned
+Rosetta PE checks the ordinal call, output layout, error returns, repeated
+negotiations, and unchanged TEB last-error.
+
 ## Controlled execution plan
 
 1. Separate loading from execution. Reuse PE static TLS metadata but check

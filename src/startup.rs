@@ -365,6 +365,13 @@ mod native {
                         return Err("entropy bridge requires the built-in guest entropy DLL".into());
                     }
                 }
+                if export == crate::winsock_init::STARTUP
+                    && (!matches!(profile, Profile::TrustedOfflineTlsChild)
+                        || !rust_providers
+                        || importer != 0)
+                {
+                    return Err("Winsock bridge requires the trusted offline root image".into());
+                }
                 if crate::appnotify::BRIDGES.contains(&export)
                     && (!matches!(profile, Profile::TrustedOfflineTlsChild)
                         || !rust_providers

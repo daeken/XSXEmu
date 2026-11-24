@@ -2684,6 +2684,50 @@ fn app_notifications_are_scoped_offline_registrations() {
     expect(output, 51, "Guest entry returned 51");
 }
 
+const WINSOCK_INIT_CAPACITY: usize = 0x400;
+#[repr(C)]
+struct WinsockInitFixture {
+    entry: u32,
+    code: [u8; WINSOCK_INIT_CAPACITY],
+}
+
+global_asm!(include_str!("fixtures/static_tls_winsock_init.S"),
+    capacity = const WINSOCK_INIT_CAPACITY,
+    iat_delta = const IAT - TEXT,
+    options(att_syntax),
+);
+unsafe extern "C" {
+    static static_tls_winsock_init_fixture: WinsockInitFixture;
+}
+
+#[test]
+fn winsock_ordinal_initializes_offline_through_win64_iat() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let mut exe = image(Kind::Solo);
+    let fixture = unsafe { &static_tls_winsock_init_fixture };
+    exe[file(TEXT)..file(TEXT) + RAW].fill(0xcc);
+    put(&mut exe, file(TEXT), &fixture.code);
+    w32(&mut exe, OP + 16, TEXT + fixture.entry as usize);
+    w64(&mut exe, file(ARRAY), PREFERRED + TEXT);
+    dir_import_one(&mut exe, b"WS2_32.dll\0", b"");
+    w64(&mut exe, file(LINK + 0x7b0), (1usize << 63) | 115);
+    let path = scratch.write("winsock-init.exe", &exe);
+    for flags in [[OPT, "--rust-providers"], [OPT, TRUSTED]] {
+        expect(run(&path, &flags), 1, "incomplete dependency graph");
+    }
+    let output = launcher(&path, &[OPT, TRUSTED, "--rust-providers"])
+        .env("XSXEMU_TRACE_STARTUP", "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stderr.matches("bridge dispatch ws2_32.dll!#115").count(), 5);
+    assert_eq!(stderr.matches("Winsock initialization only").count(), 1);
+    expect(output, 52, "Guest entry returned 52");
+}
+
 const XGR_CAPACITY: usize = 0x1000;
 #[repr(C)]
 struct XgrFixture {

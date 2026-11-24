@@ -19,6 +19,7 @@ mod tls_runtime;
 mod win_cfg;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 mod win_cfg_runtime;
+mod winsock_init;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 mod xbox_d3d12_vm;
 #[cfg(test)]

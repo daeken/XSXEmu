@@ -104,6 +104,8 @@ macro_rules! audited_bridges {
 }
 
 audited_bridges! {
+    xsxemu_tls_wsa_startup, wsa_startup: b"ws2_32.dll", b"#115",
+        crate::winsock_init::native::startup, (requested: u16, out: *mut crate::winsock_init::native::WsaData) -> i32;
     xsxemu_tls_register_app_state, register_app_state: b"api-ms-win-core-psm-appnotify-l1-1-0.dll", b"RegisterAppStateChangeNotification",
         crate::appnotify::native::register_state, (callback: usize, context: usize, out: *mut usize) -> u32;
     xsxemu_tls_unregister_app_state, unregister_app_state: b"api-ms-win-core-psm-appnotify-l1-1-0.dll", b"UnregisterAppStateChangeNotification",

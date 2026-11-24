@@ -464,6 +464,21 @@ impl Builder<'_> {
         dll: &[u8],
         symbol: &Symbol,
     ) -> Result<BindingTarget, Unresolved> {
+        // Only the original, direct root import can select Winsock startup.
+        // Do not consult the API-set router or follow a forwarder for it.
+        let startup = crate::winsock_init::STARTUP;
+        if importer == 0
+            && self.options.rust_providers
+            && self.options.trusted_offline
+            && dll.eq_ignore_ascii_case(startup.provider.as_bytes())
+            && matches!(
+                symbol,
+                Symbol::Ordinal(crate::winsock_init::STARTUP_ORDINAL)
+            )
+        {
+            return Ok(BindingTarget::Rust(startup));
+        }
+
         let mut from = importer;
         let mut dll = dll.to_vec();
         let mut symbol = symbol.clone();
@@ -992,6 +1007,66 @@ mod tests {
         }
         assert!(strings < 0x800);
         buf
+    }
+
+    #[test]
+    fn winsock_bridge_is_private_to_the_direct_root_ordinal() {
+        let temp = TempDir::new();
+        let exe = temp.0.join("Owned.exe");
+        fs::write(
+            &exe,
+            image(
+                &[
+                    (
+                        "WS2_32.dll",
+                        &[
+                            Slot::Ord(115),
+                            Slot::Ord(116),
+                            Slot::Name("WSAStartup"),
+                            Slot::Name("#115"),
+                        ],
+                    ),
+                    ("ws2_32", &[Slot::Ord(115)]),
+                    ("other.dll", &[Slot::Ord(115)]),
+                    ("front.dll", &[Slot::Ord(1)]),
+                ],
+                None,
+            ),
+        )
+        .unwrap();
+        fs::write(
+            temp.0.join("front.dll"),
+            dll_image(
+                &[("WS2_32.dll", &[Slot::Ord(115)])],
+                Some((1, &[], Some("WS2_32.#115"))),
+            ),
+        )
+        .unwrap();
+        let plan = build_configured(
+            &exe,
+            &[],
+            Options {
+                trusted_offline: true,
+                rust_providers: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let export = crate::winsock_init::STARTUP;
+        assert_eq!(
+            plan.modules[0].iat[0].target,
+            Ok(BindingTarget::Rust(export))
+        );
+        assert!(
+            plan.modules[0].iat[1..]
+                .iter()
+                .all(|binding| binding.target.is_err())
+        );
+        assert!(plan.modules[1].iat[0].target.is_err());
+        assert!(export.address().is_none());
+        assert!(!providers::has_dll(b"ws2_32.dll"));
+        assert!(providers::lookup(b"ws2_32.dll", b"WSAStartup").is_none());
+        assert!(providers::lookup(b"ws2_32.dll", b"#115").is_none());
     }
 
     #[test]
