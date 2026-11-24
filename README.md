@@ -72,3 +72,17 @@ sh tools/ucrt-fixture.sh --run
 This audits first, then invokes `run <fixture.exe> --dll-dir <isolated-root> --api-set <schema> --rust-providers --trace-missing-imports`. The static import makes the loader map UCRT and call its `DLL_PROCESS_ATTACH` before the EXE entry. The EXE allocates four bytes with `malloc`, writes and reads a marker, calls `free`, and returns 42 on success (1 for a null allocation, 2 for a marker mismatch). Startup or a called missing import can stop the run before a guest result. A static audit does not establish that attach, the heap calls, or detach work. Execution is not sandboxed; this opt-in is for the trusted fixture and pinned local DLL only, never a game title.
 
 The pinned UCRT's first attach-time dynamic probe calls `LoadLibraryExW(L"api-ms-win-core-synch-l1-2-0", NULL, 0x800)` from RVA `0x45fcb` (return RVA `0x45fd1`, IAT RVA `0xb62a8`). The UCRT helper starts at RVA `0x45f28` and uses the load to try optional exports: it caches misses and moves on to the next candidate. The isolated guest has no mapped match; a real module-not-found result lets UCRT continue without fabricating a handle. On Rosetta the fixture completes process attach and the `malloc`/`free` round trip and returns 42 without calling any unresolved static import.
+
+**Static TLS variant:** `sh tools/ucrt-fixture.sh --static-tls` builds the same
+fixture with an original PE TLS directory, a writable index DWORD, and a
+relocatable template. It inspects the result, materializes it at a nonpreferred
+base, and audits it without executing guest code. The default fixture has no
+static TLS and is unchanged.
+
+Add `--run` to opt in to the bounded Rosetta static TLS child. The fixture reads
+`GS:[0x58]` directly, checks the loader-assigned index, verifies the relocated
+template and zero-fill in a separate TLS block, then checks that its TLS state
+survived the `malloc`/`free` round trip. Return 42 requires all checks to pass.
+As with the original runner, the first call to an unresolved callable import
+terminates the run with a trace rather than counting as success. Only run the
+trusted fixture with the pinned local UCRT; this is not a sandbox.
