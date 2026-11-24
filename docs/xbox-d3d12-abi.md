@@ -54,4 +54,6 @@ On a lawfully obtained copy with the matching hash, use `llvm-objdump -p "$exe"`
 
 `cargo test --offline --target x86_64-apple-darwin --test xbox_d3d12_abi` runs the original slot-26 probe on x86-64 (Rosetta on Apple Silicon); other x86-64 hosts can run the same test with their native target. The assembly caller supplies an owned vtable, shadow space, and the observed register order; a typed `extern "win64"` callee records distinct values into separate writable storage. The output is a synthetic ledger, not an Xbox heap-properties type. The test intentionally ignores `RAX` and registers no export or provider.
 
+The [macOS CPU alias proof](xmem-cpu-alias.md) exercises shared backing and view lifetime with real host mappings. It does not verify `XMemMapPhysicalPages` or the GPU placement and visibility needs of slot 133.
+
 Do not dispatch by desktop slot number or silently report success for unknown VM/resource/heap semantics. Before exposing device creation, establish hardware-independent ownership and error behavior for the observed interfaces, determine the required inputs at the opaque boundaries, and verify that descriptor addresses and mapped memory remain coherent with the guest view.
