@@ -573,6 +573,112 @@ pub fn translate_depth_fixture(early: bool) -> Result<String, Reject> {
     Ok(msl)
 }
 
+// Independent fixture, not a context-free wait or a retail stage profile.
+const WAIT_DEPTH_PS: &[u32] = &[
+    0xf800_0081,
+    2,
+    crate::graphics_decode::WAIT_EXPORT_ZERO,
+    0x5e04_0300,
+    0xf800_1c0f,
+    0x302,
+    0xbf81_0000,
+];
+
+struct DepthSnapshot {
+    z: Vgpr,
+    pack: [Vgpr; 2],
+    ba: Vgpr,
+}
+
+fn lift_depth_snapshot(words: &[u32]) -> Result<DepthSnapshot, Reject> {
+    // Precisely one outstanding export, fixed EXEC, no branches, memory,
+    // other waits or observable timing. Require a real overwrite of the
+    // export source and use the overwritten value as final packed RG.
+    if words.len() != 7 {
+        return Err(Reject::Extent);
+    }
+    let Ok((
+        2,
+        Op::PixelDepth {
+            src: z,
+            final_export: false,
+        },
+    )) = decode(words, 0)
+    else {
+        return Err(Reject::BadExports(0));
+    };
+    if words[2] != crate::graphics_decode::WAIT_EXPORT_ZERO {
+        return Err(Reject::Unsupported(2));
+    }
+    let Ok((1, Op::PackHalfRtz { dst, src: pack })) = decode(words, 3) else {
+        return Err(Reject::Unsupported(3));
+    };
+    let Ok((
+        2,
+        Op::PackedColor {
+            slot: 0,
+            src: [rg, ba],
+            done: true,
+            vm: true,
+        },
+    )) = decode(words, 4)
+    else {
+        return Err(Reject::BadExports(4));
+    };
+    if [z, pack[0], pack[1], ba].iter().any(|r| r.0 >= 4) || dst != z || rg != z || ba == z {
+        return Err(Reject::BadExports(4));
+    }
+    if decode(words, 6) != Ok((1, Op::End)) {
+        return Err(Reject::BadEnd(6));
+    }
+    Ok(DepthSnapshot { z, pack, ba })
+}
+
+#[allow(dead_code)] // Render probe only; admitted inputs are owned finite values.
+pub(crate) fn translate_wait_depth_fixture(late_read_control: bool) -> Result<String, Reject> {
+    let vs = lift(Stage::Vertex, VS)?;
+    let DepthSnapshot {
+        z: Vgpr(z),
+        pack: [Vgpr(lo), Vgpr(hi)],
+        ba: Vgpr(ba),
+    } = lift_depth_snapshot(WAIT_DEPTH_PS)?;
+    let mut msl = vertex_module(&vs);
+    msl.push_str(RTZ_HELPER);
+    msl.push_str(
+        "struct DepthOutputs { float4 color [[color(0)]]; float depth [[depth(any)]]; };\n\
+fragment DepthOutputs wait_depth_ps(constant uint4 &input [[buffer(0)]]) {\n\
+  uint r[4] = { input.x, input.y, input.z, input.w }; DepthOutputs out;\n",
+    );
+    if !late_read_control {
+        // MRTZ enqueues the operand, and EXPCNT(0) completes the sole pending
+        // export in this path. Capture raw bits before any register reuse.
+        writeln!(msl, "  const uint pending_depth_bits = r[{z}];\n  out.depth = as_type<float>(pending_depth_bits);").unwrap();
+    }
+    writeln!(
+        msl,
+        "  r[{z}] = half_rtz_bits(r[{lo}]) | (half_rtz_bits(r[{hi}]) << 16);"
+    )
+    .unwrap();
+    if late_read_control {
+        writeln!(msl, "  out.depth = as_type<float>(r[{z}]);").unwrap();
+    }
+    emit_body(
+        &mut msl,
+        &[
+            Op::PackedColor {
+                slot: 0,
+                src: [Vgpr(z), Vgpr(ba)],
+                done: true,
+                vm: true,
+            },
+            Op::End,
+        ],
+        "out.color",
+        false,
+    );
+    Ok(msl)
+}
+
 #[allow(dead_code)] // Separate MRT render probe.
 #[derive(Clone, Copy)]
 pub(crate) enum MrtFixture {
@@ -674,7 +780,7 @@ mod tests {
             io::Write,
             process::{Command, Stdio},
         };
-        let asm = "v_mov_b32_e32 v8, v4\nexp param0 v8, v5, v6, v7\nexp pos0 v0, v1, v2, v3 done\ns_endpgm\nv_add_f32_e32 v4, 0.25, v0\nv_fma_f32 v5, v1, v2, v3\nv_mul_legacy_f32_e32 v6, v5, v4\nv_mul_legacy_f32_e32 v6, 0.5, v6\nv_mul_legacy_f32_e32 v7, 0, v3\nexp mrt0 v4, v5, v6, v7 done\ns_endpgm\nv_mul_legacy_f32_e32 v2, v0, v1\nv_mul_legacy_f32_e32 v3, 0.25, v1\nv_fmac_f32_e32 v4, v0, v1\nv_cvt_pkrtz_f16_f32_e32 v5, v0, v1\ns_inst_prefetch 3\nv_mov_b32_e32 v6, 0\ns_nop 0\nv_mov_b32_e32 v7, 0.5\nv_mov_b32_e32 v8, 1.0\nv_mov_b32_e32 v9, 0x7fc12345\nv_cmp_ne_u32_e32 vcc_lo, 0, v0\nv_cndmask_b32_e32 v10, 0x7fc12345, v1, vcc_lo\nv_cmp_ne_u32_e32 vcc_lo, 0, v1\nv_cndmask_b32_e32 v11, 0x80000000, v0, vcc_lo\nexp mrt0 v1, v1, v0, v0 done compr vm\ns_endpgm\nexp mrt0 v1, v1, off, off done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrtz v2, off, off, off done vm\ns_endpgm\nexp mrtz v2, off, off, off\nexp mrt0 v1, v1, v0, v0 done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrt1 v0, v0, v1, v1 done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrt1 v0, v0, v1, v1 compr\nexp mrt2 v1, v1, v1, v1 done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrt1 v0, v0, off, off compr\nexp mrt2 v1, v1, v1, v1 done compr vm\ns_endpgm\n";
+        let asm = "v_mov_b32_e32 v8, v4\nexp param0 v8, v5, v6, v7\nexp pos0 v0, v1, v2, v3 done\ns_endpgm\nv_add_f32_e32 v4, 0.25, v0\nv_fma_f32 v5, v1, v2, v3\nv_mul_legacy_f32_e32 v6, v5, v4\nv_mul_legacy_f32_e32 v6, 0.5, v6\nv_mul_legacy_f32_e32 v7, 0, v3\nexp mrt0 v4, v5, v6, v7 done\ns_endpgm\nv_mul_legacy_f32_e32 v2, v0, v1\nv_mul_legacy_f32_e32 v3, 0.25, v1\nv_fmac_f32_e32 v4, v0, v1\nv_cvt_pkrtz_f16_f32_e32 v5, v0, v1\ns_inst_prefetch 3\nv_mov_b32_e32 v6, 0\ns_nop 0\nv_mov_b32_e32 v7, 0.5\nv_mov_b32_e32 v8, 1.0\nv_mov_b32_e32 v9, 0x7fc12345\nv_cmp_ne_u32_e32 vcc_lo, 0, v0\nv_cndmask_b32_e32 v10, 0x7fc12345, v1, vcc_lo\nv_cmp_ne_u32_e32 vcc_lo, 0, v1\nv_cndmask_b32_e32 v11, 0x80000000, v0, vcc_lo\nexp mrt0 v1, v1, v0, v0 done compr vm\ns_endpgm\nexp mrt0 v1, v1, off, off done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrtz v2, off, off, off done vm\ns_endpgm\nexp mrtz v2, off, off, off\nexp mrt0 v1, v1, v0, v0 done compr vm\ns_endpgm\nexp mrtz v2, off, off, off\ns_waitcnt expcnt(0)\nv_cvt_pkrtz_f16_f32_e32 v2, v0, v1\nexp mrt0 v2, v2, v3, v3 done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrt1 v0, v0, v1, v1 done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrt1 v0, v0, v1, v1 compr\nexp mrt2 v1, v1, v1, v1 done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrt1 v0, v0, off, off compr\nexp mrt2 v1, v1, v1, v1 done compr vm\ns_endpgm\n";
         let mut asm = asm.to_owned();
         for n in 0..7 {
             let r = 4 + 4 * n;
@@ -694,6 +800,7 @@ mod tests {
             .chain(PACKED_RG_PS)
             .chain(DEPTH_PS)
             .chain(EARLY_DEPTH_PS)
+            .chain(WAIT_DEPTH_PS)
             .chain(DUAL_PS)
             .chain(TRIPLE_PS)
             .chain(TRIPLE_RG_PS)
@@ -903,6 +1010,32 @@ mod tests {
         assert_eq!(
             decode(&[0xf800_1c03, 0x0101], 0),
             Err(DecodeError::Unsupported(0))
+        );
+    }
+
+    #[test]
+    fn export_wait_requires_exact_dependency_and_no_other_work() {
+        assert!(lift_depth_snapshot(WAIT_DEPTH_PS).is_ok());
+        for (at, word) in [
+            (0, DEPTH_PS[2]),
+            (2, 0xbf8c_ff1f),
+            (2, 0xbf80_0000),
+            (3, 0x5e0a_0300),
+            (5, 0x300),
+            (6, 0xbf80_0000),
+        ] {
+            let mut changed = WAIT_DEPTH_PS.to_vec();
+            changed[at] = word;
+            assert!(lift_depth_snapshot(&changed).is_err());
+        }
+        let mut wrong_order = WAIT_DEPTH_PS.to_vec();
+        wrong_order.swap(2, 3);
+        assert!(lift_depth_snapshot(&wrong_order).is_err());
+        wrong_order.remove(3);
+        assert!(lift_depth_snapshot(&wrong_order).is_err());
+        assert_eq!(
+            lift(Stage::EarlyDepthPixel, WAIT_DEPTH_PS),
+            Err(Reject::Unsupported(2))
         );
     }
 

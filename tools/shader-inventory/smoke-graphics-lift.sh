@@ -85,6 +85,13 @@ compile depth
 compile early-depth
 "$p" --load-early-depth-metallib "$d/early-depth.metallib"
 
+# EXPCNT(0) protects the old MRTZ value from reuse as packed MRT0 RG.
+"$p" --wait-depth-source
+"$p" --emit-wait-depth-msl > "$d/wait-depth.metal"
+compile wait-depth
+"$p" --load-wait-depth-metallib "$d/wait-depth.metallib"
+"$p" --expect-late-depth-read
+
 # Seven explicit native PARAM outputs linked by name with a synthetic consumer.
 "$p" --multi-source
 "$p" --emit-multi-msl > "$d/multi.metal"

@@ -46,6 +46,21 @@ fn expected_depth(x: usize, y: usize, raster: bool, writes: bool) -> [f32; 4] {
     color
 }
 
+// Literal expected colors, not decoded from input bits. The first draw
+// owns the overlap because its snapped Z is 1/8 (strictly less than 1/4).
+#[cfg(any(test, target_os = "macos"))]
+fn expected_wait_depth(x: usize, y: usize) -> [f32; 4] {
+    if (1..6).contains(&y) {
+        if (2..6).contains(&x) {
+            return [0., 1.8125, 0.5, 1.];
+        }
+        if (6..8).contains(&x) {
+            return [0., 1.875, 1., -0.5];
+        }
+    }
+    [1., 0., 1., 0.]
+}
+
 #[test]
 fn depth_oracle_distinguishes_raster_depth_and_disabled_writes() {
     assert_ne!(
@@ -78,6 +93,8 @@ mod gpu {
         MultiLoad(&'a Path),
         DepthSource(bool),
         DepthLoad(&'a Path, bool),
+        WaitDepthSource(bool),
+        WaitDepthLoad(&'a Path),
         Load(&'a Path, bool),
         Archive(&'a Path, &'a Path, bool, bool, [u8; 32]),
         ExpectStrictMiss(&'a Path, &'a Path),
@@ -123,6 +140,12 @@ mod gpu {
                 print!("{}", graphics_lift::translate_multi_vertex_fixture().map_err(|e| format!("multi lift rejected: {e:?}"))?);
                 return Ok(());
             }
+            [mode] if mode == "--wait-depth-source" || mode == "--expect-late-depth-read" => Mode::WaitDepthSource(mode == "--expect-late-depth-read"),
+            [mode, lib] if mode == "--load-wait-depth-metallib" => Mode::WaitDepthLoad(Path::new(lib)),
+            [mode] if mode == "--emit-wait-depth-msl" => {
+                print!("{}", graphics_lift::translate_wait_depth_fixture(false).map_err(|e| format!("wait depth lift rejected: {e:?}"))?);
+                return Ok(());
+            }
             [mode] if mode == "--depth-source" || mode == "--early-depth-source" => Mode::DepthSource(mode == "--early-depth-source"),
             [mode, lib] if mode == "--load-depth-metallib" || mode == "--load-early-depth-metallib" => Mode::DepthLoad(Path::new(lib), mode == "--load-early-depth-metallib"),
             [mode] if mode == "--emit-depth-msl" || mode == "--emit-early-depth-msl" => {
@@ -143,7 +166,7 @@ mod gpu {
             [mode, lib] if mode == "--load-metallib" || mode == "--load-mutated-metallib" => Mode::Load(Path::new(lib), mode == "--load-mutated-metallib"),
             [mode, lib, archive] if mode == "--expect-owned-metal-miss" => Mode::ExpectStrictMiss(Path::new(lib), Path::new(archive)),
             [mode, lib, archive, compiler] if mode == "--bake-archive" || mode == "--replay-archive" || mode == "--replay-mutated-archive" => Mode::Archive(Path::new(lib), Path::new(archive), mode == "--bake-archive", mode == "--replay-mutated-archive", owned_graphics_artifact::compiler_profile(compiler)?),
-            _ => return Err("usage: shader-metal-graphics-lift [--expect-swapped-triple | --triple-rg-source | --emit-triple-rg-msl | --load-triple-rg-metallib LIB | --triple-source | --emit-triple-msl | --load-triple-metallib LIB | --dual-source | --emit-dual-msl | --load-dual-metallib LIB | --multi-source | --emit-multi-msl | --load-multi-metallib LIB | --packed-rg-source | --emit-packed-rg-msl | --load-packed-rg-metallib LIB | --early-depth-source | --emit-early-depth-msl | --load-early-depth-metallib LIB | --depth-source | --emit-depth-msl | --load-depth-metallib LIB | --packed-source | --emit-packed-msl | --load-packed-metallib LIB | --emit-msl | --emit-mutated-msl | --load-metallib LIB | --load-mutated-metallib LIB | {--bake-archive|--replay-archive|--replay-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-owned-metal-miss MUTATED_LIB ARCHIVE]".into()),
+            _ => return Err("usage: shader-metal-graphics-lift [--expect-swapped-triple | --triple-rg-source | --emit-triple-rg-msl | --load-triple-rg-metallib LIB | --triple-source | --emit-triple-msl | --load-triple-metallib LIB | --dual-source | --emit-dual-msl | --load-dual-metallib LIB | --multi-source | --emit-multi-msl | --load-multi-metallib LIB | --packed-rg-source | --emit-packed-rg-msl | --load-packed-rg-metallib LIB | --wait-depth-source | --emit-wait-depth-msl | --load-wait-depth-metallib LIB | --expect-late-depth-read | --early-depth-source | --emit-early-depth-msl | --load-early-depth-metallib LIB | --depth-source | --emit-depth-msl | --load-depth-metallib LIB | --packed-source | --emit-packed-msl | --load-packed-metallib LIB | --emit-msl | --emit-mutated-msl | --load-metallib LIB | --load-mutated-metallib LIB | {--bake-archive|--replay-archive|--replay-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-owned-metal-miss MUTATED_LIB ARCHIVE]".into()),
         };
         if matches!(mode, Mode::Archive(..) | Mode::ExpectStrictMiss(..))
             && std::env::var_os("MTL_SHADER_VALIDATION").is_some()
@@ -167,7 +190,9 @@ mod gpu {
         };
         let packed = matches!(mode, Mode::PackedSource(_) | Mode::PackedLoad(..));
         let partial = matches!(mode, Mode::PackedSource(true) | Mode::PackedLoad(_, true));
-        let depth = matches!(mode, Mode::DepthSource(_) | Mode::DepthLoad(..));
+        let wait_depth = matches!(mode, Mode::WaitDepthSource(_) | Mode::WaitDepthLoad(_));
+        let late_read = matches!(mode, Mode::WaitDepthSource(true));
+        let depth = wait_depth || matches!(mode, Mode::DepthSource(_) | Mode::DepthLoad(..));
         let early_depth = matches!(mode, Mode::DepthSource(true) | Mode::DepthLoad(_, true));
         let multi = matches!(mode, Mode::MultiSource | Mode::MultiLoad(_));
         let fixture = match mode {
@@ -187,6 +212,7 @@ mod gpu {
             Mode::Source
             | Mode::PackedSource(_)
             | Mode::DepthSource(_)
+            | Mode::WaitDepthSource(_)
             | Mode::MultiSource
             | Mode::MrtSource(_)
             | Mode::SwappedTripleSource => {
@@ -194,6 +220,8 @@ mod gpu {
                     graphics_lift::translate_mrt_fixture(fixture)
                 } else if multi {
                     graphics_lift::translate_multi_vertex_fixture()
+                } else if wait_depth {
+                    graphics_lift::translate_wait_depth_fixture(late_read)
                 } else if depth {
                     graphics_lift::translate_depth_fixture(early_depth)
                 } else if packed {
@@ -210,6 +238,7 @@ mod gpu {
             | Mode::MultiLoad(path)
             | Mode::MrtLoad(path, _)
             | Mode::DepthLoad(path, _)
+            | Mode::WaitDepthLoad(path)
             | Mode::Load(path, _)
             | Mode::Archive(path, _, _, _, _)
             | Mode::ExpectStrictMiss(path, _) => {
@@ -228,7 +257,9 @@ mod gpu {
             (
                 MTLPixelFormat::RGBA32Float,
                 16,
-                if early_depth {
+                if wait_depth {
+                    "wait_depth_ps"
+                } else if early_depth {
                     "early_depth_ps"
                 } else {
                     "depth_ps"
@@ -420,10 +451,21 @@ mod gpu {
         }
         if let Some(state) = depth_state.as_ref() {
             enc.set_depth_stencil_state(state);
-            for (x, clip_z, inputs) in [
-                (2, 0.875f32, [0xb800_3e00u32, 0x3400_c000, 0x3e00_0000, 0]),
-                (4, 0.125f32, [0x3c00_0000u32, 0x3c00_0000, 0x3e80_0000, 0]),
-            ] {
+            let draws = if wait_depth {
+                // Positive F32 inputs above a half-ULP midpoint; RTZ must
+                // produce 0x3f40/0x3f80 in the high half. A late depth read
+                // interprets the packed words as 3/4 or 1, both above clear.
+                [
+                    (2, 0.875f32, [0u32, 0x3fe8_1800, 0x3e00_0000, 0x3c00_3800]),
+                    (4, 0.125f32, [0u32, 0x3ff0_1800, 0x3e80_0000, 0xb800_3c00]),
+                ]
+            } else {
+                [
+                    (2, 0.875f32, [0xb800_3e00u32, 0x3400_c000, 0x3e00_0000, 0]),
+                    (4, 0.125f32, [0x3c00_0000u32, 0x3c00_0000, 0x3e80_0000, 0]),
+                ]
+            };
+            for (x, clip_z, inputs) in draws {
                 let mut tri = vertices;
                 for vertex in &mut tri {
                     vertex[2] = clip_z;
@@ -493,6 +535,7 @@ mod gpu {
         let pixels = unsafe { std::slice::from_raw_parts(ptr, extent) };
         let mutated = matches!(mode, Mode::Load(_, true) | Mode::Archive(_, _, _, true, _));
         let mut mapping_mismatches = 0;
+        let mut late_read_differences = 0;
         for y in 0..SIDE {
             for x in 0..SIDE {
                 let at = y * STRIDE + x * pixel_bytes;
@@ -504,6 +547,15 @@ mod gpu {
                     // dyadic pixel centers, with the same X gradient in each varying.
                     let rgba: [f32; 4] = [(2240 + 28 * (2 * x + 1)) as f32 / 16., 364., 588., 812.];
                     fp32 = rgba.map(f32::to_le_bytes).as_flattened().to_owned();
+                    &fp32
+                } else if wait_depth {
+                    let correct = expected_wait_depth(x, y);
+                    let clear: [f32; 4] = [1., 0., 1., 0.];
+                    late_read_differences += usize::from(correct != clear);
+                    fp32 = (if late_read { clear } else { correct })
+                        .map(f32::to_le_bytes)
+                        .as_flattened()
+                        .to_owned();
                     &fp32
                 } else if depth {
                     fp32 = expected_depth(x, y, false, true)
@@ -566,6 +618,15 @@ mod gpu {
                 }
             }
         }
+        if late_read {
+            if late_read_differences != 30 {
+                return Err("late depth fixture oracle must distinguish 30 pixels".into());
+            }
+            println!(
+                "late depth source read rejected by oracle: all 64 pixels cleared, including {late_read_differences} expected color writes"
+            );
+            return Ok(());
+        }
         if swapped {
             if mapping_mismatches != 2 * SIDE * SIDE {
                 return Err(format!(
@@ -582,7 +643,7 @@ mod gpu {
             println!("published owned graphics artifact identity");
         }
         println!(
-            "{} translated GFX10 VS+PS (mutated={mutated}, packed={packed}, partial={partial}, depth={depth}, early_depth={early_depth}, multi={multi}, partial_mrt={partial_mrt}, colors={attachment_count}): {n}/{n} attachment pixels matched",
+            "{} translated GFX10 VS+PS (mutated={mutated}, packed={packed}, partial={partial}, depth={depth}, early_depth={early_depth}, wait_depth={wait_depth}, multi={multi}, partial_mrt={partial_mrt}, colors={attachment_count}): {n}/{n} attachment pixels matched",
             dev.name(),
             n = SIDE * SIDE * attachment_count
         );

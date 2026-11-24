@@ -1,4 +1,7 @@
 //! Shared exact instruction decoder; no stage linkage or program semantics.
+
+// Recognized for dependency auditing; not a context-free instruction in the lift.
+pub(crate) const WAIT_EXPORT_ZERO: u32 = 0xbf8c_ff0f;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Vgpr(pub u8);
 

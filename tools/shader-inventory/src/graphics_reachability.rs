@@ -435,7 +435,7 @@ fn nearest_form(name: &str, w: u32, len: usize, text: &str) -> String {
     }
 }
 
-const WAIT_EXPORT_ZERO: u32 = 0xbf8c_ff0f;
+use crate::graphics_decode::WAIT_EXPORT_ZERO;
 
 const NEAREST_DISTANCES: usize = 3;
 const NEAREST_ROWS: usize = 6;
