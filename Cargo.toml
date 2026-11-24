@@ -1,0 +1,8 @@
+[package]
+name = "xsxemu"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Experimental Scarlett PE compatibility launcher"
+
+[dependencies]

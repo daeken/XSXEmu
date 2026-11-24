@@ -1,0 +1,313 @@
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+mod guest;
+mod link;
+mod pe;
+mod startup;
+
+use pe::{ExportTarget, ImportSymbol, Pe};
+use std::{
+    ffi::OsStr,
+    fs,
+    path::{Path, PathBuf},
+    process::ExitCode,
+};
+
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+const MAX_FILE: usize = 512 * 1024 * 1024;
+const MAX_IMAGE: usize = 512 * 1024 * 1024;
+const USAGE: &str = "Usage: xsxemu <inspect|map|audit|run> <image.exe> [options]\n\
+    inspect [--symbols]     List headers, imports, exports and startup metadata\n\
+    map [--base ADDRESS]   Materialize a non-executable image and apply relocations\n\
+    audit [--dll-dir DIR] [--symbols]  Resolve the static import graph without executing\n\
+    run [--dll-dir DIR]    Start a trusted, fully linked image (x86-64 macOS/Rosetta only; not sandboxed)";
+
+fn main() -> ExitCode {
+    match cli() {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("xsxemu: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn cli() -> Result<ExitCode> {
+    let mut args = std::env::args_os().skip(1);
+    let command = args.next().ok_or(USAGE)?;
+    if command == "--help" || command == "-h" {
+        println!("{USAGE}");
+        return Ok(ExitCode::SUCCESS);
+    }
+    let image = PathBuf::from(args.next().ok_or(USAGE)?);
+    let command = command.to_str().ok_or(USAGE)?;
+    let mut roots = Vec::new();
+    let mut symbols = false;
+    let mut base = None;
+    while let Some(arg) = args.next() {
+        match (command, arg.to_str()) {
+            ("inspect" | "audit", Some("--symbols")) => symbols = true,
+            ("audit" | "run", Some("--dll-dir")) => roots.push(PathBuf::from(
+                args.next().ok_or("--dll-dir requires a path")?,
+            )),
+            ("map", Some("--base")) if base.is_none() => {
+                base = Some(parse_base(
+                    &args.next().ok_or("--base requires an address")?,
+                )?)
+            }
+            _ => return Err(format!("unexpected option {arg:?}\n{USAGE}").into()),
+        }
+    }
+    match command {
+        "inspect" => inspect(&image, symbols)?,
+        "map" => map(&image, base)?,
+        "audit" | "run" => return resolve(&image, &roots, command == "run", symbols),
+        _ => return Err(USAGE.into()),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn parse_base(arg: &OsStr) -> Result<u64> {
+    let text = arg.to_str().ok_or("invalid address")?;
+    let base = if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16)?
+    } else {
+        text.parse()?
+    };
+    if base == 0 || base & 0xffff != 0 {
+        return Err("image base must be nonzero and 64 KiB aligned".into());
+    }
+    Ok(base)
+}
+
+pub(crate) fn read_image(path: &Path) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let file = fs::File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(format!("{} is not a regular file", path.display()).into());
+    }
+    let mut bytes = Vec::new();
+    file.take((MAX_FILE + 1) as u64).read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_FILE {
+        return Err(format!("{} exceeds file size limit", path.display()).into());
+    }
+    Ok(bytes)
+}
+
+fn inspect(path: &Path, symbols: bool) -> Result<()> {
+    let bytes = read_image(path)?;
+    let pe = Pe::parse(&bytes)?;
+    println!(
+        "AMD64 PE32+  base={:#x}  entry={:#x}  image={:#x} bytes",
+        pe.image_base, pe.entry_rva, pe.size_of_image
+    );
+    for sec in &pe.sections {
+        let name = String::from_utf8_lossy(&sec.name)
+            .trim_end_matches('\0')
+            .to_owned();
+        let r = if sec.readable() { 'r' } else { '-' };
+        let w = if sec.writable() { 'w' } else { '-' };
+        let x = if sec.executable() { 'x' } else { '-' };
+        println!(
+            "  {name:8} {:#010x}  {r}{w}{x}  virtual={:#x}  raw={:#x}",
+            sec.virtual_address, sec.virtual_size, sec.raw_size
+        );
+    }
+    let imports = pe.imports()?;
+    let mut count = 0;
+    let mut ordinals = 0;
+    for module in &imports {
+        let n = module
+            .imports
+            .iter()
+            .filter(|i| matches!(i.symbol, ImportSymbol::Ordinal(_)))
+            .count();
+        ordinals += n;
+        count += module.imports.len();
+        println!(
+            "  {}: {} entries ({n} ordinal)",
+            String::from_utf8_lossy(module.dll),
+            module.imports.len()
+        );
+        if symbols {
+            for import in &module.imports {
+                let name = match import.symbol {
+                    ImportSymbol::Name { name, .. } => String::from_utf8_lossy(name).into_owned(),
+                    ImportSymbol::Ordinal(value) => format!("#{value}"),
+                };
+                println!("    {:#010x}  {name}", import.iat_rva);
+            }
+        }
+    }
+    println!(
+        "{} modules, {count} imports ({ordinals} ordinal)",
+        imports.len()
+    );
+    for export in pe.exports()? {
+        let names = export
+            .names
+            .iter()
+            .map(|n| String::from_utf8_lossy(n))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let target = match export.target {
+            ExportTarget::Rva(rva) => format!("{rva:#x}"),
+            ExportTarget::Forwarder(name) => String::from_utf8_lossy(name).into_owned(),
+        };
+        println!("  export #{} {names} → {target}", export.ordinal);
+    }
+    if let Some(tls) = pe.tls()? {
+        println!(
+            "  static TLS: template={:?} zero-fill={} alignment={:?} index={:x?} callbacks={:x?}",
+            tls.template,
+            tls.zero_fill,
+            tls.alignment(),
+            tls.index_rva,
+            tls.callbacks
+        );
+    }
+    if let Some(cookie) = pe.security_cookie_rva()? {
+        println!("  security cookie RVA {cookie:#x}");
+    }
+    println!("  {} DIR64 relocations", pe.relocations()?.len());
+    Ok(())
+}
+
+fn map(path: &Path, requested_base: Option<u64>) -> Result<()> {
+    let bytes = read_image(path)?;
+    let pe = Pe::parse(&bytes)?;
+    let base = requested_base.unwrap_or(pe.image_base);
+    let mapped = pe.materialize(base, MAX_IMAGE)?;
+    let entry = mapped
+        .get(pe.entry_rva as usize..)
+        .ok_or("entry lies outside materialized image")?;
+    let preview = entry
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    println!(
+        "Materialized {} bytes at {base:#x}; entry {:#x} [{preview}]",
+        mapped.len(),
+        base.checked_add(u64::from(pe.entry_rva))
+            .ok_or("entry address overflow")?
+    );
+    println!("Non-executable image. No imports bound or guest code run.");
+    Ok(())
+}
+
+fn resolve(image: &Path, roots: &[PathBuf], launch: bool, symbols: bool) -> Result<ExitCode> {
+    use std::collections::BTreeMap;
+    let plan = link::build_plan(image, roots)?;
+    let root_pe = Pe::parse(&plan.modules[0].image)?;
+    if root_pe.characteristics & 0x2000 != 0 {
+        return Err("expected an executable, not a DLL".into());
+    }
+    for module in &plan.modules {
+        println!(
+            "  {} ({} IAT slots)",
+            module.path.display(),
+            module.iat.len()
+        );
+    }
+    let total: usize = plan.modules.iter().map(|m| m.iat.len()).sum();
+    let mut groups = BTreeMap::new();
+    let mut missing = 0;
+    for (index, import, err) in plan.unresolved() {
+        if symbols {
+            println!(
+                "  {}:{:#010x}: {}!{} → {err}",
+                String::from_utf8_lossy(&plan.modules[index].name),
+                import.iat_rva,
+                String::from_utf8_lossy(&import.dll),
+                import.symbol
+            );
+        }
+        missing += 1;
+        *groups.entry((index, err.to_string())).or_insert(0) += 1;
+    }
+    let mut descriptor_failures = 0;
+    for (index, module) in plan.modules.iter().enumerate() {
+        for err in &module.unresolved_dependencies {
+            descriptor_failures += 1;
+            groups.entry((index, err.to_string())).or_insert(0);
+        }
+    }
+    for ((index, error), count) in groups {
+        let name = String::from_utf8_lossy(&plan.modules[index].name);
+        println!("  {name}: {error} ({count} IAT slots)");
+    }
+    println!(
+        "Link plan: {} images, {}/{} IAT slots resolved, {descriptor_failures} descriptor failures",
+        plan.modules.len(),
+        total - missing,
+        total
+    );
+    if missing != 0 || descriptor_failures != 0 {
+        return Err("incomplete dependency graph; no guest code ran".into());
+    }
+    if !launch {
+        return Ok(ExitCode::SUCCESS);
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+    return Err("execution requires an x86-64 macOS build (Rosetta on Apple Silicon)".into());
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    {
+        let names: Vec<_> = plan
+            .modules
+            .iter()
+            .map(|m| String::from_utf8_lossy(&m.name))
+            .collect();
+        let images: Vec<_> = plan
+            .modules
+            .iter()
+            .zip(&names)
+            .map(|(m, n)| (n.as_ref(), m.image.as_slice()))
+            .collect();
+        let mut bindings = Vec::new();
+        for (i, module) in plan.modules.iter().enumerate() {
+            for binding in &module.iat {
+                let target = binding.target.as_ref().map_err(|e| e.to_string())?;
+                bindings.push((i, binding.iat_rva, target.module, target.export_rva));
+            }
+        }
+        let order = attach_order(&plan)?;
+        let status = startup::run(&images, &bindings, &order)?;
+        println!("Guest entry returned {status}");
+        Ok(ExitCode::from(status as u8))
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+fn attach_order(plan: &link::LinkPlan) -> Result<Vec<usize>> {
+    fn visit(
+        i: usize,
+        plan: &link::LinkPlan,
+        states: &mut [u8],
+        order: &mut Vec<usize>,
+    ) -> Result<()> {
+        match states[i] {
+            1 => {
+                return Err(format!(
+                    "DLL initialization cycle involving {}",
+                    String::from_utf8_lossy(&plan.modules[i].name)
+                )
+                .into());
+            }
+            2 => return Ok(()),
+            _ => (),
+        }
+        states[i] = 1;
+        for &dependency in &plan.modules[i].dependencies {
+            visit(dependency, plan, states, order)?;
+        }
+        states[i] = 2;
+        if i != 0 {
+            order.push(i);
+        }
+        Ok(())
+    }
+    let mut ordered = Vec::new();
+    visit(0, plan, &mut vec![0; plan.modules.len()], &mut ordered)?;
+    Ok(ordered)
+}
