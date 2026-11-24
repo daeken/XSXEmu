@@ -1,49 +1,19 @@
 //! Standalone Darwin CPU mapping proof. Not linked into the launcher.
 
-use std::ptr::without_provenance_mut;
+#[path = "../src/xbox_vm/host_backing.rs"]
+mod host_backing;
 
-const PAGE: u64 = 64 * 1024;
+use host_backing::{Backing, Error, PAGE, View};
+
 const VIEW: u64 = 2 * PAGE;
 const EXTENT: u64 = 3 * PAGE;
-
-// Darwin SDK: mach/{mach_init,vm_map,mach_vm,mach_port,memory_object_types,
-//                  vm_statistics,vm_prot,vm_inherit,kern_return}.h
-const ANYWHERE: i32 = 1;
-const NAMED_CREATE: i32 = 0x020000;
-const READ_WRITE: i32 = 1 | 2;
-const INHERIT_NONE: i32 = 2;
 const INVALID_ADDRESS: i32 = 1;
 
-type Port = u32;
-
 unsafe extern "C" {
-    static mach_task_self_: Port;
+    static mach_task_self_: u32;
     fn getpagesize() -> i32;
-    fn mach_make_memory_entry_64(
-        task: Port,
-        size: *mut u64,
-        offset: u64,
-        permission: i32,
-        entry: *mut Port,
-        parent: Port,
-    ) -> i32;
-    fn mach_vm_map(
-        task: Port,
-        address: *mut u64,
-        size: u64,
-        mask: u64,
-        flags: i32,
-        entry: Port,
-        offset: u64,
-        copy: i32,
-        protection: i32,
-        max_protection: i32,
-        inheritance: i32,
-    ) -> i32;
-    fn mach_port_deallocate(task: Port, entry: Port) -> i32;
-    fn mach_vm_deallocate(task: Port, address: u64, size: u64) -> i32;
     fn mach_vm_read_overwrite(
-        task: Port,
+        task: u32,
         address: u64,
         size: u64,
         data: u64,
@@ -51,113 +21,54 @@ unsafe extern "C" {
     ) -> i32;
 }
 
-fn check(op: &str, result: i32) {
-    assert_eq!(result, 0, "{op} failed (Mach status {result})");
+fn read(view: &View, offset: u64) -> u8 {
+    let mut dst = [0];
+    view.read(offset, &mut dst).unwrap();
+    dst[0]
 }
 
-// These handles are linear. Success explicitly releases each resource with
-// checked status; on assertion failure the dedicated child exits instead.
-struct Backing {
-    task: Port,
-    entry: Port,
-}
-
-impl Backing {
-    fn new(task: Port) -> Self {
-        let (mut size, mut entry) = (EXTENT, 0);
-        // SAFETY: output pointers are valid; null parent and NAMED_CREATE
-        // request a new anonymous object, not a range of an existing map.
-        check("mach_make_memory_entry_64", unsafe {
-            mach_make_memory_entry_64(task, &mut size, 0, NAMED_CREATE | READ_WRITE, &mut entry, 0)
-        });
-        assert!(entry != 0 && entry != u32::MAX && size == EXTENT);
-        Self { task, entry }
+fn check_ranges(backing: &Backing, a: &View, b: &View) {
+    for (offset, len) in [
+        (1, PAGE),
+        (0, 1),
+        (0, 0),
+        (PAGE, EXTENT),
+        (u64::MAX - PAGE + 1, PAGE),
+    ] {
+        assert!(matches!(backing.map(offset, len), Err(Error::InvalidRange)));
     }
+    let mut dst = [0xff; 2];
+    for offset in [VIEW - 1, VIEW, u64::MAX] {
+        assert_eq!(a.read(offset, &mut dst), Err(Error::InvalidRange));
+        assert_eq!(a.write(offset, &[1, 2]), Err(Error::InvalidRange));
+    }
+    assert_eq!(dst, [0xff; 2]);
+    assert_eq!(b.read(VIEW + 1, &mut []), Err(Error::InvalidRange));
+    assert_eq!(b.write(VIEW + 1, &[]), Err(Error::InvalidRange));
+    b.read(VIEW, &mut []).unwrap();
+    b.write(VIEW, &[]).unwrap();
+    assert_eq!(read(a, VIEW - 1), 0); // Rejected writes were not partial.
+}
 
-    fn map(&self, offset: u64) -> View {
-        assert_eq!(offset % PAGE, 0);
-        assert!(offset.checked_add(VIEW).is_some_and(|end| end <= EXTENT));
-        let mut base = 0;
-        // SAFETY: valid entry and bounded subrange; ANYWHERE (no OVERWRITE)
-        // lets the kernel choose free VA using the low-bit alignment mask.
-        check("mach_vm_map", unsafe {
-            mach_vm_map(
-                self.task,
-                &mut base,
-                VIEW,
-                PAGE - 1,
-                ANYWHERE,
-                self.entry,
-                offset,
-                0, // share, not copy-on-write
-                READ_WRITE,
-                READ_WRITE,
-                INHERIT_NONE,
+fn drop_and_check_unmapped(view: View) {
+    let base = view.base_address();
+    drop(view);
+    // Ask the kernel about each endpoint; never dereference a stale VA.
+    for address in [base, base + VIEW - 1] {
+        let (mut byte, mut size) = (0_u8, 0);
+        // SAFETY: libSystem supplies the initialized task-self port, the
+        // destination is one writable stack byte, and the kernel validates
+        // the source address in this task.
+        let result = unsafe {
+            mach_vm_read_overwrite(
+                mach_task_self_,
+                address,
+                1,
+                (&raw mut byte).expose_provenance() as u64,
+                &mut size,
             )
-        });
-        assert_ne!(base, 0);
-        assert_eq!(base % PAGE, 0);
-        let end = base.checked_add(VIEW).expect("view address overflow");
-        assert!(usize::try_from(end).is_ok());
-        View {
-            task: self.task,
-            base,
-            end,
-        }
-    }
-
-    fn close(self) {
-        // SAFETY: consumes the one send right returned by NAMED_CREATE.
-        check("mach_port_deallocate", unsafe {
-            mach_port_deallocate(self.task, self.entry)
-        });
-    }
-}
-
-struct View {
-    task: Port,
-    base: u64,
-    end: u64,
-}
-
-impl View {
-    fn byte(&self, offset: u64) -> *mut u8 {
-        assert!(offset < VIEW);
-        without_provenance_mut((self.base + offset) as usize)
-    }
-
-    fn read(&self, offset: u64) -> u8 {
-        // SAFETY: in the live OS allocation, outside Rust-managed allocations.
-        // No references to the aliased bytes and no concurrent accesses.
-        unsafe { self.byte(offset).read_volatile() }
-    }
-
-    fn write(&self, offset: u64, value: u8) {
-        // SAFETY: as above; the live mapping allows writes too.
-        unsafe { self.byte(offset).write_volatile(value) }
-    }
-
-    fn unmap(self) {
-        // SAFETY: exact range owned by this view; consuming it prevents reuse.
-        check("mach_vm_deallocate", unsafe {
-            mach_vm_deallocate(self.task, self.base, VIEW)
-        });
-        // Ask the kernel about each endpoint; never dereference a stale VA.
-        for address in [self.base, self.end - 1] {
-            let (mut byte, mut size) = (0_u8, 0);
-            // SAFETY: the destination is one writable stack byte, and the
-            // kernel validates the source address in this task.
-            let result = unsafe {
-                mach_vm_read_overwrite(
-                    self.task,
-                    address,
-                    1,
-                    (&raw mut byte).expose_provenance() as u64,
-                    &mut size,
-                )
-            };
-            assert_eq!(result, INVALID_ADDRESS, "unmapped endpoint {address:#x}");
-        }
+        };
+        assert_eq!(result, INVALID_ADDRESS, "unmapped endpoint {address:#x}");
     }
 }
 
@@ -166,47 +77,60 @@ fn main() {
         .nth(1)
         .expect("expected a-first or b-first");
     assert!(matches!(order.as_str(), "a-first" | "b-first"));
-    // SAFETY: libSystem's initialized task-self port and process page size.
-    let (task, host_page) = unsafe { (mach_task_self_, getpagesize()) };
-    assert!(host_page > 0 && PAGE % host_page as u64 == 0);
-    let backing = Backing::new(task);
-    let a = backing.map(0);
-    let b = backing.map(PAGE);
-    assert!(a.end <= b.base || b.end <= a.base, "overlapping host VAs");
+    // SAFETY: libSystem reports this process's page size.
+    let host_page = unsafe { getpagesize() };
+    for len in [0, PAGE - 1, PAGE + 1] {
+        assert!(matches!(Backing::new(len), Err(Error::InvalidRange)));
+    }
+    let backing = Backing::new(EXTENT).unwrap();
+    let a = backing.map(0, VIEW).unwrap();
+    let b = backing.map(PAGE, VIEW).unwrap();
+    let (a_base, b_base) = (a.base_address(), b.base_address());
+    assert!(a_base.is_multiple_of(PAGE) && b_base.is_multiple_of(PAGE));
+    assert!(
+        a_base + VIEW <= b_base || b_base + VIEW <= a_base,
+        "overlapping host VAs"
+    );
+    check_ranges(&backing, &a, &b);
 
     // Object page 1 is shared; pages 0 and 2 border it on opposite sides.
     for (view, byte) in [(&a, PAGE - 1), (&a, PAGE), (&b, PAGE - 1), (&b, PAGE)] {
-        assert_eq!(view.read(byte), 0);
+        assert_eq!(read(view, byte), 0);
     }
-    a.write(PAGE - 1, 0x11);
-    b.write(PAGE, 0x22);
-    assert_eq!(b.read(0), 0);
-    assert_eq!(a.read(VIEW - 1), 0);
-    a.write(PAGE, 0x33);
-    assert_eq!(b.read(0), 0x33);
-    b.write(PAGE - 1, 0x44);
-    assert_eq!(a.read(VIEW - 1), 0x44);
-    assert_eq!(a.read(PAGE - 1), 0x11);
-    assert_eq!(b.read(PAGE), 0x22);
+    a.write(PAGE - 1, &[0x11]).unwrap();
+    b.write(PAGE, &[0x22]).unwrap();
+    assert_eq!(read(&b, 0), 0);
+    assert_eq!(read(&a, VIEW - 1), 0);
+    a.write(PAGE, &[0x33]).unwrap();
+    assert_eq!(read(&b, 0), 0x33);
+    assert_eq!(read(&b, PAGE), 0x22);
+    b.write(PAGE - 1, &[0x44, 0x66]).unwrap();
+    assert_eq!(read(&a, VIEW - 1), 0x44);
+    assert_eq!(read(&b, PAGE), 0x66);
+    b.write(PAGE, &[0x22]).unwrap();
+    let mut pair = [0; 2];
+    a.read(PAGE - 1, &mut pair).unwrap();
+    assert_eq!(pair, [0x11, 0x33]);
+    assert_eq!(read(&b, PAGE), 0x22);
 
-    backing.close();
-    assert_eq!(b.read(0), 0x33);
-    assert_eq!(a.read(VIEW - 1), 0x44);
+    drop(backing);
+    assert_eq!(read(&b, 0), 0x33);
+    assert_eq!(read(&a, VIEW - 1), 0x44);
 
     let a_first = order == "a-first";
     let (first, survivor) = if a_first { (a, b) } else { (b, a) };
-    first.unmap();
+    drop_and_check_unmapped(first);
     let (shared, neighbor, marker) = if a_first {
         (0, PAGE, 0x22)
     } else {
         (PAGE, PAGE - 1, 0x11)
     };
-    assert_eq!(survivor.read(shared), 0x33);
-    assert_eq!(survivor.read(shared + PAGE - 1), 0x44);
-    assert_eq!(survivor.read(neighbor), marker);
-    survivor.write(shared, 0x55);
-    assert_eq!(survivor.read(shared), 0x55);
-    survivor.unmap();
+    assert_eq!(read(&survivor, shared), 0x33);
+    assert_eq!(read(&survivor, shared + PAGE - 1), 0x44);
+    assert_eq!(read(&survivor, neighbor), marker);
+    survivor.write(shared, &[0x55]).unwrap();
+    assert_eq!(read(&survivor, shared), 0x55);
+    drop_and_check_unmapped(survivor);
     println!(
         "PASS arch={} getpagesize={host_page} logical_page={PAGE} {order}",
         std::env::consts::ARCH
