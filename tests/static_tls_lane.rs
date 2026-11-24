@@ -16,7 +16,7 @@ const OPT: &str = "--experimental-static-tls";
 const TRUSTED: &str = "--trusted-offline";
 const WARNING: &str = "neither signature nor catalog is verified; Xbox policy is not evaluated";
 const PAGE: usize = 0x4000;
-const RAW: usize = 0x2e00; // Includes the shared fixture's bridge code.
+const RAW: usize = 0x3200; // Includes the shared fixture's bridge code.
 const TEXT: usize = PAGE;
 const RO: usize = 2 * PAGE;
 const DATA: usize = 3 * PAGE;
@@ -67,6 +67,9 @@ struct Fixture {
     processor_topology_entry: u32,
     system_file_time_entry: u32,
     tick_count64_entry: u32,
+    runtime_probe: u32,
+    runtime_main: u32,
+    runtime_export: u32,
     code: [u8; RAW],
 }
 global_asm!(include_str!("fixtures/static_tls_lane.S"),
@@ -2606,6 +2609,130 @@ fn dir_import_one(b: &mut [u8], dll: &[u8], symbol: &[u8]) {
     w64(b, file(imports) + 0x30, imports + 0x70);
     put(b, file(imports) + 0x40, dll);
     put(b, file(imports) + 0x72, symbol);
+}
+
+#[test]
+fn explicit_xgameruntime_uses_normal_pe_lifecycle_and_audited_lookups() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let supplied = Scratch::new();
+    let code = unsafe { &static_tls_fixture };
+    let mut root = image(Kind::Guarded);
+    w32(&mut root, OP + 16, TEXT + code.runtime_probe as usize);
+    let imp = LINK + 0x780;
+    dir(&mut root, 1, imp, 40);
+    w32(&mut root, file(imp), imp + 0x30);
+    w32(&mut root, file(imp) + 12, imp + 0x60);
+    w32(&mut root, file(imp) + 16, IAT);
+    put(&mut root, file(imp) + 0x60, b"kernel32.dll\0");
+    for (i, name) in [
+        b"LoadLibraryExW\0".as_slice(),
+        b"GetProcAddress\0",
+        b"FreeLibrary\0",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let slot = imp + 0x80 + i * 0x20;
+        w64(&mut root, file(imp) + 0x30 + i * 8, slot);
+        put(&mut root, file(slot) + 2, name);
+    }
+    let exe = scratch.write("runtime-probe.exe", &root);
+    let mut runtime = image(Kind::Guarded);
+    w16(&mut runtime, 0x96, 0x2022);
+    w32(&mut runtime, OP + 16, TEXT + code.runtime_main as usize);
+    dir(&mut runtime, 9, 0, 0);
+    dir_import_one(&mut runtime, b"owned.dll\0", b"Step\0");
+    w32(
+        &mut runtime,
+        file(GFIDS),
+        TEXT + code.runtime_export as usize,
+    );
+    dir(&mut runtime, 0, LINK, 0x100);
+    for (offset, value) in [
+        (12, LINK + 0x58),
+        (16, 1),
+        (20, 3),
+        (24, 3),
+        (28, LINK + 0x30),
+        (32, LINK + 0x40),
+        (36, LINK + 0x4c),
+    ] {
+        w32(&mut runtime, file(LINK) + offset, value);
+    }
+    put(&mut runtime, file(LINK) + 0x58, b"xgameruntime.dll\0");
+    for (i, (value, name)) in [
+        (LINK + 0xc0, b"Forwarded\0".as_slice()),
+        (TEXT + code.cfg_target as usize, b"NotGuarded\0"),
+        (TEXT + code.runtime_export as usize, b"OwnedProbe\0"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let slot = LINK + 0x70 + i * 0x18;
+        w32(&mut runtime, file(LINK) + 0x30 + i * 4, value);
+        w32(&mut runtime, file(LINK) + 0x40 + i * 4, slot);
+        w16(&mut runtime, file(LINK) + 0x4c + i * 2, i);
+        put(&mut runtime, file(slot), name);
+    }
+    put(&mut runtime, file(LINK) + 0xc0, b"kernel32.SetLastError\0");
+    let dll = supplied.write("xgameruntime.dll", &runtime);
+    let path = dll.to_str().unwrap();
+    let flags = [
+        OPT,
+        TRUSTED,
+        "--rust-providers",
+        "--xgameruntime-dll",
+        path,
+        "--trace-missing-imports",
+    ];
+    expect(
+        run(&exe, &[OPT, TRUSTED, "--rust-providers"]),
+        46,
+        "Guest entry returned 46",
+    );
+    expect(
+        run(&exe, &[OPT, "--rust-providers", "--xgameruntime-dll", path]),
+        1,
+        "--xgameruntime-dll requires",
+    );
+    expect(run(&exe, &flags), 1, "incomplete dependency closure");
+    let mut dep = image(Kind::Dll);
+    dir_import_one(&mut dep, b"kernel32.dll\0", b"SetErrorMode\0");
+    scratch.write("owned.dll", &dep);
+    expect(
+        run(&exe, &flags),
+        1,
+        "dependency closure requires an audited TLS bridge",
+    );
+    scratch.write("owned.dll", &image(Kind::Dll));
+    expect(run(&exe, &flags), 47, "Guest entry returned 47");
+
+    let mut invalid = runtime.clone();
+    w16(&mut invalid, 0x84, 0xaa64);
+    supplied.write("xgameruntime.dll", &invalid);
+    expect(run(&exe, &flags), 1, "AMD64");
+    let renamed = supplied.write("renamed.dll", &runtime);
+    expect(
+        run(
+            &exe,
+            &[
+                OPT,
+                TRUSTED,
+                "--rust-providers",
+                "--xgameruntime-dll",
+                renamed.to_str().unwrap(),
+            ],
+        ),
+        1,
+        "exact xgameruntime.dll basename",
+    );
+
+    w32(&mut runtime, file(MODE) + 8, 1);
+    supplied.write("xgameruntime.dll", &runtime);
+    expect(run(&exe, &flags), 1, "DllMain rejected process attach");
 }
 
 #[test]

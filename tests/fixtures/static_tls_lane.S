@@ -19,6 +19,7 @@ _static_tls_fixture:
     .long Lprocessor_topology_entry-Ltext
     .long Lsystem_file_time_entry-Ltext
     .long Ltick_count64_entry-Ltext
+    .long Lruntime_probe-Ltext, Lruntime_main-Ltext, Lruntime_export-Ltext
 Ltext:
 .macro tls index
     leaq Ltext(%rip), %r11
@@ -1307,5 +1308,141 @@ Lxmem_entry:
     addq $48, %rsp
     popq %rbx
     retq
+/* Original test-only PE; no game runtime interfaces or COM behavior. */
+Lruntime_main:
+    leaq Ltext(%rip), %r11
+    args
+    testl %edx, %edx
+    je 1f
+    cmpl $1, %edx
+    jne Lbad
+    cmpl $0, {mode_delta}+8(%r11)
+    jne 2f
+    movq %rcx, {mode_delta}(%r11)
+    step 2                      /* dependency must already be attached */
+    movl $1, %eax
+    retq
+1:
+    cmpq %rcx, {mode_delta}(%r11)
+    jne Lbad
+    step 4                      /* dependency must still be attached */
+    movl $1, %eax
+    retq
+2:
+    step 2                      /* allow dependency's rollback to finish */
+    leaq Ltext(%rip), %r11
+    step 3
+    leaq Ltext(%rip), %r11
+    step 4
+    xorl %eax, %eax
+    retq
+Lruntime_export:
+    leaq Ltext(%rip), %r11
+    cmpq %rcx, {mode_delta}(%r11) /* Win64 arg == actual attach base */
+    jne Lbad
+    step 3
+    movl $12345, %eax
+    retq
+.macro runtime_load name, mode, file=0
+    leaq \name(%rip), %rcx
+    movl $\file, %edx
+    movl $\mode, %r8d
+    leaq Ltext(%rip), %r11
+    callq *{iat_delta}(%r11)
+.endm
+Lruntime_probe:
+    tls 0
+    phase 1, 2
+    subq $56, %rsp
+    runtime_load Lruntime_noext, 0x800
+    testq %rax, %rax
+    jne Lbad
+    runtime_load Lruntime_path, 0x800
+    testq %rax, %rax
+    jne Lbad
+    runtime_load Lruntime_name, 0x200
+    testq %rax, %rax
+    jne Lbad
+    runtime_load Lruntime_name, 0
+    testq %rax, %rax
+    jne Lbad
+    runtime_load Lruntime_name, 0xa00, 1
+    testq %rax, %rax
+    jne Lbad
+    cmpl $87, %gs:0x68
+    jne Lbad
+    movl $0x12345678, %gs:0x68
+    runtime_load Lruntime_name, 0x800
+    testq %rax, %rax
+    je 3f
+    cmpl $0x12345678, %gs:0x68
+    jne Lbad
+    movq %rax, 32(%rsp)
+    cmpw $0x5a4d, (%rax)
+    jne Lbad
+    runtime_load Lruntime_upper, 0xa00
+    cmpq %rax, 32(%rsp)
+    jne Lbad
+    .irp name,Lruntime_forwarder,Lruntime_unguarded,Lruntime_missing
+        movq 32(%rsp), %rcx
+        leaq \name(%rip), %rdx
+        leaq Ltext(%rip), %r11
+        callq *{iat_delta}+8(%r11)
+        testq %rax, %rax
+        jne Lbad
+        cmpl $127, %gs:0x68
+        jne Lbad
+    .endr
+    movq 32(%rsp), %rcx
+    leaq Lruntime_export_name(%rip), %rdx
+    leaq Ltext(%rip), %r11
+    callq *{iat_delta}+8(%r11)
+    testq %rax, %rax
+    je Lbad
+    movq %rax, 40(%rsp)
+    .irp unused,0,1
+        movq 32(%rsp), %rcx
+        leaq Ltext(%rip), %r11
+        callq *{iat_delta}+16(%r11)
+        cmpl $1, %eax
+        jne Lbad
+    .endr
+    movq 32(%rsp), %rcx
+    leaq Ltext(%rip), %r11
+    callq *{iat_delta}+16(%r11)
+    testl %eax, %eax
+    jne Lbad
+    cmpl $6, %gs:0x68
+    jne Lbad
+    movq 32(%rsp), %rcx
+    movq 40(%rsp), %rax
+    leaq Ltext(%rip), %r11
+    callq *{dispatch_delta}(%r11) /* still mapped after FreeLibrary */
+    cmpl $12345, %eax
+    jne Lbad
+    movl $47, %eax
+    jmp 4f
+3:
+    cmpl $126, %gs:0x68
+    jne Lbad
+    runtime_load Lruntime_name, 0xa00
+    testq %rax, %rax
+    jne Lbad
+    movl $46, %eax
+4:
+    addq $56, %rsp
+    retq
+Lruntime_path:
+    .short 46,47  /* ./ */
+Lruntime_name:
+    .short 120,103,97,109,101,114,117,110,116,105,109,101,46,100,108,108,0
+Lruntime_upper:
+    .short 88,71,65,77,69,82,85,78,84,73,77,69,46,68,76,76,0
+Lruntime_noext:
+    .short 120,103,97,109,101,114,117,110,116,105,109,101,0
+Lruntime_export_name: .asciz "OwnedProbe"
+Lruntime_forwarder: .asciz "Forwarded"
+Lruntime_unguarded: .asciz "NotGuarded"
+Lruntime_missing: .asciz "ownedprobe"
 Lend:
     .org Ltext + {capacity}, 0xcc

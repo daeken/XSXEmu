@@ -49,6 +49,7 @@ const USAGE: &str = "Usage: xsxemu <inspect|map|audit|run> <image.exe> [options]
     run option: --trusted-offline  Ignore opaque CodeIntegrity and volatile hints (requires --experimental-static-tls)\n\
     run option: --no-guest-cfg  Disable guest CFG enforcement (trusted-offline static TLS only)\n\
     run option: --map-extra-dll PATH  Map an extra PE DLL (trusted-offline static TLS only)\n\
+    run option: --xgameruntime-dll PATH  Admit an explicit xgameruntime.dll (trusted-offline static TLS with Rust providers)\n\
     run option: --guest-entropy  Map the built-in entropy DLL (trusted-offline static TLS with Rust providers)\n\
     audit/run options: --api-set SCHEMA.dll, --rust-providers";
 
@@ -87,6 +88,7 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
     let mut trusted_offline = false;
     let mut no_guest_cfg = false;
     let mut map_extra_dll = None;
+    let mut xgameruntime_dll = None;
     let mut guest_entropy = false;
     let mut startup_profile = None;
     let mut options = args.iter();
@@ -128,6 +130,11 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
                     options.next().ok_or("--map-extra-dll requires a path")?,
                 ));
             }
+            ("run", Some("--xgameruntime-dll")) if xgameruntime_dll.is_none() => {
+                xgameruntime_dll = Some(PathBuf::from(
+                    options.next().ok_or("--xgameruntime-dll requires a path")?,
+                ));
+            }
             ("map", Some("--base")) if base.is_none() => {
                 base = Some(parse_base(
                     options.next().ok_or("--base requires an address")?,
@@ -138,6 +145,9 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
     }
     if guest_entropy && !(trusted_offline && experimental_tls && rust_providers) {
         return Err("--guest-entropy requires --trusted-offline, --experimental-static-tls and --rust-providers".into());
+    }
+    if xgameruntime_dll.is_some() && !(trusted_offline && experimental_tls && rust_providers) {
+        return Err("--xgameruntime-dll requires --trusted-offline, --experimental-static-tls and --rust-providers".into());
     }
     if map_extra_dll.is_some() && !(trusted_offline && experimental_tls) {
         return Err(
@@ -198,6 +208,7 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
                     rust_providers,
                     trace_missing_imports,
                     map_extra_dll: map_extra_dll.as_deref(),
+                    xgameruntime_dll: xgameruntime_dll.as_deref(),
                     guest_entropy,
                     trusted_offline: trusted_offline
                         || matches!(
@@ -533,6 +544,7 @@ fn resolve(
             .collect();
         let mut bindings = Vec::new();
         let mut traps = Vec::new();
+        let xgameruntime_closure = plan.xgameruntime_closure();
         for (i, module) in plan.modules.iter().enumerate() {
             for binding in &module.iat {
                 match &binding.target {
@@ -542,6 +554,9 @@ fn resolve(
                             && startup_options.1
                             && tls_runtime::bridge_address(*export, true).is_err() =>
                     {
+                        if xgameruntime_closure.contains(&i) {
+                            return Err(format!("{}: xgameruntime dependency closure requires an audited TLS bridge for {}!{}", module.path.display(), export.provider, export.symbol).into());
+                        }
                         traps.push(import_traps::MissingImport {
                             importer: i,
                             path: &module.path,
@@ -572,6 +587,7 @@ fn resolve(
                 startup_options.1,
                 profile,
                 _no_guest_cfg,
+                plan.xgameruntime,
             )?
         } else {
             startup::run(
@@ -656,6 +672,10 @@ fn attach_order(plan: &link::LinkPlan) -> Result<Vec<usize>> {
         Ok(())
     }
     let mut ordered = Vec::new();
-    visit(0, plan, &mut vec![0; plan.modules.len()], &mut ordered)?;
+    let mut states = vec![0; plan.modules.len()];
+    visit(0, plan, &mut states, &mut ordered)?;
+    if let Some(runtime) = plan.xgameruntime {
+        visit(runtime, plan, &mut states, &mut ordered)?;
+    }
     Ok(ordered)
 }

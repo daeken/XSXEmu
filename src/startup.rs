@@ -273,6 +273,7 @@ mod native {
             rust_providers,
             Profile::Standard,
             false,
+            None,
         )
     }
 
@@ -284,6 +285,7 @@ mod native {
         rust_providers: bool,
         profile: Profile,
         no_guest_cfg: bool,
+        xgameruntime: Option<usize>,
     ) -> Result<u32> {
         assert!(profile.uses_static_tls());
         if no_guest_cfg {
@@ -305,6 +307,7 @@ mod native {
             rust_providers,
             profile,
             no_guest_cfg,
+            xgameruntime,
         )
     }
 
@@ -317,9 +320,20 @@ mod native {
         rust_providers: bool,
         profile: Profile,
         no_guest_cfg: bool,
+        xgameruntime: Option<usize>,
     ) -> Result<u32> {
         use crate::tls_runtime;
         let static_tls = profile.uses_static_tls();
+        if xgameruntime.is_some_and(|i| {
+            !matches!(profile, Profile::TrustedOfflineTlsChild)
+                || !rust_providers
+                || !attach_order.contains(&i)
+        }) {
+            return Err(
+                "xgameruntime requires normal DLL initialization in the trusted offline TLS child"
+                    .into(),
+            );
+        }
         let mut entropy_module = None;
         for &(importer, slot, target) in bindings {
             if let BindingTarget::Rust(export) = target {
@@ -538,6 +552,7 @@ mod native {
             api_set,
             rust_providers,
             entropy_module,
+            xgameruntime,
         )?;
         if let Some(tls) = tls {
             if rust_providers {

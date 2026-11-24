@@ -535,6 +535,7 @@ pub fn run(
             }
             attached += 1;
         }
+        crate::providers::win_loader::set_xgameruntime_ready(true);
         notify(0, 1);
         let status = call(
             0,
@@ -546,6 +547,7 @@ pub fn run(
         notify(0, 0);
         Ok(status)
     })();
+    crate::providers::win_loader::set_xgameruntime_ready(false);
     for &i in order[..attached].iter().rev() {
         notify(i, 0);
         dll_entry(i, 0);

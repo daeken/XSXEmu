@@ -275,10 +275,10 @@ are accepted only if they resolve to an audited identity; ntdll
 `Rtl*LastWin32Error` identities are distinct. Win32 `Tls*` slots are
 provider-managed and separate from the PE static TLS vector at `GS:[0x58]`.
 
-`LoadLibraryExW` keeps the ordinary provider's argument validation but
-searches an intentionally empty namespace, even for DLLs in the static
-import graph. Well-formed requests return `NULL` with `ERROR_MOD_NOT_FOUND`;
-invalid or unsupported requests return their validation errors instead.
+`LoadLibraryExW` never searches for DLLs, even in the static import graph.
+Except for the explicit startup mappings described below, well-formed
+requests return `NULL` with `ERROR_MOD_NOT_FOUND`; invalid or unsupported
+requests return their validation errors instead.
 `GetModuleHandleA` and `GetModuleHandleW` return a borrowed PE base from the registered guest image
 graph: null selects the root EXE, and non-null names use the ordinary mapped
 module lookup (CP1252 for `A`, UTF-16 for `W`). Neither loads images nor creates handles for Rust providers
@@ -332,6 +332,27 @@ caller-held critical section; a zero-duration poll returns false and sets
 `ERROR_TIMEOUT` (there is no peer to observe a release/reacquire). Nonzero
 waits or a nonzero condition-variable state hit `UD2`; no blocking, wakeup,
 or lock-ownership validation is implemented by this diagnostic facade.
+
+`run --experimental-static-tls --trusted-offline --rust-providers
+--xgameruntime-dll PATH` opts into one separately supplied AMD64 PE DLL named
+`xgameruntime.dll` (ASCII case-insensitive). It is a second startup root,
+not a replacement for any ordinary static import. Normal imports resolve
+through the ordinary PE/API-set/provider rules and `--dll-dir`/EXE directory
+search; the supplied file's directory is not added automatically. Missing or
+unaudited bindings anywhere in that root's dependency closure are errors even
+with `--trace-missing-imports`. Normal startup validation and dependency-first
+attach/reverse-order detach apply, not the entryless `--map-extra-dll` path.
+
+After DLL attach, `LoadLibraryExW` can acquire this mapping only by its full
+basename, null file, and flags `0x800` (`SYSTEM32`) or `0xA00`
+(`APPLICATION_DIR | SYSTEM32`). Both are explicit overrides to the same mapped
+file; neither searches any directory at call time. `FreeLibrary` balances
+guest references without unloading startup's mapping. The TLS `GetProcAddress`
+policy is unchanged: only direct named PE exports admitted by checked CFG
+metadata, not ordinals, unchecked RVAs, forwarded or raw Rust addresses.
+This does not implement XGameRuntime or COM. The owned PE used in the launcher
+tests is only a loader fixture, not a runtime substitute; never supply it to a
+title run. No genuine XGameRuntime DLL was tested.
 
 `GetModuleFileNameW` reads the registered UTF-16 guest path: a null handle
 selects the root EXE, and a non-null handle must exactly match a mapped image
@@ -479,8 +500,9 @@ by the image's GuardCF metadata at mapping time. It never adds CFG targets,
 resolves forwarders or ordinals, or returns a Rust provider address. Success
 preserves `LastError`; an invalid handle gives `ERROR_INVALID_HANDLE` and an
 unavailable export gives `ERROR_PROC_NOT_FOUND`.
-`FreeLibrary` isn't bridged. Unbridged
-providers fail before entry unless `--trace-missing-imports` is enabled,
+`FreeLibrary` is restricted to guest references acquired through the narrowly
+admitted startup mappings. Unbridged providers fail before entry unless
+`--trace-missing-imports` is enabled,
 which treats well-formed unavailable or unbridged slots as callable, not
 as data: PE import records don't distinguish the two.
 Their writes participate in the same TLS layout and overlap checks as resolved

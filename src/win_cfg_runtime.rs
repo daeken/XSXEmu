@@ -301,6 +301,7 @@ mod tests {
                     false,
                     profile,
                     false,
+                    None,
                 )
                 .unwrap(),
                 42

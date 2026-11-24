@@ -20,9 +20,21 @@ const IMAGE_FILE_EXECUTABLE_IMAGE: u16 = 0x0002;
 pub struct LinkPlan {
     /// Module zero is always the original executable. Indices are stable within the plan.
     pub modules: Vec<ModulePlan>,
+    pub xgameruntime: Option<usize>,
 }
 
 impl LinkPlan {
+    pub fn xgameruntime_closure(&self) -> HashSet<usize> {
+        let mut seen = HashSet::new();
+        let mut pending: Vec<_> = self.xgameruntime.into_iter().collect();
+        while let Some(i) = pending.pop() {
+            if seen.insert(i) {
+                pending.extend(&self.modules[i].dependencies);
+            }
+        }
+        seen
+    }
+
     /// Unresolved IAT entries across the entire discovered closure.
     pub fn unresolved(&self) -> impl Iterator<Item = (usize, &IatBinding, &Unresolved)> {
         self.modules.iter().enumerate().flat_map(|(index, module)| {
@@ -398,6 +410,7 @@ pub struct Options<'a> {
     pub trace_missing_imports: bool,
     pub guest_entropy: bool,
     pub map_extra_dll: Option<&'a Path>,
+    pub xgameruntime_dll: Option<&'a Path>,
     pub trusted_offline: bool,
 }
 
@@ -551,10 +564,9 @@ impl Builder<'_> {
         }
     }
 
-    fn close(mut self) -> Result<LinkPlan, LinkError> {
+    fn close_imports(&mut self, mut index: usize) {
         // Loading only inserts a work item. This loop visits each module once even if imports
         // form cycles; a forwarder also queues its provider's imports for the census.
-        let mut index = 0;
         while index < self.plan.modules.len() {
             for group in std::mem::take(&mut self.tables[index].imports) {
                 if group.entries.is_empty() {
@@ -579,6 +591,75 @@ impl Builder<'_> {
                 }
             }
             index += 1;
+        }
+    }
+
+    fn admit_xgameruntime(&mut self, path: &Path) -> Result<(), LinkError> {
+        use crate::providers::win_loader::XGAMERUNTIME;
+        let error = |why: &str| LinkError::new(path, "admit xgameruntime DLL", why);
+        let named_runtime = |p: &Path| {
+            p.file_name().is_some_and(|name| {
+                name.as_encoded_bytes()
+                    .eq_ignore_ascii_case(XGAMERUNTIME.as_bytes())
+            })
+        };
+        if !(self.options.trusted_offline && self.options.rust_providers) {
+            return Err(error("requires trusted offline and Rust providers"));
+        }
+        if !named_runtime(path) {
+            return Err(error("expected the exact xgameruntime.dll basename"));
+        }
+        let source = fs::canonicalize(path)
+            .map_err(|e| LinkError::new(path, "resolve xgameruntime DLL path", e))?;
+        if !named_runtime(&source) {
+            return Err(error("resolved file must also be named xgameruntime.dll"));
+        }
+        let key = XGAMERUNTIME.as_bytes().to_vec();
+        if self.providers.contains_key(&key)
+            || self
+                .plan
+                .modules
+                .iter()
+                .any(|m| m.name.eq_ignore_ascii_case(&key))
+        {
+            return Err(error(
+                "basename already referenced by the ordinary link graph",
+            ));
+        }
+        let index = self.plan.modules.len();
+        if index >= self.max_images {
+            return Err(error("graph image limit reached"));
+        }
+        let (module, tables) = parse_image(&source, ImageKind::Dll, &mut self.remaining_bytes)?;
+        self.plan.xgameruntime = Some(index);
+        self.plan.modules.push(module);
+        self.tables.push(tables);
+        self.providers.insert(key, Ok(index));
+        self.close_imports(index);
+        let closure = self.plan.xgameruntime_closure();
+        // Unlike unrelated traced startup gaps, this closure must be complete.
+        for (i, module) in self.plan.modules.iter().enumerate() {
+            if !closure.contains(&i) {
+                continue;
+            }
+            if let Some(failure) = module
+                .unresolved_dependencies
+                .first()
+                .or_else(|| module.iat.iter().find_map(|b| b.target.as_ref().err()))
+            {
+                return Err(error(&format!(
+                    "incomplete dependency closure at {}: {failure}",
+                    module.path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn close(mut self) -> Result<LinkPlan, LinkError> {
+        self.close_imports(0);
+        if let Some(path) = self.options.xgameruntime_dll {
+            self.admit_xgameruntime(path)?;
         }
         // The explicit, export-only image is appended only after the static
         // graph closes. It cannot satisfy or redirect any static import.
@@ -717,6 +798,7 @@ fn build(
         options,
         plan: LinkPlan {
             modules: vec![root],
+            xgameruntime: None,
         },
         tables: vec![tables],
         catalog,

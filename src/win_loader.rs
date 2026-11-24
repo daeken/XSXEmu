@@ -5,6 +5,8 @@
 
 use crate::providers::HostExport;
 
+pub(crate) const XGAMERUNTIME: &str = "xgameruntime.dll";
+
 const LIBRARY_LOADER_1_1: &[u8] = b"api-ms-win-core-libraryloader-l1-1-0.dll";
 const LIBRARY_LOADER_1_2: &[u8] = b"api-ms-win-core-libraryloader-l1-2-0.dll";
 const RTL_SUPPORT: &[u8] = b"api-ms-win-core-rtlsupport-l1-1-0.dll";
@@ -133,7 +135,7 @@ fn registry_aliases_are_exact() {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-pub(crate) use native::register;
+pub(crate) use native::{register, set_xgameruntime_ready};
 
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod native {
@@ -156,6 +158,8 @@ pub(crate) mod native {
     const UNCHANGED_REFCOUNT: u32 = 2;
     const FROM_ADDRESS: u32 = 4;
     const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x800;
+    #[cfg(target_os = "macos")]
+    const LOAD_LIBRARY_SEARCH_APP_AND_SYSTEM32: u32 = 0x200 | LOAD_LIBRARY_SEARCH_SYSTEM32;
     const GUEST_SYSTEM32: &str = "c:/windows/system32/";
     const MAX_WIDE_NAME: usize = 32_768;
     const MAX_EXPORT_NAME: usize = 65_536;
@@ -193,6 +197,8 @@ pub(crate) mod native {
         rust_providers: bool,
         #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
         entropy_module: Option<usize>,
+        #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+        xgameruntime: Option<(usize, Cell<bool>)>,
     }
 
     thread_local! {
@@ -374,6 +380,7 @@ pub(crate) mod native {
             api_set: Option<&ApiSet>,
             rust_providers: bool,
             entropy_module: Option<usize>,
+            xgameruntime: Option<usize>,
         ) -> Result<Registration> {
             let mut images: Vec<Image> = Vec::new();
             for (path, pe, base, tls_cfg) in inputs {
@@ -441,6 +448,17 @@ pub(crate) mod native {
             if images.is_empty() {
                 return Err("missing process executable for module lookup".into());
             }
+            if let Some(i) = xgameruntime
+                && !images.get(i).is_some_and(|image| {
+                    i != 0
+                        && image.is_dll
+                        && image
+                            .link_name
+                            .eq_ignore_ascii_case(super::super::XGAMERUNTIME)
+                })
+            {
+                return Err("invalid xgameruntime mapping registration".into());
+            }
             GRAPH.with(|slot| {
                 let mut slot = slot.borrow_mut();
                 if slot.is_some() {
@@ -450,6 +468,7 @@ pub(crate) mod native {
                     images,
                     rust_providers,
                     entropy_module,
+                    xgameruntime: xgameruntime.map(|i| (i, Default::default())),
                 });
                 Ok(Registration(PhantomData))
             })
@@ -477,6 +496,7 @@ pub(crate) mod native {
                     .map(|(path, pe, base)| (path, pe, base, None)),
                 api_set,
                 rust_providers,
+                None,
                 None,
             )
         }
@@ -558,11 +578,11 @@ pub(crate) mod native {
             let load = |name: &str, file, flags| unsafe {
                 tls_child_load_library_ex_w(wide(name).as_ptr(), file, flags)
             };
-            let scope = super::register(inputs, None, true, None).unwrap();
+            let scope = super::register(inputs, None, true, None, None).unwrap();
             assert_eq!(load(BASENAME, 0, 0x800), 0);
             assert_eq!(last_error(), ERROR_MOD_NOT_FOUND);
             drop(scope);
-            let _scope = super::register(inputs, None, true, Some(1)).unwrap();
+            let _scope = super::register(inputs, None, true, Some(1), None).unwrap();
             for (name, file, flags, error) in [
                 (BASENAME, 0, 0, ERROR_MOD_NOT_FOUND),
                 (BASENAME, 0, 4, ERROR_NOT_SUPPORTED),
@@ -874,6 +894,10 @@ pub(crate) mod native {
         if !matches!(flags, 0 | LOAD_LIBRARY_SEARCH_SYSTEM32) {
             return Err(ERROR_NOT_SUPPORTED);
         }
+        normalize_load_key(&unsafe { load_basename(name) }?)
+    }
+
+    unsafe fn load_basename(name: *const u16) -> Result<String, u32> {
         let name = match unsafe { wide_name(name) } {
             Ok(Some(name)) if !name.is_empty() => name,
             _ => return Err(ERROR_INVALID_PARAMETER),
@@ -881,7 +905,11 @@ pub(crate) mod native {
         if name.contains(['/', '\\', ':']) {
             return Err(ERROR_NOT_SUPPORTED);
         }
-        module_key(&name)
+        Ok(name)
+    }
+
+    fn normalize_load_key(name: &str) -> Result<String, u32> {
+        module_key(name)
             .filter(|key| !key.is_empty())
             .ok_or(ERROR_INVALID_PARAMETER)
     }
@@ -892,15 +920,55 @@ pub(crate) mod native {
         g.images.get(g.entropy_module?)
     }
 
-    // No loading: only an exact SYSTEM32 request for the explicitly enabled
-    // built-in image may acquire a reference. Startup owns its mapped lifetime.
+    #[cfg(target_os = "macos")]
+    fn xgameruntime_image(graph: Option<&Graph>) -> Option<&Image> {
+        let g = graph?;
+        let (index, ready) = g.xgameruntime.as_ref()?;
+        ready.get().then(|| &g.images[*index])
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn set_xgameruntime_ready(ready: bool) {
+        graph(|g| {
+            if let Some((_, state)) = g.and_then(|g| g.xgameruntime.as_ref()) {
+                state.set(ready);
+            }
+        });
+    }
+
+    // Only predefined startup-owned mappings may acquire guest references.
+    // The XGameRuntime override does not search either guest directory.
     #[cfg(target_os = "macos")]
     pub(crate) unsafe extern "win64" fn tls_child_load_library_ex_w(
         name: *const u16,
         file: usize,
         flags: u32,
     ) -> usize {
-        let key = match unsafe { load_key(name, file, flags) } {
+        if file != 0 || name.is_null() {
+            return fail(ERROR_INVALID_PARAMETER);
+        }
+        if !matches!(
+            flags,
+            0 | LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_APP_AND_SYSTEM32
+        ) {
+            return fail(ERROR_NOT_SUPPORTED);
+        }
+        let basename = match unsafe { load_basename(name) } {
+            Ok(name) => name,
+            Err(error) => return fail(error),
+        };
+        if flags != 0 && basename.eq_ignore_ascii_case(super::XGAMERUNTIME) {
+            return graph(|g| {
+                xgameruntime_image(g)
+                    .ok_or(ERROR_MOD_NOT_FOUND)
+                    .and_then(Image::acquire)
+            })
+            .unwrap_or_else(fail);
+        }
+        if flags == LOAD_LIBRARY_SEARCH_APP_AND_SYSTEM32 {
+            return fail(ERROR_NOT_SUPPORTED);
+        }
+        let key = match normalize_load_key(&basename) {
             Ok(key) => key,
             Err(error) => return fail(error),
         };
@@ -974,6 +1042,7 @@ pub(crate) mod native {
         graph(|g| {
             entropy_image(g)
                 .filter(|m| m.base == module)
+                .or_else(|| xgameruntime_image(g).filter(|m| m.base == module))
                 .map_or_else(|| fail(ERROR_INVALID_HANDLE), release)
         })
     }
