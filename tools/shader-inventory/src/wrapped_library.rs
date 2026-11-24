@@ -701,6 +701,7 @@ pub(super) fn run(
         state_ps_profiles.get(&[0, 2][..]),
     ) {
         let mut counts = [0; 6];
+        let mut extended = [[0; 2]; 2];
         for (id, (_, vs_states)) in vs {
             let Some((_, ms_states)) = ms.get(id) else {
                 continue;
@@ -729,9 +730,30 @@ pub(super) fn run(
                         usize::from(all_nonempty && pair.iter().all(|set| set.len() == 1));
                 }
             }
+            for (extra, totals) in [44, 48].into_iter().zip(&mut extended) {
+                let mut pair = [HashSet::new(), HashSet::new()];
+                let mut all_bounded = true;
+                for (i, ids, base) in [(0, vs_states, 380), (1, ms_states, 464)] {
+                    for id in ids {
+                        let blob = library.blob(*id).ok_or("missing graphics state span")?;
+                        if let Some(suffix) = blob.get(base - extra..) {
+                            pair[i].insert(suffix);
+                        } else {
+                            all_bounded = false;
+                        }
+                    }
+                }
+                if !pair[0].is_disjoint(&pair[1]) {
+                    totals[0] += 1;
+                    totals[1] += usize::from(all_bounded && pair.iter().all(|s| s.len() == 1));
+                }
+            }
         }
         println!(
             "  PS programs shared by VS/MS cohorts [total, both nonempty, any equal suffix, invariant, any equal suffix plus previous eight, invariant]: {counts:?}"
+        );
+        println!(
+            "  Earlier state starts (44 / 48 bytes before baselines), [any equal suffix, invariant]: {extended:?}"
         );
     }
     for (slots, (programs, metadata)) in state_ps_profiles {
