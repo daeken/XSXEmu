@@ -1921,7 +1921,7 @@ fn xbox_d3d12_vm_bridge_accepts_only_observed_offline_input() {
     expect(output, 44, "Guest entry returned 44");
 }
 #[test]
-fn xmem_bridge_owns_only_the_two_observed_reservations() {
+fn xmem_bridge_owns_exact_boot_reservations_and_cpu_mapping() {
     if !rosetta() {
         return;
     }
@@ -1947,6 +1947,17 @@ fn xmem_bridge_owns_only_the_two_observed_reservations() {
             "{stderr}"
         );
         assert!(stderr.contains(&format!("size={:#x} flags=0x20402000", gib << 30)));
+        assert_eq!(
+            stderr
+                .matches("mapped anonymous demand-zero CPU RW")
+                .count(),
+            1,
+            "{stderr}"
+        );
+        assert!(
+            stderr
+                .contains("skipped Xbox protection/cache, physical page and GPU mapping semantics")
+        );
         assert!(stderr.contains("tuple already held"));
         assert!(stderr.contains("unsupported reservation tuple"));
         expect(output, 45, "Guest entry returned 45");

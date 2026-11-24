@@ -1167,6 +1167,30 @@ Lxmem_entry:
     jnz Lbad
     cmpl $50, %gs:0x68
     jne Lbad
+    movl $0x49400000, %ebx
+    xmem 0x183, 0x22004, 0x20003000
+    testq %rax, %rax
+    jz Lbad
+    testl $0x1fffff, %eax
+    jnz Lbad
+    cmpl $50, %gs:0x68
+    jne Lbad
+    leaq -1(%rax,%rbx), %rdx
+    cmpb $0, (%rax)
+    jne Lbad
+    cmpb $0, (%rdx)
+    jne Lbad
+    movb $0x55, (%rax)
+    movb $0xaa, (%rdx)
+    cmpb $0x55, (%rax)
+    jne Lbad
+    cmpb $0xaa, (%rdx)
+    jne Lbad
+    xmem 0x183, 0x22004, 0x20003000
+    testq %rax, %rax
+    jnz Lbad
+    cmpl $8, %gs:0x68
+    jne Lbad
     movl $45, %eax
     addq $48, %rsp
     popq %rbx
