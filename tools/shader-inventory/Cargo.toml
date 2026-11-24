@@ -38,3 +38,8 @@ required-features = ["metal-probe"]
 name = "shader-bake-plan"
 path = "src/bake_plan.rs"
 required-features = ["bake-planner"]
+
+[[bin]]
+name = "shader-metal-graphics-lift"
+path = "src/metal_graphics_lift.rs"
+required-features = ["metal-probe"]
