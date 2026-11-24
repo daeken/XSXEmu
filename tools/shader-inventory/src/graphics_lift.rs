@@ -112,6 +112,10 @@ fn lift(stage: Stage, words: &[u32]) -> Result<Vec<Op>, Reject> {
                 require(src)?;
                 live[usize::from(dst.0)] = true;
             }
+            Op::MoveBits { dst, .. } => live[usize::from(dst.0)] = true,
+            // All admitted profiles have no native memory, clocks, or timing-
+            // observable operations. Not valid for arbitrary guest instruction streams.
+            Op::NopOneCycle | Op::PrefetchThreeLines => {}
             Op::MulLegacyF32 { dst, lhs, rhs } => {
                 if let FloatSource::Vgpr(r) = lhs {
                     require(r)?;
@@ -186,6 +190,13 @@ fn emit_body(out: &mut String, ops: &[Op], packed_color_lvalue: &str) {
             } => {
                 writeln!(out, "  r[{dst}] = r[{src}];").unwrap();
             }
+            Op::MoveBits {
+                dst: Vgpr(dst),
+                bits,
+            } => {
+                writeln!(out, "  r[{dst}] = 0x{bits:08x}u;").unwrap();
+            }
+            Op::NopOneCycle | Op::PrefetchThreeLines => {}
             Op::AddF32Literal {
                 dst: Vgpr(dst),
                 src: Vgpr(src),
@@ -277,6 +288,16 @@ const EDGE_LITERAL: &[u32] = &[0x0e06_02ff, 0x3e80_0000]; // v_mul_legacy_f32_e3
 const EDGE_FMAC: &[u32] = &[0x5608_0300]; // v_fmac_f32_e32 v4, v0, v1
 const EDGE_RTZ: &[u32] = &[0x5e0a_0300]; // v_cvt_pkrtz_f16_f32_e32 v5, v0, v1
 
+const EDGE_MOV_HINTS: &[u32] = &[
+    0xbfa0_0003,
+    0x7e0c_0280,
+    0xbf80_0000,
+    0x7e0e_02f0,
+    0x7e10_02f2,
+    0x7e12_02ff,
+    0x7fc1_2345,
+];
+
 #[allow(dead_code)] // Used by the separate owned bit-exact edge probe.
 pub fn translate_legacy_edge_fixture() -> Result<String, DecodeError> {
     let (a_width, a) = decode(EDGE_VGPR, 0)?;
@@ -301,7 +322,13 @@ pub fn translate_legacy_edge_fixture() -> Result<String, DecodeError> {
     msl.push_str(RTZ_HELPER);
     msl.push_str("kernel void legacy_edges(const device uint4 *in [[buffer(0)]], device uint4 *out [[buffer(1)]], uint id [[thread_position_in_grid]]) {\n  uint r[256]; r[0] = in[id].x; r[1] = in[id].y; r[4] = in[id].z;\n");
     body(&mut msl, &[a, b, c, d]);
-    msl.push_str("  out[id] = uint4(r[2], r[3], r[4], r[5]);\n}\n");
+    let mut pc = 0;
+    while pc < EDGE_MOV_HINTS.len() {
+        let (width, op) = decode(EDGE_MOV_HINTS, pc)?;
+        body(&mut msl, &[op]);
+        pc += width;
+    }
+    msl.push_str("  out[2 * id] = uint4(r[2], r[3], r[4], r[5]);\n  out[2 * id + 1] = uint4(r[6], r[7], r[8], r[9]);\n}\n");
     Ok(msl)
 }
 
@@ -388,7 +415,7 @@ mod tests {
             io::Write,
             process::{Command, Stdio},
         };
-        let asm = "v_mov_b32_e32 v8, v4\nexp param0 v8, v5, v6, v7\nexp pos0 v0, v1, v2, v3 done\ns_endpgm\nv_add_f32_e32 v4, 0.25, v0\nv_fma_f32 v5, v1, v2, v3\nv_mul_legacy_f32_e32 v6, v5, v4\nv_mul_legacy_f32_e32 v6, 0.5, v6\nv_mul_legacy_f32_e32 v7, 0, v3\nexp mrt0 v4, v5, v6, v7 done\ns_endpgm\nv_mul_legacy_f32_e32 v2, v0, v1\nv_mul_legacy_f32_e32 v3, 0.25, v1\nv_fmac_f32_e32 v4, v0, v1\nv_cvt_pkrtz_f16_f32_e32 v5, v0, v1\nexp mrt0 v1, v1, v0, v0 done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrtz v2, off, off, off done vm\ns_endpgm\n";
+        let asm = "v_mov_b32_e32 v8, v4\nexp param0 v8, v5, v6, v7\nexp pos0 v0, v1, v2, v3 done\ns_endpgm\nv_add_f32_e32 v4, 0.25, v0\nv_fma_f32 v5, v1, v2, v3\nv_mul_legacy_f32_e32 v6, v5, v4\nv_mul_legacy_f32_e32 v6, 0.5, v6\nv_mul_legacy_f32_e32 v7, 0, v3\nexp mrt0 v4, v5, v6, v7 done\ns_endpgm\nv_mul_legacy_f32_e32 v2, v0, v1\nv_mul_legacy_f32_e32 v3, 0.25, v1\nv_fmac_f32_e32 v4, v0, v1\nv_cvt_pkrtz_f16_f32_e32 v5, v0, v1\ns_inst_prefetch 3\nv_mov_b32_e32 v6, 0\ns_nop 0\nv_mov_b32_e32 v7, 0.5\nv_mov_b32_e32 v8, 1.0\nv_mov_b32_e32 v9, 0x7fc12345\nexp mrt0 v1, v1, v0, v0 done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrtz v2, off, off, off done vm\ns_endpgm\n";
         let expected: Vec<u8> = VS
             .iter()
             .chain(PS)
@@ -396,6 +423,7 @@ mod tests {
             .chain(EDGE_LITERAL)
             .chain(EDGE_FMAC)
             .chain(EDGE_RTZ)
+            .chain(EDGE_MOV_HINTS)
             .chain(PACKED_PS)
             .chain(DEPTH_PS)
             .flat_map(|w| w.to_le_bytes())
@@ -491,6 +519,24 @@ mod tests {
             decode(&[DEPTH_PS[2], 0x0102], 0),
             Err(DecodeError::Unsupported(0))
         );
+    }
+
+    #[test]
+    fn raw_mov_and_hints_admit_only_checked_forms() {
+        assert_eq!(decode(&[0x7e12_02ff], 0), Err(DecodeError::Truncated(0)));
+        for word in [
+            0x7e0c_0200,
+            0x7e0c_02f1,
+            0xbf80_0001,
+            0xbfa0_0002,
+            0xbfa0_0007,
+            0xbf8c_0000,
+        ] {
+            assert_eq!(decode(&[word], 0), Err(DecodeError::Unsupported(0)));
+        }
+        let mut ps = vec![0xbfa0_0003, 0xbf80_0000, 0x7e00_0280];
+        ps.extend_from_slice(PACKED_PS);
+        assert_eq!(lift(Stage::PackedPixel, &ps).unwrap().len(), 5);
     }
 
     #[test]

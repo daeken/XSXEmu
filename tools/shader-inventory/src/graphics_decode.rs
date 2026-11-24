@@ -22,6 +22,12 @@ pub(crate) enum Op {
         dst: Vgpr,
         src: Vgpr,
     },
+    MoveBits {
+        dst: Vgpr,
+        bits: u32,
+    },
+    NopOneCycle,
+    PrefetchThreeLines,
     AddF32Literal {
         dst: Vgpr,
         src: Vgpr,
@@ -68,6 +74,30 @@ pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeErro
     let ext = || words.get(pc + 1).copied().ok_or(DecodeError::Truncated(pc));
     if w == 0xbf81_0000 {
         return Ok((1, Op::End));
+    }
+    match w {
+        0xbf80_0000 => return Ok((1, Op::NopOneCycle)),
+        0xbfa0_0003 => return Ok((1, Op::PrefetchThreeLines)),
+        _ => {}
+    }
+    // The MOV literal is a raw word, never an arithmetic float operand.
+    if w & 0xfe01_fe00 == 0x7e00_0200 {
+        let (width, bits) = match w & 0x1ff {
+            128 => (1, 0),
+            240 => (1, 0x3f00_0000),
+            242 => (1, 0x3f80_0000),
+            255 => (2, ext()?),
+            _ => (0, 0),
+        };
+        if width != 0 {
+            return Ok((
+                width,
+                Op::MoveBits {
+                    dst: Vgpr((w >> 17) as u8),
+                    bits,
+                },
+            ));
+        }
     }
     // VOP1 opcode 1, SRC0 in 256..511 (ordinary VGPRs). No modifiers.
     if w & 0xfe01_ff00 == 0x7e00_0300 {

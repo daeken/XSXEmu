@@ -526,7 +526,9 @@ impl LiftGaps {
             let matches = decode(&words[..count], 0).is_ok_and(|(width, op)| {
                 width * 4 == len
                     && match op {
-                        Op::Move { .. } => name == "v_mov_b32_e32",
+                        Op::Move { .. } | Op::MoveBits { .. } => name == "v_mov_b32_e32",
+                        Op::NopOneCycle => name == "s_nop",
+                        Op::PrefetchThreeLines => name == "s_inst_prefetch",
                         Op::AddF32Literal { .. } => name == "v_add_f32_e32",
                         Op::MulLegacyF32 { .. } => name == "v_mul_legacy_f32_e32",
                         Op::FmaF32 {
