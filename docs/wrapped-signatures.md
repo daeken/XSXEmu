@@ -65,7 +65,7 @@ The byte is present on every validated payload. The VS dual-payload case is orde
 
 The scanner also applies the existing compute raw-span checker to every wrapped native payload, **without** making a graphics entry assumption. All 26,698 satisfy its structural rules: aligned u64 start/length at `+0xc0/+0xc8`, checked stored extent, and `+0xe8` equal to the extent end or the unset sentinel. After the hypothesized `start + 40`, trimming only trailing `0xbf9f0000` leaves raw final word `0xbf810000` in every case. There are 17 unset end words: eight with stage byte `4`, five with `5`, four with `6`. This extends evidence for common framing, not for a decoded graphics entry, final instruction boundary, or equivalent execution.
 
-All 26,698 payloads contain nonempty, nonzero bytes **after** the checked stored extent. For 19,548 payloads, this tail length is not a multiple of a dword. These counts distinguish post-span data from the fill words inside the stored extent; they do not identify the post-span data's format or semantics.
+All 26,698 payloads contain nonempty, nonzero bytes **after** the checked stored extent. For 19,548 payloads, this tail length is not a multiple of a dword. These counts distinguish post-span data from the fill words inside the stored extent; they do not identify the post-span data's format or semantics. The little-endian u32 pair at tail-relative `+16/+24` is `(4, 0)` in 24,767 payloads and `(3, 1)` in 1,914; these account for every payload with a set end word. All 17 unset-end payloads instead have `(0, 0xffffffff)`. The checker keeps unexpected or truncated pairs separate. These are observed correlations, not a basis for inferring an omitted extent or assigning a meaning to either word.
 
 ## PSV0 resource declarations
 

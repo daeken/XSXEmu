@@ -317,6 +317,16 @@ struct NativeSpans {
     nonempty_tail: usize,
     nonzero_tail: usize,
     unaligned_tail: usize,
+    tail_kinds: [usize; 4],
+}
+
+fn tail_kind(tail: &[u8], unset_end: bool) -> usize {
+    match (word(tail, 16), word(tail, 24), unset_end) {
+        (Some(4), Some(0), false) => 0,
+        (Some(3), Some(1), false) => 1,
+        (Some(0), Some(0xffff_ffff), true) => 2,
+        _ => 3,
+    }
 }
 
 fn native_stages(
@@ -346,6 +356,7 @@ fn native_stages(
                 totals.nonempty_tail += usize::from(!tail.is_empty());
                 totals.nonzero_tail += usize::from(tail.iter().any(|&b| b != 0));
                 totals.unaligned_tail += usize::from(!tail.len().is_multiple_of(4));
+                totals.tail_kinds[tail_kind(tail, unset)] += 1;
             } else {
                 totals.unsupported += 1;
             }
@@ -796,6 +807,10 @@ pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
             "FSSM stage byte {stage:?}: {} matching raw span and suffix, {} unsupported, {} unset end words; {} nonempty, {} nonzero and {} non-dword-multiple post-span tails",
             s.valid, s.unsupported, s.unset_end, s.nonempty_tail, s.nonzero_tail, s.unaligned_tail
         );
+        println!(
+            "  Tail word-pair profile counts [(4,0,set), (3,1,set), (0,all-ones,unset), other/truncated]: {:?}",
+            s.tail_kinds
+        );
     }
     for (stage, totals) in groups {
         let Stage {
@@ -903,6 +918,18 @@ mod tests {
         c.payload(&bytes, [9, 1, 1], true);
         assert_eq!((c.payloads, c.wave32, c.unsupported_metadata), (4, 1, 1));
         assert_eq!((c.fixed_wave32_mismatch, c.xyz_mismatch), (1, 1));
+    }
+
+    #[test]
+    fn tail_pair_classification_distinguishes_unset_end() {
+        let mut t = [0; 28];
+        t[24..28].fill(255);
+        assert_eq!(tail_kind(&t, true), 2);
+        assert_eq!(tail_kind(&t, false), 3);
+        assert_eq!(tail_kind(&t[..27], true), 3);
+        t[16] = 3;
+        t[24..28].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(tail_kind(&t, false), 1);
     }
 
     #[test]
