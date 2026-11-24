@@ -6,11 +6,10 @@
 //! locks, not mandatory Windows I/O exclusion.
 //!
 //! Handles are opaque, typed, and never recycled. Standard handles are ordinary
-//! entries backed by duplicates of the runner's descriptors; SetStdHandle only
+//! entries backed by duplicates of the runner's descriptors; on macOS actual
+//! terminals carry a console object, not a file object. SetStdHandle only
 //! replaces a slot and never redirects the runner or closes the old handle.
-//! Future console/spawn/wait providers must use typed references/explicit
-//! duplication, never cast these IDs to descriptors. CloseHandle/DuplicateHandle
-//! will need dispatch when other providers start issuing real handles.
+//! Providers must use typed references, never cast these IDs to descriptors.
 
 use crate::providers::HostExport;
 
@@ -162,10 +161,15 @@ pub(crate) fn lookup(dll: &[u8], name: &[u8]) -> Option<HostExport> {
     }
 }
 
+#[cfg(all(target_arch = "x86_64", target_os = "macos"))]
+pub(super) use native::{console_attached, win_err, with_console};
+
 #[cfg(target_arch = "x86_64")]
 #[allow(non_snake_case)]
 mod native {
     use crate::providers::set_last_error;
+    #[cfg(target_os = "macos")]
+    use crate::providers::win_console::native::Terminal;
     use std::{
         collections::{HashMap, VecDeque},
         ffi::c_void,
@@ -215,7 +219,7 @@ mod native {
     fn boolean(r: Result<()>) -> i32 {
         ret(r.map(|()| 1), 0)
     }
-    fn win_err(e: io::Error) -> u32 {
+    pub(in crate::providers) fn win_err(e: io::Error) -> u32 {
         use io::ErrorKind::*;
         match e.kind() {
             NotFound => FILE_NOT_FOUND,
@@ -304,6 +308,8 @@ mod native {
     }
     enum Object {
         File(FileObject),
+        #[cfg(target_os = "macos")]
+        Console(Terminal),
         Pipe(PipeEnd),
         Search(Mutex<Search>),
     }
@@ -317,6 +323,8 @@ mod native {
         handles: HashMap<usize, Entry>,
         next: usize,
         std: [usize; 3],
+        #[cfg(target_os = "macos")]
+        terminals: [Option<Arc<Object>>; 3],
         cwd: Option<PathBuf>,
     }
     impl State {
@@ -348,6 +356,8 @@ mod native {
             handles: HashMap::new(),
             next: 0x1000_0000,
             std: [INVALID; 3],
+            #[cfg(target_os = "macos")]
+            terminals: [None, None, None],
             cwd: std::env::current_dir().ok(),
         })
     });
@@ -623,7 +633,7 @@ mod native {
     ) -> usize {
         ret(
             (|| {
-                let p = unsafe { path(name)? };
+                let name = unsafe { wide(name)? };
                 let inheritable = unsafe { inherit(security)? };
                 let access = access_mask(desired)?;
                 const BACKUP_SEMANTICS: u32 = 0x0200_0000;
@@ -633,6 +643,14 @@ mod native {
                 if share & !7 != 0 || !(1..=5).contains(&disposition) {
                     return Err(INVALID_PARAM);
                 }
+                #[cfg(target_os = "macos")]
+                if let Some(input) = console_name(&name) {
+                    if disposition != 3 || flags & !NORMAL != 0 || share & D != 0 {
+                        return Err(INVALID_PARAM);
+                    }
+                    return open_console(&mut lock(&STATE), input, access, inheritable);
+                }
+                let p = resolve(&name, false)?;
                 if matches!(disposition, 2 | 5) && access & W == 0 {
                     return Err(ACCESS);
                 }
@@ -773,6 +791,85 @@ mod native {
             _ => Err(INVALID_PARAM),
         }
     }
+    #[cfg(target_os = "macos")]
+    fn console_name(name: &str) -> Option<bool> {
+        let name = name.strip_prefix("\\\\.\\").unwrap_or(name);
+        if name.eq_ignore_ascii_case("CONIN$") {
+            Some(true)
+        } else if name.eq_ignore_ascii_case("CONOUT$") {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn open_console(st: &mut State, input: bool, access: u32, inheritable: bool) -> Result<usize> {
+        if access & D != 0 {
+            return Err(ACCESS);
+        }
+        let slots: &[usize] = if input { &[0] } else { &[1, 2] };
+        for &i in slots {
+            if let Some(e) = inherited_stream(st, i)?
+                && matches!(&*e.obj, Object::Console(_))
+            {
+                return st.insert(Entry {
+                    obj: e.obj,
+                    access,
+                    inheritable,
+                });
+            }
+        }
+        Err(FILE_NOT_FOUND)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(in crate::providers) fn console_attached() -> Result<bool> {
+        let mut st = lock(&STATE);
+        for i in 0..3 {
+            inherited_stream(&mut st, i)?;
+            if st.terminals[i].is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(in crate::providers) fn with_console<T>(
+        h: usize,
+        write: bool,
+        f: impl FnOnce(&Terminal) -> Result<T>,
+    ) -> Result<T> {
+        let e = entry(h)?;
+        let Object::Console(terminal) = &*e.obj else {
+            return Err(BAD_HANDLE);
+        };
+        if e.access & (if write { W } else { R }) == 0 {
+            return Err(ACCESS);
+        }
+        f(terminal)
+    }
+
+    fn inherited_stream(_st: &mut State, i: usize) -> Result<Option<Entry>> {
+        #[cfg(target_os = "macos")]
+        if let Some(obj) = &_st.terminals[i] {
+            return Ok(Some(Entry {
+                obj: obj.clone(),
+                access: if i == 0 { R } else { R | W },
+                inheritable: true,
+            }));
+        }
+        let e = host_stream(i)?;
+        #[cfg(target_os = "macos")]
+        if let Some(e) = &e
+            && matches!(&*e.obj, Object::Console(_))
+        {
+            _st.terminals[i] = Some(e.obj.clone());
+        }
+        Ok(e)
+    }
+
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn host_stream(i: usize) -> Result<Option<Entry>> {
         use std::os::fd::{FromRawFd, OwnedFd};
@@ -793,6 +890,14 @@ mod native {
             }; // EBADF
         }
         let f = File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+        #[cfg(target_os = "macos")]
+        if std::io::IsTerminal::is_terminal(&f) {
+            return Ok(Some(Entry {
+                obj: Arc::new(Object::Console(Terminal::new(f, i == 0))),
+                access: if i == 0 { R } else { R | W },
+                inheritable: true,
+            }));
+        }
         let md = f.metadata().map_err(win_err)?;
         Ok(Some(Entry {
             obj: open_file(f, 0, 7, None, kind(&md)),
@@ -809,7 +914,7 @@ mod native {
             std_slot(n).and_then(|i| {
                 let mut st = lock(&STATE);
                 if st.std[i] == INVALID {
-                    st.std[i] = if let Some(e) = host_stream(i)? {
+                    st.std[i] = if let Some(e) = inherited_stream(&mut st, i)? {
                         st.insert(e)?
                     } else {
                         0
@@ -906,6 +1011,8 @@ mod native {
                     (&*file).write(bytes).map_err(win_err)?
                 }
             }
+            #[cfg(target_os = "macos")]
+            Object::Console(c) => unsafe { c.transfer(buffer, count, read)? },
             Object::Pipe(end) if end.read == read => {
                 if count == 0 {
                     return Ok(());
@@ -1045,6 +1152,8 @@ mod native {
                     }
                     Ok(f.kind)
                 }
+                #[cfg(target_os = "macos")]
+                Object::Console(_) => Ok(2),
                 Object::Pipe(_) => Ok(3),
                 Object::Search(_) => Err(BAD_HANDLE),
             }),

@@ -36,6 +36,9 @@ macro_rules! export {
     }};
 }
 
+#[cfg(target_os = "macos")]
+#[path = "win_console.rs"]
+mod win_console;
 #[path = "win_io.rs"]
 mod win_io;
 #[path = "win_loader.rs"]
@@ -54,6 +57,10 @@ pub(crate) use native::set_last_error;
 
 /// Whether the registry has any exports for this exact lowercase module name.
 pub fn has_dll(dll: &[u8]) -> bool {
+    #[cfg(target_os = "macos")]
+    if win_console::has_dll(dll) {
+        return true;
+    }
     matches!(
         dll,
         b"kernelbase.dll"
@@ -151,7 +158,15 @@ pub fn lookup(dll: &[u8], name: &[u8]) -> Option<HostExport> {
             .or_else(|| win_sync::lookup(dll, name))
             .or_else(|| win_unwind::lookup(dll, name))
             .or_else(|| win_io::lookup(dll, name))
-            .or_else(|| win_text::lookup(dll, name)),
+            .or_else(|| win_text::lookup(dll, name))
+            .or_else(|| {
+                #[cfg(target_os = "macos")]
+                {
+                    win_console::lookup(dll, name)
+                }
+                #[cfg(not(target_os = "macos"))]
+                None
+            }),
     }
 }
 
