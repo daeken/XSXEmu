@@ -145,6 +145,11 @@ Lcfg_target:
     phase 1, 2
     movl $44, %eax
     retq
+.set FLS_FREE_WITH_VALUE, 3
+.set FLS_LEAVE_PENDING, 4
+.set FLS_CLEAR_ON_DETACH, 5
+.set FLS_INDEX_DELTA, {mode_delta}+4  /* fixture scratch storage */
+.set FLS_TEST_VALUE, 0x123456789abcdef0
 /* The TLS callback uses direct IAT calls; entry uses both CFG thunks. */
 Lbridge_cb:
     tls 0
@@ -169,6 +174,31 @@ Lbridge_detach:
     callq *{iat_delta}(%r11)
     cmpl $0xfedcba98, %eax
     jne Lbad
+    leaq Ltext(%rip), %r11
+    cmpl $FLS_CLEAR_ON_DETACH, {mode_delta}(%r11)
+    jne 1f
+    /* Entry left a live callback/value pair. Ordinary guest detach must
+     * run while the FLS slot and its original value are still live. */
+    movl FLS_INDEX_DELTA(%r11), %ecx
+    callq *{iat_delta}+184(%r11) /* FlsGetValue */
+    movabsq $FLS_TEST_VALUE, %rcx
+    cmpq %rcx, %rax
+    jne Lbad
+    movl $0xfedcba98, %gs:0x68
+    leaq Ltext(%rip), %r11
+    movl FLS_INDEX_DELTA(%r11), %ecx
+    xorl %edx, %edx
+    callq *{iat_delta}+176(%r11) /* FlsSetValue(NULL) */
+    cmpl $1, %eax
+    jne Lbad
+    leaq Ltext(%rip), %r11
+    movl FLS_INDEX_DELTA(%r11), %ecx
+    callq *{iat_delta}+192(%r11) /* FlsFree now needs no callback */
+    cmpl $1, %eax
+    jne Lbad
+    cmpl $0xfedcba98, %gs:0x68
+    jne Lbad
+1:
     addq $40, %rsp
     retq
 
@@ -377,7 +407,7 @@ Lbridge_entry:
     jne Lbad
     movl %eax, 84(%rsp)
     movl %eax, %ecx
-    movabsq $0x123456789abcdef0, %rdx
+    movabsq $FLS_TEST_VALUE, %rdx
     fls_cfg 176                 /* FlsSetValue */
     cmpl $1, %eax
     jne Lbad
@@ -385,20 +415,26 @@ Lbridge_entry:
     jne Lbad
     movl 84(%rsp), %ecx
     fls_cfg 184                 /* FlsGetValue */
-    movabsq $0x123456789abcdef0, %rcx
+    movabsq $FLS_TEST_VALUE, %rcx
     cmpq %rcx, %rax
     jne Lbad
     cmpl $0, %gs:0x68
     jne Lbad
     leaq Ltext(%rip), %r11
-    cmpl $3, {mode_delta}(%r11)
+    cmpl $FLS_FREE_WITH_VALUE, {mode_delta}(%r11)
     jne 1f
     movl 84(%rsp), %ecx
     fls_cfg 192                 /* Must stop before invoking callback */
     ud2
 1:
-    cmpl $4, {mode_delta}(%r11)
+    cmpl $FLS_LEAVE_PENDING, {mode_delta}(%r11)
     je 2f                       /* Leave callback pending for teardown */
+    cmpl $FLS_CLEAR_ON_DETACH, {mode_delta}(%r11)
+    jne 3f
+    movl 84(%rsp), %eax
+    movl %eax, FLS_INDEX_DELTA(%r11)
+    jmp 2f                       /* Leave callback live for guest detach */
+3:
     movl 84(%rsp), %ecx
     xorl %edx, %edx
     fls_cfg 176                 /* Clearing the value needs no callback */

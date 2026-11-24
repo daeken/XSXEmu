@@ -1358,6 +1358,14 @@ fn fls_stops_only_at_callback_invocation_boundaries() {
     let dir = Scratch::new();
     let mut b = image(Kind::Bridge);
     let flags = [OPT, "--rust-providers"];
+    // Both paths clear a non-null value and then successfully free its slot:
+    // mode 0 in entry, mode 5 in the ordinary PROCESS_DETACH notification.
+    for mode in [0, 5] {
+        w32(&mut b, file(MODE), mode);
+        let output = run(&dir.write("fls.exe", &b), &flags);
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("unsupported FLS callback"));
+        expect(output, 45, "Guest entry returned 45");
+    }
     for (mode, message) in [
         (
             3,
