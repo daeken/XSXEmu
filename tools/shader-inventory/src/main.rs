@@ -370,11 +370,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .ok_or("usage: xsx-shader-inventory <--pipeline-index|--compute-blobs> <expanded PS/0/9 library>")?;
         return library_index::run(&path, first == "--compute-blobs");
     }
-    if first == "--reachable-graphics" {
-        let usage = "usage: xsx-shader-inventory --reachable-graphics <trusted LLVM 21 shared library> <gfx1013|gfx1030> <native FSSM directory>";
+    if first == "--reachable-graphics" || first == "--wrapped-ps-exports" {
+        let usage = "usage: xsx-shader-inventory <--reachable-graphics|--wrapped-ps-exports> <trusted LLVM 21 shared library> <gfx1013|gfx1030> <native FSSM or wrapped DXBC directory, respectively>";
         let lib = args.next().ok_or(usage)?;
         let cpu = llvm::Cpu::parse(&args.next().ok_or(usage)?).ok_or(usage)?;
         let path = args.next().filter(|_| args.next().is_none()).ok_or(usage)?;
+        if first == "--wrapped-ps-exports" {
+            return graphics_reachability::run_wrapped_ps(&lib, cpu, std::path::Path::new(&path));
+        }
         return graphics_reachability::run(&lib, cpu, std::path::Path::new(&path));
     }
     if first == "--reachable-compute" || first == "--compute-source-join" {

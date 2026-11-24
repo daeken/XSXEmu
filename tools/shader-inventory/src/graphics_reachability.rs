@@ -68,7 +68,41 @@ enum ResultClass {
     NoExit,
 }
 
-fn walk(dis: &mut Disassembler, bytes: &[u8]) -> ResultClass {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Export {
+    Color(u8, bool), // MRT ordinal and nonzero raw EN field
+    Mrtz,
+    Null,
+    Other,
+}
+
+fn export(first: u32, len: usize, text: &str) -> Option<Export> {
+    let mut tokens = text.split_ascii_whitespace();
+    if tokens.next() != Some("exp") || len != 8 || first >> 26 != 0x3e {
+        return None;
+    }
+    let target = tokens.next()?.trim_end_matches(',');
+    let class = match ((first >> 4) & 63, target) {
+        (i @ 0..=7, name) if name.as_bytes() == [b'm', b'r', b't', b'0' + i as u8] => {
+            Export::Color(i as u8, first & 15 != 0)
+        }
+        (8, "mrtz") => Export::Mrtz,
+        (9, "null") => Export::Null,
+        _ => Export::Other,
+    };
+    Some(class)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Exports {
+    color: u8,
+    disabled_color: u8,
+    mrtz: bool,
+    null: bool,
+    other: bool,
+}
+
+fn checked_exports(dis: &mut Disassembler, bytes: &[u8]) -> Result<Exports, ResultClass> {
     let mut scratch = [0; 1024];
     let mut unsupported = ResultClass::Decode;
     match cfg::walk_extent(bytes.len() / 4, |pc| {
@@ -89,16 +123,35 @@ fn walk(dis: &mut Disassembler, bytes: &[u8]) -> ResultClass {
         Some(Instruction {
             width: len / 4,
             flow,
-            op: name == "exp" && len == 8 && first >> 26 == 0x3e,
+            op: export(first, len, text),
         })
     }) {
-        Ok(graph) if !graph.values().any(|i| i.flow == Flow::Stop) => ResultClass::NoExit,
-        Ok(graph) if graph.values().any(|i| i.op) => ResultClass::CompleteWithExp,
-        Ok(_) => ResultClass::CompleteWithoutExp,
-        Err(cfg::Error::UnsupportedEncoding) => unsupported,
-        Err(cfg::Error::BadSuccessor) => ResultClass::BadSuccessor,
-        Err(cfg::Error::BadWidth) => ResultClass::BadWidth,
-        Err(cfg::Error::OverlappingInstructions) => ResultClass::Overlap,
+        Ok(graph) if !graph.values().any(|i| i.flow == Flow::Stop) => Err(ResultClass::NoExit),
+        Ok(graph) => {
+            let mut exports = Exports::default();
+            for export in graph.values().filter_map(|i| i.op) {
+                match export {
+                    Export::Color(i, true) => exports.color |= 1 << i,
+                    Export::Color(i, false) => exports.disabled_color |= 1 << i,
+                    Export::Mrtz => exports.mrtz = true,
+                    Export::Null => exports.null = true,
+                    Export::Other => exports.other = true,
+                }
+            }
+            Ok(exports)
+        }
+        Err(cfg::Error::UnsupportedEncoding) => Err(unsupported),
+        Err(cfg::Error::BadSuccessor) => Err(ResultClass::BadSuccessor),
+        Err(cfg::Error::BadWidth) => Err(ResultClass::BadWidth),
+        Err(cfg::Error::OverlappingInstructions) => Err(ResultClass::Overlap),
+    }
+}
+
+fn walk(dis: &mut Disassembler, bytes: &[u8]) -> ResultClass {
+    match checked_exports(dis, bytes) {
+        Ok(e) if e == Exports::default() => ResultClass::CompleteWithoutExp,
+        Ok(_) => ResultClass::CompleteWithExp,
+        Err(e) => e,
     }
 }
 
@@ -189,9 +242,185 @@ pub fn run(lib: &OsStr, cpu: Cpu, root: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[derive(Default)]
+struct PsComparison {
+    complete: usize,
+    rejected: usize,
+    exact: usize,
+    source_only: usize,
+    native_only: usize,
+    both_directions: usize,
+    mismatch_same_count: usize,
+    mismatch_packed_native: usize,
+    zero_enable: usize,
+    mrtz: usize,
+    null: usize,
+    other_exp: usize,
+}
+
+impl PsComparison {
+    fn add(&mut self, source: u8, exp: Result<Exports, ResultClass>) {
+        let Ok(exp) = exp else {
+            self.rejected += 1;
+            return;
+        };
+        self.complete += 1;
+        self.zero_enable += usize::from(exp.disabled_color != 0);
+        self.mrtz += usize::from(exp.mrtz);
+        self.null += usize::from(exp.null);
+        if exp.other {
+            self.other_exp += 1;
+            return;
+        }
+        if source != exp.color {
+            let count = source.count_ones();
+            self.mismatch_same_count += usize::from(count == exp.color.count_ones());
+            self.mismatch_packed_native += usize::from(u16::from(exp.color) == (1 << count) - 1);
+        }
+        match (source & !exp.color != 0, exp.color & !source != 0) {
+            (false, false) => self.exact += 1,
+            (true, false) => self.source_only += 1,
+            (false, true) => self.native_only += 1,
+            (true, true) => self.both_directions += 1,
+        }
+    }
+}
+
+pub fn run_wrapped_ps(lib: &OsStr, cpu: Cpu, root: &Path) -> Result<(), Box<dyn Error>> {
+    let llvm = Llvm::load(lib)?;
+    let mut waves = [llvm.context(cpu, false)?, llvm.context(cpu, true)?];
+    let mut totals: [PsComparison; 2] = Default::default();
+    let (mut files, mut pixel, mut invalid, mut differences) = (0, 0, 0, 0);
+    let (mut wrapper, mut inflated) = (Vec::new(), Vec::new());
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() || entry.path().extension() != Some(OsStr::new("dxbc")) {
+            continue;
+        }
+        files += 1;
+        if files > FILE_LIMIT {
+            return Err("wrapped PS file-count limit exceeded".into());
+        }
+        wrapper.clear();
+        File::open(entry.path())?
+            .take(BLOB_LIMIT as u64 + 1)
+            .read_to_end(&mut wrapper)?;
+        if wrapper.len() > BLOB_LIMIT {
+            return Err("wrapped PS input exceeds size limit".into());
+        }
+        let dxil = crate::dxil_chunk(&wrapper).ok_or("missing unique DXIL")?;
+        if word(dxil, 0).ok_or("missing DXIL stage")? >> 16 != 0 {
+            continue;
+        }
+        pixel += 1;
+        let parts = crate::dxbc_chunks(&wrapper).ok_or("invalid DXBC directory")?;
+        let mut os = parts.iter().filter(|(tag, _)| *tag == b"OSG1");
+        let (_, signature) = os.next().ok_or("missing PS output signature")?;
+        if os.next().is_some() {
+            return Err("duplicate PS output signature".into());
+        }
+        let Some(source) = crate::signatures::color_targets(signature) else {
+            invalid += 1;
+            continue;
+        };
+        let mut result = None;
+        let mut capture = |payload: &[u8]| {
+            if payload.get(0x100) == Some(&5)
+                && let Some((bytes, _)) = code(payload)
+            {
+                result = Some(waves.each_mut().map(|dis| checked_exports(dis, bytes)));
+            }
+        };
+        let Some((0, _, 1)) =
+            crate::shader_payloads(&wrapper, &mut inflated, Some(0), Some(&mut capture))
+        else {
+            invalid += 1;
+            continue;
+        };
+        let Some(result) = result else {
+            invalid += 1;
+            continue;
+        };
+        differences += usize::from(result[0] != result[1]);
+        for (outcome, total) in result.into_iter().zip(&mut totals) {
+            total.add(source, outcome);
+        }
+    }
+    if pixel == 0 {
+        return Err("no pixel wrappers".into());
+    }
+    println!(
+        "{} LLVM {:?}; {files} wrappers, {pixel} PS, {invalid} unsupported same-wrapper joins; {differences} different wave results",
+        cpu.name(),
+        llvm.version
+    );
+    for (wave, t) in [64, 32].into_iter().zip(totals) {
+        println!(
+            "  wave{wave}: {} complete, {} rejected; complete target sets: {} exact, {} with only extra source targets, {} with only extra native targets, {} with both",
+            t.complete, t.rejected, t.exact, t.source_only, t.native_only, t.both_directions
+        );
+        println!(
+            "  wave{wave}: target-set mismatches with equal cardinality {}, native packed to low MRT ordinals {}",
+            t.mismatch_same_count, t.mismatch_packed_native
+        );
+        println!(
+            "  wave{wave}: complete payloads with zero-EN color EXP {}, MRTZ {}, NULL {}, other EXP {}",
+            t.zero_enable, t.mrtz, t.null, t.other_exp
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn export_target_projection_preserves_empty_enable_and_special_targets() {
+        assert_eq!(
+            export(0xf800_007f, 8, "exp mrt7 v0, v1, v2, v3"),
+            Some(Export::Color(7, true))
+        );
+        assert_eq!(
+            export(0xf800_0070, 8, "exp mrt7 off, off, off, off"),
+            Some(Export::Color(7, false))
+        );
+        assert_eq!(
+            export(0xf800_0081, 8, "exp mrtz v0, off, off, off"),
+            Some(Export::Mrtz)
+        );
+        assert_eq!(
+            export(0xf800_0090, 8, "exp null off, off, off, off"),
+            Some(Export::Null)
+        );
+        assert_eq!(
+            export(0xf800_007f, 8, "exp mrt0 v0, v1, v2, v3"),
+            Some(Export::Other)
+        );
+        assert_eq!(export(0xf800_007f, 4, "exp mrt7 v0, v1, v2, v3"), None);
+        let mut c = PsComparison::default();
+        c.add(
+            1 << 7,
+            Ok(Exports {
+                color: 1,
+                disabled_color: 1 << 7,
+                ..Default::default()
+            }),
+        );
+        c.add(1 << 7, Err(ResultClass::Decode));
+        assert_eq!(
+            (
+                c.complete,
+                c.rejected,
+                c.exact,
+                c.both_directions,
+                c.mismatch_same_count,
+                c.mismatch_packed_native,
+                c.zero_enable
+            ),
+            (1, 1, 0, 1, 1, 1, 1)
+        );
+    }
 
     #[test]
     fn recognized_sendmsg_is_still_an_unmodeled_control_blocker() {

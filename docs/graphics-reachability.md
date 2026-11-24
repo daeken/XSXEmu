@@ -21,3 +21,20 @@ The walk starts at stored-span offset `+40` as an explicit hypothesis. It follow
 The message classification requires the public four-byte SOPP opcode and recognized immediate fields to agree with LLVM's symbolic operands. Unrecognized cases stay grouped, with no operands printed. Only the first rejection is counted; neither the operation names nor the reported stream encoding establish how the Xbox schedules or couples stages. No message is treated as fallthrough or exit. The owned fixture also rejects noncanonical bits and a numeric-only operand presentation.
 
 Every complete graph has at least one reachable eight-byte `exp` checked against LLVM and the public GFX10 encoding prefix. No export result is attributed to an incomplete graph. An owned fixture distinguishes reachable, branch-skipped, and seen-before-rejection exports under all four decoder configurations. The census does not establish export targets or masks, payload coupling, message semantics, native linkage, authenticated entry, or executable Metal coverage. No title shader was executed or modified.
+
+## Same-wrapper PS target comparison
+
+```sh
+cargo run --locked --release --manifest-path tools/shader-inventory/Cargo.toml -- \
+  --wrapped-ps-exports "$TRUSTED_LLVM_21_DYLIB" gfx1013 "$WRAPPED_DXBC_DIRECTORY"
+# Repeat with gfx1030.
+```
+
+All 12,101 PS wrappers have one checked native stage-5 payload and a supported `OSG1` color-target projection. The source set is the `SV_Target` semantic ordinals with public enum 64. The native set is the union of reachable `exp mrt0`–`exp mrt7` ordinals whose raw four-bit enable field is nonzero, in a complete strict graph. The public six-bit target field and LLVM's symbolic target must agree. `MRTZ`, `NULL`, and zero-enable color exports are counted separately. A payload with an unclassified EXP is not compared. These are wrapper counts, not pipeline or attachment counts.
+
+| CPU (either wave test) | Complete | Exact ordinal sets | Mismatched | Has MRTZ | Has NULL |
+|---|---:|---:|---:|---:|---:|
+| `gfx1013` | 12,091 | 11,870 | 221 | 1,171 | 6,180 |
+| `gfx1030` | 6,188 | 5,967 | 221 | 1,166 | 2,497 |
+
+No complete payload has a zero-enable color EXP or an unclassified EXP in either comparison. Every mismatch in each pass has both source-only and native-only ordinals, with equal cardinality; the native set is always dense from `mrt0` through ordinal `count - 1`. This supports a compact set hypothesis for those cases but does not establish the order of any mapping, component writes, whether a path actually reaches a given export, pixel-depth/stencil/coverage channels, or the PSO attachment binding. The two wave settings give identical projected results per wrapper, not a measured native wave width.
