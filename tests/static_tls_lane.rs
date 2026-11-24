@@ -3535,7 +3535,7 @@ fn unsupported_guardcf_policy_and_guard_tls_overlap_fail_preentry() {
     );
 }
 
-const THREAD_CODE: usize = 0x800;
+const THREAD_CODE: usize = 0x1000;
 #[repr(C)]
 struct ThreadFixture {
     entry: u32,
@@ -3620,7 +3620,7 @@ fn created_guest_thread_has_own_teb_and_tls_and_joins_before_process_detach() {
         }
     }
     let flags = [OPT, "--rust-providers"];
-    for mode in [0, 1, 2, 3, 4] {
+    for mode in 0..=5 {
         w32(&mut exe, file(MODE), mode);
         let path = scratch.write(&format!("threads-{mode}.exe"), &exe);
         let output = launcher(&path, &flags)
@@ -3635,9 +3635,10 @@ fn created_guest_thread_has_own_teb_and_tls_and_joins_before_process_detach() {
                 86,
                 "guest EXE returned with active threads; refusing process detach",
             );
-        } else if mode >= 3 {
+        } else if matches!(mode, 3 | 4) {
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(!stderr.contains("phase=tls-detach"), "{stderr}");
+            assert!(!stderr.contains("end phase=thread-entry"), "{stderr}");
             let message = if mode == 3 {
                 "unsupported FLS callback: worker thread teardown requires invocation"
             } else {

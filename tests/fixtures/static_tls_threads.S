@@ -106,6 +106,8 @@ Lthread_entry:
     xorl %ecx, %ecx
     cmpl $3, {mode}(%r11)
     jb 1f
+    cmpl $4, {mode}(%r11)
+    ja 1f
     leaq Lthread_unexpected_fls(%rip), %rcx
 1:
     th_api 11                /* FlsAlloc, process-wide index */
@@ -198,6 +200,39 @@ Lthread_release:
     th_api 14                /* Must detect another lane's callback value. */
     ud2
 1:
+    cmpl $5, {mode}(%r11)
+    jne Lthread_join
+    movl {data}+0x38(%r11), %ecx
+    th_api 14                /* Free while worker is live with a non-null value. */
+    cmpl $1, %eax
+    th_ensure e
+    xorl %ecx, %ecx
+    th_api 11
+    th_ref
+    cmpl {data}+0x38(%r11), %eax
+    th_ensure e
+    movl %eax, %ecx
+    th_api 12
+    testq %rax, %rax
+    th_ensure e
+    cmpl $0, %gs:0x68
+    th_ensure e
+    th_ref
+    movl {data}+0x38(%r11), %ecx
+    movl $0xdead, %edx
+    th_api 13
+    cmpl $1, %eax
+    th_ensure e
+    th_ref
+    movq {data}(%r11), %rcx
+    movl $1, %edx
+    xorl %r8d, %r8d
+    th_api 5
+    cmpl $1, %eax
+    th_ensure e
+    movl $0x1234, %gs:0x68
+    th_ref
+Lthread_join:
     movq {data}+0x08(%r11), %rcx
     movl $-1, %edx
     th_api 4
@@ -337,12 +372,23 @@ Lthread_worker:
     th_ensure e
     th_ref
     cmpl $4, {mode}(%r11)
-    jne 1f
+    jb Lthread_worker_return
     movq {data}(%r11), %rcx
     movl $-1, %edx
     th_api 4
-    ud2
-1:
+    testl %eax, %eax
+    th_ensure e
+    th_ref
+    cmpl $5, {mode}(%r11)
+    th_ensure e
+    movl {data}+0x38(%r11), %ecx
+    th_api 12                /* Reused index, live worker's old value is gone. */
+    testq %rax, %rax
+    th_ensure e
+    cmpl $0, %gs:0x68
+    th_ensure e
+    movl $0x8765, %gs:0x68
+Lthread_worker_return:
     movl $0xeda7babe, %eax
     addq $32, %rsp
     popq %rbx
