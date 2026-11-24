@@ -50,6 +50,10 @@ pub(crate) enum Op {
     FinalPixelDepth {
         src: Vgpr,
     },
+    PackHalfRtz {
+        dst: Vgpr,
+        src: [Vgpr; 2],
+    },
     End,
 }
 
@@ -128,6 +132,16 @@ pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeErro
                 dst,
                 src: [Vgpr(w as u8), Vgpr((w >> 9) as u8), dst],
                 accumulate: true,
+            },
+        ));
+    }
+    // VOP2 opcode 47, two ordinary VGPR operands.
+    if w & 0xfe00_0100 == 0x5e00_0100 {
+        return Ok((
+            1,
+            Op::PackHalfRtz {
+                dst: Vgpr((w >> 17) as u8),
+                src: [Vgpr(w as u8), Vgpr((w >> 9) as u8)],
             },
         ));
     }

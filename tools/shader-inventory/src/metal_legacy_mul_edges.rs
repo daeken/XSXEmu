@@ -86,6 +86,15 @@ mod gpu {
             ],
             [P3, N2, 7_f32.to_bits(), 0],
         ]);
+        let rtz_start = inputs.len();
+        // First row is above the half-ULP tie in both components: nearest-even
+        // would give 0xc0013c01. Golden words are literal and do not use the helper.
+        let rtz = [
+            ([0x3f80_1800, 0xc000_1800], 0xc000_3c00),
+            ([N0, 0x3e80_0000], 0x3400_8000),
+            ([0x3e80_0000, P0], 0x0000_3400),
+        ];
+        inputs.extend(rtz.iter().map(|([a, b], _)| [*a, *b, 0, 0]));
         let bytes = std::mem::size_of_val(inputs.as_slice());
         let usage = MTLResourceOptions::StorageModeShared;
         let input = dev.new_buffer_with_data(inputs.as_ptr().cast(), bytes as u64, usage);
@@ -125,14 +134,20 @@ mod gpu {
         // The first loses that unit if the multiplication rounds before the add.
         assert_eq!(4097_i64 * 4097 - 16785408, 1);
         assert_eq!(4097_f32 * 4097. - 16785408., 0.);
-        for i in cases.len()..inputs.len() {
+        for i in cases.len()..rtz_start {
             let got = unsafe { out.add(i).read() }[2];
             if got != 1_f32.to_bits() {
                 return Err(format!("FMAC row {i} returned {got:08x}").into());
             }
         }
+        for (i, (_, expected)) in rtz.into_iter().enumerate() {
+            let got = unsafe { out.add(rtz_start + i).read() }[3];
+            if got != expected {
+                return Err(format!("RTZ row {i}: got {got:08x}, expected {expected:08x}").into());
+            }
+        }
         println!(
-            "{}: strict arithmetic archive, 16/16 legacy words and 2/2 FMAC words",
+            "{}: strict arithmetic archive, 16/16 legacy words, 2/2 FMAC words and 3/3 packed RTZ words",
             dev.name()
         );
         Ok(())

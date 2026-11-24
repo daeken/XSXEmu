@@ -157,6 +157,8 @@ fn lift(stage: Stage, words: &[u32]) -> Result<Vec<Op>, Reject> {
                 require(src)?;
                 exported += 1;
             }
+            // The separate owned raw-bit probe establishes the value domain.
+            Op::PackHalfRtz { .. } => return Err(Reject::Unsupported(pc)),
             Op::End => {
                 if pc + width != words.len() || exported != stage.export_count() {
                     return Err(Reject::BadEnd(pc));
@@ -236,6 +238,16 @@ fn emit_body(out: &mut String, ops: &[Op], packed_color_lvalue: &str) {
             Op::FinalPixelDepth { src: Vgpr(r) } => {
                 writeln!(out, "  out.depth = as_type<float>(r[{r}]);").unwrap();
             }
+            Op::PackHalfRtz {
+                dst: Vgpr(dst),
+                src: [Vgpr(lo), Vgpr(hi)],
+            } => {
+                writeln!(
+                    out,
+                    "  r[{dst}] = half_rtz_bits(r[{lo}]) | (half_rtz_bits(r[{hi}]) << 16);"
+                )
+                .unwrap();
+            }
             Op::End => out.push_str("  return out;\n}\n"),
         }
     }
@@ -247,16 +259,32 @@ static uint mul_legacy_f32_bits(uint a, uint b) {\n\
   return as_type<uint>(as_type<float>(a) * as_type<float>(b));\n\
 }\n";
 
+// The probe covers finite normal results and signed zero. No guest denormal
+// mode or NaN payload mapping is established by this helper.
+const RTZ_HELPER: &str = "static uint half_rtz_bits(uint a) {\n\
+  uint sign = (a >> 16) & 0x8000u;\n\
+  uint exp = (a >> 23) & 255u;\n\
+  uint fraction = a & 0x7fffffu;\n\
+  if (exp == 255u) return sign | (fraction != 0u ? 0x7e00u : 0x7c00u);\n\
+  if (exp > 142u) return sign | 0x7bffu;\n\
+  if (exp >= 113u) return sign | ((exp - 112u) << 10) | (fraction >> 13);\n\
+  if (exp < 103u) return sign;\n\
+  return sign | ((fraction | 0x800000u) >> (126u - exp));\n\
+}\n";
+
 const EDGE_VGPR: &[u32] = &[0x0e04_0300]; // v_mul_legacy_f32_e32 v2, v0, v1
 const EDGE_LITERAL: &[u32] = &[0x0e06_02ff, 0x3e80_0000]; // v_mul_legacy_f32_e32 v3, 0.25, v1
 const EDGE_FMAC: &[u32] = &[0x5608_0300]; // v_fmac_f32_e32 v4, v0, v1
+const EDGE_RTZ: &[u32] = &[0x5e0a_0300]; // v_cvt_pkrtz_f16_f32_e32 v5, v0, v1
 
 #[allow(dead_code)] // Used by the separate owned bit-exact edge probe.
 pub fn translate_legacy_edge_fixture() -> Result<String, DecodeError> {
     let (a_width, a) = decode(EDGE_VGPR, 0)?;
     let (b_width, b) = decode(EDGE_LITERAL, 0)?;
     let (c_width, c) = decode(EDGE_FMAC, 0)?;
-    if (a_width, b_width, c_width) != (1, 2, 1)
+    let (d_width, d) = decode(EDGE_RTZ, 0)?;
+    if (a_width, b_width, c_width, d_width) != (1, 2, 1, 1)
+        || !matches!(d, Op::PackHalfRtz { .. })
         || !matches!(
             c,
             Op::FmaF32 {
@@ -270,9 +298,10 @@ pub fn translate_legacy_edge_fixture() -> Result<String, DecodeError> {
         return Err(DecodeError::Unsupported(0));
     }
     let mut msl = MSL_HEADER.to_owned();
+    msl.push_str(RTZ_HELPER);
     msl.push_str("kernel void legacy_edges(const device uint4 *in [[buffer(0)]], device uint4 *out [[buffer(1)]], uint id [[thread_position_in_grid]]) {\n  uint r[256]; r[0] = in[id].x; r[1] = in[id].y; r[4] = in[id].z;\n");
-    body(&mut msl, &[a, b, c]);
-    msl.push_str("  out[id] = uint4(r[2], r[3], r[4], 0u);\n}\n");
+    body(&mut msl, &[a, b, c, d]);
+    msl.push_str("  out[id] = uint4(r[2], r[3], r[4], r[5]);\n}\n");
     Ok(msl)
 }
 
@@ -359,13 +388,14 @@ mod tests {
             io::Write,
             process::{Command, Stdio},
         };
-        let asm = "v_mov_b32_e32 v8, v4\nexp param0 v8, v5, v6, v7\nexp pos0 v0, v1, v2, v3 done\ns_endpgm\nv_add_f32_e32 v4, 0.25, v0\nv_fma_f32 v5, v1, v2, v3\nv_mul_legacy_f32_e32 v6, v5, v4\nv_mul_legacy_f32_e32 v6, 0.5, v6\nv_mul_legacy_f32_e32 v7, 0, v3\nexp mrt0 v4, v5, v6, v7 done\ns_endpgm\nv_mul_legacy_f32_e32 v2, v0, v1\nv_mul_legacy_f32_e32 v3, 0.25, v1\nv_fmac_f32_e32 v4, v0, v1\nexp mrt0 v1, v1, v0, v0 done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrtz v2, off, off, off done vm\ns_endpgm\n";
+        let asm = "v_mov_b32_e32 v8, v4\nexp param0 v8, v5, v6, v7\nexp pos0 v0, v1, v2, v3 done\ns_endpgm\nv_add_f32_e32 v4, 0.25, v0\nv_fma_f32 v5, v1, v2, v3\nv_mul_legacy_f32_e32 v6, v5, v4\nv_mul_legacy_f32_e32 v6, 0.5, v6\nv_mul_legacy_f32_e32 v7, 0, v3\nexp mrt0 v4, v5, v6, v7 done\ns_endpgm\nv_mul_legacy_f32_e32 v2, v0, v1\nv_mul_legacy_f32_e32 v3, 0.25, v1\nv_fmac_f32_e32 v4, v0, v1\nv_cvt_pkrtz_f16_f32_e32 v5, v0, v1\nexp mrt0 v1, v1, v0, v0 done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrtz v2, off, off, off done vm\ns_endpgm\n";
         let expected: Vec<u8> = VS
             .iter()
             .chain(PS)
             .chain(EDGE_VGPR)
             .chain(EDGE_LITERAL)
             .chain(EDGE_FMAC)
+            .chain(EDGE_RTZ)
             .chain(PACKED_PS)
             .chain(DEPTH_PS)
             .flat_map(|w| w.to_le_bytes())
@@ -461,6 +491,15 @@ mod tests {
             decode(&[DEPTH_PS[2], 0x0102], 0),
             Err(DecodeError::Unsupported(0))
         );
+    }
+
+    #[test]
+    fn packed_rtz_rejects_scalar_source_and_unvalidated_graphics_fp_mode() {
+        assert_eq!(
+            decode(&[EDGE_RTZ[0] & !0x100], 0),
+            Err(DecodeError::Unsupported(0))
+        );
+        assert_eq!(lift(Stage::Pixel, EDGE_RTZ), Err(Reject::Unsupported(0)));
     }
 
     #[test]
