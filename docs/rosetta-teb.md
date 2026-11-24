@@ -307,6 +307,44 @@ the original importer, module, name or ordinal, and IAT RVA, then exits the
 child with status 1. It never switches back to guest GS, resumes guest code,
 runs guest detach, or restores the signal mask on this terminal path.
 
+## Opt-in child: dormant linker guard slots
+
+The initial title probe stopped at its PE32+ load configuration. Read-only
+inspection found directory RVA `0x6158d20`, declared and directory size
+`0x138`, `GUARD_CF` clear, and zero `GuardFlags`, GFID VA and GFID count.
+The qwords at `+0x70` and `+0x78` address distinct read-only, aligned slots,
+not the placeholder instructions themselves:
+
+| Load-config field | Slot RVA | Preferred-base target/disassembly |
+| --- | --- | --- |
+| CFG check `+0x70` | `0x678f650` | `0x1456004b0`: `ret 0` |
+| CFG dispatch `+0x78` | `0x678f658` | `0x1456a2090`: `jmp rax` |
+| XFG check `+0x118` | `0x678f660` | same `ret 0` target |
+| XFG dispatch `+0x120` | `0x678f668` | `0x1456a20b0`: `jmp [rip+disp32]` through the CFG dispatch slot |
+| XFG table dispatch `+0x128` | `0x678f670` | same RIP-relative jump target |
+| CastGuard `+0x130` | `0x678f678` | zero data qword |
+
+The raw `IMAGE_LOAD_CONFIG_CODE_INTEGRITY` tuple at `+0x94` is `(Flags=1,
+Catalog=0, CatalogOffset=0, Reserved=0)`; `CatalogOffset` is the DWORD at
+`+0x98`, not the nonzero word at `+0x94`. This is a metadata observation,
+not a signature or integrity claim; the PE certificate directory is absent.
+The security-cookie field is handled independently. The dormant classifier
+requires this exact layout, zero elsewhere in load config, file-backed RX
+placeholder instructions and read-only slots, and exact DIR64 fixups for the
+expected VA words only in the validated ranges. It does not infer inactivity
+from a missing header bit alone or claim that static analysis proved the slots
+unreachable.
+
+Only the opt-in static TLS child accepts this profile. After relocation and
+before any guest callback, the binder replaces all five callable slots with
+terminal gates and seals the slots read-only; the CastGuard cell stays zero.
+An attempted call restores and checks host GS, reports the slot kind and exits
+with status 86, without returning to the guest or dispatching to the candidate.
+An advertised guarded image still requires its own supported policy and exact
+GFID enforcement; the dormant slots add no entries to that policy. The tests
+use only original PEs and exercise all five calls, rebasing, near-miss metadata
+and the existing guarded enforcement fixtures. The title was inspected only.
+
 ## Controlled execution plan
 
 1. Separate loading from execution. Reuse PE static TLS metadata but check

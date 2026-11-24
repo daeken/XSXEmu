@@ -1,7 +1,7 @@
 /* Fixed SysV -> Win64 boundary (EXE entry, TLS callback or DllMain).
  * From the first switch to the checked restore, only this assembly, trusted
  * PE code, the GS-neutral GuardCF leaf checks/dispatch and the pre-resolved
- * Rosetta TSD setter may execute, along with the sealed import trap entries
+ * Rosetta TSD setter may execute, along with the sealed terminal trap entries
  * below. Never call a dyld stub, Rust function, or signal-mask operation
  * with guest GS. */
 .text
@@ -75,3 +75,30 @@ _xsxemu_tls_missing_import:
     movq %r13, %rdi
     addq $8, %rsp          /* SysV function-entry alignment for the tail jump */
     jmp {missing_import}
+
+/* These terminal entries ignore every guest argument and candidate target.
+ * They cannot return to the original call or jump to the candidate. */
+.macro dormant_guard_entry name, id
+.globl \name
+\name:
+    movl $\id, %r13d
+    jmp Ldormant_guard
+.endm
+
+dormant_guard_entry _xsxemu_tls_dormant_cfg_check, 0
+dormant_guard_entry _xsxemu_tls_dormant_cfg_dispatch, 1
+dormant_guard_entry _xsxemu_tls_dormant_xfg_check, 2
+dormant_guard_entry _xsxemu_tls_dormant_xfg_dispatch, 3
+dormant_guard_entry _xsxemu_tls_dormant_xfg_table_dispatch, 4
+
+Ldormant_guard:
+    movq %gs:{context_slot}, %r12
+    testq %r12, %r12
+    jz Lbad_tls_boundary
+    check_guest %r12
+    andq $-16, %rsp
+    switch_to {host_base}, %r12
+    check_host %r12
+    movq %r13, %rdi
+    callq {dormant_guard}
+    ud2

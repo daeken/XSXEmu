@@ -1,7 +1,7 @@
 //! Static IAT-only entry points. No runtime code generation or raw provider
 //! target selection. Each row states an exact reviewed Win64 prototype and
 //! emits a typed SysV adapter plus a matching assembly entry in host text.
-use super::{CONTEXT_OFFSET, Context, LAST_ERROR_OFFSET};
+use super::{CONTEXT_OFFSET, Context, LAST_ERROR_OFFSET, called_dormant_guard};
 use crate::{
     Result,
     import_traps::called_missing_import_tls,
@@ -60,6 +60,7 @@ macro_rules! audited_bridges {
             context_slot = const CONTEXT_OFFSET,
             last_error = const LAST_ERROR_OFFSET,
             missing_import = sym called_missing_import_tls,
+            dormant_guard = sym called_dormant_guard,
             $($adapter = sym $adapter,)*
             options(att_syntax),
         );

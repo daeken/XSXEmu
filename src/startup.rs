@@ -12,7 +12,7 @@ mod native {
         link::BindingTarget,
         pe::Pe,
         providers::{win_loader, win_proc, win_unwind},
-        win_cfg::CfgMetadata,
+        win_cfg::{CfgProfile, DORMANT_CALLABLE},
         win_cfg_runtime::{SLOT_THUNKS, Targets},
     };
     use std::{fs::File, io::Read};
@@ -22,11 +22,7 @@ mod native {
     const MAX_MAPPED_TOTAL: usize = 1024 * 1024 * 1024;
     const AMD64_DEFAULT_COOKIE: u64 = 0x0000_2b99_2ddf_a232;
 
-    fn validate_profile<'a>(
-        pe: &Pe<'a>,
-        name: &str,
-        static_tls: bool,
-    ) -> Result<Option<CfgMetadata<'a>>> {
+    fn validate_profile<'a>(pe: &Pe<'a>, name: &str, static_tls: bool) -> Result<CfgProfile<'a>> {
         if !static_tls && pe.tls()?.is_some() {
             return Err(format!("{name}: static TLS requires a Windows TEB and is not supported by this startup profile").into());
         }
@@ -42,8 +38,14 @@ mod native {
                 return Err(format!("{name}: unsupported {label} directory").into());
             }
         }
-        let cfg = CfgMetadata::parse(pe).map_err(|e| format!("{name}: {e}"))?;
-        if cfg.is_none()
+        let cfg = CfgProfile::parse(pe).map_err(|e| format!("{name}: {e}"))?;
+        if matches!(cfg, CfgProfile::Dormant(_)) && !static_tls {
+            return Err(format!(
+                "{name}: dormant guard slots require the experimental static TLS child"
+            )
+            .into());
+        }
+        if matches!(cfg, CfgProfile::None)
             && let Some(dir) = pe.directory(10)
         {
             let raw = pe.rva_slice(dir.rva, dir.size as _)?;
@@ -65,16 +67,21 @@ mod native {
         Ok(())
     }
 
-    fn guard_slots(cfg: &CfgMetadata<'_>) -> [u32; 2] {
-        [cfg.check_slot_rva(), cfg.dispatch_slot_rva()]
-    }
-
-    fn reject_slot_overlap(cfg: Option<&CfgMetadata<'_>>, rva: u32) -> Result<()> {
-        if cfg.is_some_and(|cfg| {
-            guard_slots(cfg)
-                .into_iter()
-                .any(|slot| slot.abs_diff(rva) < 8)
-        }) {
+    fn reject_slot_overlap(cfg: &CfgProfile<'_>, rva: u32) -> Result<()> {
+        let hits_slot = |slot: &u32| slot.abs_diff(rva) < 8;
+        let overlap = match cfg {
+            CfgProfile::None => false,
+            CfgProfile::Guarded(cfg) => cfg.slots().iter().any(hits_slot),
+            CfgProfile::Dormant(cfg) => {
+                if cfg.overlaps_config_write(rva) {
+                    return Err(
+                        "security cookie or IAT patch overlaps dormant guard load config".into(),
+                    );
+                }
+                cfg.slots().iter().any(hits_slot)
+            }
+        };
+        if overlap {
             return Err("security cookie or IAT patch overlaps a CFG slot".into());
         }
         Ok(())
@@ -203,7 +210,10 @@ mod native {
             })
             .transpose()?;
         validate_trap_slots(&pes, bindings, missing)?;
-        let mut targets = cfgs.iter().any(Option::is_some).then(Targets::default);
+        let mut targets = cfgs
+            .iter()
+            .any(|cfg| matches!(cfg, CfgProfile::Guarded(_)))
+            .then(Targets::default);
         let mut total = 0usize;
         let mut memories = Vec::new();
         for (pe, cfg) in pes.iter().zip(&cfgs) {
@@ -215,13 +225,13 @@ mod native {
             let mut mem = GuestMemory::allocate(len, Some(pe.image_base))?;
             pe.materialize_into(mem.base(), mem.bytes_mut()?)?;
             if let Some(rva) = pe.security_cookie_rva()? {
-                reject_slot_overlap(cfg.as_ref(), rva)?;
+                reject_slot_overlap(cfg, rva)?;
                 patch(&mut mem, rva, new_cookie()?)?;
             }
             memories.push(mem);
         }
         for &(importer, iat, target) in bindings {
-            reject_slot_overlap(cfgs[importer].as_ref(), iat)?;
+            reject_slot_overlap(&cfgs[importer], iat)?;
             let addr = match target {
                 BindingTarget::Pe(export) => memories[export.module]
                     .base()
@@ -253,7 +263,7 @@ mod native {
         if let Some(traps) = &traps {
             for (import, addr) in traps.bindings() {
                 let iat = import.binding.iat_rva;
-                reject_slot_overlap(cfgs[import.importer].as_ref(), iat)?;
+                reject_slot_overlap(&cfgs[import.importer], iat)?;
                 patch(&mut memories[import.importer], iat, addr)?;
                 if let Some(targets) = &mut targets {
                     targets.add_bound_host_target(addr)?;
@@ -280,20 +290,34 @@ mod native {
                     });
                 }
             }
-            if let Some(cfg) = cfg {
-                let slots = guard_slots(cfg);
-                // Overwrite both slots after relocation and IAT fixes. The
-                // original pointer contents never select or seed the policy.
-                for (rva, thunk) in slots.into_iter().zip(SLOT_THUNKS) {
-                    patch(mem, rva, thunk as usize as u64)?;
+            let slot_range = |rva: u32| rva as usize..rva as usize + 8;
+            match cfg {
+                CfgProfile::Guarded(cfg) => {
+                    let slots = cfg.slots();
+                    // Overwrite after relocation and IAT fixes. The original
+                    // pointer contents never select or seed the policy.
+                    for (rva, thunk) in slots.into_iter().zip(SLOT_THUNKS) {
+                        patch(mem, rva, thunk as usize as u64)?;
+                    }
+                    mem.seal_with_readonly(&regions, &slots.map(slot_range))?;
+                    targets
+                        .as_mut()
+                        .expect("CFG policy for guarded image")
+                        .add_image(mem.base(), cfg)?;
                 }
-                mem.seal_with_readonly(&regions, &slots.map(|rva| rva as usize..rva as usize + 8))?;
-                targets
-                    .as_mut()
-                    .expect("CFG policy for guarded image")
-                    .add_image(mem.base(), cfg)?;
-            } else {
-                mem.seal(&regions)?;
+                CfgProfile::Dormant(cfg) => {
+                    let slots = cfg.slots();
+                    // Never run either a no-op check or a nonenforcing dispatch.
+                    // Not registered as CFG targets, even in a mixed graph.
+                    for (&rva, trap) in slots[..DORMANT_CALLABLE]
+                        .iter()
+                        .zip(tls_runtime::dormant_guard_entries())
+                    {
+                        patch(mem, rva, trap)?;
+                    }
+                    mem.seal_with_readonly(&regions, &cfg.readonly_ranges())?;
+                }
+                CfgProfile::None => mem.seal(&regions)?,
             }
             if pe.entry_rva != 0 {
                 mem.validate_target(pe.entry_rva as usize)?;

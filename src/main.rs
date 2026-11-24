@@ -237,8 +237,9 @@ fn inspect(path: &Path, symbols: bool) -> Result<()> {
     if let Some(cookie) = pe.security_cookie_rva()? {
         println!("  security cookie RVA {cookie:#x}");
     }
-    match win_cfg::CfgMetadata::parse(&pe) {
-        Ok(Some(cfg)) => {
+    use win_cfg::CfgProfile;
+    match CfgProfile::parse(&pe) {
+        Ok(CfgProfile::Guarded(cfg)) => {
             use win_cfg::ExportSuppression;
             let candidates = cfg
                 .entries()
@@ -261,7 +262,11 @@ fn inspect(path: &Path, symbols: bool) -> Result<()> {
                 "  GuardCF static policy: {candidates} candidates without export suppression; {suppressed} suppressed with export suppression"
             );
         }
-        Ok(None) => {}
+        Ok(CfgProfile::None) => {}
+        Ok(CfgProfile::Dormant(cfg)) => println!(
+            "  Dormant linker guard slots (CFG check/dispatch, XFG check/dispatch/table dispatch, null CastGuard): {:x?}",
+            cfg.slots()
+        ),
         Err(err) => println!("  GuardCF profile unsupported: {err}"),
     }
     println!("  {} DIR64 relocations", pe.relocations()?.len());

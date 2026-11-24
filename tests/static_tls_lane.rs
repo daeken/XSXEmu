@@ -269,6 +269,65 @@ fn image(kind: Kind) -> Vec<u8> {
     b
 }
 
+// Original fixture plus the exact inactive PE32+ linker layout. No bytes
+// from an external image are used (the defaults are single instructions).
+fn dormant_image(kind: Kind) -> Vec<u8> {
+    let mut b = image(kind);
+    dir(&mut b, 10, LOAD, 0x138);
+    w32(&mut b, file(LOAD), 0x138);
+    w32(&mut b, file(LOAD) + 0x94, 1);
+    const RET: usize = TEXT + 0x800;
+    const JMP: usize = RET + 0x10;
+    const XFG: usize = JMP + 0x10;
+    put(&mut b, file(RET), &[0xc2, 0, 0]);
+    put(&mut b, file(JMP), &[0xff, 0xe0]);
+    put(&mut b, file(XFG), &[0xff, 0x25]);
+    w32(&mut b, file(XFG) + 2, DISPATCH - (XFG + 6));
+    let mut fix = vec![RO, RO + 8, RO + 16, RO + 24, ARRAY, TEMPLATE, LOAD + 88];
+    for (i, (field, target)) in [
+        (0x70, RET),
+        (0x78, JMP),
+        (0x118, RET),
+        (0x120, XFG),
+        (0x128, XFG),
+        (0x130, 0),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let slot = CHECK + 8 * i;
+        w64(&mut b, file(LOAD) + field, PREFERRED + slot);
+        fix.push(LOAD + field);
+        if target != 0 {
+            w64(&mut b, file(slot), PREFERRED + target);
+            fix.push(slot);
+        }
+    }
+    let size = 8 + 2 * fix.len();
+    dir(&mut b, 5, RELOC, size);
+    w32(&mut b, file(RELOC) + 4, size);
+    for (i, rva) in fix.into_iter().enumerate() {
+        w16(&mut b, file(RELOC) + 8 + 2 * i, 0xa000 | (rva - RO));
+    }
+    b
+}
+
+fn dormant_call(b: &mut [u8], slot: usize) {
+    const ENTRY: usize = TEXT + 0x900;
+    w32(b, OP + 16, ENTRY);
+    // Valid in-image target in RAX, then call [rip + slot]. If a dormant
+    // linker default were actually executed, this would return 101.
+    put(b, file(ENTRY), &[0x48, 0x83, 0xec, 0x28, 0x48, 0x8d, 0x05]);
+    w32(b, file(ENTRY) + 7, 12);
+    put(b, file(ENTRY) + 11, &[0xff, 0x15]);
+    w32(b, file(ENTRY) + 13, slot - (ENTRY + 17));
+    put(
+        b,
+        file(ENTRY) + 17,
+        &[0x48, 0x83, 0xc4, 0x28, 0x90, 0x90, 0xb8, 101, 0, 0, 0, 0xc3],
+    );
+}
+
 struct Scratch(PathBuf);
 
 impl Scratch {
@@ -325,6 +384,106 @@ fn opt_in_and_pe_only_lifecycle() {
     expect(run(&exe, &[OPT]), 1, "incomplete dependency graph");
     dir.write("owned.dll", &image(Kind::Dll));
     expect(run(&exe, &[OPT]), 42, "Guest entry returned 42");
+}
+
+#[test]
+fn dormant_linker_slots_stop_instead_of_checking_or_dispatching() {
+    if !rosetta() {
+        return;
+    }
+    let dir = Scratch::new();
+    let original = dormant_image(Kind::Solo);
+    let exe = dir.write("dormant.exe", &original);
+    expect(run(&exe, &[OPT]), 43, "Guest entry returned 43");
+    for (i, name) in [
+        "CFG check",
+        "CFG dispatch",
+        "XFG check",
+        "XFG dispatch",
+        "XFG table dispatch",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut b = original.clone();
+        dormant_call(&mut b, CHECK + 8 * i);
+        dir.write("dormant.exe", &b);
+        expect(
+            run(&exe, &[OPT]),
+            86,
+            &format!("called dormant linker guard slot: {name}"),
+        );
+    }
+}
+
+#[test]
+fn dormant_profiles_survive_relocation_at_a_colliding_preferred_base() {
+    if !rosetta() {
+        return;
+    }
+    let dir = Scratch::new();
+    let exe = dir.write("root.exe", &dormant_image(Kind::Exe));
+    let mut dll = dormant_image(Kind::Dll);
+    dir.write("owned.dll", &dll);
+    expect(run(&exe, &[OPT]), 42, "Guest entry returned 42");
+    dormant_call(&mut dll, CHECK + 8);
+    dir.write("owned.dll", &dll);
+    expect(
+        run(&exe, &[OPT]),
+        86,
+        "called dormant linker guard slot: CFG dispatch",
+    );
+}
+
+#[test]
+fn dormant_profile_rejects_metadata_slot_and_relocation_near_misses() {
+    if !rosetta() {
+        return;
+    }
+    let dir = Scratch::new();
+    let original = dormant_image(Kind::Solo);
+    for (at, value, error) in [
+        (OP + 71, 0x40, "CFG without instrumentation"), // GUARD_CF
+        (file(LOAD) + 4, 1, "not dormant linker layout"),
+        (file(LOAD) + 0x80, 1, "not dormant linker layout"), // GFID VA
+        (file(LOAD) + 0x88, 1, "not dormant linker layout"), // GFID count
+        (file(LOAD) + 0x91, 1, "not dormant linker layout"), // GuardFlags
+        (file(LOAD) + 0x94, 0, "not dormant linker layout"),
+        (file(LOAD) + 0x98, 1, "not dormant linker layout"), // CatalogOffset
+        (file(LOAD) + 0x104, 1, "not dormant linker layout"), // Volatile metadata
+        (file(LOAD) + 0x118, 0, "overlapping dormant guard slots"), // aliases CFG check slot
+        (
+            file(CHECK) + 0x10,
+            1,
+            "unexpected dormant XFG or CastGuard slot values",
+        ),
+        (
+            file(CHECK) + 0x28,
+            1,
+            "unexpected dormant XFG or CastGuard slot values",
+        ),
+        (
+            file(TEXT) + 0x810,
+            0xc3,
+            "unexpected dormant guard target instructions",
+        ),
+        (
+            file(TEXT) + 0x822,
+            0,
+            "unexpected dormant guard target instructions",
+        ),
+        (file(RELOC) + 25, 0, "missing dormant guard relocation"),
+        (
+            file(RELOC) + 42,
+            0x28,
+            "unexpected dormant guard relocation",
+        ),
+    ] {
+        let mut b = original.clone();
+        b[at] = value;
+        let exe = dir.write("dormant.exe", &b);
+        expect(run(&exe, &[OPT]), 1, error);
+    }
 }
 
 #[test]

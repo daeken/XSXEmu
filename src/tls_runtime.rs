@@ -14,7 +14,7 @@ use crate::{
     link::BindingTarget,
     pe::Pe,
     static_tls::{self, Image, ImageId, Limits, PatchSites, Plan},
-    win_cfg::CfgMetadata,
+    win_cfg::{CfgProfile, DORMANT_CALLABLE},
 };
 use std::{
     arch::asm,
@@ -97,10 +97,48 @@ unsafe extern "C" {
 unsafe extern "win64" {
     // Only used as an address; the gate receives the record pointer in RCX.
     fn xsxemu_tls_missing_import();
+    fn xsxemu_tls_dormant_cfg_check();
+    fn xsxemu_tls_dormant_cfg_dispatch();
+    fn xsxemu_tls_dormant_xfg_check();
+    fn xsxemu_tls_dormant_xfg_dispatch();
+    fn xsxemu_tls_dormant_xfg_table_dispatch();
 }
 
 pub fn import_trap_entry() -> u64 {
     xsxemu_tls_missing_import as *const () as u64
+}
+
+pub fn dormant_guard_entries() -> [u64; DORMANT_CALLABLE] {
+    [
+        xsxemu_tls_dormant_cfg_check,
+        xsxemu_tls_dormant_cfg_dispatch,
+        xsxemu_tls_dormant_xfg_check,
+        xsxemu_tls_dormant_xfg_dispatch,
+        xsxemu_tls_dormant_xfg_table_dispatch,
+    ]
+    .map(|entry| entry as *const () as u64)
+}
+
+// Terminal assembly gate restores and checks host GS first. Never unwind
+// or run guest detach, even when the attempted call came from a callback.
+extern "C" fn called_dormant_guard(slot: usize) -> ! {
+    use std::io::Write;
+    const NAMES: [&str; DORMANT_CALLABLE] = [
+        "CFG check",
+        "CFG dispatch",
+        "XFG check",
+        "XFG dispatch",
+        "XFG table dispatch",
+    ];
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "xsxemu: called dormant linker guard slot: {}",
+        NAMES.get(slot).unwrap_or(&"unknown")
+    );
+    unsafe extern "C" {
+        fn _exit(status: c_int) -> !;
+    }
+    unsafe { _exit(86) }
 }
 
 pub fn require_rosetta() -> Result<()> {
@@ -178,7 +216,7 @@ impl PatchWrites {
         pes: &[Pe<'_>],
         bindings: &[(usize, u32, BindingTarget)],
         missing: &[MissingImport<'_>],
-        cfgs: &[Option<CfgMetadata<'_>>],
+        cfgs: &[CfgProfile<'_>],
         rust_providers: bool,
     ) -> Result<Self> {
         if pes.is_empty() || pes.len() > Limits::default().images {
@@ -234,13 +272,14 @@ impl PatchWrites {
             }
         }
         for (slots, cfg) in writes.iter_mut().zip(cfgs) {
-            if let Some(cfg) = cfg {
-                // The shared binder checks guard-vs-IAT/cookie conflicts. A
-                // DIR64 at a guard slot is valid (e.g. a default check stub);
-                // the slot is deliberately overwritten after relocation.
-                slots.extend([cfg.check_slot_rva(), cfg.dispatch_slot_rva()]);
-                slots.sort_unstable();
+            // The shared binder checks guard-vs-IAT/cookie conflicts. Guard
+            // slots are protected from TLS write/metadata overlap as well.
+            match cfg {
+                CfgProfile::None => continue,
+                CfgProfile::Guarded(cfg) => slots.extend(cfg.slots()),
+                CfgProfile::Dormant(cfg) => slots.extend(cfg.slots()),
             }
+            slots.sort_unstable();
         }
         Ok(Self(writes))
     }

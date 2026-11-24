@@ -68,12 +68,141 @@ pub struct CfgMetadata<'a> {
     table: &'a [u8],
 }
 
-impl<'a> CfgMetadata<'a> {
+#[derive(Debug)]
+pub enum CfgProfile<'a> {
+    None,
+    Dormant(DormantSlots),
+    Guarded(CfgMetadata<'a>),
+}
+
+// The first five are callable. CastGuard is a null data slot, not a function
+// pointer to substitute: keep that qword zero and protect it alongside them.
+pub const DORMANT_CALLABLE: usize = 5;
+const DORMANT_FIELDS: [usize; DORMANT_CALLABLE + 1] = [CHECK, DISPATCH, 0x118, 0x120, 0x128, 0x130];
+const DORMANT_SIZE: usize = 0x138;
+
+#[derive(Debug)]
+pub struct DormantSlots {
+    slots: [u32; DORMANT_FIELDS.len()],
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    config: Range<u32>,
+}
+
+impl DormantSlots {
+    pub fn slots(&self) -> &[u32; DORMANT_FIELDS.len()] {
+        &self.slots
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    pub fn overlaps_config_write(&self, rva: u32) -> bool {
+        overlaps(&self.config, &(rva..rva.saturating_add(8)))
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    pub fn readonly_ranges(&self) -> [Range<usize>; DORMANT_FIELDS.len() + 1] {
+        std::array::from_fn(|i| match self.slots.get(i) {
+            Some(&rva) => rva as usize..rva as usize + 8,
+            None => self.config.start as usize..self.config.end as usize,
+        })
+    }
+
+    fn parse(pe: &Pe<'_>, rva: u32, raw: &[u8], size: usize) -> Result<Self> {
+        // Only the observed PE32+ layout, with no guard policy or other
+        // optional load-config data. The CodeIntegrity tuple at +0x94 is
+        // (Flags=1, Catalog=0, CatalogOffset=0, Reserved=0). Match it as
+        // metadata only; this is not a signature or integrity decision.
+        if size != DORMANT_SIZE
+            || raw.len() != size
+            || nonzero(&raw[4..0x58])
+            || nonzero(&raw[0x60..CHECK])
+            || nonzero(&raw[FUNCTION_TABLE..0x94])
+            || u32_at(raw, 0x94) != 1 // CodeIntegrity.Flags and Catalog
+            || nonzero(&raw[0x98..0x118])
+            || pe.directory(4).is_some()
+        {
+            return Err(PeError::Invalid(
+                "CFG metadata without GUARD_CF characteristic (not dormant linker layout)",
+            ));
+        }
+        let config = readonly_range(pe, rva, size)?;
+        let mut slots = [0; DORMANT_FIELDS.len()];
+        let mut values = [0; DORMANT_FIELDS.len()];
+        for (i, field) in DORMANT_FIELDS.into_iter().enumerate() {
+            let rva = preferred_rva(pe, u64_at(raw, field))?;
+            let slot = slot_range(pe, rva)?;
+            if overlaps(&config, &slot) || slots[..i].contains(&rva) {
+                return Err(PeError::Invalid(
+                    "overlapping dormant guard slots or load config",
+                ));
+            }
+            slots[i] = rva;
+            values[i] = u64_at(pe.rva_slice(rva, 8)?, 0);
+        }
+        let [check, dispatch, xcheck, xdispatch, xtable, cast] = values;
+        if check != xcheck || xdispatch != xtable || cast != 0 {
+            return Err(PeError::Invalid(
+                "unexpected dormant XFG or CastGuard slot values",
+            ));
+        }
+        let check = preferred_rva(pe, check)?;
+        let dispatch = preferred_rva(pe, dispatch)?;
+        let xdispatch = preferred_rva(pe, xdispatch)?;
+        let code = [range(check, 3)?, range(dispatch, 2)?, range(xdispatch, 6)?];
+        for r in &code {
+            let section = section_for(pe, r)?;
+            if !section.readable() || !section.executable() || section.writable() {
+                return Err(PeError::Invalid("dormant guard target section permissions"));
+            }
+        }
+        let xfg = pe.rva_slice(xdispatch, 6)?;
+        let displacement = i32::from_le_bytes(xfg[2..6].try_into().unwrap());
+        if pe.rva_slice(check, 3)? != [0xc2, 0, 0] // ret 0
+            || pe.rva_slice(dispatch, 2)? != [0xff, 0xe0] // jmp rax
+            || xfg[..2] != [0xff, 0x25] // jmp [rip + disp32]
+            || i64::from(code[2].end) + i64::from(displacement) != i64::from(slots[1])
+        {
+            return Err(PeError::Invalid(
+                "unexpected dormant guard target instructions",
+            ));
+        }
+
+        // All VA words must rebase exactly once. No DIR64 may change the
+        // validated opcodes, other metadata, or the null CastGuard cell.
+        let mut remaining = DORMANT_FIELDS.map(|offset| rva + offset as u32).to_vec();
+        remaining.extend(&slots[..DORMANT_CALLABLE]);
+        if u64_at(raw, 0x58) != 0 {
+            remaining.push(rva + 0x58);
+        }
+        for fix in pe.relocations()? {
+            let fix_range = range(fix, 8)?;
+            if overlaps(&config, &fix_range)
+                || slots.iter().any(|&s| s.abs_diff(fix) < 8)
+                || code.iter().any(|r| overlaps(r, &fix_range))
+            {
+                if let Some(i) = remaining.iter().position(|&s| s == fix) {
+                    remaining.swap_remove(i);
+                } else {
+                    return Err(PeError::Invalid("unexpected dormant guard relocation"));
+                }
+            }
+        }
+        if !remaining.is_empty() {
+            return Err(PeError::Invalid("missing dormant guard relocation"));
+        }
+        Ok(Self {
+            slots,
+            #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+            config,
+        })
+    }
+}
+
+impl<'a> CfgProfile<'a> {
     /// Inspect preferred-base load-config data. A guarded image outside this
     /// profile is an error, not an image with no CFG. This profile rejects an
     /// image that requests enabling export suppression process-wide, because
     /// doing so involves runtime export resolution, not just table validation.
-    pub fn parse(pe: &Pe<'a>) -> Result<Option<Self>> {
+    pub fn parse(pe: &Pe<'a>) -> Result<Self> {
         let advertised = pe.dll_characteristics & DLL_GUARD_CF != 0;
         let Some(dir) = pe.directory(LOAD_CONFIG) else {
             return no_cfg(advertised);
@@ -99,10 +228,21 @@ impl<'a> CfgMetadata<'a> {
             return no_cfg(advertised);
         }
         if !advertised {
-            return Err(PeError::Invalid(
-                "CFG metadata without GUARD_CF characteristic",
-            ));
+            return DormantSlots::parse(pe, dir.rva, raw, size).map(Self::Dormant);
         }
+        CfgMetadata::parse_guarded(pe, dir.rva, raw, size).map(Self::Guarded)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+impl CfgMetadata<'_> {
+    pub fn slots(&self) -> [u32; 2] {
+        [self.check_slot_rva(), self.dispatch_slot_rva()]
+    }
+}
+
+impl<'a> CfgMetadata<'a> {
+    fn parse_guarded(pe: &Pe<'a>, rva: u32, raw: &[u8], size: usize) -> Result<Self> {
         let flags = u32_at(raw, GUARD_FLAGS);
         if flags & !SUPPORTED_FLAGS != 0 {
             // Includes CFW, RF, EH continuations, XFG, CastGuard, memcpy guard,
@@ -130,7 +270,7 @@ impl<'a> CfgMetadata<'a> {
             ));
         }
 
-        let config = readonly_range(pe, dir.rva, dir.size as usize)?;
+        let config = readonly_range(pe, rva, raw.len())?;
         let check_slot_rva = preferred_rva(pe, u64_at(raw, CHECK))?;
         let dispatch_slot_rva = preferred_rva(pe, u64_at(raw, DISPATCH))?;
         let check = slot_range(pe, check_slot_rva)?;
@@ -154,10 +294,7 @@ impl<'a> CfgMetadata<'a> {
         let table_range = readonly_range(pe, table_rva, bytes)?;
         let ranges = [config, check, dispatch, table_range];
         for (i, a) in ranges.iter().enumerate() {
-            if ranges[..i]
-                .iter()
-                .any(|b| a.start < b.end && b.start < a.end)
-            {
+            if ranges[..i].iter().any(|b| overlaps(a, b)) {
                 return Err(PeError::Invalid("overlapping CFG metadata or slots"));
             }
         }
@@ -186,14 +323,14 @@ impl<'a> CfgMetadata<'a> {
             // Do not accept an RVA in an executable zero-fill tail.
             pe.rva_slice(entry.rva, 1)?;
         }
-        Ok(Some(Self {
+        Ok(Self {
             check_slot_rva,
             dispatch_slot_rva,
             table_rva,
             flags,
             stride,
             table,
-        }))
+        })
     }
 
     /// Location of an eight-byte pointer slot, not the VA stored in the slot.
@@ -248,11 +385,15 @@ impl<'a> CfgMetadata<'a> {
     }
 }
 
-fn no_cfg(advertised: bool) -> Result<Option<CfgMetadata<'static>>> {
+fn overlaps(a: &Range<u32>, b: &Range<u32>) -> bool {
+    a.start < b.end && b.start < a.end
+}
+
+fn no_cfg(advertised: bool) -> Result<CfgProfile<'static>> {
     if advertised {
         Err(PeError::Invalid("missing CFG load-config fields"))
     } else {
-        Ok(None)
+        Ok(CfgProfile::None)
     }
 }
 
@@ -503,7 +644,11 @@ pub(super) mod tests {
     }
 
     fn parse(file: &[u8]) -> Result<Option<CfgMetadata<'_>>> {
-        CfgMetadata::parse(&Pe::parse(file).expect("synthetic PE header"))
+        match CfgProfile::parse(&Pe::parse(file).expect("synthetic PE header"))? {
+            CfgProfile::None => Ok(None),
+            CfgProfile::Guarded(cfg) => Ok(Some(cfg)),
+            CfgProfile::Dormant(_) => panic!("expected guarded or absent metadata"),
+        }
     }
 
     #[test]
