@@ -93,18 +93,22 @@ fn fspx<'a>(bytes: &'a [u8], xyz: [usize; 3], digest: &[u8]) -> Option<(Dispatch
         return None;
     }
     let code = &bytes[code];
-    // Check the observed prologue fingerprint without interpreting any instructions.
-    if [2, 14, 26]
-        .into_iter()
-        .any(|at| code[at..at + 2] != [0x80, 0xd5])
-        || code[..2] != digest[..2]
-        || code[12..14] != digest[8..10]
-        || code[8..12] != digest[4..8]
-        || code[20..24] != digest[12..16]
-    {
+    if !has_digest_prefix(code, digest) || code[26..28] != [0x80, 0xd5] {
         return None;
     }
     Some((state, resources))
+}
+
+// First two groups of the observed fingerprint; this is not an ISA entry rule.
+pub(crate) fn has_digest_prefix(code: &[u8], digest: &[u8]) -> bool {
+    code.len() >= 24
+        && digest.len() == 16
+        && code[2..4] == [0x80, 0xd5]
+        && code[14..16] == [0x80, 0xd5]
+        && code[..2] == digest[..2]
+        && code[12..14] == digest[8..10]
+        && code[8..12] == digest[4..8]
+        && code[20..24] == digest[12..16]
 }
 
 fn dxil_nominal(bytes: &[u8], plain_size: bool) -> Option<(usize, &[u8])> {

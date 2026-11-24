@@ -1,5 +1,6 @@
 //! Test the relation between tagged layout words and stored code, without patching it.
 use crate::{
+    embedded::has_digest_prefix,
     llvm::{Cpu, Llvm},
     span, word,
 };
@@ -58,6 +59,9 @@ pub fn run(lib: &OsStr, path: &Path) -> Result<(), Box<dyn Error>> {
     let mut text = [0; 1024];
     let mut class41_items = 0;
     let mut class41_shared_word1 = 0;
+    // Pair counts indexed by presence of nonzero sites, then by fingerprint shape.
+    let mut prefixes = [[0; 3]; 2];
+    let mut sites_in_first_36 = 0;
     for row in library.compute() {
         let leaf = ComputeMetadata::from_library(&library, row).ok_or("invalid compute leaf")?;
         let wave32 = leaf.dispatch.wave32;
@@ -72,6 +76,7 @@ pub fn run(lib: &OsStr, path: &Path) -> Result<(), Box<dyn Error>> {
         let code = library
             .program(row.program)
             .ok_or("missing compute program")?;
+        let mut has_sites = false;
         for item in layout[24..layout.len() - 32].chunks_exact(32) {
             let value = word(item, 4).unwrap();
             if word(item, 0).unwrap() == 0x41 {
@@ -85,12 +90,14 @@ pub fn run(lib: &OsStr, path: &Path) -> Result<(), Box<dyn Error>> {
                 continue;
             }
             nonzero += 1;
+            has_sites = true;
             site_programs.insert(row.program);
             site_pcs.insert((row.program, value));
             let Some((bytes, dwords)) = candidate(code, value) else {
                 continue;
             };
             in_pattern += 1;
+            sites_in_first_36 += usize::from(value < 36);
             let (index, expect) = if dwords == 4 {
                 (0, "s_load_dwordx4")
             } else {
@@ -105,6 +112,17 @@ pub fn run(lib: &OsStr, path: &Path) -> Result<(), Box<dyn Error>> {
                 }
             }
         }
+        let digest = &layout[layout.len() - 28..layout.len() - 12];
+        let shape = if has_digest_prefix(code, digest) {
+            if code.get(26..28) == Some(&[0x80, 0xd5]) {
+                2
+            } else {
+                1
+            }
+        } else {
+            0
+        };
+        prefixes[usize::from(has_sites)][shape] += 1;
     }
     println!(
         "Checked {} compute program/layout pairs across {} programs",
@@ -122,6 +140,13 @@ pub fn run(lib: &OsStr, path: &Path) -> Result<(), Box<dyn Error>> {
     println!(
         "Nonzero values selecting a dword-aligned in-span 8-byte SMEM pattern from stored-span start: {in_pattern}/{nonzero}"
     );
+    for (i, [no_match, two, three]) in prefixes.into_iter().enumerate() {
+        println!(
+            "Digest prefix (nonzero site present={}): {no_match} no match, {two} first two groups only, {three} plus third group marker",
+            i == 1
+        );
+    }
+    println!("Checked scalar-load patterns starting before byte 36: {sites_in_first_36}");
     println!(
         "LLVM {}.{}.{}; both references use the associated compute dispatch wave bit",
         llvm.version.0, llvm.version.1, llvm.version.2
