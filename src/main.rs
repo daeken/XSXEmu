@@ -6,6 +6,8 @@ mod pe;
 mod providers;
 mod startup;
 mod win_cfg;
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+mod win_cfg_runtime;
 
 use pe::{ExportTarget, ImportSymbol, Pe};
 use std::{

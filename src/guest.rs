@@ -143,6 +143,16 @@ mod platform {
         /// page. Uncovered pages are inaccessible. A page requiring both write and
         /// execute is rejected, even if the two requests came from distinct sections.
         pub fn seal(&mut self, regions: &[Region]) -> io::Result<()> {
+            self.seal_with_readonly(regions, &[])
+        }
+
+        /// Additionally require the specified ranges to remain read-only at
+        /// host-page granularity, even when PE sections share a host page.
+        pub fn seal_with_readonly(
+            &mut self,
+            regions: &[Region],
+            readonly: &[Range<usize>],
+        ) -> io::Result<()> {
             if !matches!(self.state, State::Loading) {
                 return Err(invalid(
                     "guest mapping cannot be sealed in its current state",
@@ -185,6 +195,19 @@ mod platform {
                             "guest layout requires a writable executable host page",
                         ));
                     }
+                }
+            }
+
+            for range in readonly {
+                if range.start >= range.end
+                    || range.end > self.image_len
+                    || perms[range.start / self.page_size..=(range.end - 1) / self.page_size]
+                        .iter()
+                        .any(|&prot| prot & (PROT_READ | PROT_WRITE) != PROT_READ)
+                {
+                    return Err(invalid(
+                        "immutable guest range is not on read-only host pages",
+                    ));
                 }
             }
 
@@ -328,6 +351,19 @@ mod platform {
             assert!(image.validate_target(0).is_err());
             assert!(image.seal(&[code, data]).is_err()); // page-granular W+X
             data.rva = data_rva;
+            let readonly_slot = Region {
+                rva: data_rva + 8,
+                len: 8,
+                read: true,
+                write: false,
+                execute: false,
+            };
+            let slot = readonly_slot.rva..readonly_slot.rva + readonly_slot.len;
+            assert!(
+                image
+                    .seal_with_readonly(&[code, data, readonly_slot], &[slot])
+                    .is_err()
+            );
             image.seal(&[code, data]).unwrap();
             assert!(image.bytes_mut().is_err());
             assert!(image.seal(&[code, data]).is_err());

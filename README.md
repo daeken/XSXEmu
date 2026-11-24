@@ -27,7 +27,9 @@ cargo run --offline -- audit /path/to/title.exe --dll-dir /path/to/x64-dlls \
 
 `--api-set` loads only the schema data (an ARM64 schema is fine). Lookups use exact contracts, respecting importer-specific aliases and then a default host. A desktop schema does not describe all Xbox contracts. `--rust-providers` enables the exact registered KernelBase/Kernel32 and ntdll APIs and selected legacy API-set aliases. Missing system APIs stay unresolved: this mode does not load on-disk replacements for these system providers. Diagnostics name the routed provider, if any; `--symbols` also shows the original module and symbol.
 
-A real Windows TEB, exception handling/unwind, GuardCF startup support, dynamic library loading, and Xbox graphics are still unimplemented. Don't substitute desktop D3D12 for `d3d12_xs.dll`: the Xbox device, memory and layout contracts need an explicit adapter.
+The bounded AMD64 GuardCF profile installs enforcing check and dispatch thunks before entry. Targets are limited to exact validated entries from guarded images and statically bound Rust functions; suppressed entries are denied. Other mitigation configurations can still be rejected.
+
+A Windows TEB, full exception dispatch, dynamic library loading, and Xbox graphics are still unimplemented. Static AMD64 unwind primitives are available but do not provide exception dispatch. Don't substitute desktop D3D12 for `d3d12_xs.dll`: the Xbox device, memory and layout contracts need an explicit adapter.
 
 ## Verification
 

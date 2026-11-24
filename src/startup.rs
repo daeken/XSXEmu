@@ -11,6 +11,8 @@ mod native {
         link::BindingTarget,
         pe::Pe,
         providers::{win_loader, win_proc, win_unwind},
+        win_cfg::CfgMetadata,
+        win_cfg_runtime::{SLOT_THUNKS, Targets},
     };
     use std::{fs::File, io::Read};
 
@@ -19,13 +21,7 @@ mod native {
     const MAX_MAPPED_TOTAL: usize = 1024 * 1024 * 1024;
     const AMD64_DEFAULT_COOKIE: u64 = 0x0000_2b99_2ddf_a232;
 
-    fn validate_profile(pe: &Pe<'_>, name: &str) -> Result<()> {
-        if pe.dll_characteristics & 0x4000 != 0 {
-            return Err(format!(
-                "{name}: Control Flow Guard is not supported by this startup profile"
-            )
-            .into());
-        }
+    fn validate_profile<'a>(pe: &Pe<'a>, name: &str) -> Result<Option<CfgMetadata<'a>>> {
         if pe.tls()?.is_some() {
             return Err(format!("{name}: static TLS requires a Windows TEB and is not supported by this startup profile").into());
         }
@@ -41,15 +37,17 @@ mod native {
                 return Err(format!("{name}: unsupported {label} directory").into());
             }
         }
-        if let Some(dir) = pe.directory(10) {
+        let cfg = CfgMetadata::parse(pe).map_err(|e| format!("{name}: {e}"))?;
+        if cfg.is_none()
+            && let Some(dir) = pe.directory(10)
+        {
             let raw = pe.rva_slice(dir.rva, dir.size as _)?;
-            // The bounded profile only handles the ordinary security cookie,
-            // not SEH/CFG tables, dynamic relocations, or hybrid architectures.
+            // For unguarded images, still reject unrelated extended fields.
             if raw.get(0x60..).is_some_and(|s| s.iter().any(|&x| x != 0)) {
                 return Err(format!("{name}: unsupported extended load-config fields").into());
             }
         }
-        Ok(())
+        Ok(cfg)
     }
 
     fn patch(mem: &mut GuestMemory, rva: u32, value: u64) -> Result<()> {
@@ -59,6 +57,21 @@ mod native {
             .get_mut(at..end)
             .ok_or("address patch outside image")?
             .copy_from_slice(&value.to_le_bytes());
+        Ok(())
+    }
+
+    fn guard_slots(cfg: &CfgMetadata<'_>) -> [u32; 2] {
+        [cfg.check_slot_rva(), cfg.dispatch_slot_rva()]
+    }
+
+    fn reject_slot_overlap(cfg: Option<&CfgMetadata<'_>>, rva: u32) -> Result<()> {
+        if cfg.is_some_and(|cfg| {
+            guard_slots(cfg)
+                .into_iter()
+                .any(|slot| slot.abs_diff(rva) < 8)
+        }) {
+            return Err("security cookie or IAT patch overlaps a CFG slot".into());
+        }
         Ok(())
     }
 
@@ -79,7 +92,7 @@ mod native {
         api_set: Option<&ApiSet>,
         rust_providers: bool,
     ) -> Result<u32> {
-        let pes = images
+        let (pes, cfgs): (Vec<_>, Vec<_>) = images
             .iter()
             .enumerate()
             .map(|(index, (name, bytes))| {
@@ -88,13 +101,16 @@ mod native {
                 if dll != (index != 0) {
                     return Err(format!("{name}: wrong image kind for startup").into());
                 }
-                validate_profile(&pe, name)?;
-                Ok(pe)
+                let cfg = validate_profile(&pe, name)?;
+                Ok((pe, cfg))
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .unzip();
+        let mut targets = cfgs.iter().any(Option::is_some).then(Targets::default);
         let mut total = 0usize;
         let mut memories = Vec::new();
-        for pe in &pes {
+        for (pe, cfg) in pes.iter().zip(&cfgs) {
             let len = pe.size_of_image as usize;
             total = total.checked_add(len).ok_or("total image space overflow")?;
             if len > MAX_IMAGE || total > MAX_MAPPED_TOTAL {
@@ -103,24 +119,32 @@ mod native {
             let mut mem = GuestMemory::allocate(len, Some(pe.image_base))?;
             pe.materialize_into(mem.base(), mem.bytes_mut()?)?;
             if let Some(rva) = pe.security_cookie_rva()? {
+                reject_slot_overlap(cfg.as_ref(), rva)?;
                 patch(&mut mem, rva, new_cookie()?)?;
             }
             memories.push(mem);
         }
         for &(importer, iat, target) in bindings {
+            reject_slot_overlap(cfgs[importer].as_ref(), iat)?;
             let addr = match target {
                 BindingTarget::Pe(export) => memories[export.module]
                     .base()
                     .checked_add(u64::from(export.export_rva))
                     .ok_or("export address overflow")?,
-                BindingTarget::Rust(export) => export
-                    .address()
-                    .ok_or("Rust provider has no executable address on this host")?
-                    as u64,
+                BindingTarget::Rust(export) => {
+                    let addr = export
+                        .address()
+                        .ok_or("Rust provider has no executable address on this host")?
+                        as u64;
+                    if let Some(targets) = &mut targets {
+                        targets.add_provider(addr)?;
+                    }
+                    addr
+                }
             };
             patch(&mut memories[importer], iat, addr)?;
         }
-        for (pe, mem) in pes.iter().zip(&mut memories) {
+        for ((pe, mem), cfg) in pes.iter().zip(&mut memories).zip(&cfgs) {
             let mut regions = vec![Region {
                 rva: 0,
                 len: pe.size_of_headers as usize,
@@ -140,7 +164,21 @@ mod native {
                     });
                 }
             }
-            mem.seal(&regions)?;
+            if let Some(cfg) = cfg {
+                let slots = guard_slots(cfg);
+                // Overwrite both slots after relocation and IAT fixes. The
+                // original pointer contents never select or seed the policy.
+                for (rva, thunk) in slots.into_iter().zip(SLOT_THUNKS) {
+                    patch(mem, rva, thunk as usize as u64)?;
+                }
+                mem.seal_with_readonly(&regions, &slots.map(|rva| rva as usize..rva as usize + 8))?;
+                targets
+                    .as_mut()
+                    .expect("CFG policy for guarded image")
+                    .add_image(mem.base(), cfg)?;
+            } else {
+                mem.seal(&regions)?;
+            }
             if pe.entry_rva != 0 {
                 mem.validate_target(pe.entry_rva as usize)?;
             }
@@ -188,6 +226,9 @@ mod native {
         if rust_providers {
             win_proc::init_process(images[0].0)?;
         }
+        // Keep the sealed policy active through DLL detach, and withdraw it
+        // before any of the tracked image mappings are released.
+        let _cfg_registration = targets.map(Targets::install).transpose()?;
         let mut attached: Vec<usize> = Vec::new();
         let mut outcome = Ok(0);
         for &i in attach_order {

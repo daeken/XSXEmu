@@ -51,6 +51,12 @@ pub struct GuardFunction {
     pub export_suppressed: bool,
 }
 
+impl GuardFunction {
+    pub fn permitted(self, policy: ExportSuppression) -> bool {
+        !(self.fid_suppressed || (self.export_suppressed && policy == ExportSuppression::Enabled))
+    }
+}
+
 /// A validated, strictly RVA-sorted GFID table borrowing the on-disk image.
 #[derive(Debug)]
 pub struct CfgMetadata<'a> {
@@ -237,10 +243,8 @@ impl<'a> CfgMetadata<'a> {
     /// process initially denies export-suppressed entries; this parser does not
     /// track subsequent explicit export resolutions or other target registries.
     pub fn permits_rva(&self, rva: u32, export_suppression: ExportSuppression) -> bool {
-        self.entry_for_rva(rva).is_some_and(|entry| {
-            !(entry.fid_suppressed
-                || (entry.export_suppressed && export_suppression == ExportSuppression::Enabled))
-        })
+        self.entry_for_rva(rva)
+            .is_some_and(|entry| entry.permitted(export_suppression))
     }
 }
 
@@ -321,7 +325,7 @@ fn slot_range(pe: &Pe<'_>, rva: u32) -> Result<Range<u32>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     const NT: usize = 0x80;
@@ -397,6 +401,49 @@ mod tests {
             if extra != 0 && (bits & EXPORT_SUPPRESSED == 0 || info & ES != 0) {
                 file[off + 4] = bits;
             }
+        }
+        file
+    }
+
+    /// Original freestanding test PE. Both slot defaults would allow any
+    /// callable target; none of the negative cases rely on an invalid address.
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    pub(crate) fn executable_fixture(dispatch: bool, target: u32, extra_flags: u32) -> Vec<u8> {
+        let mut file = fixture(1, ES | extra_flags);
+        const ENTRY: u32 = 0x1080;
+        put16(&mut file, NT + 22, 0x0002); // EXE
+        put32(&mut file, OPT + 16, ENTRY);
+        put64(&mut file, LC + 0x110, BASE + 0x1050);
+        put64(&mut file, LC + 0x118, BASE + 0x1058);
+        file[0x450] = 0xc3; // check placeholder: ret
+        file[0x458..0x45a].copy_from_slice(&[0xff, 0xe0]); // dispatch placeholder: jmp rax
+        for rva in [0x1003, 0x1009, 0x1011, 0x1017] {
+            let offset = 0x400 + rva - 0x1000;
+            file[offset..offset + 6].copy_from_slice(&[0xb8, 42, 0, 0, 0, 0xc3]); // return 42
+        }
+        let mut code = vec![0x48, 0x83, 0xec, 0x28]; // sub rsp, 40 (align and reserve home area)
+        // lea rax/rcx, [rip + target]; call [rip + dispatch/check slot]
+        code.extend([0x48, 0x8d, if dispatch { 0x05 } else { 0x0d }]);
+        code.extend((target as i32 - (ENTRY as i32 + 11)).to_le_bytes());
+        code.extend([0xff, 0x15]);
+        let slot = if dispatch { 0x2118_i32 } else { 0x2110 };
+        code.extend((slot - (ENTRY as i32 + 17)).to_le_bytes());
+        if !dispatch {
+            code.extend([0xff, 0xd1]); // call rcx
+        }
+        code.extend([0x48, 0x83, 0xc4, 0x28, 0xc3]); // add rsp, 40; ret
+        file[0x480..0x480 + code.len()].copy_from_slice(&code);
+
+        // Allow ASLR and make the placeholders valid even if the image rebases.
+        put32(&mut file, OPT + 112 + 5 * 8, 0x2300);
+        put32(&mut file, OPT + 112 + 5 * 8 + 4, 20);
+        put32(&mut file, LC + 0x300, 0x2000);
+        put32(&mut file, LC + 0x304, 20);
+        for (i, offset) in [0xa070, 0xa078, 0xa080, 0xa110, 0xa118, 0]
+            .into_iter()
+            .enumerate()
+        {
+            put16(&mut file, LC + 0x308 + i * 2, offset);
         }
         file
     }
