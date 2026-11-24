@@ -96,7 +96,7 @@ mod native {
         pe::Pe,
         providers::{win_fls, win_loader, win_proc, win_unwind},
         win_cfg::{CfgProfile, DORMANT_CALLABLE},
-        win_cfg_runtime::{SLOT_THUNKS, Targets},
+        win_cfg_runtime::{SLOT_THUNKS, Targets, UNCHECKED_SLOT_THUNKS},
     };
     use std::{fs::File, io::Read};
 
@@ -272,6 +272,7 @@ mod native {
             api_set,
             rust_providers,
             Profile::Standard,
+            false,
         )
     }
 
@@ -282,8 +283,19 @@ mod native {
         attach_order: &[usize],
         rust_providers: bool,
         profile: Profile,
+        no_guest_cfg: bool,
     ) -> Result<u32> {
         assert!(profile.uses_static_tls());
+        if no_guest_cfg {
+            if !matches!(profile, Profile::TrustedOfflineTlsChild) {
+                return Err(
+                    "disabling guest CFG requires the trusted offline static TLS child".into(),
+                );
+            }
+            eprintln!(
+                "xsxemu: WARNING: guest CFG enforcement is disabled (--no-guest-cfg); trusted input only"
+            );
+        }
         run_impl(
             images,
             bindings,
@@ -292,6 +304,7 @@ mod native {
             None,
             rust_providers,
             profile,
+            no_guest_cfg,
         )
     }
 
@@ -303,9 +316,15 @@ mod native {
         api_set: Option<&ApiSet>,
         rust_providers: bool,
         profile: Profile,
+        no_guest_cfg: bool,
     ) -> Result<u32> {
         use crate::tls_runtime;
         let static_tls = profile.uses_static_tls();
+        let slot_thunks = if no_guest_cfg {
+            UNCHECKED_SLOT_THUNKS
+        } else {
+            SLOT_THUNKS
+        };
         let (pes, cfgs): (Vec<_>, Vec<_>) = images
             .iter()
             .enumerate()
@@ -329,10 +348,9 @@ mod native {
             validate_address_taken_iat(images, &cfgs, bindings)?;
         }
         validate_trap_slots(&pes, bindings, missing)?;
-        let mut targets = cfgs
-            .iter()
-            .any(|cfg| matches!(cfg, CfgProfile::Guarded(_)))
-            .then(Targets::default);
+        let mut targets = (!no_guest_cfg
+            && cfgs.iter().any(|cfg| matches!(cfg, CfgProfile::Guarded(_))))
+        .then(Targets::default);
         let mut total = 0usize;
         let mut memories = Vec::new();
         for (pe, cfg) in pes.iter().zip(&cfgs) {
@@ -424,7 +442,7 @@ mod native {
                     let slots = cfg.slots();
                     // Overwrite after relocation and IAT fixes. The original
                     // pointer contents never select or seed the policy.
-                    for (rva, thunk) in slots.into_iter().zip(SLOT_THUNKS) {
+                    for (rva, thunk) in slots.into_iter().zip(slot_thunks) {
                         patch(mem, rva, thunk as usize as u64)?;
                     }
                     let mut readonly = slots.map(slot_range).to_vec();
@@ -442,20 +460,20 @@ mod native {
                         readonly.push(slot_range(rva));
                     }
                     mem.seal_with_readonly(&regions, &readonly)?;
-                    targets
-                        .as_mut()
-                        .expect("CFG policy for guarded image")
-                        .add_image(mem.base(), cfg)?;
+                    if let Some(targets) = &mut targets {
+                        targets.add_image(mem.base(), cfg)?;
+                    }
                 }
                 CfgProfile::Dormant(cfg) => {
                     let slots = cfg.slots();
-                    // Never run either a no-op check or a nonenforcing dispatch.
-                    // Their original stub addresses never seed mixed-image CFG.
-                    for (&rva, trap) in slots[..DORMANT_CALLABLE]
-                        .iter()
-                        .zip(tls_runtime::dormant_guard_entries())
-                    {
-                        patch(mem, rva, trap)?;
+                    // Never use the image's original linker stubs. The explicit
+                    // opt-out replaces only ordinary check and dispatch, not XFG.
+                    let mut entries = tls_runtime::dormant_guard_entries();
+                    if no_guest_cfg {
+                        entries[..2].copy_from_slice(&slot_thunks.map(|f| f as usize as u64));
+                    }
+                    for (&rva, thunk) in slots[..DORMANT_CALLABLE].iter().zip(entries) {
+                        patch(mem, rva, thunk)?;
                     }
                     let mut readonly = cfg.readonly_ranges();
                     readonly.extend(memcpy.map(slot_range));

@@ -994,6 +994,92 @@ fn instrumented_volatile_rows_reject_duplicates_and_overlaps() {
 }
 
 #[test]
+fn no_guest_cfg_requires_both_trusted_offline_and_static_tls() {
+    let path = Path::new("unused-owned-fixture.exe");
+    for flags in [
+        &["--no-guest-cfg"][..],
+        &[OPT, "--no-guest-cfg"],
+        &[TRUSTED, "--no-guest-cfg"],
+    ] {
+        expect(
+            run(path, flags),
+            1,
+            "--no-guest-cfg requires --trusted-offline and --experimental-static-tls",
+        );
+    }
+    expect(
+        Command::new(env!("CARGO_BIN_EXE_xsxemu"))
+            .args(["audit", "unused-owned-fixture.exe", "--no-guest-cfg"])
+            .output()
+            .unwrap(),
+        1,
+        "unexpected option \"--no-guest-cfg\"",
+    );
+}
+
+#[test]
+fn no_guest_cfg_is_opt_in_for_guarded_and_dormant_slots() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let opts = [OPT, TRUSTED, "--no-guest-cfg"];
+    for active in [false, true] {
+        let mut original = memcpy_slot_image(active);
+        // The synthetic entry below does not update the normal fixture's
+        // lifecycle phase. Make its TLS callback a leaf return on both calls.
+        let callback = unsafe { static_tls_fixture.solo_cb } as usize;
+        original[file(TEXT + callback)] = 0xc3;
+        let mut b = original.clone();
+        dormant_call(&mut b, DISPATCH);
+        // Return the dispatched target's EAX; don't fall through to the
+        // target if a broken dispatch thunk simply returns.
+        b[file(TEXT + 0x900) + 21] = 0xc3;
+        let exe = scratch.write("opt-out.exe", &b);
+        if active {
+            expect(
+                run(&exe, &[OPT, TRUSTED]),
+                1,
+                "child terminated by signal 4",
+            );
+        } else {
+            expect(
+                run(&exe, &[OPT, TRUSTED]),
+                86,
+                "called dormant linker guard slot: CFG dispatch",
+            );
+        }
+        let output = run(&exe, &opts);
+        assert!(String::from_utf8_lossy(&output.stderr).contains(
+            "WARNING: guest CFG enforcement is disabled (--no-guest-cfg); trusted input only"
+        ));
+        expect(output, 101, "Guest entry returned 101");
+        for (slot, status, diagnostic) in [
+            (CHECK, 101, "Guest entry returned 101"),
+            (
+                CHECK + 0x18,
+                86,
+                "called dormant linker guard slot: XFG dispatch",
+            ),
+            (
+                MEMCPY_SLOT,
+                86,
+                "GuardMemcpy (unsupported; copy not performed)",
+            ),
+        ] {
+            let mut b = original.clone();
+            dormant_call(&mut b, slot);
+            scratch.write("opt-out.exe", &b);
+            expect(run(&exe, &opts), status, diagnostic);
+        }
+        let mut b = original;
+        w64(&mut b, file(LOAD) + 0x138, PREFERRED + CHECK);
+        scratch.write("opt-out.exe", &b);
+        expect(run(&exe, &opts), 1, "overlapping GuardMemcpy");
+    }
+}
+
+#[test]
 fn companion_slots_trap_without_widening_active_cfg() {
     if !rosetta() {
         return;
@@ -1719,6 +1805,14 @@ fn mapped_sync_facade_exports_must_already_be_callable_cfg_entries() {
     w32(&mut dll, file(GFIDS), wake);
     scratch.write(DLL, &dll);
     expect(run(&exe_path, &flags), 47, "Guest entry returned 47");
+    expect(
+        run(
+            &exe_path,
+            &[OPT, TRUSTED, "--rust-providers", "--no-guest-cfg"],
+        ),
+        47,
+        "Guest entry returned 47",
+    );
     // A data export also cannot escape through the child look-up adapter.
     w32(&mut dll, file(LINK) + 0x30, MODE);
     scratch.write(DLL, &dll);

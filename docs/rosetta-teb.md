@@ -418,6 +418,14 @@ and never runs the original linker stubs. The tests
 use only original PEs and exercise all five calls, rebasing, near-miss metadata
 and the existing guarded enforcement fixtures. The title was inspected only.
 
+For trusted input only, `run … --experimental-static-tls --trusted-offline
+--no-guest-cfg` disables guest CFG enforcement and prints a warning. Validated
+ordinary check and dispatch slots in mapped images, including dormant slots,
+are wired to Win64 `ret` and `jmp rax` thunks. The opt-out does not build an
+exact target registry or run the image's original linker stubs. It does not
+relax image or slot validation, change `GetProcAddress` admission, or enable
+XFG or GuardMemcpy. Omit the flag to keep the behavior described above.
+
 ## Active CFG with optional EHCONT and volatile metadata
 
 A guarded AMD64 image can additionally carry bounded EH continuation and

@@ -42,6 +42,7 @@ const USAGE: &str = "Usage: xsxemu <inspect|map|audit|run> <image.exe> [options]
     run option: --trace-missing-imports  Treat missing static imports as callable and stop on first call (not data imports)\n\
     run option: --experimental-static-tls  Trusted PE-only startup in a disposable Rosetta child\n\
     run option: --trusted-offline  Ignore opaque CodeIntegrity and volatile hints (requires --experimental-static-tls)\n\
+    run option: --no-guest-cfg  Disable guest CFG enforcement (trusted-offline static TLS only)\n\
     run option: --map-extra-dll PATH  Map an extra PE DLL (trusted-offline static TLS only)\n\
     audit/run options: --api-set SCHEMA.dll, --rust-providers";
 
@@ -78,6 +79,7 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
     let mut trace_missing_imports = false;
     let mut experimental_tls = false;
     let mut trusted_offline = false;
+    let mut no_guest_cfg = false;
     let mut map_extra_dll = None;
     let mut startup_profile = None;
     let mut options = args.iter();
@@ -112,6 +114,7 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
             ("run", Some("--trace-missing-imports")) => trace_missing_imports = true,
             ("run", Some("--experimental-static-tls")) => experimental_tls = true,
             ("run", Some("--trusted-offline")) => trusted_offline = true,
+            ("run", Some("--no-guest-cfg")) => no_guest_cfg = true,
             ("run", Some("--map-extra-dll")) if map_extra_dll.is_none() => {
                 map_extra_dll = Some(PathBuf::from(
                     options.next().ok_or("--map-extra-dll requires a path")?,
@@ -128,6 +131,11 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
     if map_extra_dll.is_some() && !(trusted_offline && experimental_tls) {
         return Err(
             "--map-extra-dll requires --trusted-offline and --experimental-static-tls".into(),
+        );
+    }
+    if no_guest_cfg && !(trusted_offline && experimental_tls) {
+        return Err(
+            "--no-guest-cfg requires --trusted-offline and --experimental-static-tls".into(),
         );
     }
     if trusted_offline && !experimental_tls {
@@ -189,6 +197,7 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
                 } else {
                     startup_profile
                 },
+                no_guest_cfg,
             );
         }
         _ => return Err(USAGE.into()),
@@ -410,6 +419,7 @@ fn resolve(
     symbols: bool,
     options: link::Options<'_>,
     startup_profile: Option<startup::Profile>,
+    _no_guest_cfg: bool,
 ) -> Result<ExitCode> {
     use std::collections::BTreeMap;
     let trace = launch && options.trace_missing_imports;
@@ -535,6 +545,7 @@ fn resolve(
                 &order,
                 startup_options.1,
                 profile,
+                _no_guest_cfg,
             )?
         } else {
             startup::run(

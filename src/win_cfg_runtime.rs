@@ -240,6 +240,21 @@ unsafe extern "win64" fn dispatch() {
 
 pub const SLOT_THUNKS: [unsafe extern "win64" fn(); 2] = [check, dispatch];
 
+// Explicit diagnostic opt-out only. Preserve the original Win64 call frame
+// and arguments; these thunks never touch GS or call into the host.
+#[unsafe(naked)]
+unsafe extern "win64" fn unchecked_check() {
+    naked_asm!("ret");
+}
+
+#[unsafe(naked)]
+unsafe extern "win64" fn unchecked_dispatch() {
+    naked_asm!("jmp rax");
+}
+
+pub const UNCHECKED_SLOT_THUNKS: [unsafe extern "win64" fn(); 2] =
+    [unchecked_check, unchecked_dispatch];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,6 +300,7 @@ mod tests {
                     &[1],
                     false,
                     profile,
+                    false,
                 )
                 .unwrap(),
                 42
