@@ -68,3 +68,33 @@ if "$emu" run "$tmp/tls.exe" > "$tmp/tls.out" 2>&1; then
     exit 1
 fi
 grep -F 'static TLS requires a Windows TEB' "$tmp/tls.out"
+
+cat > "$tmp/host.def" <<'EOF'
+LIBRARY api-ms-win-core-errorhandling-l1-1-0.dll
+EXPORTS
+GetLastError
+SetLastError
+EOF
+cat > "$tmp/host.c" <<'EOF'
+__declspec(dllimport) unsigned GetLastError(void);
+__declspec(dllimport) void SetLastError(unsigned);
+int app_entry(void) {
+    if (GetLastError() != 0) return 1;
+    SetLastError(0x12345678);
+    return GetLastError() == 0x12345678 ? 43 : 2;
+}
+EOF
+# The import library makes the PE name its dependency; the DLL is never built or installed.
+dlltool=${PE_DLLTOOL:-$(dirname "$(command -v "$cc")")/llvm-dlltool}
+"$dlltool" -m i386:x86-64 -d "$tmp/host.def" -l "$tmp/libhost.a"
+"$cc" -O2 -nostdlib -Wl,--entry,app_entry "$tmp/host.c" "$tmp/libhost.a" -o "$tmp/host.exe"
+"$emu" audit "$tmp/host.exe" --rust-providers | grep -F '2/2 IAT slots resolved (2 Rust)'
+set +e
+"$emu" run "$tmp/host.exe" --rust-providers
+status=$?
+set -e
+if [ "$status" -ne 43 ]; then
+    echo "guest should round-trip last error through Rust and return 43; got exit status $status" >&2
+    exit 1
+fi
+echo 'Win64 guest called the Rust last-error provider through its API-set contract.'

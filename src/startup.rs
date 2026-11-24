@@ -7,6 +7,7 @@ mod native {
     use crate::{
         MAX_IMAGE, Result,
         guest::{GuestMemory, Region},
+        link::BindingTarget,
         pe::Pe,
     };
     use std::{fs::File, io::Read};
@@ -71,7 +72,7 @@ mod native {
 
     pub fn run(
         images: &[(&str, &[u8])],
-        bindings: &[(usize, u32, usize, u32)],
+        bindings: &[(usize, u32, BindingTarget)],
         attach_order: &[usize],
     ) -> Result<u32> {
         let pes = images
@@ -102,11 +103,17 @@ mod native {
             }
             memories.push(mem);
         }
-        for &(importer, iat, provider, rva) in bindings {
-            let addr = memories[provider]
-                .base()
-                .checked_add(u64::from(rva))
-                .ok_or("export address overflow")?;
+        for &(importer, iat, target) in bindings {
+            let addr = match target {
+                BindingTarget::Pe(export) => memories[export.module]
+                    .base()
+                    .checked_add(u64::from(export.export_rva))
+                    .ok_or("export address overflow")?,
+                BindingTarget::Rust(export) => export
+                    .address()
+                    .ok_or("Rust provider has no executable address on this host")?
+                    as u64,
+            };
             patch(&mut memories[importer], iat, addr)?;
         }
         for (pe, mem) in pes.iter().zip(&mut memories) {

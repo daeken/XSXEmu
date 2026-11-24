@@ -7,6 +7,10 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::pe::{ExportTarget, ImportSymbol, Pe};
+use crate::{
+    apiset::ApiSet,
+    providers::{self, HostExport},
+};
 
 const MAX_GRAPH_IMAGES: usize = 256;
 const MAX_GRAPH_FILE_BYTES: usize = 1024 * 1024 * 1024;
@@ -54,7 +58,13 @@ pub struct IatBinding {
     /// Original DLL and symbol in the import descriptor; the outcome may name a later DLL.
     pub dll: Vec<u8>,
     pub symbol: Symbol,
-    pub target: Result<ResolvedExport, Unresolved>,
+    pub target: Result<BindingTarget, Unresolved>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BindingTarget {
+    Pe(ResolvedExport),
+    Rust(HostExport),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -369,7 +379,14 @@ fn forwarder(value: &[u8]) -> Option<(Vec<u8>, Symbol)> {
     Some((dll, symbol))
 }
 
-struct Builder {
+#[derive(Default)]
+pub struct Options<'a> {
+    pub api_set: Option<&'a ApiSet>,
+    pub rust_providers: bool,
+}
+
+struct Builder<'a> {
+    options: Options<'a>,
     plan: LinkPlan,
     tables: Vec<Tables>,
     catalog: HashMap<Vec<u8>, PathBuf>,
@@ -378,7 +395,89 @@ struct Builder {
     remaining_bytes: usize,
 }
 
-impl Builder {
+impl Builder<'_> {
+    fn route(&self, importer: usize, dll: &[u8]) -> Vec<u8> {
+        // Exact schema lookup; no prefix guessing. Keep original spelling for
+        // diagnostics when this attempt did not actually reroute the import.
+        self.options
+            .api_set
+            .and_then(|schema| schema.resolve(dll, &self.plan.modules[importer].name))
+            .unwrap_or(dll)
+            .to_vec()
+    }
+
+    fn rust_export(&self, dll: &[u8], symbol: &Symbol) -> Option<HostExport> {
+        if self.options.rust_providers
+            && let Symbol::Name(name) = symbol
+        {
+            return providers::lookup(&dll.to_ascii_lowercase(), name);
+        }
+        None
+    }
+
+    fn system_provider(&self, dll: &[u8]) -> bool {
+        self.options.rust_providers && providers::has_dll(&dll.to_ascii_lowercase())
+    }
+
+    fn resolve_provider(
+        &mut self,
+        importer: usize,
+        dll: &[u8],
+        symbol: &Symbol,
+    ) -> Result<BindingTarget, Unresolved> {
+        let mut from = importer;
+        let mut dll = dll.to_vec();
+        let mut symbol = symbol.clone();
+        let mut seen = HashSet::new();
+        loop {
+            if has_separator(&dll) {
+                return Err(Unresolved::InvalidModuleName { dll });
+            }
+            if let Some(host) = self.rust_export(&dll, &symbol) {
+                return Ok(BindingTarget::Rust(host));
+            }
+            let routed = self.route(from, &dll);
+            if let Some(host) = self.rust_export(&routed, &symbol) {
+                return Ok(BindingTarget::Rust(host));
+            }
+            if self.system_provider(&routed) || self.system_provider(&dll) {
+                return Err(Unresolved::MissingSymbol {
+                    dll: routed,
+                    symbol,
+                });
+            }
+            let module = self.provider(&routed)?;
+            self.edge(from, module);
+            if !seen.insert((module, symbol.clone())) {
+                return Err(Unresolved::ForwarderCycle {
+                    dll: routed,
+                    symbol,
+                });
+            }
+            match self.tables[module].exports.get(&symbol) {
+                Some(Target::Rva(export_rva)) => {
+                    return Ok(BindingTarget::Pe(ResolvedExport {
+                        module,
+                        export_rva: *export_rva,
+                    }));
+                }
+                Some(Target::Forwarder(value)) => {
+                    (dll, symbol) =
+                        forwarder(value).ok_or_else(|| Unresolved::InvalidForwarder {
+                            value: value.clone(),
+                        })?;
+                    from = module;
+                }
+                None => {
+                    return Err(Unresolved::MissingSymbol {
+                        dll: routed,
+                        symbol,
+                    });
+                }
+            }
+        }
+    }
+
     fn provider(&mut self, dll: &[u8]) -> Result<usize, Unresolved> {
         if has_separator(dll) {
             return Err(Unresolved::InvalidModuleName { dll: dll.to_vec() });
@@ -424,70 +523,25 @@ impl Builder {
         }
     }
 
-    fn resolve(
-        &mut self,
-        mut module: usize,
-        origin_dll: &[u8],
-        symbol: &Symbol,
-    ) -> Result<ResolvedExport, Unresolved> {
-        let mut symbol = symbol.clone();
-        let mut forwarded_dll: Option<Vec<u8>> = None;
-        let mut seen = HashSet::new();
-        loop {
-            let dll = forwarded_dll.as_deref().unwrap_or(origin_dll);
-            if !seen.insert((module, symbol.clone())) {
-                return Err(Unresolved::ForwarderCycle {
-                    dll: dll.to_vec(),
-                    symbol,
-                });
-            }
-            match self.tables[module].exports.get(&symbol) {
-                Some(Target::Rva(export_rva)) => {
-                    return Ok(ResolvedExport {
-                        module,
-                        export_rva: *export_rva,
-                    });
-                }
-                Some(Target::Forwarder(value)) => {
-                    let (next_dll, next_symbol) =
-                        forwarder(value).ok_or_else(|| Unresolved::InvalidForwarder {
-                            value: value.clone(),
-                        })?;
-                    let next = self.provider(&next_dll)?;
-                    self.edge(module, next);
-                    module = next;
-                    forwarded_dll = Some(next_dll);
-                    symbol = next_symbol;
-                }
-                None => {
-                    return Err(Unresolved::MissingSymbol {
-                        dll: dll.to_vec(),
-                        symbol,
-                    });
-                }
-            }
-        }
-    }
-
     fn close(mut self) -> LinkPlan {
         // Loading only inserts a work item. This loop visits each module once even if imports
         // form cycles; a forwarder also queues its provider's imports for the census.
         let mut index = 0;
         while index < self.plan.modules.len() {
             for group in std::mem::take(&mut self.tables[index].imports) {
-                let provider = self.provider(&group.dll);
-                match &provider {
-                    Ok(provider) => self.edge(index, *provider),
-                    Err(error) if group.entries.is_empty() => self.plan.modules[index]
-                        .unresolved_dependencies
-                        .push(error.clone()),
-                    _ => {}
+                if group.entries.is_empty() {
+                    let dll = self.route(index, &group.dll);
+                    if !self.system_provider(&dll) {
+                        match self.provider(&dll) {
+                            Ok(provider) => self.edge(index, provider),
+                            Err(error) => {
+                                self.plan.modules[index].unresolved_dependencies.push(error)
+                            }
+                        }
+                    }
                 }
                 for (iat_rva, symbol) in group.entries {
-                    let target = match &provider {
-                        Ok(provider) => self.resolve(*provider, &group.dll, &symbol),
-                        Err(error) => Err(error.clone()),
-                    };
+                    let target = self.resolve_provider(index, &group.dll, &symbol);
                     self.plan.modules[index].iat.push(IatBinding {
                         iat_rva,
                         dll: group.dll.clone(),
@@ -506,13 +560,45 @@ impl Builder {
 /// Directory searches are nonrecursive. The first matching basename wins even if it is invalid.
 /// Import DLL names must be basenames. The graph is limited to 256 images and 1 GiB of
 /// file bytes. Missing or rejected providers and missing symbols are reported in the plan.
+#[cfg(test)]
 pub fn build_plan(exe: &Path, dll_dirs: &[PathBuf]) -> Result<LinkPlan, LinkError> {
     build_with_limits(exe, dll_dirs, MAX_GRAPH_IMAGES, MAX_GRAPH_FILE_BYTES)
 }
 
+pub fn build_configured(
+    exe: &Path,
+    dll_dirs: &[PathBuf],
+    options: Options<'_>,
+) -> Result<LinkPlan, LinkError> {
+    build(
+        exe,
+        dll_dirs,
+        options,
+        MAX_GRAPH_IMAGES,
+        MAX_GRAPH_FILE_BYTES,
+    )
+}
+
+#[cfg(test)]
 fn build_with_limits(
     exe: &Path,
     dll_dirs: &[PathBuf],
+    max_images: usize,
+    remaining_bytes: usize,
+) -> Result<LinkPlan, LinkError> {
+    build(
+        exe,
+        dll_dirs,
+        Options::default(),
+        max_images,
+        remaining_bytes,
+    )
+}
+
+fn build(
+    exe: &Path,
+    dll_dirs: &[PathBuf],
+    options: Options<'_>,
     max_images: usize,
     mut remaining_bytes: usize,
 ) -> Result<LinkPlan, LinkError> {
@@ -528,6 +614,7 @@ fn build_with_limits(
             .chain(std::iter::once(sibling.to_owned())),
     )?;
     Ok(Builder {
+        options,
         plan: LinkPlan {
             modules: vec![root],
         },
@@ -731,10 +818,10 @@ mod tests {
         for binding in [0, 1, 3] {
             assert_eq!(
                 modules[0].iat[binding].target,
-                Ok(ResolvedExport {
+                Ok(BindingTarget::Pe(ResolvedExport {
                     module: 3,
                     export_rva: ENTRY_RVA
-                })
+                }))
             );
         }
         assert!(matches!(

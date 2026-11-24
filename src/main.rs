@@ -1,7 +1,9 @@
+mod apiset;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 mod guest;
 mod link;
 mod pe;
+mod providers;
 mod startup;
 
 use pe::{ExportTarget, ImportSymbol, Pe};
@@ -19,7 +21,8 @@ const USAGE: &str = "Usage: xsxemu <inspect|map|audit|run> <image.exe> [options]
     inspect [--symbols]     List headers, imports, exports and startup metadata\n\
     map [--base ADDRESS]   Materialize a non-executable image and apply relocations\n\
     audit [--dll-dir DIR] [--symbols]  Resolve the static import graph without executing\n\
-    run [--dll-dir DIR]    Start a trusted, fully linked image (x86-64 macOS/Rosetta only; not sandboxed)";
+    run [--dll-dir DIR]    Start a trusted, fully linked image (x86-64 macOS/Rosetta only; not sandboxed)\n\
+    audit/run options: --api-set SCHEMA.dll, --rust-providers";
 
 fn main() -> ExitCode {
     match cli() {
@@ -43,12 +46,22 @@ fn cli() -> Result<ExitCode> {
     let mut roots = Vec::new();
     let mut symbols = false;
     let mut base = None;
+    let mut schema = None;
+    let mut rust_providers = false;
     while let Some(arg) = args.next() {
         match (command, arg.to_str()) {
             ("inspect" | "audit", Some("--symbols")) => symbols = true,
             ("audit" | "run", Some("--dll-dir")) => roots.push(PathBuf::from(
                 args.next().ok_or("--dll-dir requires a path")?,
             )),
+            ("audit" | "run", Some("--api-set")) if schema.is_none() => {
+                let path = PathBuf::from(args.next().ok_or("--api-set requires a path")?);
+                schema = Some(
+                    apiset::ApiSet::parse(&read_image(&path)?)
+                        .map_err(|e| format!("{}: {e}", path.display()))?,
+                );
+            }
+            ("audit" | "run", Some("--rust-providers")) => rust_providers = true,
             ("map", Some("--base")) if base.is_none() => {
                 base = Some(parse_base(
                     &args.next().ok_or("--base requires an address")?,
@@ -60,7 +73,18 @@ fn cli() -> Result<ExitCode> {
     match command {
         "inspect" => inspect(&image, symbols)?,
         "map" => map(&image, base)?,
-        "audit" | "run" => return resolve(&image, &roots, command == "run", symbols),
+        "audit" | "run" => {
+            return resolve(
+                &image,
+                &roots,
+                command == "run",
+                symbols,
+                link::Options {
+                    api_set: schema.as_ref(),
+                    rust_providers,
+                },
+            );
+        }
         _ => return Err(USAGE.into()),
     }
     Ok(ExitCode::SUCCESS)
@@ -196,13 +220,15 @@ fn map(path: &Path, requested_base: Option<u64>) -> Result<()> {
     Ok(())
 }
 
-fn resolve(image: &Path, roots: &[PathBuf], launch: bool, symbols: bool) -> Result<ExitCode> {
+fn resolve(
+    image: &Path,
+    roots: &[PathBuf],
+    launch: bool,
+    symbols: bool,
+    options: link::Options<'_>,
+) -> Result<ExitCode> {
     use std::collections::BTreeMap;
-    let plan = link::build_plan(image, roots)?;
-    let root_pe = Pe::parse(&plan.modules[0].image)?;
-    if root_pe.characteristics & 0x2000 != 0 {
-        return Err("expected an executable, not a DLL".into());
-    }
+    let plan = link::build_configured(image, roots, options)?;
     for module in &plan.modules {
         println!(
             "  {} ({} IAT slots)",
@@ -211,6 +237,12 @@ fn resolve(image: &Path, roots: &[PathBuf], launch: bool, symbols: bool) -> Resu
         );
     }
     let total: usize = plan.modules.iter().map(|m| m.iat.len()).sum();
+    let rust_slots = plan
+        .modules
+        .iter()
+        .flat_map(|m| &m.iat)
+        .filter(|b| matches!(b.target, Ok(link::BindingTarget::Rust(_))))
+        .count();
     let mut groups = BTreeMap::new();
     let mut missing = 0;
     for (index, import, err) in plan.unresolved() {
@@ -238,7 +270,7 @@ fn resolve(image: &Path, roots: &[PathBuf], launch: bool, symbols: bool) -> Resu
         println!("  {name}: {error} ({count} IAT slots)");
     }
     println!(
-        "Link plan: {} images, {}/{} IAT slots resolved, {descriptor_failures} descriptor failures",
+        "Link plan: {} images, {}/{} IAT slots resolved ({rust_slots} Rust), {descriptor_failures} descriptor failures",
         plan.modules.len(),
         total - missing,
         total
@@ -267,8 +299,8 @@ fn resolve(image: &Path, roots: &[PathBuf], launch: bool, symbols: bool) -> Resu
         let mut bindings = Vec::new();
         for (i, module) in plan.modules.iter().enumerate() {
             for binding in &module.iat {
-                let target = binding.target.as_ref().map_err(|e| e.to_string())?;
-                bindings.push((i, binding.iat_rva, target.module, target.export_rva));
+                let target = *binding.target.as_ref().map_err(|e| e.to_string())?;
+                bindings.push((i, binding.iat_rva, target));
             }
         }
         let order = attach_order(&plan)?;
