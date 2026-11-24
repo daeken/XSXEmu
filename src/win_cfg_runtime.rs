@@ -1,11 +1,14 @@
 //! Runtime for the bounded AMD64 GuardCF profile, not a sandbox. Only exact
-//! GFIDs and explicitly bound host call targets are valid. FID suppression is
+//! GFIDs and explicitly bound host call targets are valid by default. The
+//! trusted offline TLS child can also admit exact legacy root callbacks from
+//! immutable PE metadata. FID suppression is
 //! unconditional; export-suppressed entries stay denied for the entire run
 //! (including after GetProcAddress). No Windows export-policy opt-in is supported.
 
 use crate::{
     Result,
     guest::{GuestMemory, Region},
+    pe::Pe,
     win_cfg::{CfgMetadata, ExportSuppression},
 };
 use std::{
@@ -29,6 +32,93 @@ impl Targets {
                     base.checked_add(u64::from(entry.rva))
                         .ok_or("CFG address overflow")?,
                 )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Bounded subset of Windows mixed guarded/non-guarded compatibility.
+    /// Only the explicitly trusted, non-guarded root may use this rule. Require
+    /// both an immutable relocated pointer and an exact AMD64 function start;
+    /// neither arbitrary RX nor unwind metadata alone confers admission.
+    pub fn add_legacy_root(
+        &mut self,
+        pe: &Pe<'_>,
+        mem: &mut GuestMemory,
+        regions: &[Region],
+        guard_slots: &[u32],
+    ) -> Result<()> {
+        let Some(dir) = pe.directory(3) else {
+            return Ok(());
+        };
+        let Some(pdata) = pe.rva_slice(dir.rva, dir.size as usize).ok().filter(|_| {
+            dir.rva >= pe.size_of_headers
+                && dir.rva % 4 == 0
+                && mem.readonly_data(regions, dir.rva as usize, dir.size as usize)
+        }) else {
+            return Ok(());
+        };
+        let (rows, tail) = pdata.as_chunks::<12>();
+        let mut end = 0;
+        if !tail.is_empty()
+            || !rows.iter().all(|row| {
+                let start = rva_word(row);
+                let next = rva_word(&row[4..]);
+                let valid = start != 0 && start >= end && next > start && next <= pe.size_of_image;
+                end = next;
+                valid
+            })
+        {
+            return Ok(());
+        }
+        let base = mem.base();
+        let is_ro = |rva| mem.readonly_data(regions, rva, 8);
+        let mut candidates = Vec::new();
+        for slot in pe.relocations()? {
+            if slot < pe.size_of_headers || slot % 8 != 0 || !is_ro(slot as usize) {
+                continue;
+            }
+            let Ok(raw) = pe.rva_slice(slot, 8) else {
+                continue;
+            };
+            let preferred = u64::from_le_bytes(raw.try_into().unwrap());
+            let Some(rva) = preferred
+                .checked_sub(pe.image_base)
+                .and_then(|r| u32::try_from(r).ok())
+            else {
+                continue;
+            };
+            let Ok(i) = rows.binary_search_by_key(&rva, |row| rva_word(row)) else {
+                continue;
+            };
+            let len = rva_word(&rows[i][4..]) - rva;
+            if !pe.sections.iter().any(|s| {
+                s.readable()
+                    && s.executable()
+                    && !s.writable()
+                    && rva.checked_sub(s.virtual_address).is_some_and(|off| {
+                        off.checked_add(len).is_some_and(|end| end <= s.raw_size)
+                    })
+            }) || guard_slots
+                .iter()
+                .any(|&guard| pe.rva_slice(guard, 8).is_ok_and(|p| p == raw))
+            {
+                continue;
+            }
+            if candidates.len() == MAX_TARGETS {
+                return Err("legacy CFG candidate budget exceeded".into());
+            }
+            candidates.try_reserve(1)?;
+            candidates.push((slot as usize, base + u64::from(rva)));
+        }
+        let mapped = mem.bytes_mut()?;
+        let start = dir.rva as usize;
+        if mapped[start..start + pdata.len()] == *pdata {
+            for (slot, target) in candidates {
+                // IAT and other loader writes cannot seed the policy.
+                if mapped[slot..slot + 8] == target.to_le_bytes() {
+                    self.add(target)?;
+                }
             }
         }
         Ok(())
@@ -69,6 +159,10 @@ impl Targets {
             .map_err(|_| "a CFG runtime is already active")?;
         Ok(Registration { _table: table })
     }
+}
+
+fn rva_word(bytes: &[u8]) -> u32 {
+    u32::from_le_bytes(bytes[..4].try_into().unwrap())
 }
 
 pub struct Registration {
@@ -150,9 +244,9 @@ pub const SLOT_THUNKS: [unsafe extern "win64" fn(); 2] = [check, dispatch];
 mod tests {
     use super::*;
     use crate::{
-        link::BindingTarget,
+        link::{BindingTarget, ResolvedExport},
         providers, startup,
-        win_cfg::tests::{executable_aux_fixture, executable_fixture},
+        win_cfg::tests::{executable_aux_fixture, executable_fixture, mixed_cfg_fixture},
     };
     use std::{os::unix::process::ExitStatusExt, process::Command};
 
@@ -164,6 +258,31 @@ mod tests {
             return;
         };
         let (form, value) = case.split_once(':').unwrap();
+        if form == "legacy" {
+            let (exe, dll) = mixed_cfg_fixture(value);
+            let profile = if value == "strict" {
+                startup::Profile::StaticTlsChild
+            } else {
+                startup::Profile::TrustedOfflineTlsChild
+            };
+            let binding = BindingTarget::Pe(ResolvedExport {
+                module: 1,
+                export_rva: 0x1080,
+            });
+            assert_eq!(
+                startup::run_tls_child(
+                    &[("legacy-fixture.exe", &exe), ("guarded-fixture.dll", &dll)],
+                    &[(0, 0x2250, binding)],
+                    &[],
+                    &[1],
+                    false,
+                    profile,
+                )
+                .unwrap(),
+                42
+            );
+            return;
+        }
         if form == "provider" {
             let host = providers::lookup(b"kernelbase.dll", b"GetCurrentProcessId").unwrap();
             let mut file = executable_fixture(true, 0x2250, 0);
@@ -225,6 +344,14 @@ mod tests {
             ] {
                 assert_case(&format!("{form}:{target}"), allowed);
             }
+        }
+    }
+
+    #[test]
+    fn mixed_image_dispatch_requires_exact_legacy_root_evidence_and_opt_in() {
+        assert_case("legacy:exact", true);
+        for case in ["interior", "no-pdata", "no-fixup", "writable", "strict"] {
+            assert_case(&format!("legacy:{case}"), false);
         }
     }
 

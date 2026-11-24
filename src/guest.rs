@@ -139,6 +139,28 @@ mod platform {
             Ok(unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), self.image_len) })
         }
 
+        /// Is this range entirely within a read-only data region whose host
+        /// pages will not share writable or executable sections when sealed?
+        pub fn readonly_data(&self, regions: &[Region], start: usize, len: usize) -> bool {
+            let Some(end) = start.checked_add(len) else {
+                return false;
+            };
+            if len == 0 || end > self.image_len {
+                return false;
+            }
+            let first_page = start / self.page_size;
+            let last_page = (end - 1) / self.page_size;
+            regions
+                .iter()
+                .any(|r| r.read && !r.write && !r.execute && r.rva <= start && end <= r.rva + r.len)
+                && !regions.iter().any(|r| {
+                    (r.write || r.execute)
+                        && r.len != 0
+                        && r.rva / self.page_size <= last_page
+                        && (r.rva + r.len - 1) / self.page_size >= first_page
+                })
+        }
+
         /// Commit page permissions, combining all regions that share a Darwin VM
         /// page. Uncovered pages are inaccessible. A page requiring both write and
         /// execute is rejected, even if the two requests came from distinct sections.

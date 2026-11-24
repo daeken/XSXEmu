@@ -1517,6 +1517,111 @@ pub(super) mod tests {
         file
     }
 
+    /// Original non-CFG EXE calls a guarded DLL through a bound IAT. The DLL
+    /// reads an initializer pointer from RCX and uses its own dispatch slot.
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    pub(crate) fn mixed_cfg_fixture(case: &str) -> (Vec<u8>, Vec<u8>) {
+        let mut dll = executable_fixture(true, 0x1003, 0);
+        put16(&mut dll, NT + 22, 0x2002);
+        put32(&mut dll, OPT + 16, 0);
+        // sub rsp,40; mov rax,[rcx]; call [rip+dispatch]; add rsp,40; ret
+        dll[0x480..0x492].copy_from_slice(&[
+            0x48, 0x83, 0xec, 0x28, 0x48, 0x8b, 0x01, 0xff, 0x15, 0x8b, 0x10, 0, 0, 0x48, 0x83,
+            0xc4, 0x28, 0xc3,
+        ]);
+
+        let mut exe = executable_fixture(true, 0x1003, 0);
+        exe[LC..LC + 0x400].fill(0);
+        put16(&mut exe, OPT + 70, 0);
+        put32(&mut exe, LC, DORMANT_SIZE as u32);
+        put32(&mut exe, DIR + 4, DORMANT_SIZE as u32);
+        put32(&mut exe, LC + CFG_END, 1); // legacy catalog marker
+        exe[0x450..0x453].copy_from_slice(&[0xc2, 0, 0]);
+        exe[0x460..0x466].copy_from_slice(&[0xff, 0x25, 0x22, 0x11, 0, 0]);
+        let mut fixes = Vec::new();
+        for (i, (field, target)) in DORMANT_FIELDS
+            .into_iter()
+            .zip([0x1050, 0x1058, 0x1050, 0x1060, 0x1060, 0])
+            .enumerate()
+        {
+            let slot = 0x2180 + i as u32 * 8;
+            put64(&mut exe, LC + field, BASE + u64::from(slot));
+            fixes.push(0xa000 | field as u16);
+            if target != 0 {
+                put64(&mut exe, LC + (slot - 0x2000) as usize, BASE + target);
+                fixes.push(0xa000 | (slot - 0x2000) as u16);
+            }
+        }
+        // The static-TLS lane requires a real TLS directory and writable index.
+        exe.resize(0xc00, 0);
+        put16(&mut exe, NT + 6, 3);
+        put32(&mut exe, OPT + 56, 0x4000);
+        let data = RDATA + 40;
+        put32(&mut exe, data + 8, 0x200);
+        put32(&mut exe, data + 12, 0x3000);
+        put32(&mut exe, data + 16, 0x200);
+        put32(&mut exe, data + 20, 0xa00);
+        put32(&mut exe, data + 36, 0xc000_0040);
+        put32(&mut exe, OPT + 112 + 9 * 8, 0x2260);
+        put32(&mut exe, OPT + 112 + 9 * 8 + 4, 40);
+        put64(&mut exe, 0x870, BASE + 0x3000);
+        fixes.push(0xa270);
+        let target = if case == "interior" { 0x1041 } else { 0x1040 };
+        exe[0x440..0x447].copy_from_slice(&[0x90, 0xb8, 42, 0, 0, 0, 0xc3]);
+        let pointer_rva = if case == "writable" {
+            put64(&mut exe, 0xa08, BASE + target);
+            0x3008_u32
+        } else {
+            put64(&mut exe, 0x800, BASE + target);
+            if case != "no-fixup" {
+                fixes.push(0xa200);
+            }
+            0x2200_u32
+        };
+        if case != "no-pdata" {
+            put32(&mut exe, OPT + 112 + 3 * 8, 0x2240);
+            put32(&mut exe, OPT + 112 + 3 * 8 + 4, 12);
+        }
+        put32(&mut exe, 0x840, 0x1040);
+        put32(&mut exe, 0x844, 0x1047);
+        put32(&mut exe, 0x848, 0x2230);
+        exe[0x830] = 1; // version 1 unwind record; no operations
+        if fixes.len() % 2 != 0 {
+            fixes.push(0);
+        }
+        let size = 8 + fixes.len() as u32 * 2;
+        let extra_block = if case == "writable" { 12 } else { 0 };
+        put32(&mut exe, OPT + 112 + 5 * 8 + 4, size + extra_block);
+        put32(&mut exe, LC + 0x300, 0x2000);
+        put32(&mut exe, LC + 0x304, size);
+        fixes.sort_unstable();
+        for (i, fix) in fixes.into_iter().enumerate() {
+            put16(&mut exe, LC + 0x308 + i * 2, fix);
+        }
+        if extra_block != 0 {
+            let off = LC + 0x300 + size as usize;
+            put32(&mut exe, off, 0x3000);
+            put32(&mut exe, off + 4, extra_block);
+            put16(&mut exe, off + 8, 0xa008);
+        }
+        let mut code = vec![0x48, 0x83, 0xec, 0x38]; // align, home, and local
+        if case == "no-fixup" {
+            // Still exercise a callable pointer after rebasing, but manufacture
+            // it at runtime; the identical preferred VA on disk lacks DIR64.
+            code.extend([0x48, 0x8d, 0x05, 0xb5, 0xff, 0xff, 0xff]);
+            code.extend([0x48, 0x89, 0x44, 0x24, 0x20]);
+            code.extend([0x48, 0x8d, 0x4c, 0x24, 0x20]);
+        } else {
+            code.extend([0x48, 0x8d, 0x0d]);
+            code.extend((pointer_rva - 0x108b).to_le_bytes());
+        }
+        code.extend([0xff, 0x15]);
+        code.extend((0x2250_u32 - (0x1080 + code.len() as u32 + 4)).to_le_bytes());
+        code.extend([0x48, 0x83, 0xc4, 0x38, 0xc3]);
+        exe[0x480..0x480 + code.len()].copy_from_slice(&code);
+        (exe, dll)
+    }
+
     /// Original EXE with two imports: a name and an ordinal in the same IAT.
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
     pub(crate) fn missing_import_fixture(case: &str) -> Vec<u8> {

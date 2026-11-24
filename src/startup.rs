@@ -389,7 +389,7 @@ mod native {
                 }
             }
         }
-        for ((pe, mem), cfg) in pes.iter().zip(&mut memories).zip(&cfgs) {
+        for (index, ((pe, mem), cfg)) in pes.iter().zip(&mut memories).zip(&cfgs).enumerate() {
             let mut regions = vec![Region {
                 rva: 0,
                 len: pe.size_of_headers as usize,
@@ -414,6 +414,11 @@ mod native {
             if let Some(rva) = memcpy {
                 patch(mem, rva, tls_runtime::guard_memcpy_entry())?;
             }
+            let legacy = if index == 0 && matches!(profile, Profile::TrustedOfflineTlsChild) {
+                targets.as_mut()
+            } else {
+                None
+            };
             match cfg {
                 CfgProfile::Guarded(cfg) => {
                     let slots = cfg.slots();
@@ -445,7 +450,7 @@ mod native {
                 CfgProfile::Dormant(cfg) => {
                     let slots = cfg.slots();
                     // Never run either a no-op check or a nonenforcing dispatch.
-                    // Not registered as CFG targets, even in a mixed graph.
+                    // Their original stub addresses never seed mixed-image CFG.
                     for (&rva, trap) in slots[..DORMANT_CALLABLE]
                         .iter()
                         .zip(tls_runtime::dormant_guard_entries())
@@ -454,9 +459,17 @@ mod native {
                     }
                     let mut readonly = cfg.readonly_ranges();
                     readonly.extend(memcpy.map(slot_range));
+                    if let Some(targets) = legacy {
+                        targets.add_legacy_root(pe, mem, &regions, slots)?;
+                    }
                     mem.seal_with_readonly(&regions, &readonly)?;
                 }
-                CfgProfile::None => mem.seal(&regions)?,
+                CfgProfile::None => {
+                    if let Some(targets) = legacy {
+                        targets.add_legacy_root(pe, mem, &regions, &[])?;
+                    }
+                    mem.seal(&regions)?;
+                }
             }
             if pe.entry_rva != 0 {
                 mem.validate_target(pe.entry_rva as usize)?;
@@ -477,8 +490,8 @@ mod native {
             if rust_providers {
                 win_proc::init_process(images[0].0)?;
             }
-            // Only exact PE GFIDs and explicitly bound bridge/trace entries are
-            // registered. No unwind or dynamic symbol lookup is enabled.
+            // Registration remains exact-address, including bounded legacy root
+            // callbacks in trusted offline mode. No unwind or dynamic lookup.
             let _cfg_registration = targets.map(Targets::install).transpose()?;
             let outcome = tls_runtime::run(&tls, images, &pes, &memories, attach_order);
             win_fls::native::finish_initial_thread()?;
