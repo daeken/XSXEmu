@@ -473,8 +473,15 @@ with aligned stack/home space, and captures the DWORD return after checking
 both GS domains. Loader notifications run serially: dependency-order DLLs
 then EXE TLS callbacks on attach, reverse ordering on detach. Within a module,
 TLS callbacks precede DllMain. No guest routine is invoked inline by the
-creating bridge. Worker FLS stops explicitly when called; it needs a
-process-wide index and callback model beyond the initial-thread provider.
+creating bridge. The observed UCRT worker calls `FlsGetValue` (return PC `0x1802b176f`)
+with an index allocated during process startup. FLS allocations are shared
+across the process, but each worker starts with null values. A valid read
+clears LastError, even for null; an invalid index sets `ERROR_INVALID_PARAMETER`.
+`FlsFree` removes the index and all implicit fibers' values before reuse.
+If a non-null value requires a registered callback on free or worker exit,
+the child stops with a diagnostic instead of calling guest code or making the
+thread handle ready. Fiber creation, switching, and FLS callback delivery are
+not implemented.
 
 Only thread and semaphore handles participate in non-alertable single
 waits (including polling, timeout and infinite wait). Closing a thread

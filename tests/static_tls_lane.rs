@@ -3535,7 +3535,7 @@ fn unsupported_guardcf_policy_and_guard_tls_overlap_fail_preentry() {
     );
 }
 
-const THREAD_CODE: usize = 0x600;
+const THREAD_CODE: usize = 0x800;
 #[repr(C)]
 struct ThreadFixture {
     entry: u32,
@@ -3576,7 +3576,7 @@ fn created_guest_thread_has_own_teb_and_tls_and_joins_before_process_detach() {
     w32(&mut dll, file(LINK) + 0x30, TEXT + fixture.probe as usize);
     scratch.write("owned.dll", &dll);
     let mut exe = prepare(Kind::Solo, fixture.entry);
-    dir(&mut exe, 1, LINK, 5 * 20);
+    dir(&mut exe, 1, LINK, 6 * 20);
     let groups: &[(&[u8], &[&[u8]])] = &[
         (
             b"api-ms-win-core-processthreads-l1-1-0.dll\0",
@@ -3592,14 +3592,23 @@ fn created_guest_thread_has_own_teb_and_tls_and_joins_before_process_detach() {
         ),
         (b"api-ms-win-core-handle-l1-1-0.dll\0", &[b"CloseHandle\0"]),
         (b"owned.dll\0", &[b"Step\0"]),
+        (
+            b"api-ms-win-core-fibers-l1-1-0.dll\0",
+            &[
+                b"FlsAlloc\0",
+                b"FlsGetValue\0",
+                b"FlsSetValue\0",
+                b"FlsFree\0",
+            ],
+        ),
     ];
     // Every descriptor needs its own terminating IAT entry, even when the
     // adjacent lookup table has its own terminator as well.
-    let iat_offsets = [0, 3, 7, 9];
+    let iat_offsets = [0, 3, 7, 9, 11];
     for (i, &(module, imports)) in groups.iter().enumerate() {
         let rec = file(LINK) + 20 * i;
         let lookup = LINK + 0x80 + 0x28 * i;
-        let name = LINK + 0x140 + 0x40 * i;
+        let name = LINK + 0x160 + 0x40 * i;
         w32(&mut exe, rec, lookup);
         w32(&mut exe, rec + 12, name);
         w32(&mut exe, rec + 16, IAT + 8 * iat_offsets[i]);
@@ -3611,7 +3620,7 @@ fn created_guest_thread_has_own_teb_and_tls_and_joins_before_process_detach() {
         }
     }
     let flags = [OPT, "--rust-providers"];
-    for mode in [0, 1, 2] {
+    for mode in [0, 1, 2, 3, 4] {
         w32(&mut exe, file(MODE), mode);
         let path = scratch.write(&format!("threads-{mode}.exe"), &exe);
         let output = launcher(&path, &flags)
@@ -3626,8 +3635,21 @@ fn created_guest_thread_has_own_teb_and_tls_and_joins_before_process_detach() {
                 86,
                 "guest EXE returned with active threads; refusing process detach",
             );
+        } else if mode >= 3 {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!stderr.contains("phase=tls-detach"), "{stderr}");
+            let message = if mode == 3 {
+                "unsupported FLS callback: worker thread teardown requires invocation"
+            } else {
+                "unsupported FLS callback: FlsFree requires invocation"
+            };
+            expect(output, 1, message);
         } else {
-            assert!(String::from_utf8_lossy(&output.stderr).contains("status=0xeda7babe"));
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("status=0xeda7babe"),
+                "mode {mode}: {stderr}"
+            );
             expect(output, 55, "Guest entry returned 55");
         }
     }

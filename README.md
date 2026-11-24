@@ -26,7 +26,7 @@ On Apple Silicon under Rosetta, `run <trusted-fixture.exe> --experimental-static
 
 Set `XSXEMU_TRACE_STARTUP=1` on the static-TLS launcher to log mapped image ranges, the module and target RVA before and after each TLS callback, DllMain call, and EXE entry, and each audited bridge dispatch with its guest return PC. The last unmatched `begin` identifies the active startup transfer even if it called into another module. A bridge return PC is a caller clue, not the faulting RIP. All logging runs on host GS; fault signals still terminate the child with their default disposition, without guest recovery or detach.
 
-The Rust FLS provider implements `FlsAlloc`, `FlsGetValue`, `FlsSetValue`, and `FlsFree` for the initial thread's implicit fiber, with 127 usable slots separate from dynamic and static TLS. Callback registration does not invoke guest code. If `FlsFree` or launcher teardown would need to invoke a registered callback for a non-null value, execution stops with a diagnostic instead. Fiber creation and switching are not supported.
+The Rust FLS provider implements `FlsAlloc`, `FlsGetValue`, `FlsSetValue`, and `FlsFree` with 127 process-wide indices and separate values for each guest thread’s implicit fiber. FLS is separate from dynamic and static TLS. Callback registration does not invoke guest code. If `FlsFree`, worker exit, or launcher teardown would need to invoke a registered callback for a non-null value, execution stops with a diagnostic instead. Fiber creation and switching are not supported.
 
 App-local MSVC CRT DLLs and an AMD64 `ucrtbase.dll` can be supplied as ordinary PE libraries. Nothing in this project redistributes them. Resolving an import to a CRT export does **not** mean its dependencies or startup work yet.
 

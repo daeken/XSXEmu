@@ -188,7 +188,6 @@ impl Workers {
                     let tls = workers.plan.new_thread()?;
                     let vector = tls.vector_address().ok_or("missing worker TLS vector")?;
                     with_context(vector, workers.trace, |ctx, tid| {
-                        win_fls::native::mark_guest_worker();
                         // Only return success after the worker really owns its
                         // stack, TLS, TEB, ID and checked host GS context.
                         ready.send(tid).unwrap();
@@ -198,6 +197,7 @@ impl Workers {
                             ));
                         }
                         let code = workers.run(ctx, start, parameter);
+                        win_fls::native::finish_worker_thread();
                         if workers.trace {
                             startup_trace(format_args!(
                                 "end phase=thread-entry id={tid} status={code:#x}"

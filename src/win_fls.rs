@@ -1,5 +1,5 @@
-//! FLS for one initial guest thread and its implicit fiber. No fiber or
-//! thread creation/switching, callback dispatch, or sharing across threads.
+//! Process-wide FLS indices and one implicit fiber per guest thread. Explicit
+//! fiber creation/switching and callbacks are not implemented.
 
 use crate::providers::HostExport;
 
@@ -24,30 +24,14 @@ pub(crate) fn lookup(dll: &[u8], name: &[u8]) -> Option<HostExport> {
 
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod native {
-    use crate::providers::set_last_error;
-    #[cfg(target_os = "macos")]
-    use std::cell::Cell;
-    use std::{cell::RefCell, ffi::c_void, io::Write, ptr};
-
-    #[cfg(target_os = "macos")]
-    fn require_initial_thread() {
-        if GUEST_WORKER.get() {
-            stop(
-                "unsupported FLS operation on a guest worker (process-wide FLS indexes are not implemented)",
-            );
-        }
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    fn require_initial_thread() {}
-
-    #[cfg(target_os = "macos")]
-    thread_local! { static GUEST_WORKER: Cell<bool> = const { Cell::new(false) }; }
-
-    #[cfg(target_os = "macos")]
-    pub(crate) fn mark_guest_worker() {
-        GUEST_WORKER.set(true);
-    }
+    use crate::providers::{native::current_thread_id, set_last_error};
+    use std::{
+        collections::HashMap,
+        ffi::c_void,
+        io::Write,
+        ptr,
+        sync::{Mutex, MutexGuard},
+    };
 
     const ERROR_INVALID_PARAMETER: u32 = 87;
     const ERROR_NO_MORE_ITEMS: u32 = 259;
@@ -55,94 +39,86 @@ pub(crate) mod native {
     // Bounded to the legacy 128-index range (index 0 reserved).
     const SLOTS: usize = 128;
 
-    // Correct Win64 type, but only retained as a registration token. No
-    // callback address is dereferenced, called or added to the CFG policy.
+    // Retained as a registration token, never dereferenced or called.
     pub(crate) type Callback = Option<unsafe extern "win64" fn(*mut c_void)>;
 
-    #[derive(Clone, Copy)]
     struct Slot {
         callback: Callback,
-        value: *mut c_void,
+        // An absent entry means NULL. Opaque addresses are never dereferenced.
+        values: HashMap<u32, usize>,
     }
 
-    impl Slot {
-        fn requires_callback(self) -> bool {
-            self.callback.is_some() && !self.value.is_null()
-        }
-    }
+    // Allocation, changing a value, free and fiber teardown are serialized.
+    // Removing a slot also removes every lane's value before index reuse.
+    static SLOTS_STATE: Mutex<[Option<Slot>; SLOTS]> = Mutex::new([const { None }; SLOTS]);
 
-    thread_local! {
-        static INITIAL_FIBER: RefCell<[Option<Slot>; SLOTS]> = const { RefCell::new([None; SLOTS]) };
+    fn state() -> MutexGuard<'static, [Option<Slot>; SLOTS]> {
+        SLOTS_STATE.lock().unwrap_or_else(|_| std::process::abort())
     }
 
     pub(crate) extern "win64" fn fls_alloc(callback: Callback) -> u32 {
-        require_initial_thread();
-        INITIAL_FIBER.with_borrow_mut(|slots| {
-            if let Some((i, slot)) = slots
-                .iter_mut()
-                .enumerate()
-                .skip(1)
-                .find(|(_, s)| s.is_none())
-            {
-                *slot = Some(Slot {
-                    callback,
-                    value: ptr::null_mut(),
-                });
-                return i as u32;
-            }
+        let mut slots = state();
+        if let Some((i, slot)) = slots
+            .iter_mut()
+            .enumerate()
+            .skip(1)
+            .find(|(_, s)| s.is_none())
+        {
+            *slot = Some(Slot {
+                callback,
+                values: HashMap::new(),
+            });
+            i as u32
+        } else {
             set_last_error(ERROR_NO_MORE_ITEMS);
             FLS_OUT_OF_INDEXES
-        })
+        }
     }
 
     pub(crate) extern "win64" fn fls_get_value(index: u32) -> *mut c_void {
-        require_initial_thread();
-        INITIAL_FIBER.with_borrow(|slots| {
-            if let Some(slot) = slots.get(index as usize).and_then(Option::as_ref) {
-                set_last_error(0); // An allocated slot can hold NULL.
-                return slot.value;
-            }
-            set_last_error(ERROR_INVALID_PARAMETER);
-            ptr::null_mut()
-        })
+        let tid = current_thread_id();
+        if let Some(slot) = state().get(index as usize).and_then(Option::as_ref) {
+            set_last_error(0); // Valid allocated indexes may return NULL.
+            return ptr::with_exposed_provenance_mut(slot.values.get(&tid).copied().unwrap_or(0));
+        }
+        set_last_error(ERROR_INVALID_PARAMETER);
+        ptr::null_mut()
     }
 
     pub(crate) extern "win64" fn fls_set_value(index: u32, value: *mut c_void) -> i32 {
-        require_initial_thread();
-        INITIAL_FIBER.with_borrow_mut(|slots| {
-            if let Some(slot) = slots.get_mut(index as usize).and_then(Option::as_mut) {
-                slot.value = value;
-                return 1;
+        let tid = current_thread_id();
+        if let Some(slot) = state().get_mut(index as usize).and_then(Option::as_mut) {
+            if value.is_null() {
+                slot.values.remove(&tid);
+            } else {
+                slot.values.insert(tid, value.expose_provenance());
             }
-            set_last_error(ERROR_INVALID_PARAMETER);
-            0
-        })
+            return 1;
+        }
+        set_last_error(ERROR_INVALID_PARAMETER);
+        0
     }
 
     pub(crate) extern "win64" fn fls_free(index: u32) -> i32 {
-        require_initial_thread();
-        let result = INITIAL_FIBER.with_borrow_mut(|slots| {
+        {
+            let mut slots = state();
             let Some(slot) = slots.get_mut(index as usize).filter(|s| s.is_some()) else {
-                return Ok(false);
-            };
-            if slot.is_some_and(Slot::requires_callback) {
-                return Err(());
-            }
-            *slot = None;
-            Ok(true)
-        });
-        match result {
-            Ok(true) => 1,
-            Ok(false) => {
                 set_last_error(ERROR_INVALID_PARAMETER);
-                0
+                return 0;
+            };
+            if !slot
+                .as_ref()
+                .is_some_and(|s| s.callback.is_some() && !s.values.is_empty())
+            {
+                *slot = None;
+                return 1;
             }
-            // Do not complete the free, return a pretend Win32 failure, or
-            // call an unaudited guest target from Rust. Already on host GS.
-            Err(()) => stop(&format!(
-                "unsupported FLS callback: FlsFree requires invocation for slot {index}"
-            )),
         }
+        // This may be required for a different lane's value. Neither clear
+        // that value nor report success when callback delivery is unsupported.
+        stop(&format!(
+            "unsupported FLS callback: FlsFree requires invocation for slot {index}"
+        ));
     }
 
     fn stop(message: &str) -> ! {
@@ -159,18 +135,44 @@ pub(crate) mod native {
         std::process::exit(1)
     }
 
-    /// Checked at the launcher teardown boundary, after guest detach and
-    /// before mappings disappear. Report pending work rather than declaring
-    /// guest completion. This also clears the per-run state for later runs.
+    /// Checked before worker completion is published. After DLL detach, any
+    /// still-live callback value requires real guest callback delivery.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn finish_worker_thread() {
+        let tid = current_thread_id();
+        let pending = {
+            let mut slots = state();
+            let pending = slots.iter().position(|slot| {
+                slot.as_ref()
+                    .is_some_and(|s| s.callback.is_some() && s.values.contains_key(&tid))
+            });
+            if pending.is_none() {
+                for slot in slots.iter_mut().flatten() {
+                    slot.values.remove(&tid);
+                }
+            }
+            pending
+        };
+        if let Some(index) = pending {
+            stop(&format!(
+                "unsupported FLS callback: worker thread teardown requires invocation for slot {index}"
+            ));
+        }
+    }
+
+    /// After all guest threads and process detach have finished, before the
+    /// loader releases mappings. Clear the process registry for another run.
     #[cfg(any(target_os = "macos", test))]
     pub(crate) fn finish_initial_thread() -> crate::Result<()> {
-        let pending = INITIAL_FIBER.with_borrow_mut(|slots| {
-            let pending = slots
-                .iter()
-                .position(|s| s.is_some_and(Slot::requires_callback));
-            slots.fill(None);
+        let pending = {
+            let mut slots = state();
+            let pending = slots.iter().position(|slot| {
+                slot.as_ref()
+                    .is_some_and(|s| s.callback.is_some() && !s.values.is_empty())
+            });
+            slots.fill_with(|| None);
             pending
-        });
+        };
         if let Some(index) = pending {
             return Err(format!(
                 "unsupported FLS callback: initial thread teardown requires invocation for slot {index}"
@@ -184,12 +186,15 @@ pub(crate) mod native {
         use super::*;
         use crate::providers::native::{get_last_error, tls_alloc, tls_free, tls_set_value};
 
+        static TEST_FLS_PROCESS: Mutex<()> = Mutex::new(());
+
         unsafe extern "win64" fn forbidden_callback(_: *mut c_void) {
             std::process::abort();
         }
 
         #[test]
         fn slots_are_bounded_and_independent_of_tls() {
+            let _guard = TEST_FLS_PROCESS.lock().unwrap();
             let tls = tls_alloc();
             let value = ptr::without_provenance_mut(0xabcd);
             assert_eq!(tls_set_value(tls, value), 1);
@@ -232,6 +237,7 @@ pub(crate) mod native {
 
         #[test]
         fn only_non_null_callback_and_value_require_invocation() {
+            let _guard = TEST_FLS_PROCESS.lock().unwrap();
             let index = fls_alloc(Some(forbidden_callback));
             assert_eq!(fls_free(index), 1);
             let value = ptr::without_provenance_mut(0xabcd);

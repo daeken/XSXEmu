@@ -103,6 +103,31 @@ Lthread_entry:
     movq %rax, {data}+0x18(%r11)
     th_make_semaphore 0
     th_make_semaphore 0x30
+    xorl %ecx, %ecx
+    cmpl $3, {mode}(%r11)
+    jb 1f
+    leaq Lthread_unexpected_fls(%rip), %rcx
+1:
+    th_api 11                /* FlsAlloc, process-wide index */
+    cmpl $-1, %eax
+    th_ensure ne
+    th_ref
+    movl %eax, {data}+0x38(%r11)
+    movl %eax, %ecx
+    movl $0xdead, %edx
+    th_api 13                /* Creator stores its own value. */
+    cmpl $1, %eax
+    th_ensure e
+    th_ref
+    cmpl $4, {mode}(%r11)
+    jne 1f
+    movl {data}+0x38(%r11), %ecx
+    xorl %edx, %edx
+    th_api 13                /* Leave only the worker callback value live. */
+    cmpl $1, %eax
+    th_ensure e
+1:
+    th_ref
     movl $0x1234, %gs:0x68
     xorq %rcx, %rcx
     movl $65536, %edx
@@ -167,6 +192,12 @@ Lthread_release:
     testl %eax, %eax
     th_ensure e
     th_ref
+    cmpl $4, {mode}(%r11)
+    jne 1f
+    movl {data}+0x38(%r11), %ecx
+    th_api 14                /* Must detect another lane's callback value. */
+    ud2
+1:
     movq {data}+0x08(%r11), %rcx
     movl $-1, %edx
     th_api 4
@@ -182,6 +213,18 @@ Lthread_release:
     cmpl $0x1234, %gs:0x68
     th_ensure e
     cmpl $1, {data}+0x28(%r11)
+    th_ensure e
+    th_ref
+    movl {data}+0x38(%r11), %ecx
+    th_api 12
+    cmpq $0xdead, %rax        /* Worker SetValue did not change creator. */
+    th_ensure e
+    cmpl $0, %gs:0x68
+    th_ensure e
+    th_ref
+    movl {data}+0x38(%r11), %ecx
+    th_api 14
+    cmpl $1, %eax
     th_ensure e
     th_api 9                  /* DLL detach completed before thread signaled. */
     cmpq $2, %rax
@@ -252,6 +295,32 @@ Lthread_worker:
     th_ensure e
     cmpl %gs:0x48, %eax
     th_ensure e
+    th_ref
+    movl {data}+0x38(%r11), %ecx
+    th_api 12                /* First read in a worker: NULL, ERROR_SUCCESS. */
+    testq %rax, %rax
+    th_ensure e
+    cmpl $0, %gs:0x68
+    th_ensure e
+    cmpq %gs:0x30, %rbx
+    th_ensure e
+    movl $0x8765, %gs:0x68
+    th_ref
+    movl {data}+0x38(%r11), %ecx
+    movl $0xbeef, %edx
+    th_api 13
+    cmpl $1, %eax
+    th_ensure e
+    cmpl $0x8765, %gs:0x68
+    th_ensure e
+    th_ref
+    movl {data}+0x38(%r11), %ecx
+    th_api 12
+    cmpq $0xbeef, %rax
+    th_ensure e
+    cmpl $0, %gs:0x68
+    th_ensure e
+    movl $0x8765, %gs:0x68
     th_api 9                  /* DLL thread attach followed its TLS callback. */
     cmpq $7, %rax
     th_ensure e
@@ -266,8 +335,18 @@ Lthread_worker:
     th_ensure e
     cmpl $0x8765, %gs:0x68
     th_ensure e
+    th_ref
+    cmpl $4, {mode}(%r11)
+    jne 1f
+    movq {data}(%r11), %rcx
+    movl $-1, %edx
+    th_api 4
+    ud2
+1:
     movl $0xeda7babe, %eax
     addq $32, %rsp
     popq %rbx
     retq
+Lthread_unexpected_fls:
+    ud2
     .fill {capacity}-(.-Lthread_text), 1, 0xcc
