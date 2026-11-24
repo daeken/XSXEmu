@@ -5,7 +5,7 @@ const WIDTH: usize = 8;
 const HEIGHT: usize = 4;
 const CLEAR: [u8; 4] = [0, 0, 0, 255];
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum ColorPipeline {
     Rgba,
     Green,
@@ -299,9 +299,12 @@ fragment FragmentOutput owned_depth_fragment(constant float4 &color [[buffer(0)]
                     );
                     return Ok(());
                 }
-                let strict = descriptors
-                    .iter()
-                    .map(|desc| strict_pipeline(&dev, desc))
+                let strict = ColorPipeline::ALL
+                    .into_iter()
+                    .zip(&descriptors)
+                    .map(|(kind, desc)| {
+                        strict_pipeline(&dev, desc).map_err(|err| format!("strict {kind:?}: {err}"))
+                    })
                     .collect::<Result<_, _>>()?;
                 println!(
                     "{}: {} owned render pipelines created with FailOnBinaryArchiveMiss",

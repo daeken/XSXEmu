@@ -109,3 +109,24 @@ if ! grep -Fq 'in binary archives' "$d/render-miss.log"; then
     exit 1
 fi
 printf '%s\n' 'strict render archive refused the independently compiled same-name changed fragment'
+
+# Change only the explicit depth result, leaving the function name and color intact.
+sed 's/FragmentOutput{color, depth}/FragmentOutput{color, 1.0f - depth}/' "$d/render.metal" > "$d/modified-depth.metal"
+if cmp -s "$d/render.metal" "$d/modified-depth.metal"; then
+    echo 'owned depth mutation did not apply' >&2
+    exit 1
+fi
+compile modified-depth
+if "$r" --load-metallib "$d/modified-depth.metallib" > "$d/depth-modified.log" 2>&1 ||
+    ! grep -Fq 'pixel (3,0): expected [255, 0, 255, 255], got [255, 255, 255, 255]' "$d/depth-modified.log"; then
+    cat "$d/depth-modified.log" >&2
+    echo 'owned depth mutation did not produce its expected pixel change' >&2
+    exit 1
+fi
+if "$r" --replay-archive "$d/modified-depth.metallib" "$d/render.metalar" > "$d/depth-miss.log" 2>&1 ||
+    ! grep -Eq 'strict FragmentDepth: .*in binary archives' "$d/depth-miss.log"; then
+    cat "$d/depth-miss.log" >&2
+    echo 'changed depth fragment did not produce a descriptor-specific strict miss' >&2
+    exit 1
+fi
+printf '%s\n' 'strict render archive refused only the changed depth descriptor after the three unchanged hits'
