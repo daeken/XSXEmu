@@ -21,7 +21,13 @@ fn key(name: &[u8], index: usize) -> Key {
     (name.to_ascii_lowercase(), index)
 }
 
-fn check(bytes: &[u8]) -> Option<(Count, Vec<Key>)> {
+struct SignatureRow {
+    key: Key,
+    register: usize,
+    primary: u8,
+}
+
+fn check(bytes: &[u8]) -> Option<(Count, Vec<SignatureRow>)> {
     let n = word(bytes, 0)?;
     if n > 128 || word(bytes, 4)? != 8 {
         return None;
@@ -54,7 +60,11 @@ fn check(bytes: &[u8]) -> Option<(Count, Vec<Key>)> {
         {
             return None;
         }
-        keys.push(key(&bytes[name_start..name_start + name], word(row, 8)?));
+        keys.push(SignatureRow {
+            key: key(&bytes[name_start..name_start + name], word(row, 8)?),
+            register: word(row, 20)?,
+            primary,
+        });
         count.entries += 1;
         count.system += usize::from(word(row, 12)? != 0);
         count.secondary_outside += usize::from(secondary & !primary != 0);
@@ -83,10 +93,43 @@ fn resource_rows(psv: &[u8], stage: u16) -> Option<&[u8]> {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum Element {
+enum Semantic {
     Nameless,
     MultiRow,
     Single(Key),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Element {
+    semantic: Semantic,
+    packing: Option<Packing>,
+    dynamic: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Packing {
+    row: u8,
+    rows: u8,
+    stream: u8,
+    mask: u8,
+}
+
+fn packing(r: &[u8]) -> Option<Option<Packing>> {
+    let cols = r[10] & 15;
+    let col = (r[10] >> 4) & 3;
+    let relative_mask = (1..=4).contains(&cols).then(|| (1u8 << cols) - 1)?;
+    if r[10] & 0x80 != 0 || r[14] & 0xc0 != 0 {
+        return None;
+    }
+    if r[10] & 0x40 == 0 {
+        return Some(None); // Start row/column are not defined for unallocated elements.
+    }
+    (col + cols <= 4).then_some(Some(Packing {
+        row: r[9],
+        rows: r[8],
+        stream: (r[14] >> 4) & 3,
+        mask: relative_mask << col,
+    }))
 }
 
 fn psv_elements(psv: &[u8], at: usize) -> Option<([Vec<Element>; 3], &[u8])> {
@@ -129,10 +172,14 @@ fn psv_elements(psv: &[u8], at: usize) -> Option<([Vec<Element>; 3], &[u8])> {
                 {
                     return None;
                 }
-                group.push(match (r[8], e) {
-                    (1, 0) => Element::Nameless,
-                    (1, _) => Element::Single(key(&label[..e], word(index_bytes, first * 4)?)),
-                    _ => Element::MultiRow,
+                group.push(Element {
+                    semantic: match (r[8], e) {
+                        (1, 0) => Semantic::Nameless,
+                        (1, _) => Semantic::Single(key(&label[..e], word(index_bytes, first * 4)?)),
+                        _ => Semantic::MultiRow,
+                    },
+                    packing: packing(r)?,
+                    dynamic: r[14] & 15 != 0,
                 });
             }
         }
@@ -197,28 +244,87 @@ struct Correspondence {
     multi: usize,
     ordinal_mismatch: usize,
     unmatched: usize,
+    packed_compared: usize,
+    packed_register_different: usize,
+    packed_mask_different: usize,
 }
 
 impl Correspondence {
-    fn add(&mut self, group: &[Element], signature: &[Key]) {
-        let mut remaining = BTreeMap::<&Key, usize>::new();
-        for k in signature {
-            *remaining.entry(k).or_default() += 1;
+    fn add(&mut self, group: &[Element], signature: &[SignatureRow]) {
+        let mut remaining = BTreeMap::<&Key, (usize, &SignatureRow)>::new();
+        let mut psv_count = BTreeMap::<&Key, usize>::new();
+        for r in signature {
+            remaining.entry(&r.key).or_insert((0, r)).0 += 1;
+        }
+        let mut has_multi = false;
+        for elem in group {
+            match &elem.semantic {
+                Semantic::Single(k) => *psv_count.entry(k).or_default() += 1,
+                Semantic::MultiRow => has_multi = true,
+                Semantic::Nameless => (),
+            }
         }
         for (i, elem) in group.iter().enumerate() {
-            match elem {
-                Element::Nameless => self.nameless_single += 1,
-                Element::MultiRow => self.multi += 1,
-                Element::Single(k) => {
+            match &elem.semantic {
+                Semantic::Nameless => self.nameless_single += 1,
+                Semantic::MultiRow => self.multi += 1,
+                Semantic::Single(k) => {
                     self.named_single += 1;
-                    self.ordinal_mismatch += usize::from(signature.get(i) != Some(k));
+                    self.ordinal_mismatch +=
+                        usize::from(signature.get(i).map(|r| &r.key) != Some(k));
                     match remaining.get_mut(k) {
-                        Some(count) if *count > 0 => *count -= 1,
+                        Some((count, r)) if *count > 0 => {
+                            if let Some(p) = &elem.packing
+                                && !has_multi // Multi-row semantic keys are not expanded here.
+                                && p.stream == 0
+                                && *count == 1
+                                && psv_count[k] == 1
+                            {
+                                self.packed_compared += 1;
+                                self.packed_register_different +=
+                                    usize::from(usize::from(p.row) != r.register);
+                                self.packed_mask_different += usize::from(p.mask != r.primary);
+                            }
+                            *count -= 1;
+                        }
                         _ => self.unmatched += 1,
                     }
                 }
             }
         }
+    }
+}
+
+#[derive(Default)]
+struct PackingTotals {
+    allocated: usize,
+    unallocated: usize,
+    dynamic: usize,
+}
+
+impl PackingTotals {
+    fn add(&mut self, group: &[Element], limits: &[u8]) -> Option<()> {
+        let mut occupancy = [[0u8; 256]; 4];
+        for elem in group {
+            self.dynamic += usize::from(elem.dynamic);
+            let Some(p) = &elem.packing else {
+                self.unallocated += 1;
+                continue;
+            };
+            let stream = usize::from(p.stream);
+            let end = usize::from(p.row) + usize::from(p.rows);
+            if end > usize::from(*limits.get(stream)?) {
+                return None;
+            }
+            for mask in &mut occupancy[stream][usize::from(p.row)..end] {
+                if *mask & p.mask != 0 {
+                    return None;
+                }
+                *mask |= p.mask;
+            }
+            self.allocated += 1;
+        }
+        Some(())
     }
 }
 
@@ -248,6 +354,7 @@ pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
     let mut files = 0;
     let (mut count_disagreements, mut patch_rows) = (0, 0);
     let mut correspondence = [Correspondence::default(), Correspondence::default()];
+    let mut packing_totals = [PackingTotals::default(), PackingTotals::default()];
     for entry in fs::read_dir(path)? {
         let entry = entry?;
         if entry.path().extension().and_then(|ext| ext.to_str()) != Some("dxbc")
@@ -299,6 +406,14 @@ pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
                 .ok_or("invalid or unsupported wrapped signature")?;
             same &= elements[i].len() == c.entries;
             correspondence[i].add(&elements[i], &keys);
+            let limits = match (i, stage) {
+                (0, _) => &psv[35..36],
+                (_, 2) => &psv[36..40],
+                _ => &psv[36..37],
+            };
+            packing_totals[i]
+                .add(&elements[i], limits)
+                .ok_or("overlapping or out-of-extent PSV0 input/output packing")?;
             total.entries += c.entries;
             total.system += c.system;
             total.secondary_outside += c.secondary_outside;
@@ -311,10 +426,23 @@ pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
     println!(
         "{files} wrapped DXBC files with agreeing DXIL/PSV0 stages and checked ISG1/OSG1 rows"
     );
-    for (tag, c) in ["ISG1", "OSG1"].into_iter().zip(correspondence) {
+    for ((tag, c), p) in ["ISG1", "OSG1"]
+        .into_iter()
+        .zip(correspondence)
+        .zip(packing_totals)
+    {
         println!(
             "PSV0 vs {tag}: {} named single-row elements, {} unmatched by key multiplicity, {} ordinal disagreements, {} nameless single-row, {} multi-row elements",
             c.named_single, c.unmatched, c.ordinal_mismatch, c.nameless_single, c.multi
+        );
+        println!(
+            "  PSV0 packing: {} allocated, {} unallocated, {} dynamic-index masks nonzero; {} unique-key allocated pairs compared, {} register disagreements, {} primary-mask disagreements",
+            p.allocated,
+            p.unallocated,
+            p.dynamic,
+            c.packed_compared,
+            c.packed_register_different,
+            c.packed_mask_different
         );
     }
     for (stage, (files, sizes, resources, deps)) in groups {
@@ -347,13 +475,25 @@ mod tests {
     #[test]
     fn validates_psv_semantic_indices_and_returns_exact_suffix() {
         let mut psv = [0; 97];
-        for (at, v) in [(32, 1), (60, 4), (64, b'X'), (68, 1), (76, 16), (88, 1)] {
+        for (at, v) in [
+            (32, 1),
+            (60, 4),
+            (64, b'X'),
+            (68, 1),
+            (76, 16),
+            (88, 1),
+            (90, 1),
+        ] {
             psv[at] = v;
         }
         assert_eq!(
             psv_elements(&psv, 60),
             Some((
-                [vec![Element::Single(key(b"x", 0))], vec![], vec![]],
+                [
+                    vec![element(Semantic::Single(key(b"x", 0)))],
+                    vec![],
+                    vec![]
+                ],
                 &psv[96..]
             ))
         );
@@ -395,16 +535,73 @@ mod tests {
         assert!(d.add(&header, &[]).is_none()); // Outside the checked profile.
     }
 
+    fn element(semantic: Semantic) -> Element {
+        Element {
+            semantic,
+            packing: None,
+            dynamic: false,
+        }
+    }
+
+    fn sig(key: Key) -> SignatureRow {
+        SignatureRow {
+            key,
+            register: 0,
+            primary: 1,
+        }
+    }
+
+    #[test]
+    fn packing_validates_bounds_and_compares_only_unique_keys() {
+        let mut first = element(Semantic::Single(key(b"a", 0)));
+        let mut row = [0; 16];
+        row[8] = 1;
+        row[9] = 1;
+        row[10] = 0x52; // Two columns starting in column 1 at row 1.
+        first.packing = packing(&row).unwrap();
+        row[10] = 0x73;
+        assert!(packing(&row).is_none());
+        row[10] = 0x33; // Unallocated: the start coordinate must be ignored.
+        assert!(packing(&row).unwrap().is_none());
+        let group = [first];
+        let mut p = PackingTotals::default();
+        assert!(p.add(&group, &[1]).is_none());
+        assert!(p.add(&group, &[2]).is_some());
+        let overlap = Element {
+            packing: Some(Packing {
+                row: 1,
+                rows: 1,
+                stream: 0,
+                mask: 2,
+            }),
+            ..element(Semantic::Nameless)
+        };
+        let mut c = Correspondence::default();
+        c.add(&group, &[sig(key(b"a", 0)), sig(key(b"a", 0))]);
+        assert_eq!(c.packed_compared, 0);
+        c.add(&group, &[sig(key(b"A", 0))]);
+        assert_eq!(
+            (
+                c.packed_compared,
+                c.packed_register_different,
+                c.packed_mask_different
+            ),
+            (1, 1, 1)
+        );
+        let [first] = group;
+        assert!(p.add(&[first, overlap], &[2]).is_none());
+    }
+
     #[test]
     fn semantic_matching_consumes_duplicates_without_requiring_row_order() {
         let psv = [
-            Element::Single(key(b"B", 0)),
-            Element::Single(key(b"a", 1)),
-            Element::Single(key(b"A", 1)),
-            Element::Nameless,
-            Element::MultiRow,
+            element(Semantic::Single(key(b"B", 0))),
+            element(Semantic::Single(key(b"a", 1))),
+            element(Semantic::Single(key(b"A", 1))),
+            element(Semantic::Nameless),
+            element(Semantic::MultiRow),
         ];
-        let signature = [key(b"A", 1), key(b"A", 1), key(b"b", 0)];
+        let signature = [sig(key(b"A", 1)), sig(key(b"A", 1)), sig(key(b"b", 0))];
         let mut c = Correspondence::default();
         c.add(&psv, &signature);
         assert_eq!(
@@ -415,10 +612,11 @@ mod tests {
                 multi: 1,
                 ordinal_mismatch: 2,
                 unmatched: 0,
+                ..Correspondence::default()
             }
         );
         let mut c = Correspondence::default();
-        c.add(&psv, &[key(b"a", 1), key(b"a", 2)]);
+        c.add(&psv, &[sig(key(b"a", 1)), sig(key(b"a", 2))]);
         assert_eq!(c.unmatched, 2); // B is absent and only one (A, 1) can match.
     }
 
@@ -455,7 +653,7 @@ mod tests {
             buf[at] = v;
         }
         let (c, keys) = check(&buf).unwrap();
-        assert_eq!(keys, [key(b"a", 1)]);
+        assert_eq!(keys[0].key, key(b"a", 1));
         assert_eq!((c.entries, c.system, c.secondary_outside), (1, 1, 1));
         assert!(check(&buf[..41]).is_none());
         for (at, v) in [(12, 39), (24, 4), (32, 0), (33, 16), (34, 1)] {
