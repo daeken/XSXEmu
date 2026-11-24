@@ -1,5 +1,7 @@
 //! Structural program/blob/PSO reference audit of expanded PS/0/9 metadata.
 use crate::{ARCHIVE_LIMIT, word};
+#[path = "compute_blobs.rs"]
+mod compute_blobs;
 use std::{fmt, io::Read};
 
 const HEADER: usize = 0x80;
@@ -177,7 +179,10 @@ fn tables(layout: &Layout, data: &[u8]) -> Result<Counts, Invalid> {
     Ok(counts)
 }
 
-pub fn run(path: &std::ffi::OsStr) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run(
+    path: &std::ffi::OsStr,
+    inspect_compute_blobs: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut file = std::fs::File::open(path)?;
     let len = usize::try_from(file.metadata()?.len())?;
     let mut header = [0; HEADER];
@@ -186,6 +191,27 @@ pub fn run(path: &std::ffi::OsStr) -> Result<(), Box<dyn std::error::Error>> {
     let mut data = vec![0; layout.table_len];
     file.read_exact(&mut data)?;
     let counts = tables(&layout, &data)?;
+    if inspect_compute_blobs {
+        const COMPUTE_AUDIT_BLOB_LIMIT: usize = 64 << 20;
+        if layout.blob_bytes > COMPUTE_AUDIT_BLOB_LIMIT {
+            return Err("compute audit blob section exceeds limit".into());
+        }
+        let mut bodies = vec![0; layout.blob_bytes];
+        file.read_exact(&mut bodies)?;
+        let start = layout.graphics * 112;
+        let end = start + layout.compute * 24;
+        let mut audit = compute_blobs::Audit::default();
+        for row in data[start..end].chunks_exact(24) {
+            audit.add(row, |index| {
+                let at = end + 8 * index;
+                let off = word(&data, at)?;
+                let size = word(&data, at + 4)?;
+                bodies.get(off..off.checked_add(size)?)
+            })?;
+        }
+        audit.print();
+        return Ok(());
+    }
     println!(
         "PS/0/9 expanded metadata: graphics={} compute={} programs={} blobs={} table_bytes={}",
         layout.graphics, layout.compute, layout.programs, layout.blobs, layout.table_len
