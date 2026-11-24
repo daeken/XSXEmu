@@ -42,7 +42,12 @@ mod native {
                 return Err(format!("{name}: unsupported {label} directory").into());
             }
         }
-        let cfg = CfgProfile::parse(pe).map_err(|e| format!("{name}: {e}"))?;
+        let cfg = if static_tls {
+            CfgProfile::parse_tls_child(pe)
+        } else {
+            CfgProfile::parse(pe)
+        }
+        .map_err(|e| format!("{name}: {e}"))?;
         if matches!(cfg, CfgProfile::Dormant(_)) && !static_tls {
             return Err(format!(
                 "{name}: dormant guard slots require the experimental static TLS child"
@@ -75,7 +80,17 @@ mod native {
         let hits_slot = |slot: &u32| slot.abs_diff(rva) < 8;
         let overlap = match cfg {
             CfgProfile::None => false,
-            CfgProfile::Guarded(cfg) => cfg.slots().iter().any(hits_slot),
+            CfgProfile::Guarded(cfg) => {
+                if cfg.overlaps_companion_config_write(rva) {
+                    return Err(
+                        "security cookie or IAT patch overlaps companion guard load config".into(),
+                    );
+                }
+                cfg.slots()
+                    .iter()
+                    .chain(cfg.companion_slots())
+                    .any(hits_slot)
+            }
             CfgProfile::Dormant(cfg) => {
                 if cfg.overlaps_config_write(rva) {
                     return Err(
@@ -303,7 +318,19 @@ mod native {
                     for (rva, thunk) in slots.into_iter().zip(SLOT_THUNKS) {
                         patch(mem, rva, thunk as usize as u64)?;
                     }
-                    mem.seal_with_readonly(&regions, &slots.map(slot_range))?;
+                    let mut readonly = slots.map(slot_range).to_vec();
+                    readonly.extend(cfg.companion_config_range());
+                    // XFG is not implemented; route attempts to a terminal gate,
+                    // never to the active CFG thunk or the candidate target.
+                    for (&rva, trap) in cfg
+                        .companion_callable()
+                        .iter()
+                        .zip(tls_runtime::inactive_xfg_entries())
+                    {
+                        patch(mem, rva, trap)?;
+                        readonly.push(slot_range(rva));
+                    }
+                    mem.seal_with_readonly(&regions, &readonly)?;
                     targets
                         .as_mut()
                         .expect("CFG policy for guarded image")

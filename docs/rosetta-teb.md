@@ -385,6 +385,33 @@ performed by this profile.
 [coff]: https://github.com/llvm/llvm-project/blob/main/llvm/tools/llvm-readobj/COFFDumper.cpp
 [lief]: https://lief.re/doc/latest/doxygen/classLIEF_1_1PE_1_1VolatileMetadata.html
 
+## Opt-in child: inactive XFG/CastGuard fields on active CFG images
+
+Read-only inspection of the MSVC companions found the `0x138` load-config
+layout with active CFG but no XFG or CastGuard flags. The three XFG fields
+address distinct aligned, file-backed, read-only qwords. The check target
+aliases the CFG check's `ret 0`; both dispatch targets alias the same
+`jmp [rip+disp32]` through the active CFG dispatch slot, whose linker default
+is `jmp rax`. The CastGuard field instead addresses an aligned zero qword in
+non-executable writable data (either file-backed or in the section's zero-fill
+tail). This last field is a failure-mode data cell, not a fourth function slot.
+
+The opt-in parser recognizes only those exact forms, including section
+permissions, disjointness from guard metadata, and exact DIR64 fixups on
+validated VAs. The CastGuard cell cannot be a relocation, cookie, IAT or TLS
+index destination. It remains null at startup and retains its section's data
+permissions; this does not implement CastGuard or prove what guest code may
+write later. The three XFG qwords get the same read-only, terminal assembly
+gates used by the dormant profile. They restore host GS and exit the child
+with status 86; they do not resume the guest or fall back to CFG dispatch.
+The active CFG slots retain the existing exact GFID policy. Neither this
+classification nor installing a gate adds a policy target.
+
+The non-opt-in launcher still rejects these fields. CodeIntegrity metadata
+and the real address-taken IAT table in `vcruntime140.dll` remain independent
+pre-entry blockers. Other unsupported guard metadata is not normalized. Only
+owned fixtures are executed for this profile.
+
 ## Controlled execution plan
 
 1. Separate loading from execution. Reuse PE static TLS metadata but check

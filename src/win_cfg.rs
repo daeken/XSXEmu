@@ -74,6 +74,11 @@ pub struct CfgMetadata<'a> {
     flags: u32,
     stride: usize,
     table: &'a [u8],
+    #[cfg_attr(
+        not(all(target_os = "macos", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
+    companion: Option<CompanionSlots>,
 }
 
 #[derive(Debug)]
@@ -205,12 +210,142 @@ impl DormantSlots {
     }
 }
 
+const COMPANION_CALLABLE: usize = 3;
+const COMPANION_FIELDS: [usize; COMPANION_CALLABLE + 1] = [0x118, 0x120, 0x128, 0x130];
+const COMPANION_END: usize = 0x138;
+
+/// Flag-clear XFG linker defaults and a null CastGuard failure-mode data cell
+/// in an otherwise actively CFG-guarded image. Never a source of CFG targets.
+#[derive(Debug)]
+struct CompanionSlots {
+    #[cfg_attr(
+        not(all(target_os = "macos", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
+    slots: [u32; COMPANION_FIELDS.len()],
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    config: Range<u32>,
+}
+
+impl CompanionSlots {
+    fn parse(
+        pe: &Pe<'_>,
+        raw: &[u8],
+        config: &Range<u32>,
+        ranges: &[Range<u32>],
+        check: u32,
+        dispatch: u32,
+    ) -> Result<Self> {
+        if raw.len() != COMPANION_END || config.end - config.start != COMPANION_END as u32 {
+            return Err(PeError::Unsupported("companion guard load-config size"));
+        }
+        let mut slots = [0; COMPANION_FIELDS.len()];
+        for (i, field) in COMPANION_FIELDS.into_iter().enumerate() {
+            let rva = preferred_rva(pe, u64_at(raw, field))?;
+            let span = if i < COMPANION_CALLABLE {
+                slot_range(pe, rva)?
+            } else {
+                null_castguard_data(pe, rva)?
+            };
+            if slots[..i].contains(&rva) || ranges.iter().any(|r| overlaps(r, &span)) {
+                return Err(PeError::Invalid(
+                    "overlapping companion guard slots or metadata",
+                ));
+            }
+            slots[i] = rva;
+        }
+        let value = |rva| -> Result<u64> { Ok(u64_at(pe.rva_slice(rva, 8)?, 0)) };
+        let [xcheck, xdispatch, xtable, _cast] = slots;
+        if value(check)? != value(xcheck)? || value(xdispatch)? != value(xtable)? {
+            return Err(PeError::Invalid("unexpected companion XFG slot values"));
+        }
+        let ret = preferred_rva(pe, value(check)?)?;
+        let jmp = preferred_rva(pe, value(dispatch)?)?;
+        let xjmp = preferred_rva(pe, value(xdispatch)?)?;
+        let code = [range(ret, 3)?, range(jmp, 2)?, range(xjmp, 6)?];
+        for span in &code {
+            validate_aux_code(pe, span.start, (span.end - span.start) as usize)?;
+        }
+        let xfg = pe.rva_slice(xjmp, 6)?;
+        let disp = i32::from_le_bytes(xfg[2..].try_into().unwrap());
+        if pe.rva_slice(ret, 3)? != [0xc2, 0, 0]
+            || pe.rva_slice(jmp, 2)? != [0xff, 0xe0]
+            || xfg[..2] != [0xff, 0x25]
+            || i64::from(code[2].end) + i64::from(disp) != i64::from(dispatch)
+        {
+            return Err(PeError::Invalid(
+                "unexpected companion guard target instructions",
+            ));
+        }
+
+        // The extension's VA words and the linker defaults used to establish
+        // the form must rebase exactly once. The CastGuard data is not a VA.
+        let mut expected = COMPANION_FIELDS
+            .map(|off| config.start + off as u32)
+            .to_vec();
+        expected.extend([CHECK, DISPATCH, FUNCTION_TABLE].map(|off| config.start + off as u32));
+        for off in [0x58, VOLATILE_METADATA, EH_TABLE] {
+            if u64_at(raw, off) != 0 {
+                expected.push(config.start + off as u32);
+            }
+        }
+        expected.extend([check, dispatch]);
+        expected.extend(&slots[..COMPANION_CALLABLE]);
+        for fix in pe.relocations()? {
+            let fix_range = range(fix, 8)?;
+            if ranges.iter().any(|r| overlaps(r, &fix_range))
+                || slots.iter().any(|&s| s.abs_diff(fix) < 8)
+                || code.iter().any(|r| overlaps(r, &fix_range))
+            {
+                let Some(i) = expected.iter().position(|&r| r == fix) else {
+                    return Err(PeError::Invalid("unexpected companion guard relocation"));
+                };
+                expected.swap_remove(i);
+            }
+        }
+        if !expected.is_empty() {
+            return Err(PeError::Invalid("missing companion guard relocation"));
+        }
+        Ok(Self {
+            slots,
+            #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+            config: config.clone(),
+        })
+    }
+}
+
+fn null_castguard_data(pe: &Pe<'_>, rva: u32) -> Result<Range<u32>> {
+    let span = range(rva, 8)?;
+    let section = section_for(pe, &span)?;
+    if rva % 8 != 0 || !section.readable() || !section.writable() || section.executable() {
+        return Err(PeError::Invalid(
+            "companion CastGuard data permissions or alignment",
+        ));
+    }
+    let offset = rva - section.virtual_address;
+    // Observed companions put the cell in ordinary RW data, either fully
+    // file-backed or entirely zero-filled. Do not seal unrelated data pages.
+    if offset < section.raw_size && nonzero(pe.rva_slice(rva, 8)?) {
+        return Err(PeError::Invalid("nonzero companion CastGuard data"));
+    }
+    Ok(span)
+}
+
 impl<'a> CfgProfile<'a> {
     /// Inspect preferred-base load-config data. A guarded image outside this
     /// profile is an error, not an image with no CFG. This profile rejects an
     /// image that requests enabling export suppression process-wide, because
     /// doing so involves runtime export resolution, not just table validation.
     pub fn parse(pe: &Pe<'a>) -> Result<Self> {
+        Self::parse_profile(pe, false)
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    pub fn parse_tls_child(pe: &Pe<'a>) -> Result<Self> {
+        Self::parse_profile(pe, true)
+    }
+
+    fn parse_profile(pe: &Pe<'a>, static_tls: bool) -> Result<Self> {
         let advertised = pe.dll_characteristics & DLL_GUARD_CF != 0;
         let Some(dir) = pe.directory(LOAD_CONFIG) else {
             return no_cfg(advertised);
@@ -238,7 +373,7 @@ impl<'a> CfgProfile<'a> {
         if !advertised {
             return DormantSlots::parse(pe, dir.rva, raw, size).map(Self::Dormant);
         }
-        CfgMetadata::parse_guarded(pe, dir.rva, raw, size).map(Self::Guarded)
+        CfgMetadata::parse_guarded(pe, dir.rva, raw, size, static_tls).map(Self::Guarded)
     }
 }
 
@@ -247,10 +382,38 @@ impl CfgMetadata<'_> {
     pub fn slots(&self) -> [u32; 2] {
         [self.check_slot_rva(), self.dispatch_slot_rva()]
     }
+
+    pub fn companion_slots(&self) -> &[u32] {
+        self.companion.as_ref().map_or(&[], |c| &c.slots)
+    }
+
+    pub fn companion_callable(&self) -> &[u32] {
+        self.companion_slots()
+            .get(..COMPANION_CALLABLE)
+            .unwrap_or_default()
+    }
+
+    pub fn companion_config_range(&self) -> Option<Range<usize>> {
+        self.companion
+            .as_ref()
+            .map(|c| c.config.start as usize..c.config.end as usize)
+    }
+
+    pub fn overlaps_companion_config_write(&self, rva: u32) -> bool {
+        self.companion
+            .as_ref()
+            .is_some_and(|c| overlaps(&c.config, &(rva..rva.saturating_add(8))))
+    }
 }
 
 impl<'a> CfgMetadata<'a> {
-    fn parse_guarded(pe: &Pe<'a>, rva: u32, raw: &[u8], size: usize) -> Result<Self> {
+    fn parse_guarded(
+        pe: &Pe<'a>,
+        rva: u32,
+        raw: &[u8],
+        size: usize,
+        static_tls: bool,
+    ) -> Result<Self> {
         let flags = u32_at(raw, GUARD_FLAGS);
         if flags & !SUPPORTED_FLAGS != 0 {
             // Includes CFW, RF, XFG, CastGuard, memcpy guard,
@@ -302,11 +465,24 @@ impl<'a> CfgMetadata<'a> {
         if nonzero(tail_between(declared, 0xa0, 0xb0)) {
             return Err(PeError::Unsupported("CFG address-taken IAT table"));
         }
-        if nonzero(declared.get(EH_END..).unwrap_or_default()) {
-            return Err(PeError::Unsupported(
-                "post-EHCONT load-config fields on CFG image",
-            ));
-        }
+        let companion = if nonzero(declared.get(EH_END..).unwrap_or_default()) {
+            if !static_tls {
+                return Err(PeError::Unsupported(
+                    "post-EHCONT load-config fields on CFG image",
+                ));
+            }
+            // SUPPORTED_FLAGS excludes the active XFG/CastGuard bits.
+            Some(CompanionSlots::parse(
+                pe,
+                declared,
+                &ranges[0],
+                &ranges,
+                check_slot_rva,
+                dispatch_slot_rva,
+            )?)
+        } else {
+            None
+        };
         // A long-jump hint is allowed only without a table. Keep rejecting
         // real long-jump tables, SEH, and other extensions.
         if nonzero(&raw[0x60..CHECK]) || nonzero(tail_between(declared, 0xb0, VOLATILE_METADATA)) {
@@ -351,6 +527,7 @@ impl<'a> CfgMetadata<'a> {
             flags,
             stride,
             table,
+            companion,
         })
     }
 

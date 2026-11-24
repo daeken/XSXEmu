@@ -312,6 +312,30 @@ fn dormant_image(kind: Kind) -> Vec<u8> {
     b
 }
 
+const COMPANION_GFIDS: usize = CHECK + 0x30;
+const CAST: usize = DATA + 0x400;
+
+fn companion_image(kind: Kind) -> Vec<u8> {
+    let mut b = dormant_image(kind);
+    let code = unsafe { &static_tls_fixture };
+    w16(&mut b, OP + 70, 0x4000);
+    w64(&mut b, file(LOAD) + 0x88, 1);
+    w32(&mut b, file(LOAD) + 0x90, 0x500);
+    w32(&mut b, file(LOAD) + 0x94, 0); // signing metadata is independently unsupported
+    w64(&mut b, file(LOAD) + 0x80, PREFERRED + COMPANION_GFIDS);
+    w32(
+        &mut b,
+        file(COMPANION_GFIDS),
+        TEXT + code.cfg_target as usize,
+    );
+    w64(&mut b, file(LOAD) + 0x130, PREFERRED + CAST);
+    let size = 48;
+    dir(&mut b, 5, RELOC, size);
+    w32(&mut b, file(RELOC) + 4, size);
+    w16(&mut b, file(RELOC) + 44, 0xa000 | (LOAD + 0x80 - RO));
+    b
+}
+
 fn dormant_call(b: &mut [u8], slot: usize) {
     const ENTRY: usize = TEXT + 0x900;
     w32(b, OP + 16, ENTRY);
@@ -510,6 +534,132 @@ fn dormant_profile_rejects_metadata_slot_and_relocation_near_misses() {
         let exe = dir.write("dormant.exe", &b);
         expect(run(&exe, &[OPT]), 1, error);
     }
+}
+
+#[test]
+fn companion_slots_trap_without_widening_active_cfg() {
+    if !rosetta() {
+        return;
+    }
+    let dir = Scratch::new();
+    let original = companion_image(Kind::Guarded);
+    let exe = dir.write("companion.exe", &original);
+    expect(run(&exe, &[OPT]), 44, "Guest entry returned 44");
+    for mode in [1, 2] {
+        let mut b = original.clone();
+        w32(&mut b, file(MODE), mode);
+        dir.write("companion.exe", &b);
+        expect(run(&exe, &[OPT]), 1, "child terminated by signal 4");
+    }
+    for (i, name) in ["XFG check", "XFG dispatch", "XFG table dispatch"]
+        .into_iter()
+        .enumerate()
+    {
+        let mut b = original.clone();
+        dormant_call(&mut b, CHECK + 0x10 + 8 * i);
+        dir.write("companion.exe", &b);
+        expect(
+            run(&exe, &[OPT]),
+            86,
+            &format!("called dormant linker guard slot: {name}"),
+        );
+    }
+    // The null cell can also lie entirely in the mapped zero-fill tail.
+    let mut b = original.clone();
+    w32(&mut b, OP + 240 + 40 * 2 + 16, CAST - DATA);
+    dir.write("companion.exe", &b);
+    expect(run(&exe, &[OPT]), 44, "Guest entry returned 44");
+}
+
+#[test]
+fn companion_dll_is_opt_in_and_its_xfg_trap_survives_rebase() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let exe = scratch.write("root.exe", &image(Kind::Exe));
+    let mut dll = companion_image(Kind::Dll);
+    scratch.write("owned.dll", &dll);
+    expect(run(&exe, &[OPT]), 42, "Guest entry returned 42");
+    // Both prefer the same VA. Forcing the DLL slot call during attach
+    // must still terminate before the root's entry.
+    dormant_call(&mut dll, CHECK + 0x20);
+    scratch.write("owned.dll", &dll);
+    expect(
+        run(&exe, &[OPT]),
+        86,
+        "called dormant linker guard slot: XFG table dispatch",
+    );
+
+    let mut exe = companion_image(Kind::Guarded);
+    dir(&mut exe, 9, 0, 0); // avoid the earlier TLS-specific default refusal
+    let exe = scratch.write("default.exe", &exe);
+    expect(
+        run(&exe, &[]),
+        1,
+        "post-EHCONT load-config fields on CFG image",
+    );
+}
+
+#[test]
+fn companion_near_misses_refuse_admission() {
+    if !rosetta() {
+        return;
+    }
+    let dir = Scratch::new();
+    let original = companion_image(Kind::Guarded);
+    let exe = dir.write("companion.exe", &original);
+    for (offset, value, diagnostic) in [
+        (file(LOAD) + 0x92, 0x80, "GuardFlags requirements"), // active XFG
+        (file(LOAD) + 0x93, 1, "GuardFlags requirements"),    // active CastGuard
+        (file(LOAD) + 0x94, 1, "CodeIntegrity load-config fields"),
+        (file(LOAD) + 0x118, 0, "overlapping companion guard slots"),
+        (
+            file(CHECK) + 0x10,
+            1,
+            "unexpected companion XFG slot values",
+        ),
+        (file(CAST), 1, "nonzero companion CastGuard data"),
+        (
+            file(TEXT) + 0x822,
+            0,
+            "unexpected companion guard target instructions",
+        ),
+        (file(RELOC) + 45, 0, "missing companion guard relocation"),
+    ] {
+        let mut b = original.clone();
+        b[offset] = value;
+        dir.write("companion.exe", &b);
+        expect(run(&exe, &[OPT]), 1, diagnostic);
+    }
+    let mut b = original.clone();
+    w64(&mut b, file(LOAD) + 0x58, PREFERRED + CAST);
+    dir.write("companion.exe", &b);
+    expect(
+        run(&exe, &[OPT]),
+        1,
+        "security cookie or IAT patch overlaps",
+    );
+
+    // A nonempty table naming an actual IAT row is not a hint.
+    let mut b = companion_image(Kind::Exe);
+    let table = COMPANION_GFIDS + 8;
+    w64(&mut b, file(LOAD) + 0xa0, PREFERRED + table);
+    w64(&mut b, file(LOAD) + 0xa8, 1);
+    w32(&mut b, file(table), IAT);
+    w16(&mut b, file(RELOC) + 46, 0xa000 | (LOAD + 0xa0 - RO));
+    dir.write("owned.dll", &image(Kind::Dll));
+    dir.write("companion.exe", &b);
+    expect(run(&exe, &[OPT]), 1, "CFG address-taken IAT table");
+
+    let mut b = original;
+    w64(&mut b, file(RO) + 16, PREFERRED + CAST); // TLS AddressOfIndex
+    dir.write("companion.exe", &b);
+    expect(
+        run(&exe, &[OPT]),
+        1,
+        "IAT, security-cookie, or GuardCF write conflict",
+    );
 }
 
 #[test]

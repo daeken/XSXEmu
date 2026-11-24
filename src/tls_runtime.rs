@@ -119,6 +119,11 @@ pub fn dormant_guard_entries() -> [u64; DORMANT_CALLABLE] {
     .map(|entry| entry as *const () as u64)
 }
 
+pub fn inactive_xfg_entries() -> [u64; 3] {
+    let [_, _, check, dispatch, table_dispatch] = dormant_guard_entries();
+    [check, dispatch, table_dispatch]
+}
+
 // Terminal assembly gate restores and checks host GS first. Never unwind
 // or run guest detach, even when the attempted call came from a callback.
 extern "C" fn called_dormant_guard(slot: usize) -> ! {
@@ -276,7 +281,10 @@ impl PatchWrites {
             // slots are protected from TLS write/metadata overlap as well.
             match cfg {
                 CfgProfile::None => continue,
-                CfgProfile::Guarded(cfg) => slots.extend(cfg.slots()),
+                CfgProfile::Guarded(cfg) => {
+                    slots.extend(cfg.slots());
+                    slots.extend(cfg.companion_slots());
+                }
                 CfgProfile::Dormant(cfg) => slots.extend(cfg.slots()),
             }
             slots.sort_unstable();
