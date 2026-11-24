@@ -272,6 +272,8 @@ audited_bridges! {
         proc::get_command_line_a, () -> *const u8;
     xsxemu_tls_get_command_line_w, get_command_line_w: b"kernelbase.dll", b"GetCommandLineW",
         proc::get_command_line_w, () -> *const u16;
+    xsxemu_tls_get_system_time_precise_as_file_time, get_system_time_precise_as_file_time: b"kernelbase.dll", b"GetSystemTimePreciseAsFileTime",
+        text::get_system_time_as_file_time, (out: *mut text::FileTime) -> ();
     xsxemu_tls_get_system_time_as_file_time, get_system_time_as_file_time: b"kernelbase.dll", b"GetSystemTimeAsFileTime",
         text::get_system_time_as_file_time, (out: *mut text::FileTime) -> ();
     xsxemu_tls_get_acp, get_acp: b"kernelbase.dll", b"GetACP",

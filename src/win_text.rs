@@ -38,14 +38,15 @@ const STRING: &[u8] = b"api-ms-win-core-string-l1-1-0.dll";
 const LOCALIZATION: &[u8] = b"api-ms-win-core-localization-l1-2-0.dll";
 const DATETIME: &[u8] = b"api-ms-win-core-datetime-l1-1-0.dll";
 const SYSINFO: &[u8] = b"api-ms-win-core-sysinfo-l1-1-0.dll";
+const SYSINFO_1_2: &[u8] = b"api-ms-win-core-sysinfo-l1-2-0.dll";
 const TIMEZONE: &[u8] = b"api-ms-win-core-timezone-l1-1-0.dll";
 
 // Both desktop hosts export these exact names in the Win11 ARM64 reference.
-// API-set arms below are restricted to pairs observed in the AMD64 UCRT.
+// API-set arms below are restricted to the observed guest contract pairs.
 pub(crate) fn has_dll(dll: &[u8]) -> bool {
     matches!(
         dll,
-        KERNELBASE | KERNEL32 | STRING | LOCALIZATION | DATETIME | SYSINFO | TIMEZONE
+        KERNELBASE | KERNEL32 | STRING | LOCALIZATION | DATETIME | SYSINFO | SYSINFO_1_2 | TIMEZONE
     )
 }
 
@@ -134,6 +135,13 @@ pub(crate) fn lookup(dll: &[u8], name: &[u8]) -> Option<HostExport> {
         }
         (KERNELBASE | KERNEL32 | SYSINFO, b"GetLocalTime") => {
             export!("kernelbase.dll", "GetLocalTime", native::get_local_time)
+        }
+        (KERNELBASE | KERNEL32 | SYSINFO_1_2, b"GetSystemTimePreciseAsFileTime") => {
+            export!(
+                "kernelbase.dll",
+                "GetSystemTimePreciseAsFileTime",
+                native::get_system_time_as_file_time
+            )
         }
         (KERNELBASE | KERNEL32 | SYSINFO, b"GetSystemTimeAsFileTime") => {
             export!(

@@ -1777,23 +1777,32 @@ fn system_file_time_bridge_writes_eight_bytes_and_preserves_last_error() {
         OP + 16,
         TEXT + unsafe { static_tls_fixture.system_file_time_entry } as usize,
     );
-    dir_import_one(
-        &mut exe,
-        b"api-ms-win-core-sysinfo-l1-1-0.dll\0",
-        b"GetSystemTimeAsFileTime\0",
-    );
-    let path = scratch.write("system-file-time.exe", &exe);
-    expect(run(&path, &[OPT]), 1, "incomplete dependency graph");
-    let output = launcher(&path, &[OPT, "--rust-providers"])
-        .env("XSXEMU_TRACE_STARTUP", "1")
-        .output()
-        .unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("bridge dispatch kernelbase.dll!GetSystemTimeAsFileTime guest_return_pc="),
-        "{stderr}"
-    );
-    expect(output, 50, "Guest entry returned 50");
+    for (contract, symbol) in [
+        (
+            &b"api-ms-win-core-sysinfo-l1-1-0.dll\0"[..],
+            "GetSystemTimeAsFileTime",
+        ),
+        (
+            &b"api-ms-win-core-sysinfo-l1-2-0.dll\0"[..],
+            "GetSystemTimePreciseAsFileTime",
+        ),
+    ] {
+        dir_import_one(&mut exe, contract, format!("{symbol}\0").as_bytes());
+        let path = scratch.write(&format!("{symbol}.exe"), &exe);
+        expect(run(&path, &[OPT]), 1, "incomplete dependency graph");
+        let output = launcher(&path, &[OPT, "--rust-providers"])
+            .env("XSXEMU_TRACE_STARTUP", "1")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!(
+                "bridge dispatch kernelbase.dll!{symbol} guest_return_pc="
+            )),
+            "{stderr}"
+        );
+        expect(output, 50, "Guest entry returned 50");
+    }
 }
 
 #[test]
