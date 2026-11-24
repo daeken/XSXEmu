@@ -318,6 +318,14 @@ struct NativeSpans {
     nonzero_tail: usize,
     unaligned_tail: usize,
     tail_kinds: [usize; 4],
+    tail_prefix_mismatch: usize,
+}
+
+fn tail_prefix_matches(tail: &[u8]) -> bool {
+    let Some(words) = tail.get(..24) else {
+        return false;
+    };
+    words[..4] == words[12..16] && words[4..8] == words[8..12] && word(words, 20) == Some(0)
 }
 
 fn tail_kind(tail: &[u8], unset_end: bool) -> usize {
@@ -357,6 +365,7 @@ fn native_stages(
                 totals.nonzero_tail += usize::from(tail.iter().any(|&b| b != 0));
                 totals.unaligned_tail += usize::from(!tail.len().is_multiple_of(4));
                 totals.tail_kinds[tail_kind(tail, unset)] += 1;
+                totals.tail_prefix_mismatch += usize::from(!tail_prefix_matches(tail));
             } else {
                 totals.unsupported += 1;
             }
@@ -808,8 +817,8 @@ pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
             s.valid, s.unsupported, s.unset_end, s.nonempty_tail, s.nonzero_tail, s.unaligned_tail
         );
         println!(
-            "  Tail word-pair profile counts [(4,0,set), (3,1,set), (0,all-ones,unset), other/truncated]: {:?}",
-            s.tail_kinds
+            "  Tail word-pair profile counts [(4,0,set), (3,1,set), (0,all-ones,unset), other/truncated]: {:?}; {} prefix mismatches",
+            s.tail_kinds, s.tail_prefix_mismatch
         );
     }
     for (stage, totals) in groups {
@@ -918,6 +927,22 @@ mod tests {
         c.payload(&bytes, [9, 1, 1], true);
         assert_eq!((c.payloads, c.wave32, c.unsupported_metadata), (4, 1, 1));
         assert_eq!((c.fixed_wave32_mismatch, c.xyz_mismatch), (1, 1));
+    }
+
+    #[test]
+    fn tail_prefix_checks_mirrored_words_and_zero_slot() {
+        let mut t = [0; 24];
+        t[0] = 42;
+        t[12] = 42;
+        t[4] = 9;
+        t[8] = 9;
+        assert!(tail_prefix_matches(&t));
+        assert!(!tail_prefix_matches(&t[..23]));
+        t[20] = 1;
+        assert!(!tail_prefix_matches(&t));
+        t[20] = 0;
+        t[8] = 0;
+        assert!(!tail_prefix_matches(&t));
     }
 
     #[test]
