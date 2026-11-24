@@ -155,6 +155,17 @@ fn walk(dis: &mut Disassembler, bytes: &[u8]) -> ResultClass {
     }
 }
 
+/// Color projection only, not a claim about the library program or launch wave.
+pub(super) fn candidate_ps_colors(waves: &mut [Disassembler; 2], payload: &[u8]) -> Option<u8> {
+    if payload.get(0x100) != Some(&5) {
+        return None;
+    }
+    let (body, _) = code(payload)?;
+    let [a, b] = waves.each_mut().map(|dis| checked_exports(dis, body));
+    let (a, b) = (a.ok()?, b.ok()?);
+    (!a.other && !b.other && a.color == b.color).then_some(a.color)
+}
+
 const HEADER: usize = 0x101;
 const FILE_LIMIT: usize = 100_000;
 

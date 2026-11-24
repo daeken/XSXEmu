@@ -5,6 +5,7 @@ use crate::{
     coverage::Metadata,
     coverage::code,
     dxbc_chunks,
+    graphics_reachability::candidate_ps_colors,
     llvm::{Cpu, Llvm},
     reachable::reference_walk_result,
     shader_payloads,
@@ -75,6 +76,7 @@ struct SourceFamily {
     invariant: Option<SourceInterface>,
     system_invariant: Option<SystemInterface>,
     targets: Option<Option<u8>>,
+    native_targets: Option<Option<u8>>,
 }
 
 impl SourceFamily {
@@ -90,6 +92,51 @@ fn update_projection<T: Eq>(current: &mut Option<T>, candidate: T, first: bool) 
         *current = Some(candidate);
     } else if current.as_ref() != Some(&candidate) {
         *current = None;
+    }
+}
+
+#[derive(Debug, Default)]
+struct NativeTargetRows {
+    missing_family: usize,
+    divergent: usize,
+    unsupported: usize,
+    unique: usize,
+    invariant_multi: usize,
+    source_native_different: usize,
+    compacted: usize,
+    different_with_bounded_residual: usize,
+    occupancy_equal_to_source: usize,
+    occupancy_equal_to_native: usize,
+}
+
+impl NativeTargetRows {
+    fn add(&mut self, family: Option<&SourceFamily>, occupied: Option<u8>) {
+        let Some(family) = family else {
+            self.missing_family += 1;
+            return;
+        };
+        let (Some(source), Some(native)) = (family.targets, family.native_targets) else {
+            self.divergent += 1;
+            return;
+        };
+        let (Some(source), Some(native)) = (source, native) else {
+            self.unsupported += 1;
+            return;
+        };
+        if family.count == 1 {
+            self.unique += 1;
+        } else {
+            self.invariant_multi += 1;
+        }
+        if source != native {
+            self.source_native_different += 1;
+            self.compacted += usize::from(u16::from(native) == (1 << source.count_ones()) - 1);
+            if let Some(occupied) = occupied {
+                self.different_with_bounded_residual += 1;
+                self.occupancy_equal_to_source += usize::from(occupied == source);
+                self.occupancy_equal_to_native += usize::from(occupied == native);
+            }
+        }
     }
 }
 
@@ -494,7 +541,13 @@ pub(super) fn run(
             return Err("wrapped library comparison budget exceeded".into());
         }
         let count = counts.entry(stage).or_default();
+        let mut native_targets = None;
         let mut compare = |payload: &[u8]| {
+            if stage == 0
+                && let Some(waves) = &mut graphs
+            {
+                native_targets = candidate_ps_colors(waves, payload);
+            }
             let Some(raw) = extent(payload) else {
                 count.invalid += eligible.len();
                 return;
@@ -555,8 +608,18 @@ pub(super) fn run(
                 }
             }
         };
-        shader_payloads(&bytes, &mut inflate, None, Some(&mut compare))
+        let (_, _, n) = shader_payloads(&bytes, &mut inflate, None, Some(&mut compare))
             .ok_or("invalid candidate XDAT/XBCH framing")?;
+        if stage == 0 && graphs.is_some() {
+            let family = sources
+                .get_mut(&(stage, key))
+                .ok_or("missing PS source family")?;
+            update_projection(
+                &mut family.native_targets,
+                native_targets.filter(|_| n == 1),
+                family.count == 1,
+            );
+        }
     }
     println!(
         "Wrapped library identity hypotheses: {files} wrappers, {joined_wrappers} in at least one candidate family, {} distinct unlabelled slot/program pairs excluded",
@@ -577,6 +640,7 @@ pub(super) fn run(
     let mut state_sizes = BTreeMap::<Vec<usize>, BTreeMap<usize, HashSet<_>>>::new();
     let mut state_bases = HashMap::<_, HashSet<_>>::new();
     let mut target_positions = BTreeMap::<_, [usize; 8]>::new();
+    let mut native_target_rows = BTreeMap::<_, NativeTargetRows>::new();
     let mut layouts_seen = HashMap::<_, Option<Layout>>::new();
     let mut format_matches = [0usize; 7];
     let mut vertex_fields = VertexFields::default();
@@ -647,6 +711,16 @@ pub(super) fn run(
             .or_default()
             .insert(state_base(&slots));
         if let Some(pixel) = pso.slots[0] {
+            if graphs.is_some() {
+                let occupied = state_base(&slots)
+                    .and_then(|b| state.get(b..))
+                    .and_then(residual_occupancy)
+                    .map(|(_, occupied)| occupied);
+                native_target_rows
+                    .entry(slots.clone())
+                    .or_default()
+                    .add(families[0], occupied);
+            }
             let counts = target_positions.entry(slots.clone()).or_default();
             match (families[0], state_base(&slots)) {
                 (_, None) => counts[0] += 1,
@@ -803,6 +877,9 @@ pub(super) fn run(
         println!(
             "  PS color target vs eight-byte state residual, slots {slots:?} [unknown base, missing source, divergent, unsupported signature, invalid residual, compared, equal count, equal occupancy]: {totals:?}"
         );
+    }
+    for (slots, totals) in native_target_rows {
+        println!("  PSO PS candidate export projection, slots {slots:?}: {totals:?}");
     }
     for (slots, by_size) in state_sizes {
         let counts: Vec<_> = by_size
@@ -1094,6 +1171,45 @@ mod tests {
         assert_eq!(residual_occupancy(&[]), Some((0, 0)));
         assert_eq!(residual_occupancy(&residual[..23]), None);
         assert_eq!(residual_occupancy(&[0; 72]), None);
+    }
+
+    #[test]
+    fn ps_export_row_preserves_candidate_ambiguity_and_compaction() {
+        let mut f = SourceFamily {
+            count: 2,
+            targets: Some(Some(4)),
+            native_targets: Some(Some(1)),
+            ..Default::default()
+        };
+        let mut rows = NativeTargetRows::default();
+        rows.add(None, Some(1));
+        rows.add(Some(&f), Some(4));
+        rows.add(Some(&f), Some(1));
+        rows.add(Some(&f), None);
+        update_projection(&mut f.native_targets, Some(2), false);
+        rows.add(Some(&f), Some(2));
+        f.native_targets = Some(None);
+        rows.add(Some(&f), None);
+        assert_eq!(
+            (
+                rows.missing_family,
+                rows.divergent,
+                rows.unsupported,
+                rows.unique,
+                rows.invariant_multi
+            ),
+            (1, 1, 1, 0, 3)
+        );
+        assert_eq!(
+            (
+                rows.source_native_different,
+                rows.compacted,
+                rows.different_with_bounded_residual,
+                rows.occupancy_equal_to_source,
+                rows.occupancy_equal_to_native
+            ),
+            (3, 3, 2, 1, 1)
+        );
     }
 
     #[test]

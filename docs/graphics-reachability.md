@@ -40,3 +40,16 @@ All 12,101 PS wrappers have one checked native stage-5 payload and a supported `
 No complete payload has a zero-enable color EXP or an unclassified EXP in either comparison. Every mismatch in each pass has both source-only and native-only ordinals, with equal cardinality; the native set is always dense from `mrt0` through ordinal `count - 1`. This supports a compact set hypothesis for those cases but does not establish the order of any mapping, component writes, whether a path actually reaches a given export, or the PSO attachment binding. The two wave settings give identical projected results per wrapper, not a measured native wave width.
 
 A separate same-wrapper test compares the [PSV0 `DepthOutput` flag](wrapped-signatures.md) against reachable `MRTZ` presence. In complete `gfx1013` graphs all 1,171 positive flags have an `MRTZ` and all 10,920 clear flags do not. The `gfx1030` counts are 1,166 and 5,022, also with zero disagreement. Every observed `MRTZ` in those complete graphs has raw `EN=1`; no other four-bit enable value is observed. This says which encoding correlates with the depth declaration, not what value is computed, which source components feed it, whether it executes for a specific fragment, or whether the depth attachment receives a write. Rejected graphs do not contribute to this comparison.
+
+## PSO candidate projection
+
+With its optional LLVM reference, [the wrapped/library audit](shader-pipeline-library.md) joins each PSO row to PS wrapper candidates by the exact PS metadata footer digest and stage. Each candidate must have one stage-5 FSSM payload with a complete, classifiable PS export projection under both wave settings of the selected CPU, and both settings must agree on the color set. Multi-wrapper families are compared only when both source and native sets are invariant across every candidate. This is **not** an exact match to the library's native program bytes.
+
+| CPU | Slots | Unique candidate compared | Invariant multi compared | Missing family | Unsupported | Source/native sets differ |
+|---|---|---:|---:|---:|---:|---:|
+| `gfx1013` | PS+VS | 13,340 | 24 | 19 | 0 | 11 |
+| `gfx1013` | PS+MS | 10,656 | 70 | 0 | 0 | 250 |
+| `gfx1030` | PS+VS | 10,029 | 18 | 19 | 3,317 | 11 |
+| `gfx1030` | PS+MS | 4,250 | 24 | 0 | 6,452 | 250 |
+
+Two extra-slot rows lack a PS family under either CPU; neither pass has a divergent family in the checked projection. All 261 differing rows per pass have native sets packed from `mrt0` and bounded eight-byte residuals at the empirical state baselines. In **none** does the position set of nonzero residual chunks match either the declared set or the candidate's compacted native set. The result does not support interpreting those residuals as target-indexed arrays, even after compaction, and does not determine bound attachments. Counts are per PSO row, not distinct shaders.
