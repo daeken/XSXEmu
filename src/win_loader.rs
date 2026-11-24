@@ -71,6 +71,14 @@ pub(crate) fn lookup(dll: &[u8], name: &[u8]) -> Option<HostExport> {
             b"kernel32.dll" | b"kernelbase.dll" | LIBRARY_LOADER_1_1 | LIBRARY_LOADER_1_2,
             b"FreeLibrary",
         ) => export!("kernelbase.dll", "FreeLibrary", native::free_library),
+        (
+            b"kernel32.dll" | b"kernelbase.dll" | LIBRARY_LOADER_1_1 | LIBRARY_LOADER_1_2,
+            b"DisableThreadLibraryCalls",
+        ) => export!(
+            "kernelbase.dll",
+            "DisableThreadLibraryCalls",
+            native::disable_thread_library_calls
+        ),
         (b"ntdll.dll" | b"kernel32.dll" | RTL_SUPPORT, b"RtlPcToFileHeader") => {
             export!(
                 "ntdll.dll",
@@ -99,6 +107,7 @@ fn registry_aliases_are_exact() {
             "GetProcAddress",
             "LoadLibraryExW",
             "FreeLibrary",
+            "DisableThreadLibraryCalls",
         ] {
             assert_eq!(lookup(dll, name.as_bytes()).unwrap().symbol, name);
         }
@@ -158,6 +167,8 @@ pub(crate) mod native {
         filename: Vec<u16>,
         path_key: String,
         link_name: String,
+        is_dll: bool,
+        has_static_tls: bool,
         // Startup's ownership is independent of these guest acquisitions.
         references: Cell<u32>,
         names: HashMap<Vec<u8>, usize>,
@@ -378,6 +389,12 @@ pub(crate) mod native {
                     filename: guest_path.encode_utf16().collect(),
                     path_key: path_key(&guest_path),
                     link_name: basename(path).to_owned(),
+                    is_dll: pe.is_dll(),
+                    // Startup rejects PE TLS in the ordinary lane. The TLS lane
+                    // validates and allocates a slot for every TLS directory
+                    // before registration and process attach, even for an empty
+                    // template. Read the source PE metadata, not guest memory.
+                    has_static_tls: pe.directory(9).is_some(), // IMAGE_DIRECTORY_ENTRY_TLS
                     references: Default::default(),
                     names: Default::default(),
                     ordinals: Default::default(),
@@ -802,6 +819,20 @@ pub(crate) mod native {
             image.ok_or(ERROR_MOD_NOT_FOUND).and_then(Image::acquire)
         })
         .unwrap_or_else(fail)
+    }
+
+    pub(crate) extern "win64" fn disable_thread_library_calls(module: usize) -> i32 {
+        graph(|g| {
+            let Some(image) = g.and_then(|g| g.by_handle(module)).filter(|m| m.is_dll) else {
+                return fail(ERROR_INVALID_HANDLE);
+            };
+            if image.has_static_tls {
+                return fail(ERROR_INVALID_PARAMETER);
+            }
+            // No guest thread attach/detach events are generated in the current
+            // single-thread model. Process attach/detach are not affected.
+            1
+        })
     }
 
     pub(super) extern "win64" fn free_library(module: usize) -> i32 {

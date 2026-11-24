@@ -47,6 +47,7 @@ struct Fixture {
     bridge_cb: u32,
     bridge_entry: u32,
     trace_entry: u32,
+    disable_calls_dll_main: u32,
     code: [u8; RAW],
 }
 global_asm!(include_str!("fixtures/static_tls_lane.S"),
@@ -1379,6 +1380,55 @@ fn address_taken_iat_requires_an_independently_callable_static_pe_export() {
     self::dir(&mut b, 9, 0, 0);
     dir.write("importer.exe", &b);
     expect(run(&exe, &[]), 1, "CFG address-taken IAT table");
+}
+
+#[test]
+fn disable_thread_library_calls_checks_dllmain_handle_and_static_tls() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let mut exe = image(Kind::Solo);
+    // Bring owned.dll into the mapped graph without calling its Step export.
+    dir_import_one(&mut exe, b"owned.dll\0", b"Step\0");
+    let exe = scratch.write("disable-calls.exe", &exe);
+    let mut dll = image(Kind::Dll);
+    w32(
+        &mut dll,
+        OP + 16,
+        TEXT + unsafe { static_tls_fixture.disable_calls_dll_main } as usize,
+    );
+    dir_import_one(
+        &mut dll,
+        b"api-ms-win-core-libraryloader-l1-2-0.dll\0",
+        b"DisableThreadLibraryCalls\0",
+    );
+    // First the TLS-bearing DLL must refuse its own handle. Then clear the
+    // directory (leaving the other bytes intact) and require it to succeed.
+    w32(&mut dll, file(MODE), 1);
+    for has_tls in [true, false] {
+        if !has_tls {
+            dir(&mut dll, 9, 0, 0);
+            w32(&mut dll, file(MODE), 0);
+        }
+        scratch.write("owned.dll", &dll);
+        expect(
+            run(&exe, &[OPT, "--rust-providers"]),
+            43,
+            "Guest entry returned 43",
+        );
+    }
+}
+
+fn dir_import_one(b: &mut [u8], dll: &[u8], symbol: &[u8]) {
+    let imports = LINK + 0x780;
+    dir(b, 1, imports, 40);
+    w32(b, file(imports), imports + 0x30);
+    w32(b, file(imports) + 12, imports + 0x40);
+    w32(b, file(imports) + 16, IAT);
+    w64(b, file(imports) + 0x30, imports + 0x70);
+    put(b, file(imports) + 0x40, dll);
+    put(b, file(imports) + 0x72, symbol);
 }
 
 #[test]

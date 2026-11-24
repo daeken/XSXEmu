@@ -282,6 +282,16 @@ invalid or unsupported requests return their validation errors instead.
 `RtlPcToFileHeader` looks up PCs only in the mapped guest image graph, which
 is registered before process attach. It returns and writes the image base
 (or null for an unknown PC), without changing LastError.
+[`DisableThreadLibraryCalls`](https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-disablethreadlibrarycalls)
+accepts only the exact base of a mapped guest DLL, including its own handle
+passed to `DllMain`. As documented, active PE static TLS prevents success.
+The graph records TLS directory presence from each source PE: the TLS lane
+allocates a static slot for every validated directory, even with an empty
+template, and the ordinary lane rejects PE static TLS at startup. The Rust
+provider uses `ERROR_INVALID_HANDLE` for non-DLL handles and
+`ERROR_INVALID_PARAMETER` for a DLL with static TLS. Success preserves
+LastError. There are no guest thread attach/detach notifications to suppress
+in the single-thread model, and process attach/detach still run.
 `GetProcAddress` and `FreeLibrary` aren't bridged. Unbridged
 providers fail before entry unless `--trace-missing-imports` is enabled,
 which treats well-formed unavailable or unbridged slots as callable, not

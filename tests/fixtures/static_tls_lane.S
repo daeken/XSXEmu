@@ -8,7 +8,7 @@ _static_tls_fixture:
     .long Lsolo_cb-Ltext, Lsolo_entry-Ltext
     .long Lcfg_entry-Ltext, Lcfg_target-Ltext
     .long Lbridge_cb-Ltext, Lbridge_entry-Ltext
-    .long Ltrace_entry-Ltext
+    .long Ltrace_entry-Ltext, Ldisable_calls_dll_main-Ltext
 Ltext:
 .macro tls index
     leaq Ltext(%rip), %r11
@@ -92,6 +92,61 @@ Ldll_main:
     retq
 Ldll_main_detach:
     phase 6, 7
+    movl $1, %eax
+    retq
+Ldisable_calls_dll_main:
+    leaq Ltext(%rip), %r11
+    args                         /* RCX is the actual mapped self handle. */
+    testl %edx, %edx
+    je Ldisable_calls_detach
+    cmpl $1, %edx
+    jne Lbad
+    cmpl $0, {mode_delta}(%r11)
+    je 1f
+    tls 1
+    phase 1, 5                  /* Keep exercising TLS after the refusal. */
+1:
+    subq $40, %rsp
+    movl $0x12345678, %gs:0x68
+    callq *{iat_delta}(%r11)     /* DisableThreadLibraryCalls(self) */
+    leaq Ltext(%rip), %r11
+    cmpl $0, {mode_delta}(%r11)
+    jne 2f
+    cmpl $1, %eax
+    jne Lbad
+    cmpl $0x12345678, %gs:0x68
+    jne Lbad
+    jmp 3f
+2:
+    testl %eax, %eax
+    jne Lbad
+    cmpl $87, %gs:0x68           /* ERROR_INVALID_PARAMETER */
+    jne Lbad
+    tls 1
+3:
+    leaq 1-{text_rva}(%r11), %rcx
+    callq *{iat_delta}(%r11)     /* Interior pointer is not a handle. */
+    testl %eax, %eax
+    jne Lbad
+    cmpl $6, %gs:0x68            /* ERROR_INVALID_HANDLE */
+    jne Lbad
+    movl $0x12345678, %gs:0x68
+    leaq Ltext(%rip), %r11
+    xorl %ecx, %ecx
+    callq *{iat_delta}(%r11)
+    testl %eax, %eax
+    jne Lbad
+    cmpl $6, %gs:0x68
+    jne Lbad
+    addq $40, %rsp
+    movl $1, %eax
+    retq
+Ldisable_calls_detach:
+    cmpl $0, {mode_delta}(%r11)
+    je 1f
+    tls 1
+    phase 6, 7
+1:
     movl $1, %eax
     retq
 Lstep:
