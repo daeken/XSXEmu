@@ -13,6 +13,7 @@ const S16: usize = 16 * GIB;
 const S24: usize = 24 * GIB;
 const COMMIT_SIZE: usize = 0x4940_0000;
 const SECOND_COMMIT_SIZE: usize = 0x8970_0000;
+const THIRD_COMMIT_SIZE: usize = 0x2330_0000;
 const COMMIT_ALIGN: usize = 2 * 1024 * 1024;
 const ANYWHERE: i32 = 1;
 const INHERIT_NONE: i32 = 2;
@@ -23,9 +24,9 @@ const ERROR_NOT_SUPPORTED: u32 = 50;
 
 // No supported XMem release operation. Each slot owns its mapping until this
 // disposable static-TLS child exits. At most 48 GiB of inaccessible VA plus
-// exactly one mapping per accepted CPU commit shape (at most 3,371 MiB
+// exactly one mapping per accepted CPU commit shape (at most 3,934 MiB
 // combined). No host page wiring or eager touch.
-static MAPPINGS: Mutex<[Option<Reservation>; 4]> = Mutex::new([None, None, None, None]);
+static MAPPINGS: Mutex<[Option<Reservation>; 5]> = Mutex::new([const { None }; 5]);
 
 #[derive(Clone, Copy)]
 enum Mode {
@@ -157,6 +158,7 @@ fn reserve(
         (0, S16 | S24, 0x2040_2000, 3, 0x801) => (1, Mode::Reserve),
         (0, COMMIT_SIZE, 0x2000_3000, 0x183, 0x22004) => (2, Mode::CpuCommit),
         (0, SECOND_COMMIT_SIZE, 0x2000_3000, 0x283, 0x2404) => (3, Mode::CpuCommit),
+        (0, THIRD_COMMIT_SIZE, 0x2000_3000, 0x183, 0x22004) => (4, Mode::CpuCommit),
         _ => return Err(Failure::UnsupportedTuple),
     };
     let mut slots = MAPPINGS.lock().unwrap_or_else(|_| std::process::abort());
@@ -285,6 +287,7 @@ mod tests {
             check(&b);
             let c = Reservation::new(COMMIT_SIZE, Mode::CpuCommit).unwrap();
             let d = Reservation::new(SECOND_COMMIT_SIZE, Mode::CpuCommit).unwrap();
+            let e = Reservation::new(THIRD_COMMIT_SIZE, Mode::CpuCommit).unwrap();
             let disjoint = |first: &Reservation, second: &Reservation| {
                 first.base + first.len <= second.base || second.base + second.len <= first.base
             };
@@ -307,6 +310,11 @@ mod tests {
                 }
             };
             assert!(disjoint(&c, &d));
+            check_rw(&c, COMMIT_SIZE);
+            check_rw(&d, SECOND_COMMIT_SIZE);
+            assert!(disjoint(&c, &e) && disjoint(&d, &e));
+            check_rw(&e, THIRD_COMMIT_SIZE);
+            release(e);
             check_rw(&c, COMMIT_SIZE);
             check_rw(&d, SECOND_COMMIT_SIZE);
             release(d);

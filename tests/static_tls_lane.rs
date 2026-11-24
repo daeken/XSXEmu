@@ -1951,7 +1951,7 @@ fn xmem_bridge_owns_exact_boot_reservations_and_cpu_mapping() {
             stderr
                 .matches("mapped anonymous demand-zero CPU RW")
                 .count(),
-            2,
+            3,
             "{stderr}"
         );
         assert!(
