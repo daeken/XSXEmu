@@ -29,6 +29,8 @@ struct Program {
     adjusted_equal: bool,
     marker_present: bool,
     conditional_equal: [bool; 3],
+    conditional_same_length: [bool; 3],
+    nonzero_site_word: bool,
     library_profiles: HashSet<([usize; 3], bool)>,
     agreeing_profile: bool,
     disagreeing_profile: bool,
@@ -167,18 +169,21 @@ pub(super) fn run(
         }
     }
     let mut profiles = HashMap::<_, HashSet<_>>::new();
+    let mut site_programs = HashSet::new();
     for pso in library.compute() {
         let dispatch = ComputeMetadata::from_library(&library, pso)
             .ok_or("invalid compute metadata framing")?
             .dispatch;
-        add(
-            5,
-            pso.program,
-            library
-                .blob(pso.layout)
-                .ok_or("missing compute layout span")?,
-        )
-        .ok_or("missing compute layout digest")?;
+        let layout = library
+            .blob(pso.layout)
+            .ok_or("missing compute layout span")?;
+        add(5, pso.program, layout).ok_or("missing compute layout digest")?;
+        if layout[24..layout.len() - 32]
+            .chunks_exact(32)
+            .any(|item| word(item, 0) == Some(0x42) && word(item, 4) != Some(0))
+        {
+            site_programs.insert(pso.program);
+        }
         profiles
             .entry(pso.program)
             .or_default()
@@ -186,11 +191,12 @@ pub(super) fn run(
     }
     let multi_profiles = profiles.values().filter(|p| p.len() > 1).count();
     for (id, profile) in profiles {
-        programs
+        let p = programs
             .get_mut(&5)
             .and_then(|p| p.get_mut(&id))
-            .ok_or("missing indexed compute program")?
-            .library_profiles = profile;
+            .ok_or("missing indexed compute program")?;
+        p.library_profiles = profile;
+        p.nonzero_site_word = site_programs.contains(&id);
     }
 
     let mut counts = BTreeMap::<u16, Payloads>::new();
@@ -272,7 +278,10 @@ pub(super) fn run(
                     p.marker_present = true;
                     if let Some(fssm_cut) = fssm_cut {
                         for (k, start) in STARTS.into_iter().enumerate() {
-                            let equal = library_cut.get(start..) == Some(fssm_cut);
+                            let lib = library_cut.get(start..);
+                            p.conditional_same_length[k] |=
+                                lib.is_some_and(|b| b.len() == fssm_cut.len());
+                            let equal = lib == Some(fssm_cut);
                             byte_match |= equal;
                             p.conditional_equal[k] |= equal;
                         }
@@ -337,6 +346,25 @@ pub(super) fn run(
             offsets
         );
         if stage == 5 {
+            let site_windows: Vec<_> = STARTS
+                .into_iter()
+                .enumerate()
+                .map(|(i, start)| {
+                    (
+                        start,
+                        values()
+                            .filter(|p| p.nonzero_site_word && p.conditional_same_length[i])
+                            .count(),
+                        values()
+                            .filter(|p| p.nonzero_site_word && p.conditional_equal[i])
+                            .count(),
+                    )
+                })
+                .collect();
+            println!(
+                "  Nonzero layout-site subset: {} programs; per tested start (offset, same length, exact) {site_windows:?}",
+                site_programs.len()
+            );
             println!(
                 "  Compute launch cross-check: {multi_profiles} programs with multiple library XYZ/wave-bit pairs; {} comparisons with unsupported FSSM profiles; candidate programs {} with agreement, {} with disagreement, {} with both; byte-window positives {} with agreement, {} with disagreement",
                 totals.unsupported_compute_profiles,
