@@ -607,22 +607,24 @@ pub(crate) mod native {
         })
     }
 
-    pub(super) extern "win64" fn encode_pointer(value: *const c_void) -> *const c_void {
+    // Opaque PVOID values: the transform uses every address bit and never
+    // dereferences its argument or changes LastError on success.
+    pub(crate) extern "win64" fn encode_pointer(value: *mut c_void) -> *mut c_void {
         let Some(command) = COMMAND.get() else {
             fail(ERROR_NOT_SUPPORTED);
-            return ptr::null();
+            return ptr::null_mut();
         };
-        ptr::with_exposed_provenance(
+        ptr::with_exposed_provenance_mut(
             (value.expose_provenance() ^ command.pointer_key).rotate_right(11),
         )
     }
 
-    pub(super) extern "win64" fn decode_pointer(value: *const c_void) -> *const c_void {
+    pub(crate) extern "win64" fn decode_pointer(value: *mut c_void) -> *mut c_void {
         let Some(command) = COMMAND.get() else {
             fail(ERROR_NOT_SUPPORTED);
-            return ptr::null();
+            return ptr::null_mut();
         };
-        ptr::with_exposed_provenance(value.addr().rotate_left(11) ^ command.pointer_key)
+        ptr::with_exposed_provenance_mut(value.addr().rotate_left(11) ^ command.pointer_key)
     }
 
     #[cfg(test)]
@@ -669,12 +671,13 @@ pub(crate) mod native {
                 );
             }
             assert!(init_process("other.exe").is_err());
-            let value = ptr::from_ref(&expected).cast();
+            let mut value = 42u32;
+            let value = ptr::from_mut(&mut value).cast();
             let encoded = encode_pointer(value);
             assert_eq!(encode_pointer(value), encoded);
             assert_eq!(decode_pointer(encoded), value);
-            assert!(!encode_pointer(ptr::null()).is_null());
-            assert!(decode_pointer(encode_pointer(ptr::null())).is_null());
+            assert!(!encode_pointer(ptr::null_mut()).is_null());
+            assert!(decode_pointer(encode_pointer(ptr::null_mut())).is_null());
         }
 
         #[test]
@@ -782,6 +785,7 @@ mod registry_tests {
             (INFO, b"GetSystemInfo"),
             (PROFILE, b"QueryPerformanceCounter"),
             (UTIL, b"EncodePointer"),
+            (UTIL, b"DecodePointer"),
         ] {
             assert!(has_dll(contract));
             let export = lookup(contract, name).unwrap();

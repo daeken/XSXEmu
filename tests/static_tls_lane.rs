@@ -235,8 +235,8 @@ fn image(kind: Kind) -> Vec<u8> {
         Kind::Solo => (),
     }
     if matches!(kind, Kind::Bridge) {
-        let imports = LINK + 0x468;
-        dir(&mut b, 1, imports, 100);
+        let imports = LINK + 0x450;
+        dir(&mut b, 1, imports, 120);
         w32(&mut b, file(imports), LINK + 0x30);
         w32(&mut b, file(imports) + 12, LINK + 0xd0);
         w32(&mut b, file(imports) + 16, IAT);
@@ -317,6 +317,24 @@ fn image(kind: Kind) -> Vec<u8> {
             b"api-ms-win-core-interlocked-l1-1-0.dll\0",
         );
         put(&mut b, file(LINK) + 0x672, b"InitializeSListHead\0");
+
+        let util = imports + 80;
+        w32(&mut b, file(util), LINK + 0x6a0);
+        w32(&mut b, file(util) + 12, LINK + 0x6c0);
+        w32(&mut b, file(util) + 16, IAT + 224);
+        put(
+            &mut b,
+            file(LINK) + 0x6c0,
+            b"api-ms-win-core-util-l1-1-0.dll\0",
+        );
+        for (i, name) in [b"EncodePointer\0", b"DecodePointer\0"]
+            .into_iter()
+            .enumerate()
+        {
+            let off = 0x6e0 + i * 0x20;
+            w64(&mut b, file(LINK) + 0x6a0 + i * 8, LINK + off);
+            put(&mut b, file(LINK) + off + 2, name);
+        }
     }
     b
 }

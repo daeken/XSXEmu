@@ -398,6 +398,34 @@ Lbridge_entry:
     cmpq $-1, 112(%rsp)
     jne Lbad
 
+    /* Opaque 64-bit PVOID round trips through the util API-set IAT and
+     * exact CFG dispatch. Null is encoded, not passed through unchanged.
+     * Neither operation may alter the guest LastError DWORD. */
+    .irp value,0,0x123456789abcdef0
+        movl $0x87654321, %gs:0x68
+        movabsq $\value, %rcx
+        leaq Ltext(%rip), %r11
+        movq {iat_delta}+224(%r11), %rax
+        callq *{dispatch_delta}(%r11) /* EncodePointer */
+        cmpl $0x87654321, %gs:0x68
+        jne Lbad
+        .if \value == 0
+            testq %rax, %rax
+            je Lbad
+        .endif
+
+        movl $0xabcdef01, %gs:0x68
+        movq %rax, %rcx
+        leaq Ltext(%rip), %r11
+        movq {iat_delta}+232(%r11), %rax
+        callq *{dispatch_delta}(%r11) /* DecodePointer */
+        cmpl $0xabcdef01, %gs:0x68
+        jne Lbad
+        movabsq $\value, %rcx
+        cmpq %rcx, %rax
+        jne Lbad
+    .endr
+
     /* Win32 dynamic TLS slots are a provider table, not GS:[0x58]. */
     movq %gs:0x58, %rax
     movq %rax, 64(%rsp)
