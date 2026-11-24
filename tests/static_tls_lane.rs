@@ -16,7 +16,7 @@ const OPT: &str = "--experimental-static-tls";
 const TRUSTED: &str = "--trusted-offline";
 const WARNING: &str = "neither signature nor catalog is verified; Xbox policy is not evaluated";
 const PAGE: usize = 0x4000;
-const RAW: usize = 0x2c00; // Includes the shared fixture's bridge code.
+const RAW: usize = 0x2e00; // Includes the shared fixture's bridge code.
 const TEXT: usize = PAGE;
 const RO: usize = 2 * PAGE;
 const DATA: usize = 3 * PAGE;
@@ -66,6 +66,7 @@ struct Fixture {
     xmem_entry: u32,
     processor_topology_entry: u32,
     system_file_time_entry: u32,
+    tick_count64_entry: u32,
     code: [u8; RAW],
 }
 global_asm!(include_str!("fixtures/static_tls_lane.S"),
@@ -1614,6 +1615,46 @@ fn processor_feature_bridge_preserves_last_error_and_reports_fastfail_unavailabl
         43,
         "Guest entry returned 43",
     );
+}
+
+#[test]
+fn tick_count64_bridge_returns_monotonic_uptime_and_preserves_last_error() {
+    if !rosetta() {
+        return;
+    }
+    unsafe extern "C" {
+        fn clock_gettime_nsec_np(clock_id: std::ffi::c_int) -> u64;
+    }
+    let scratch = Scratch::new();
+    let mut exe = image(Kind::Solo);
+    w32(
+        &mut exe,
+        OP + 16,
+        TEXT + unsafe { static_tls_fixture.tick_count64_entry } as usize,
+    );
+    dir_import_one(
+        &mut exe,
+        b"api-ms-win-core-sysinfo-l1-1-0.dll\0",
+        b"GetTickCount64\0",
+    );
+    // Compare the guest's full RAX value with a pre-launch host uptime sample.
+    let host_ms = unsafe { clock_gettime_nsec_np(4) } / 1_000_000; // CLOCK_MONOTONIC_RAW
+    put(&mut exe, file(MODE), &host_ms.to_le_bytes());
+    let path = scratch.write("tick-count64.exe", &exe);
+    expect(run(&path, &[OPT]), 1, "incomplete dependency graph");
+    let output = launcher(&path, &[OPT, "--rust-providers"])
+        .env("XSXEMU_TRACE_STARTUP", "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr
+            .matches("bridge dispatch kernelbase.dll!GetTickCount64 guest_return_pc=")
+            .count(),
+        2,
+        "{stderr}"
+    );
+    expect(output, 51, "Guest entry returned 51");
 }
 
 #[test]

@@ -18,6 +18,7 @@ _static_tls_fixture:
     .long Lxmem_entry-Ltext
     .long Lprocessor_topology_entry-Ltext
     .long Lsystem_file_time_entry-Ltext
+    .long Ltick_count64_entry-Ltext
 Ltext:
 .macro tls index
     leaq Ltext(%rip), %r11
@@ -928,6 +929,30 @@ Lprocessor_feature_entry:
     jne Lbad
     addq $40, %rsp
     movl $43, %eax
+    retq
+Ltick_count64_entry:
+    tls 0
+    phase 1, 2
+    subq $40, %rsp
+    movl $0x87654321, %gs:0x68
+    callq *{iat_delta}(%r11)
+    cmpl $0x87654321, %gs:0x68
+    jne Lbad
+    leaq Ltext(%rip), %r11
+    movq %rax, %rcx
+    subq {mode_delta}(%r11), %rcx     /* Host sample taken before launch. */
+    cmpq $60000, %rcx                /* Unsigned: also rejects values below the sample. */
+    ja Lbad
+    movq %rax, 32(%rsp)
+    movl $0x12345678, %gs:0x68
+    leaq Ltext(%rip), %r11
+    callq *{iat_delta}(%r11)
+    cmpl $0x12345678, %gs:0x68
+    jne Lbad
+    cmpq 32(%rsp), %rax
+    jb Lbad
+    addq $40, %rsp
+    movl $51, %eax
     retq
 Lsystem_file_time_entry:
     tls 0

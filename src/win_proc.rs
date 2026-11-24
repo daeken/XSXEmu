@@ -121,6 +121,10 @@ pub(crate) fn lookup(dll: &[u8], name: &[u8]) -> Option<HostExport> {
             "GetNativeSystemInfo",
             native::get_system_info
         ),
+        #[cfg(target_os = "macos")]
+        (BASE | K32 | INFO, b"GetTickCount64") => {
+            export!("kernelbase.dll", "GetTickCount64", native::get_tick_count64)
+        }
         (BASE | K32 | PROFILE, b"QueryPerformanceCounter") => export!(
             "kernelbase.dll",
             "QueryPerformanceCounter",
@@ -643,6 +647,18 @@ pub(crate) mod native {
         })
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) extern "win64" fn get_tick_count64() -> u64 {
+        // Darwin's raw monotonic clock advances during sleep and does not
+        // follow wall-clock adjustments. Use host uptime as modeled guest
+        // uptime, not time since the first call to QueryPerformanceCounter.
+        const CLOCK_MONOTONIC_RAW: std::ffi::c_int = 4;
+        unsafe extern "C" {
+            fn clock_gettime_nsec_np(clock_id: std::ffi::c_int) -> u64;
+        }
+        unsafe { clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) / 1_000_000 }
+    }
+
     const QPC_HZ: i64 = 1_000_000_000;
     static QPC_ORIGIN: OnceLock<Instant> = OnceLock::new();
 
@@ -853,6 +869,16 @@ pub(crate) mod native {
             assert!(tail.iter().all(|&byte| byte == 0xa5));
         }
 
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn tick_count64_advances_in_milliseconds() {
+            const DELAY_MS: u64 = 20;
+            let before = get_tick_count64();
+            std::thread::sleep(std::time::Duration::from_millis(DELAY_MS));
+            let after = get_tick_count64();
+            assert!(after >= before + DELAY_MS - 1);
+        }
+
         #[test]
         fn system_info_and_monotonic_clock() {
             let mut sys = MaybeUninit::uninit();
@@ -896,6 +922,8 @@ mod registry_tests {
             (ERROR, b"SetErrorMode"),
             (INFO, b"GetSystemInfo"),
             (INFO, b"GetLogicalProcessorInformation"),
+            #[cfg(target_os = "macos")]
+            (INFO, b"GetTickCount64"),
             (PROFILE, b"QueryPerformanceCounter"),
             (UTIL, b"EncodePointer"),
             (UTIL, b"DecodePointer"),

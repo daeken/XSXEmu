@@ -302,6 +302,10 @@ union or require any other relationship.
 `GetSystemTimeAsFileTime` uses the same host UTC wall clock as the ordinary
 provider. It writes one Win64 `FILETIME` (two DWORDs encoding 100 ns ticks
 since 1601-01-01 UTC) and preserves `LastError` on success.
+`GetTickCount64` models guest uptime with the macOS raw monotonic clock,
+including host sleep. It returns whole milliseconds as an unsigned 64-bit
+value and preserves `LastError`. Its epoch is independent of the guest's
+`QueryPerformanceCounter` origin.
 
 `run --experimental-static-tls --trusted-offline --map-extra-dll PATH`
 explicitly maps one additional trusted, entryless PE DLL without imports,
