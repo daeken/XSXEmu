@@ -110,14 +110,50 @@ installs host TSD on handler entry and reinstalls guest GS on exit only when
 not returning to the signal or syscall stack. Its assembly dispatcher
 [switches to host GS and reconstructs the `%rcx` frame pointer after `syscall`](https://github.com/wine-mirror/wine/blob/db11d0fe6a169c457e23d007e20404643d067aa8/dlls/ntdll/unix/signal_x86_64.c#L3113-L3135)
 and [switches back to guest GS, saving and restoring `%rax` and `%rcx`](https://github.com/wine-mirror/wine/blob/db11d0fe6a169c457e23d007e20404643d067aa8/dlls/ntdll/unix/signal_x86_64.c#L3181-L3190).
-These boundaries illustrate work the probe does not attempt. The fixture
-proves only one synchronous leaf interval on one worker. It does
-not prove imports calling host Rust/libc, host-to-guest callbacks, nesting,
-thread attach/exit, signal/Mach exception delivery or return, unwind,
-pthread cancellation, profiling/sampling, or interrupted install/restore.
-Do not promote the private hook until those transitions and restoration
-are proven, including interruption at each boundary. Masking signals is
-not proof of correctness for synchronous traps or Mach exceptions.
+The original `tools/teb-probe` private test proves only one synchronous
+leaf interval on one worker. The standalone follow-up below tests a nested
+boundary and one signal case; neither is a production hook.
+
+## Standalone boundary fixture
+
+```sh
+tools/probe_rosetta_teb_boundary.sh                         # synchronous check
+tools/probe_rosetta_teb_boundary.sh signal-host signal-guest # optional observations
+```
+
+The runner builds a Rust/assembly x86-64 Mach-O and gives each mode a fresh
+Rosetta subprocess with a 10-second deadline. It uses only an owned TEB,
+TLS vector/block, and test routines; no C source, Wine runtime, PE input,
+production startup changes, or OS security changes. The private libSystem
+`_thread_set_tsd_base` and `THREAD_IDENTIFIER_INFO.thread_handle` are the
+same mechanism tested by `tools/teb-probe`, not a supported macOS interface.
+
+**Observed on Apple Silicon, macOS 27.0.1 (26A434):**
+
+- `sync`: host → Win64 guest → Rust Win64 provider (host GS) → nested Win64
+  callback (guest GS) → provider (host GS) → outer guest → restored host.
+  Mixed positional GPR/XMM arguments and integer/floating stack arguments
+  matched bit-for-bit in both directions, as did the integer provider return
+  and floating callback return. Guest RDI/RSI and XMM6/XMM15 sentinels survived.
+  The callback read and changed guest TLS and `GS:[0x68]`; the outer guest
+  saw both changes. The provider read, changed and rechecked independent
+  Rust thread-local TLS/last-error values and Darwin `errno`; the final host
+  saw the provider's values and the original host GS observations. Rust
+  last-error here is a fixture model, not the production provider's state.
+- `signal-host` / `signal-guest`: a sender used `pthread_kill(SIGUSR1)` after
+  the target parked in assembly. The assembly-only handler saw the
+  interrupted context's GS (host and guest, respectively), and the target
+  saw that same GS after handler return. Final host GS checks passed in both
+  modes. In particular, **signal entry did not automatically restore host
+  GS** when the interrupted leaf held guest GS. The handler did not call
+  Rust, access host TLS, or switch GS.
+
+This covers fixed signatures, one thread's boundary, one nested callback,
+normal returns, and one directed signal at a stable point. It does not
+establish a safe host handler, reentrant signals or delivery during a switch,
+Mach exceptions, synchronous traps, unwinding, cancellation, profiling,
+thread lifecycle, or other Rosetta versions. Masking signals would not settle
+synchronous traps or Mach exceptions. No title or UCRT was run.
 
 ## Controlled execution plan
 
