@@ -3074,6 +3074,86 @@ fn app_notifications_are_scoped_offline_registrations() {
     expect(output, 51, "Guest entry returned 51");
 }
 
+const GAMEINPUT_CAPACITY: usize = 0x800;
+#[repr(C)]
+struct GameInputFixture {
+    entry: u32,
+    unsupported: u32,
+    code: [u8; GAMEINPUT_CAPACITY],
+}
+
+global_asm!(include_str!("fixtures/static_tls_gameinput.S"),
+    capacity = const GAMEINPUT_CAPACITY,
+    iat_delta = const IAT - TEXT,
+    dispatch_delta = const DISPATCH - TEXT,
+    options(att_syntax),
+);
+unsafe extern "C" {
+    static static_tls_gameinput_fixture: GameInputFixture;
+}
+
+#[test]
+fn gameinput_root_ordinal_exposes_guarded_no_device_service() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let fixture = unsafe { &static_tls_gameinput_fixture };
+    let mut exe = image(Kind::Guarded);
+    put(&mut exe, file(TEXT), &fixture.code);
+    // Occupy the facade's preferred base so its vtable and GFIDs rebase.
+    const BASE: usize = 0x1_8600_0000;
+    w64(&mut exe, OP + 24, BASE);
+    w64(&mut exe, file(ARRAY), BASE + TEXT);
+    w64(&mut exe, file(LOAD) + 88, BASE + COOKIE);
+    for (field, rva) in [(0x70, CHECK), (0x78, DISPATCH), (0x80, GFIDS)] {
+        w64(&mut exe, file(LOAD) + field, BASE + rva);
+    }
+    for (i, rva) in [TEMPLATE, TEMPLATE + 8, INDEX, ARRAY]
+        .into_iter()
+        .enumerate()
+    {
+        w64(&mut exe, file(RO) + 8 * i, BASE + rva);
+    }
+    w64(&mut exe, file(TEMPLATE), BASE + COOKIE);
+    let set_entry = |exe: &mut [u8], entry| {
+        w32(exe, OP + 16, TEXT + entry as usize);
+        w32(exe, file(GFIDS), TEXT + entry as usize);
+    };
+    set_entry(&mut exe, fixture.entry);
+    dir_import_one(&mut exe, b"GameInput.dll\0", b"");
+    w64(&mut exe, file(LINK + 0x7b0), (1usize << 63) | 1);
+    let path = scratch.write("gameinput.exe", &exe);
+    let opt = "--gameinput-no-devices";
+    let args = [OPT, TRUSTED, "--rust-providers", opt];
+    expect(
+        run(&path, &[OPT, TRUSTED, "--rust-providers"]),
+        1,
+        "incomplete dependency graph",
+    );
+    expect(
+        run(&path, &[OPT, "--rust-providers", opt]),
+        1,
+        "--gameinput-no-devices requires",
+    );
+    expect(run(&path, &args), 53, "Guest entry returned 53");
+    let mut named = exe.clone();
+    dir_import_one(&mut named, b"GameInput.dll\0", b"GameInputCreate\0");
+    let path = scratch.write("gameinput-name.exe", &named);
+    expect(run(&path, &args), 1, "incomplete dependency graph");
+    let mut other = exe.clone();
+    w64(&mut other, file(LINK + 0x7b0), (1usize << 63) | 2);
+    let path = scratch.write("gameinput-other-ordinal.exe", &other);
+    expect(run(&path, &args), 1, "incomplete dependency graph");
+    set_entry(&mut exe, fixture.unsupported);
+    let path = scratch.write("gameinput-unmodeled.exe", &exe);
+    expect(
+        run(&path, &args),
+        87,
+        "unsupported IGameInput v0 vtable slot 7",
+    );
+}
+
 const WINSOCK_INIT_CAPACITY: usize = 0x400;
 #[repr(C)]
 struct WinsockInitFixture {

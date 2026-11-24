@@ -2,6 +2,7 @@ mod apiset;
 mod appnotify;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 mod darwin_guest_mask;
+mod gameinput;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 mod guest;
 mod guest_entropy;
@@ -54,6 +55,7 @@ const USAGE: &str = "Usage: xsxemu <inspect|map|audit|run> <image.exe> [options]
     run option: --map-extra-dll PATH  Map an extra PE DLL (trusted-offline static TLS only)\n\
     run option: --xgameruntime-compat  Model pinned XGameRuntime startup (trusted-offline static TLS with Rust providers)\n\
     run option: --xgameruntime-dll PATH  Admit an explicit xgameruntime.dll (trusted-offline static TLS with Rust providers)\n\
+    run option: --gameinput-no-devices  Model the root GameInput #1 import with no devices (trusted-offline static TLS with Rust providers)\n\
     run option: --guest-entropy  Map the built-in entropy DLL (trusted-offline static TLS with Rust providers)\n\
     audit/run options: --api-set SCHEMA.dll, --rust-providers";
 
@@ -94,6 +96,7 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
     let mut map_extra_dll = None;
     let mut xgameruntime_dll = None;
     let mut xgameruntime_compat = false;
+    let mut gameinput_no_devices = false;
     let mut guest_entropy = false;
     let mut startup_profile = None;
     let mut options = args.iter();
@@ -128,6 +131,7 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
             ("run", Some("--trace-missing-imports")) => trace_missing_imports = true,
             ("run", Some("--experimental-static-tls")) => experimental_tls = true,
             ("run", Some("--trusted-offline")) => trusted_offline = true,
+            ("run", Some("--gameinput-no-devices")) => gameinput_no_devices = true,
             ("run", Some("--guest-entropy")) => guest_entropy = true,
             ("run", Some("--no-guest-cfg")) => no_guest_cfg = true,
             ("run", Some("--map-extra-dll")) if map_extra_dll.is_none() => {
@@ -150,6 +154,9 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
             }
             _ => return Err(format!("unexpected option {arg:?}\n{USAGE}").into()),
         }
+    }
+    if gameinput_no_devices && !(trusted_offline && experimental_tls && rust_providers) {
+        return Err("--gameinput-no-devices requires --trusted-offline, --experimental-static-tls and --rust-providers".into());
     }
     if guest_entropy && !(trusted_offline && experimental_tls && rust_providers) {
         return Err("--guest-entropy requires --trusted-offline, --experimental-static-tls and --rust-providers".into());
@@ -224,6 +231,7 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
                     map_extra_dll: map_extra_dll.as_deref(),
                     xgameruntime_dll: xgameruntime_dll.as_deref(),
                     xgameruntime_compat,
+                    gameinput_no_devices,
                     guest_entropy,
                     trusted_offline: trusted_offline
                         || matches!(

@@ -2,6 +2,7 @@
 //! target selection. Each row states an exact reviewed Win64 prototype and
 //! emits a typed SysV adapter plus a matching assembly entry in host text.
 use super::{CONTEXT_OFFSET, Context, LAST_ERROR_OFFSET, called_dormant_guard, startup_trace};
+use crate::gameinput::native as gi;
 use crate::xgameruntime_compat::native as xgr;
 use crate::{
     Result,
@@ -104,6 +105,32 @@ macro_rules! audited_bridges {
 }
 
 audited_bridges! {
+    xsxemu_tls_gi_create, gi_create: b"gameinput.dll", b"GameInputCreate",
+        gi::create, (out: *mut usize, vtable: usize) -> i32;
+    xsxemu_tls_gi_query, gi_query: b"gameinput.dll", b"QueryInterface",
+        gi::query, (this: usize, iid: *const [u8; 16], out: *mut usize) -> i32;
+    xsxemu_tls_gi_add_ref, gi_add_ref: b"gameinput.dll", b"AddRef",
+        gi::add_ref, (this: usize) -> u32;
+    xsxemu_tls_gi_release, gi_release: b"gameinput.dll", b"Release",
+        gi::release, (this: usize) -> u32;
+    xsxemu_tls_gi_timestamp, gi_timestamp: b"gameinput.dll", b"GetCurrentTimestamp",
+        gi::timestamp, (this: usize) -> u64;
+    xsxemu_tls_gi_current, gi_current: b"gameinput.dll", b"GetCurrentReading",
+        gi::current, (this: usize, kind: u32, device: usize, out: *mut usize) -> i32;
+    xsxemu_tls_gi_next, gi_next: b"gameinput.dll", b"GetNextReading",
+        gi::adjacent, (this: usize, reference: usize, kind: u32, device: usize, out: *mut usize) -> i32;
+    xsxemu_tls_gi_previous, gi_previous: b"gameinput.dll", b"GetPreviousReading",
+        gi::adjacent, (this: usize, reference: usize, kind: u32, device: usize, out: *mut usize) -> i32;
+    xsxemu_tls_gi_register, gi_register: b"gameinput.dll", b"RegisterDeviceCallback",
+        gi::register, (this: usize, device: usize, kind: u32, status: u32, enumeration: u32, context: usize, callback: usize, out: *mut u64) -> i32;
+    xsxemu_tls_gi_stop, gi_stop: b"gameinput.dll", b"StopCallback",
+        gi::stop_callback, (this: usize, token: u64) -> ();
+    xsxemu_tls_gi_unregister, gi_unregister: b"gameinput.dll", b"UnregisterCallback",
+        gi::unregister, (this: usize, token: u64, timeout_us: u64) -> u8;
+    xsxemu_tls_gi_find, gi_find: b"gameinput.dll", b"FindDeviceFromId",
+        gi::find, (this: usize, id: usize, out: *mut usize) -> i32;
+    xsxemu_tls_gi_unsupported, gi_unsupported: b"gameinput.dll", b"unsupported-vtable-slot",
+        gi::unsupported, (slot: u32) -> !;
     xsxemu_tls_wsa_startup, wsa_startup: b"ws2_32.dll", b"#115",
         crate::winsock_init::native::startup, (requested: u16, out: *mut crate::winsock_init::native::WsaData) -> i32;
     xsxemu_tls_register_app_state, register_app_state: b"api-ms-win-core-psm-appnotify-l1-1-0.dll", b"RegisterAppStateChangeNotification",

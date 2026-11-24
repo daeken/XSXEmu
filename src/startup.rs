@@ -337,6 +337,9 @@ mod native {
         use crate::xgameruntime_compat as compat;
         let expected_compat_bindings: Vec<_> = compat::bridges().collect();
         let mut compat_bindings = 0;
+        use crate::gameinput as gi;
+        let mut expected_gameinput: std::collections::BTreeMap<_, _> = gi::bridges().collect();
+        let mut gameinput_module = None;
         let mut entropy_module = None;
         for &(importer, slot, target) in bindings {
             if let BindingTarget::Rust(export) = target {
@@ -352,6 +355,20 @@ mod native {
                         );
                     }
                     compat_bindings += 1;
+                }
+                if export.provider == gi::IMPORT {
+                    if !matches!(profile, Profile::TrustedOfflineTlsChild)
+                        || !rust_providers
+                        || importer == 0
+                        || images[importer].0 != gi::GUEST_PATH
+                        || gameinput_module.is_some_and(|module| module != importer)
+                        || expected_gameinput.remove(&slot) != Some(export)
+                    {
+                        return Err(
+                            "GameInput bridge requires the original private guest facade".into(),
+                        );
+                    }
+                    gameinput_module = Some(importer);
                 }
                 if export == GUEST_ENTROPY {
                     use crate::guest_entropy::{BRIDGE_SLOT, GUEST_PATH};
@@ -394,6 +411,11 @@ mod native {
                 || images[xgameruntime.unwrap()].1 != compat::image())
         {
             return Err("incomplete or non-original XGameRuntime compatibility PE".into());
+        }
+        if let Some(module) = gameinput_module
+            && (!expected_gameinput.is_empty() || images[module].1 != gi::image())
+        {
+            return Err("incomplete or non-original GameInput facade".into());
         }
         let slot_thunks = if no_guest_cfg {
             UNCHECKED_SLOT_THUNKS

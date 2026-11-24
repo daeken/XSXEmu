@@ -418,6 +418,7 @@ pub struct Options<'a> {
     pub rust_providers: bool,
     pub trace_missing_imports: bool,
     pub guest_entropy: bool,
+    pub gameinput_no_devices: bool,
     pub map_extra_dll: Option<&'a Path>,
     pub xgameruntime_dll: Option<&'a Path>,
     pub xgameruntime_compat: bool,
@@ -458,6 +459,50 @@ impl Builder<'_> {
         self.options.rust_providers && providers::has_dll(&dll.to_ascii_lowercase())
     }
 
+    fn admit_gameinput(&mut self) -> Result<usize, LinkError> {
+        use crate::gameinput as gi;
+        let path = Path::new(gi::GUEST_PATH);
+        if let Some((index, module)) = self
+            .plan
+            .modules
+            .iter()
+            .enumerate()
+            .find(|(_, m)| m.name.eq_ignore_ascii_case(gi::BASENAME.as_bytes()))
+        {
+            if module.built_in && module.path == path {
+                return Ok(index);
+            }
+            return Err(LinkError::new(
+                path,
+                "map GameInput facade",
+                "duplicate module basename",
+            ));
+        }
+        let index = self.plan.modules.len();
+        let image = gi::image();
+        if index >= self.max_images || image.len() > self.remaining_bytes {
+            return Err(LinkError::new(
+                path,
+                "map GameInput facade",
+                "graph limit reached",
+            ));
+        }
+        self.remaining_bytes -= image.len();
+        let (mut module, tables) = decode_image(path, ImageKind::Dll, image)?;
+        module.built_in = true;
+        module
+            .iat
+            .extend(gi::bridges().map(|(iat_rva, export)| IatBinding {
+                iat_rva,
+                dll: export.provider.as_bytes().to_vec(),
+                symbol: Symbol::Name(export.symbol.as_bytes().to_vec()),
+                target: Ok(BindingTarget::Rust(export)),
+            }));
+        self.plan.modules.push(module);
+        self.tables.push(tables);
+        Ok(index)
+    }
+
     fn resolve_provider(
         &mut self,
         importer: usize,
@@ -477,6 +522,30 @@ impl Builder<'_> {
             )
         {
             return Ok(BindingTarget::Rust(startup));
+        }
+
+        // Match only the original root ordinal, not names, API-set aliases,
+        // forwarders or DLL imports. The facade has no discoverable exports.
+        use crate::gameinput as gi;
+        if importer == 0
+            && self.options.gameinput_no_devices
+            && self.options.trusted_offline
+            && self.options.rust_providers
+            && dll.eq_ignore_ascii_case(gi::IMPORT.as_bytes())
+            && *symbol == Symbol::Ordinal(gi::ORDINAL)
+        {
+            let module = self
+                .admit_gameinput()
+                .map_err(|error| Unresolved::InvalidProvider {
+                    dll: dll.to_vec(),
+                    path: PathBuf::from(gi::GUEST_PATH),
+                    error: error.to_string(),
+                })?;
+            self.edge(importer, module);
+            return Ok(BindingTarget::Pe(ResolvedExport {
+                module,
+                export_rva: gi::CREATE,
+            }));
         }
 
         let mut from = importer;

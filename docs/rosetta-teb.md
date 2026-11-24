@@ -408,6 +408,32 @@ inventing a return value. The owned Win64 fixture verifies these behaviors
 and the ordered trace under Rosetta with checked CFG and a rebased runtime.
 No title execution or device progress has been validated by this fixture.
 
+`--gameinput-no-devices` is a separate opt-in requiring `--trusted-offline`,
+`--experimental-static-tls`, and `--rust-providers`. It handles only the
+root's direct `GameInput.dll` ordinal 1, not names, forwarders, other
+ordinals or dynamic lookup. A private, original guest PE contains the
+relocated vtable and checked guest method entry points; its bridge slots
+are not public PE exports.
+
+Microsoft's [GameInputCreate reference](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/input/gameinput/functions/gameinputcreate)
+defines `HRESULT GameInputCreate(IGameInput** out)`. In the pinned Scarlett
+image the caller at RVA `0x59258c3` passes a cleared output slot, checks the
+signed HRESULT and hits `INT3` on failure. Success caches the instance via
+`AddRef`/`Release`; a null instance is not a fallback. Static callers use the
+v0 layout: device callback registration at byte offset `0x48` includes
+blocking enumeration for keyboard (`0x10`) and gamepad (`0x40000`).
+
+The facade supplies `IUnknown` and v0 `IGameInput` identity, object
+reference counts, monotonic microsecond timestamps, and actual empty
+registrations with tracked tokens and zero deliveries. It returns
+`GAMEINPUT_E_READING_NOT_FOUND` for current/next/previous reading requests
+and `GAMEINPUT_E_DEVICE_NOT_FOUND` for device-ID lookup (null outputs).
+There are no devices, workers or host input dependencies. Unmodeled
+vtable slots stop the child with the slot number rather than report
+success. An owned Win64 fixture covers the ordinal gate and checked
+GuardCF calls (including the eight-argument registration ABI); it does
+not establish further live title progress.
+
 `GetModuleFileNameW` reads the registered UTF-16 guest path: a null handle
 selects the root EXE, and a non-null handle must exactly match a mapped image
 base. It performs no filesystem lookup. Success preserves `LastError`;
