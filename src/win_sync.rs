@@ -45,7 +45,7 @@ pub(crate) fn lookup(dll: &[u8], name: &[u8]) -> Option<HostExport> {
         (b"kernelbase.dll" | b"kernel32.dll" | SYNCH, b"DeleteCriticalSection") => {
             export!("kernelbase.dll", "DeleteCriticalSection", native::delete_cs)
         }
-        (b"kernelbase.dll" | b"kernel32.dll", b"InitializeCriticalSection") => export!(
+        (b"kernelbase.dll" | b"kernel32.dll" | SYNCH, b"InitializeCriticalSection") => export!(
             "kernelbase.dll",
             "InitializeCriticalSection",
             native::init_cs
@@ -143,6 +143,14 @@ mod registry_tests {
             assert_eq!(Some(entry), lookup(b"kernel32.dll", name));
             assert!(lookup(b"ntdll.dll", name).is_none());
         }
+        let init = b"InitializeCriticalSection";
+        let entry = lookup(SYNCH, init).unwrap();
+        assert_eq!(entry.provider, "kernelbase.dll");
+        assert_eq!(entry.symbol.as_bytes(), init);
+        assert_eq!(Some(entry), lookup(b"kernelbase.dll", init));
+        assert_eq!(Some(entry), lookup(b"kernel32.dll", init));
+        assert!(lookup(SYNCH_12, init).is_none());
+
         let ex = b"InitializeCriticalSectionEx";
         let entry = crate::providers::lookup(SYNCH, ex).unwrap();
         assert_eq!(entry.provider, "kernelbase.dll");
@@ -310,7 +318,7 @@ pub(crate) mod native {
         unsafe { init_cs_spin(cs, spin) }
     }
 
-    pub(super) unsafe extern "win64" fn init_cs(cs: *mut CriticalSection) {
+    pub(crate) unsafe extern "win64" fn init_cs(cs: *mut CriticalSection) {
         // SAFETY: same writable pointer contract.
         unsafe { init_cs_spin(cs, 0) };
     }

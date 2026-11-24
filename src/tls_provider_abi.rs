@@ -200,6 +200,8 @@ audited_bridges! {
         fls::fls_set_value, (index: u32, value: *mut c_void) -> i32;
     xsxemu_tls_fls_free, fls_free: b"kernelbase.dll", b"FlsFree",
         fls::fls_free, (index: u32) -> i32;
+    xsxemu_tls_init_cs, init_cs: b"kernelbase.dll", b"InitializeCriticalSection",
+        sync::init_cs, (cs: *mut sync::CriticalSection) -> ();
     xsxemu_tls_init_cs_ex, init_cs_ex: b"kernelbase.dll", b"InitializeCriticalSectionEx",
         sync::init_cs_ex, (cs: *mut sync::CriticalSection, spin: u32, flags: u32) -> i32;
     xsxemu_tls_init_cs_spin, init_cs_spin: b"kernelbase.dll", b"InitializeCriticalSectionAndSpinCount",

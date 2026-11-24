@@ -410,6 +410,11 @@ bridge preserves `LastError`; it does not add guest thread creation or handles.
 An owned PE imports it through `api-ms-win-core-processthreads-l1-1-0.dll` and
 checks the return against the TEB and verifies `LastError` across repeated calls.
 
+`InitializeCriticalSection` uses the one-pointer, void bridge and the same
+provider state as the spin-count initializer (with zero spin). The observed
+IAT RVA `0x6793ae0` takes a writable critical-section pointer in RCX; no
+return value is consumed. Successful initialization preserves LastError.
+
 `CreateSemaphoreExW` uses the existing audited six-argument bridge. Read-only
 inspection of the two direct call sites targeting IAT RVA `0x6793ac8` shows
 null security and name, a caller-supplied signed initial count, maximum

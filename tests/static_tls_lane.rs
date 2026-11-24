@@ -2311,6 +2311,77 @@ fn mutex_bridge_creates_distinct_unnamed_mutexes_and_rejects_pointer_inputs() {
     expect(output, 52, "Guest entry returned 52");
 }
 
+const INIT_CS_CODE_CAPACITY: usize = 0x200;
+
+#[repr(C)]
+struct InitCsFixture {
+    entry: u32,
+    code: [u8; INIT_CS_CODE_CAPACITY],
+}
+
+global_asm!(include_str!("fixtures/static_tls_init_cs.S"),
+    capacity = const INIT_CS_CODE_CAPACITY,
+    iat_delta = const IAT - TEXT,
+    cs_delta = const DATA + 0x350 - TEXT,
+    options(att_syntax),
+);
+
+unsafe extern "C" {
+    static static_tls_init_cs_fixture: InitCsFixture;
+}
+
+#[test]
+fn plain_init_cs_bridge_shares_state_with_enter_leave_and_delete() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let mut exe = image(Kind::Solo);
+    let fixture = unsafe { &static_tls_init_cs_fixture };
+    exe[file(TEXT)..file(TEXT) + RAW].fill(0xcc);
+    put(&mut exe, file(TEXT), &fixture.code);
+    w32(&mut exe, OP + 16, TEXT + fixture.entry as usize);
+    w64(&mut exe, file(ARRAY), PREFERRED + TEXT);
+    let imports = LINK + 0x780;
+    dir(&mut exe, 1, imports, 40);
+    w32(&mut exe, file(imports), imports + 0x30);
+    w32(&mut exe, file(imports) + 12, imports + 0x60);
+    w32(&mut exe, file(imports) + 16, IAT);
+    put(
+        &mut exe,
+        file(imports) + 0x60,
+        b"api-ms-win-core-synch-l1-1-0.dll\0",
+    );
+    for (i, symbol) in [
+        b"InitializeCriticalSection\0".as_slice(),
+        b"EnterCriticalSection\0",
+        b"LeaveCriticalSection\0",
+        b"DeleteCriticalSection\0",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let hint_name = imports + 0x90 + i * 0x20;
+        w64(&mut exe, file(imports) + 0x30 + i * 8, hint_name);
+        put(&mut exe, file(hint_name) + 2, symbol);
+    }
+    let path = scratch.write("init-cs.exe", &exe);
+    expect(run(&path, &[OPT]), 1, "incomplete dependency graph");
+    let output = launcher(&path, &[OPT, "--rust-providers"])
+        .env("XSXEMU_TRACE_STARTUP", "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr
+            .matches("bridge dispatch kernelbase.dll!InitializeCriticalSection guest_return_pc=")
+            .count(),
+        2,
+        "{stderr}"
+    );
+    expect(output, 54, "Guest entry returned 54");
+}
+
 const SRW_CODE_CAPACITY: usize = 0x200;
 
 #[repr(C)]
