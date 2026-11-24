@@ -232,6 +232,10 @@ audited_bridges! {
         io::create_semaphore_ex_w, (security: *const c_void, initial: i32, maximum: i32, name: *const u16, flags: u32, desired_access: u32) -> usize;
     xsxemu_tls_create_semaphore_w, create_semaphore_w: b"kernelbase.dll", b"CreateSemaphoreW",
         io::create_semaphore_w, (security: *const c_void, initial: i32, maximum: i32, name: *const u16) -> usize;
+    xsxemu_tls_wait_for_single_object, wait_for_single_object: b"kernelbase.dll", b"WaitForSingleObject",
+        io::wait_for_single_object, (handle: usize, milliseconds: u32) -> u32;
+    xsxemu_tls_release_semaphore, release_semaphore: b"kernelbase.dll", b"ReleaseSemaphore",
+        io::release_semaphore, (handle: usize, count: i32, previous: *mut i32) -> i32;
     xsxemu_tls_create_event_a, create_event_a: b"kernelbase.dll", b"CreateEventA",
         io::create_event_a, (security: *const c_void, manual_reset: i32, initial_state: i32, name: *const u8) -> usize;
     xsxemu_tls_create_mutex_a, create_mutex_a: b"kernelbase.dll", b"CreateMutexA",

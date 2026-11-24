@@ -128,7 +128,16 @@ pub(crate) fn lookup(dll: &[u8], name: &[u8]) -> Option<HostExport> {
             "ReleaseSRWLockExclusive",
             native::release_srw_exclusive
         ),
-        // Creation does not implement release, signaling, or waits.
+        (b"kernelbase.dll" | b"kernel32.dll" | SYNCH, b"WaitForSingleObject") => export!(
+            "kernelbase.dll",
+            "WaitForSingleObject",
+            crate::providers::win_io::native::wait_for_single_object
+        ),
+        (b"kernelbase.dll" | b"kernel32.dll" | SYNCH, b"ReleaseSemaphore") => export!(
+            "kernelbase.dll",
+            "ReleaseSemaphore",
+            crate::providers::win_io::native::release_semaphore
+        ),
         _ => None,
     }
 }
@@ -138,7 +147,7 @@ mod registry_tests {
     use super::*;
 
     #[test]
-    fn aliases_are_exact_and_wait_remains_unbound() {
+    fn aliases_are_exact_and_extended_wait_remains_unbound() {
         for (dll, name) in [
             (SYNCH, b"EnterCriticalSection".as_slice()),
             (SYNCH_12, b"Sleep".as_slice()),
@@ -190,6 +199,8 @@ mod registry_tests {
         }
         for name in [
             b"AcquireSRWLockExclusive".as_slice(),
+            b"ReleaseSemaphore",
+            b"WaitForSingleObject",
             b"ReleaseSRWLockExclusive",
         ] {
             let entry = crate::providers::lookup(SYNCH, name).unwrap();
@@ -201,11 +212,10 @@ mod registry_tests {
             assert!(crate::providers::lookup(SYNCH_12, name).is_none());
         }
         for name in [
-            b"ReleaseSemaphore".as_slice(),
-            b"ReleaseMutex",
+            b"ReleaseMutex".as_slice(),
             b"SetEvent",
             b"ResetEvent",
-            b"WaitForSingleObject",
+            b"WaitForSingleObjectEx",
             b"AcquireSRWLockShared",
             b"TryAcquireSRWLockExclusive",
             b"SleepConditionVariableSRW",

@@ -203,6 +203,10 @@ pub(crate) mod native {
     const BROKEN_PIPE: u32 = 109;
     const INVALID_NAME: u32 = 123;
     const ALREADY_EXISTS: u32 = 183;
+    const TOO_MANY_POSTS: u32 = 298;
+    const WAIT_OBJECT_0: u32 = 0;
+    const WAIT_TIMEOUT: u32 = 258;
+    const WAIT_FAILED: u32 = u32::MAX;
     const R: u32 = 1;
     const W: u32 = 2;
     const D: u32 = 4;
@@ -311,8 +315,10 @@ pub(crate) mod native {
             self.pipe.changed.notify_all();
         }
     }
-    // SYNCHRONIZE | SEMAPHORE_MODIFY_STATE. No generic/standard rights mapping.
-    const SEMAPHORE_RIGHTS: u32 = 0x0010_0002;
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const SEMAPHORE_MODIFY_STATE: u32 = 2;
+    // No generic/standard rights mapping for the ExW creation API.
+    const SEMAPHORE_RIGHTS: u32 = SYNCHRONIZE | SEMAPHORE_MODIFY_STATE;
     const SEMAPHORE_ALL_ACCESS: u32 = 0x001f_0003;
 
     const EVENT_ALL_ACCESS: u32 = 0x001f_0003;
@@ -331,11 +337,11 @@ pub(crate) mod native {
         Console(Terminal),
         Pipe(PipeEnd),
         Search(Mutex<Search>),
-        // The object owns the count and limit, shared across duplicated handles.
-        #[allow(dead_code, reason = "wait and release are not implemented yet")]
+        // Count and wait queue belong to the object, not an individual handle.
         Semaphore {
-            count: i32,
+            count: Mutex<i32>,
             maximum: i32,
+            available: Condvar,
         },
         #[allow(
             dead_code,
@@ -808,12 +814,95 @@ pub(crate) mod native {
         let access = access?;
         lock(&STATE).insert(Entry {
             obj: Arc::new(Object::Semaphore {
-                count: initial,
+                count: Mutex::new(initial),
                 maximum,
+                available: Condvar::new(),
             }),
             access,
             inheritable: false,
         })
+    }
+
+    pub(crate) extern "win64" fn wait_for_single_object(h: usize, milliseconds: u32) -> u32 {
+        ret(
+            (|| {
+                // Clone the entry before sleeping; never hold the handle-table lock.
+                let e = entry(h)?;
+                let Object::Semaphore {
+                    count, available, ..
+                } = &*e.obj
+                else {
+                    return Err(if matches!(&*e.obj, Object::Search(_)) {
+                        BAD_HANDLE
+                    } else {
+                        UNSUPPORTED
+                    });
+                };
+                if e.access & SYNCHRONIZE == 0 {
+                    return Err(ACCESS);
+                }
+                let count = lock(count);
+                let mut count = match milliseconds {
+                    0 => count,
+                    u32::MAX => available
+                        .wait_while(count, |n| *n == 0)
+                        .unwrap_or_else(|e| e.into_inner()),
+                    ms => {
+                        available
+                            .wait_timeout_while(count, Duration::from_millis(u64::from(ms)), |n| {
+                                *n == 0
+                            })
+                            .unwrap_or_else(|e| e.into_inner())
+                            .0
+                    }
+                };
+                if *count == 0 {
+                    return Ok(WAIT_TIMEOUT);
+                }
+                *count -= 1;
+                Ok(WAIT_OBJECT_0)
+            })(),
+            WAIT_FAILED,
+        )
+    }
+
+    pub(crate) unsafe extern "win64" fn release_semaphore(
+        h: usize,
+        amount: i32,
+        previous: *mut i32,
+    ) -> i32 {
+        boolean((|| {
+            let e = entry(h)?;
+            let Object::Semaphore {
+                count,
+                maximum,
+                available,
+            } = &*e.obj
+            else {
+                return Err(BAD_HANDLE);
+            };
+            if e.access & SEMAPHORE_MODIFY_STATE == 0 {
+                return Err(ACCESS);
+            }
+            if amount <= 0 {
+                return Err(INVALID_PARAM);
+            }
+            let mut count = lock(count);
+            if amount > *maximum - *count {
+                return Err(TOO_MANY_POSTS);
+            }
+            if !previous.is_null() {
+                // SAFETY: the caller must supply writable LONG storage.
+                unsafe { previous.write_unaligned(*count) };
+            }
+            *count += amount;
+            if amount == 1 {
+                available.notify_one();
+            } else {
+                available.notify_all();
+            }
+            Ok(())
+        })())
     }
 
     pub(crate) extern "win64" fn create_event_a(
@@ -946,10 +1035,10 @@ pub(crate) mod native {
         assert_ne!(other, h);
         let weak = {
             let e = entry(h).unwrap();
-            let Object::Semaphore { count, maximum } = *e.obj else {
+            let Object::Semaphore { count, maximum, .. } = &*e.obj else {
                 panic!("expected a semaphore object");
             };
-            assert_eq!((count, maximum), (3, 17));
+            assert_eq!((*lock(count), *maximum), (3, 17));
             assert_eq!(e.access, SEMAPHORE_RIGHTS);
             assert!(!e.inheritable);
             Arc::downgrade(&e.obj)
@@ -1051,17 +1140,63 @@ pub(crate) mod native {
         assert_ne!(h, 0);
         assert_eq!(get_last_error(), 0x1234);
         let e = entry(h).unwrap();
-        assert!(matches!(
-            *e.obj,
-            Object::Semaphore {
-                count: 0,
-                maximum: 1
-            }
-        ));
+        let Object::Semaphore { count, maximum, .. } = &*e.obj else {
+            panic!("expected a semaphore object");
+        };
+        assert_eq!((*lock(count), *maximum), (0, 1));
         assert_eq!(e.access, SEMAPHORE_ALL_ACCESS);
         assert!(!e.inheritable);
         assert_eq!(CloseHandle(h), 1);
         assert!(entry(h).is_err());
+    }
+
+    #[test]
+    fn semaphore_wait_wakes_through_duplicate_and_checks_access() {
+        use crate::providers::native::get_last_error;
+        use std::{sync::mpsc, thread};
+
+        let h = create_semaphore_w(ptr::null(), 0, 1, ptr::null());
+        let (mut wait, mut post) = (0, 0);
+        unsafe {
+            assert_eq!(
+                DuplicateHandle(INVALID, h, INVALID, &mut wait, SYNCHRONIZE, 0, 0),
+                1
+            );
+            assert_eq!(
+                DuplicateHandle(INVALID, h, INVALID, &mut post, SEMAPHORE_MODIFY_STATE, 0, 0),
+                1
+            );
+            assert_eq!(release_semaphore(wait, 1, ptr::null_mut()), 0);
+        }
+        assert_eq!(get_last_error(), ACCESS);
+        assert_eq!(wait_for_single_object(post, 0), WAIT_FAILED);
+        assert_eq!(get_last_error(), ACCESS);
+        assert_eq!(CloseHandle(h), 1);
+        let (tx, rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            set_last_error(111);
+            tx.send((wait_for_single_object(wait, 10), get_last_error()))
+                .unwrap();
+            tx.send((wait_for_single_object(wait, u32::MAX), get_last_error()))
+                .unwrap();
+        });
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            (WAIT_TIMEOUT, 111)
+        );
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(20)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+        assert_eq!(unsafe { release_semaphore(post, 1, ptr::null_mut()) }, 1);
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            (WAIT_OBJECT_0, 111)
+        );
+        worker.join().unwrap();
+        assert_eq!(wait_for_single_object(wait, 0), WAIT_TIMEOUT);
+        assert_eq!(CloseHandle(wait), 1);
+        assert_eq!(CloseHandle(post), 1);
     }
 
     fn std_slot(n: u32) -> Result<usize> {

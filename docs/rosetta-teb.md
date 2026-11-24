@@ -429,8 +429,8 @@ success. Invalid counts or flags fail with `ERROR_INVALID_PARAMETER`;
 non-null security/name or unsupported access bits fail with
 `ERROR_NOT_SUPPORTED`. No pointer is dereferenced. Existing ordinary
 `DuplicateHandle` and `CloseHandle` share and release the object as usual;
-this change does not audit those APIs for static TLS. Named objects,
-security attributes, `ReleaseSemaphore`, and wait APIs remain unsupported.
+these creation bridges do not audit those APIs for static TLS. Named objects
+and security attributes remain unsupported.
 The owned PE tests both stack DWORDs with nonzero upper halves, distinct
 handles, and guest LastError on success and failure.
 
@@ -438,7 +438,18 @@ handles, and guest LastError on success and failure.
 `synch-l1-2-1` import. Both calls through IAT RVA `0x6793ee8` pass
 `(NULL, 0, 1, NULL)`. It uses the same typed semaphore objects and count,
 pointer and LastError rules, granting `SEMAPHORE_ALL_ACCESS` to the new
-handle. Release and waits remain unsupported.
+handle.
+
+The first worker statically uses `WaitForSingleObject(handle, INFINITE)`
+through IAT RVA `0x6793b20` and `ReleaseSemaphore(other, 1, NULL)` through
+`0x6793b08`. These audited bridges operate only on semaphore objects. A wait
+requires `SYNCHRONIZE`, consumes one count on success, and returns
+`WAIT_TIMEOUT` without touching LastError if a zero or finite timeout expires.
+An infinite wait blocks until a count is available. Release requires
+`SEMAPHORE_MODIFY_STATE`, optionally writes the previous count, and rejects
+nonpositive increments and overflow without modifying count or output.
+Closing a handle concurrently with a wait is outside the contract. Other
+object waits and alertable or multiple-object waits are unsupported.
 
 `CreateEventA` uses a four-argument bridge. The direct calls and tail thunk
 referencing IAT RVA `0x6793ab0` pass null security and name, manual-reset

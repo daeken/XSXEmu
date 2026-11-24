@@ -2255,6 +2255,66 @@ fn plain_semaphore_bridge_creates_distinct_handles_and_checks_inputs() {
     expect(output, 55, "Guest entry returned 55");
 }
 
+const SEMAPHORE_WAIT_CAPACITY: usize = 0x300;
+
+#[repr(C)]
+struct SemaphoreWaitFixture {
+    entry: u32,
+    code: [u8; SEMAPHORE_WAIT_CAPACITY],
+}
+
+global_asm!(include_str!("fixtures/static_tls_semaphore_wait.S"),
+    capacity = const SEMAPHORE_WAIT_CAPACITY,
+    iat_delta = const IAT - TEXT,
+    options(att_syntax),
+);
+
+unsafe extern "C" {
+    static static_tls_semaphore_wait_fixture: SemaphoreWaitFixture;
+}
+
+#[test]
+fn semaphore_wait_and_release_bridge_checks_counts_and_last_error() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let mut exe = image(Kind::Solo);
+    let fixture = unsafe { &static_tls_semaphore_wait_fixture };
+    exe[file(TEXT)..file(TEXT) + RAW].fill(0xcc);
+    put(&mut exe, file(TEXT), &fixture.code);
+    w32(&mut exe, OP + 16, TEXT + fixture.entry as usize);
+    w64(&mut exe, file(ARRAY), PREFERRED + TEXT);
+    let imports = LINK + 0x780;
+    dir(&mut exe, 1, imports, 40);
+    w32(&mut exe, file(imports), imports + 0x30);
+    w32(&mut exe, file(imports) + 12, imports + 0x60);
+    w32(&mut exe, file(imports) + 16, IAT);
+    put(
+        &mut exe,
+        file(imports) + 0x60,
+        b"api-ms-win-core-synch-l1-1-0.dll\0",
+    );
+    for (i, symbol) in [
+        b"CreateSemaphoreExW\0".as_slice(),
+        b"WaitForSingleObject\0",
+        b"ReleaseSemaphore\0",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let hint_name = imports + 0x90 + i * 0x20;
+        w64(&mut exe, file(imports) + 0x30 + i * 8, hint_name);
+        put(&mut exe, file(hint_name) + 2, symbol);
+    }
+    let path = scratch.write("semaphore-wait.exe", &exe);
+    expect(
+        run(&path, &[OPT, "--rust-providers"]),
+        56,
+        "Guest entry returned 56",
+    );
+}
+
 const EVENT_CODE_CAPACITY: usize = 0x200;
 
 #[repr(C)]
