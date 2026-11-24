@@ -2611,6 +2611,79 @@ fn dir_import_one(b: &mut [u8], dll: &[u8], symbol: &[u8]) {
     put(b, file(imports) + 0x72, symbol);
 }
 
+const APPNOTIFY_CAPACITY: usize = 0x200;
+#[repr(C)]
+struct AppNotifyFixture {
+    entry: u32,
+    code: [u8; APPNOTIFY_CAPACITY],
+}
+
+global_asm!(include_str!("fixtures/static_tls_appnotify.S"),
+    capacity = const APPNOTIFY_CAPACITY,
+    iat_delta = const IAT - TEXT,
+    options(att_syntax),
+);
+unsafe extern "C" {
+    static static_tls_appnotify_fixture: AppNotifyFixture;
+}
+
+#[test]
+fn app_notifications_are_scoped_offline_registrations() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let mut exe = image(Kind::Solo);
+    let fixture = unsafe { &static_tls_appnotify_fixture };
+    exe[file(TEXT)..file(TEXT) + RAW].fill(0xcc);
+    put(&mut exe, file(TEXT), &fixture.code);
+    w32(&mut exe, OP + 16, TEXT + fixture.entry as usize);
+    w64(&mut exe, file(ARRAY), PREFERRED + TEXT);
+    let imports = LINK + 0x780;
+    dir(&mut exe, 1, imports, 60);
+    for (i, (dll, register, unregister)) in [
+        (
+            &b"api-ms-win-core-psm-appnotify-l1-1-0.dll\0"[..],
+            &b"RegisterAppStateChangeNotification\0"[..],
+            &b"UnregisterAppStateChangeNotification\0"[..],
+        ),
+        (
+            &b"api-ms-win-core-psm-appnotify-l1-1-1.dll\0"[..],
+            &b"RegisterAppConstrainedChangeNotification\0"[..],
+            &b"UnregisterAppConstrainedChangeNotification\0"[..],
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let descriptor = file(imports) + 20 * i;
+        let strings = imports + 0x80 + i * 0x100;
+        let lookup = strings + 0xa0;
+        w32(&mut exe, descriptor, lookup);
+        w32(&mut exe, descriptor + 12, strings);
+        w32(&mut exe, descriptor + 16, IAT + i * 16);
+        w64(&mut exe, file(lookup), strings + 0x30);
+        w64(&mut exe, file(lookup) + 8, strings + 0x60);
+        put(&mut exe, file(strings), dll);
+        put(&mut exe, file(strings) + 0x32, register);
+        put(&mut exe, file(strings) + 0x62, unregister);
+    }
+    let path = scratch.write("app-notifications.exe", &exe);
+    expect(
+        run(&path, &[OPT, "--rust-providers"]),
+        1,
+        "incomplete dependency graph",
+    );
+    let output = run(&path, &[OPT, TRUSTED, "--rust-providers"]);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr)
+            .matches("registration only; app lifecycle delivery is not implemented")
+            .count(),
+        3
+    );
+    expect(output, 51, "Guest entry returned 51");
+}
+
 const XGR_CAPACITY: usize = 0x1000;
 #[repr(C)]
 struct XgrFixture {

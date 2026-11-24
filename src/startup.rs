@@ -365,6 +365,15 @@ mod native {
                         return Err("entropy bridge requires the built-in guest entropy DLL".into());
                     }
                 }
+                if crate::appnotify::BRIDGES.contains(&export)
+                    && (!matches!(profile, Profile::TrustedOfflineTlsChild)
+                        || !rust_providers
+                        || importer != 0)
+                {
+                    return Err(
+                        "app notification bridge requires the trusted offline root image".into(),
+                    );
+                }
                 if [D3D12_VM_CONFIGURE, XMEM_VIRTUAL_ALLOC].contains(&export)
                     && (!matches!(profile, Profile::TrustedOfflineTlsChild)
                         || (export == XMEM_VIRTUAL_ALLOC && importer != 0))

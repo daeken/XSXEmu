@@ -104,6 +104,14 @@ macro_rules! audited_bridges {
 }
 
 audited_bridges! {
+    xsxemu_tls_register_app_state, register_app_state: b"api-ms-win-core-psm-appnotify-l1-1-0.dll", b"RegisterAppStateChangeNotification",
+        crate::appnotify::native::register_state, (callback: usize, context: usize, out: *mut usize) -> u32;
+    xsxemu_tls_unregister_app_state, unregister_app_state: b"api-ms-win-core-psm-appnotify-l1-1-0.dll", b"UnregisterAppStateChangeNotification",
+        crate::appnotify::native::unregister_state, (token: usize) -> ();
+    xsxemu_tls_register_app_constrained, register_app_constrained: b"api-ms-win-core-psm-appnotify-l1-1-1.dll", b"RegisterAppConstrainedChangeNotification",
+        crate::appnotify::native::register_constrained, (callback: usize, context: usize, out: *mut usize) -> u32;
+    xsxemu_tls_unregister_app_constrained, unregister_app_constrained: b"api-ms-win-core-psm-appnotify-l1-1-1.dll", b"UnregisterAppConstrainedChangeNotification",
+        crate::appnotify::native::unregister_constrained, (token: usize) -> ();
     xsxemu_tls_xgr_dll_main, xgr_dll_main: b"xgameruntime.dll", b"DllMain",
         xgr::dll_main, (base: usize, reason: u32, reserved: usize) -> i32;
     xsxemu_tls_xgr_initialize, xgr_initialize: b"xgameruntime.dll", b"InitializeApiImplEx2",

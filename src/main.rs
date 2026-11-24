@@ -1,4 +1,5 @@
 mod apiset;
+mod appnotify;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 mod darwin_guest_mask;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]

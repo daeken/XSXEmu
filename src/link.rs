@@ -475,8 +475,13 @@ impl Builder<'_> {
             // Only direct named imports can use these offline Xbox shims,
             // never a different provider routed here or a PE forwarder.
             if seen.is_empty() && self.options.rust_providers && self.options.trusted_offline {
-                for shim in [providers::D3D12_VM_CONFIGURE, providers::XMEM_VIRTUAL_ALLOC] {
-                    if (shim != providers::XMEM_VIRTUAL_ALLOC || importer == 0)
+                for shim in [providers::D3D12_VM_CONFIGURE, providers::XMEM_VIRTUAL_ALLOC]
+                    .into_iter()
+                    .chain(crate::appnotify::BRIDGES)
+                {
+                    if (importer == 0
+                        || (shim != providers::XMEM_VIRTUAL_ALLOC
+                            && !crate::appnotify::BRIDGES.contains(&shim)))
                         && dll.eq_ignore_ascii_case(shim.provider.as_bytes())
                         && matches!(&symbol, Symbol::Name(name) if name == shim.symbol.as_bytes())
                     {
