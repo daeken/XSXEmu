@@ -117,6 +117,16 @@ pub(super) fn color_targets(bytes: &[u8]) -> Option<u8> {
     Some(mask)
 }
 
+/// Source declaration flag only; no assumption about native export channels.
+pub(super) fn ps_depth_declared(psv: &[u8]) -> Option<bool> {
+    resource_rows(psv, 0)?;
+    match psv.get(4) {
+        Some(0) => Some(false),
+        Some(1) => Some(true),
+        _ => None,
+    }
+}
+
 // Equality is over only this ordinary-row projection and the number of
 // excluded system rows, not all signature fields or all system semantics.
 #[derive(Default, PartialEq, Eq)]

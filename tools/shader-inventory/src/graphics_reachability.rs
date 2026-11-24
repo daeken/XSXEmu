@@ -71,7 +71,7 @@ enum ResultClass {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Export {
     Color(u8, bool), // MRT ordinal and nonzero raw EN field
-    Mrtz,
+    Mrtz(u8),
     Null,
     Other,
 }
@@ -86,7 +86,7 @@ fn export(first: u32, len: usize, text: &str) -> Option<Export> {
         (i @ 0..=7, name) if name.as_bytes() == [b'm', b'r', b't', b'0' + i as u8] => {
             Export::Color(i as u8, first & 15 != 0)
         }
-        (8, "mrtz") => Export::Mrtz,
+        (8, "mrtz") => Export::Mrtz((first & 15) as u8),
         (9, "null") => Export::Null,
         _ => Export::Other,
     };
@@ -97,7 +97,7 @@ fn export(first: u32, len: usize, text: &str) -> Option<Export> {
 struct Exports {
     color: u8,
     disabled_color: u8,
-    mrtz: bool,
+    mrtz_masks: u16,
     null: bool,
     other: bool,
 }
@@ -133,7 +133,7 @@ fn checked_exports(dis: &mut Disassembler, bytes: &[u8]) -> Result<Exports, Resu
                 match export {
                     Export::Color(i, true) => exports.color |= 1 << i,
                     Export::Color(i, false) => exports.disabled_color |= 1 << i,
-                    Export::Mrtz => exports.mrtz = true,
+                    Export::Mrtz(en) => exports.mrtz_masks |= 1 << en,
                     Export::Null => exports.null = true,
                     Export::Other => exports.other = true,
                 }
@@ -254,19 +254,30 @@ struct PsComparison {
     mismatch_packed_native: usize,
     zero_enable: usize,
     mrtz: usize,
+    depth_vs_mrtz: [[usize; 2]; 2],
+    no_depth_flag: usize,
+    mrtz_masks: [usize; 16],
     null: usize,
     other_exp: usize,
 }
 
 impl PsComparison {
-    fn add(&mut self, source: u8, exp: Result<Exports, ResultClass>) {
+    fn add(&mut self, source: u8, depth: Option<bool>, exp: Result<Exports, ResultClass>) {
         let Ok(exp) = exp else {
             self.rejected += 1;
             return;
         };
         self.complete += 1;
         self.zero_enable += usize::from(exp.disabled_color != 0);
-        self.mrtz += usize::from(exp.mrtz);
+        self.mrtz += usize::from(exp.mrtz_masks != 0);
+        for (en, count) in self.mrtz_masks.iter_mut().enumerate() {
+            *count += usize::from(exp.mrtz_masks & (1 << en) != 0);
+        }
+        if let Some(depth) = depth {
+            self.depth_vs_mrtz[usize::from(depth)][usize::from(exp.mrtz_masks != 0)] += 1;
+        } else {
+            self.no_depth_flag += 1;
+        }
         self.null += usize::from(exp.null);
         if exp.other {
             self.other_exp += 1;
@@ -323,6 +334,11 @@ pub fn run_wrapped_ps(lib: &OsStr, cpu: Cpu, root: &Path) -> Result<(), Box<dyn 
             invalid += 1;
             continue;
         };
+        let mut psv = parts.iter().filter(|(tag, _)| *tag == b"PSV0");
+        let depth = psv
+            .next()
+            .filter(|_| psv.next().is_none())
+            .and_then(|(_, bytes)| crate::signatures::ps_depth_declared(bytes));
         let mut result = None;
         let mut capture = |payload: &[u8]| {
             if payload.get(0x100) == Some(&5)
@@ -343,7 +359,7 @@ pub fn run_wrapped_ps(lib: &OsStr, cpu: Cpu, root: &Path) -> Result<(), Box<dyn 
         };
         differences += usize::from(result[0] != result[1]);
         for (outcome, total) in result.into_iter().zip(&mut totals) {
-            total.add(source, outcome);
+            total.add(source, depth, outcome);
         }
     }
     if pixel == 0 {
@@ -367,6 +383,10 @@ pub fn run_wrapped_ps(lib: &OsStr, cpu: Cpu, root: &Path) -> Result<(), Box<dyn 
             "  wave{wave}: complete payloads with zero-EN color EXP {}, MRTZ {}, NULL {}, other EXP {}",
             t.zero_enable, t.mrtz, t.null, t.other_exp
         );
+        println!(
+            "  wave{wave}: PSV0 depth flag by any checked MRTZ [depth=false/true][MRTZ=absent/present] {:?}, unsupported flag {}; payloads per MRTZ EN value {:?}",
+            t.depth_vs_mrtz, t.no_depth_flag, t.mrtz_masks
+        );
     }
     Ok(())
 }
@@ -387,7 +407,7 @@ mod tests {
         );
         assert_eq!(
             export(0xf800_0081, 8, "exp mrtz v0, off, off, off"),
-            Some(Export::Mrtz)
+            Some(Export::Mrtz(1))
         );
         assert_eq!(
             export(0xf800_0090, 8, "exp null off, off, off, off"),
@@ -401,13 +421,14 @@ mod tests {
         let mut c = PsComparison::default();
         c.add(
             1 << 7,
+            None,
             Ok(Exports {
                 color: 1,
                 disabled_color: 1 << 7,
                 ..Default::default()
             }),
         );
-        c.add(1 << 7, Err(ResultClass::Decode));
+        c.add(1 << 7, None, Err(ResultClass::Decode));
         assert_eq!(
             (
                 c.complete,
@@ -420,6 +441,33 @@ mod tests {
             ),
             (1, 1, 0, 1, 1, 1, 1)
         );
+    }
+
+    #[test]
+    fn mrtz_presence_and_en_values_are_separate_from_source_depth() {
+        let mut c = PsComparison::default();
+        c.add(0, Some(true), Ok(Exports::default()));
+        c.add(
+            0,
+            Some(false),
+            Ok(Exports {
+                mrtz_masks: (1 << 0) | (1 << 3),
+                ..Default::default()
+            }),
+        );
+        c.add(0, Some(true), Err(ResultClass::Decode));
+        c.add(
+            0,
+            None,
+            Ok(Exports {
+                mrtz_masks: 1 << 3,
+                ..Default::default()
+            }),
+        );
+        assert_eq!(c.depth_vs_mrtz, [[0, 1], [1, 0]]);
+        assert_eq!(c.no_depth_flag, 1);
+        assert_eq!(c.mrtz, 2);
+        assert_eq!(c.mrtz_masks[..4], [1, 0, 0, 2]);
     }
 
     #[test]
