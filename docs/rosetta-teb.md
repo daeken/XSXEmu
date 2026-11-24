@@ -230,35 +230,42 @@ tools/probe_rosetta_tls_owned_pe.sh
 
 The runner takes no arguments. It builds and runs a single-threaded x86_64
 child under Rosetta with a ten-second deadline. The child generates a fixed
-import-free AMD64 PE32+ EXE in memory from original assembly, not from an
-external image. It uses `Pe::materialize_into` at a nonpreferred address,
+AMD64 PE32+ EXE in memory from owned assembly, not from an external image.
+It uses `Pe::materialize_into` at a nonpreferred address,
 checks all six DIR64 relocations, gives the EXE's TLS module index zero via
 `static_tls::Plan`, and seals the mapping with `GuestMemory`. The planner
 snapshots a relocated pointer and a nonzero seed and adds eight zero bytes
 in a 16-byte-aligned block; the PE's initially nonzero index DWORD is patched
 to zero. The test TEB points to the planner's vector at `GS:[0x58]`.
 
-A single assembly window calls the mapped PE's TLS callback (process attach),
-EXE entry, then the same callback (process detach). Each call reads the image's
-index DWORD and follows `GS:[0x58]` to the block. Each checks the relocated
-pointer and the previous phase's values before mutating both the initialized
-state and the zero-fill word. The callback also checks the mapped image base,
-reason, and the fixture's null reserved argument. On macOS 27.0.1 (26A434)
-under Rosetta, entry returned 42 and the host read final TLS state
-`0x33300303` with scratch `0xc3`. The boundary checked the restored host
-`GS:[0]` and `GS:[0x30]` before returning to Rust; the child then restored and
-verified the original signal mask. The runner requires both a success record
-and exit status zero.
+The child binds exactly one named import (`owned-probe.dll!RoundTrip`) at the
+fixture's fixed IAT slot to an assembly thunk. No DLL is loaded. The outer
+boundary calls TLS process attach, EXE entry, then TLS process detach. Entry
+calls through the IAT; the thunk restores and checks host GS before it calls
+Rust. The provider invokes a distinct, validated callback in the same mapped
+`.text` via a second thunk that switches to guest GS and restores host GS
+before returning to Rust. The first thunk then restores guest GS for entry.
+The fixed Win64 calls check mixed GPR/XMM arguments and two stack arguments in
+each direction, an integer provider result, and a floating-point callback
+result. Guest RDI/RSI and XMM6/XMM15 sentinels survive the import call.
 
-Only the private setter, assembly boundary, and mapped PE execute while guest
-GS is active. The child shares the preceding signal probe's mask and default
-fault dispositions, with no handlers or recovery added for the PE. Guest
-invariant failures and GS mismatches trap; faults, unexpected exits, and
-timeouts fail the probe. The detach call is an explicit normal-return fixture
-step, not an emulation of process teardown. No imports or providers, extra
-threads, UCRT or title code, or OS security changes are involved. Production
-startup still rejects static TLS; this is not an execution option for other
-images or a security boundary.
+Attach, nested callback, resumed entry and detach advance one TLS block in
+that order. They follow the image's index through `GS:[0x58]` and check the
+relocated pointer before mutating initialized state and the zero-fill word.
+Attach and detach also check image base, reason and the null reserved argument.
+The provider verifies host thread-local state and the effective mask on both
+sides of the nested call. On macOS 27.0.1 (26A434) under Rosetta, entry returned
+42 and final TLS held state `0x33300303` and scratch `0xc3`. The outer boundary
+checked host GS slots before Rust restored and verified the original mask.
+The runner requires both a success record and exit status zero.
+
+The child reuses the fail-closed mask and default dispositions above; it sends
+no signals and tests no fault handling. Only the private setter, assembly and
+owned PE execute with guest GS. Unexpected exits and timeouts fail the probe.
+Detach is an explicit normal-return step, not process teardown emulation.
+There are no external PE inputs, extra guest threads, or Wine dependency.
+Production startup still rejects static TLS. This is neither a general import
+bridge nor a sandbox for other images.
 
 ## Controlled execution plan
 

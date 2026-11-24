@@ -3,7 +3,7 @@
 pub const IMAGE_BASE: u64 = 0x1_4000_0000;
 // Separate RX, R and RW on both 4 KiB and 16 KiB host VM pages.
 const ALIGN: usize = 0x4000;
-pub const RAW: usize = 0x200;
+pub const RAW: usize = 0x400;
 pub const TEXT: usize = ALIGN;
 const RDATA: usize = 2 * ALIGN;
 const DATA: usize = 3 * ALIGN;
@@ -14,14 +14,23 @@ pub const TEMPLATE: usize = RDATA + 0x50;
 pub const COOKIE: usize = RDATA + 0x60;
 pub const INDEX: usize = DATA;
 const RELOC: usize = RDATA + 0x80;
+const IMPORTS: usize = RDATA + 0xa0;
+const LOOKUP: usize = RDATA + 0xd0;
+const DLL: usize = RDATA + 0xe0;
+pub const IMPORT_BY_NAME: usize = RDATA + 0x100;
+pub const IAT: usize = DATA + 8;
+pub const IMPORT_DLL: &str = "owned-probe.dll";
+pub const IMPORT_NAME: &str = "RoundTrip";
 
 pub const INDEX_SENTINEL: u32 = 0xbeef_1122;
 pub const COOKIE_VALUE: u64 = 0x3456_789a;
 pub const SEED: u64 = 0x1234_5678;
 pub const ATTACHED: u64 = 0x1110_0101;
+pub const NESTED: u64 = 0x1210_0112;
 pub const ENTERED: u64 = 0x2220_0202;
 pub const DETACHED: u64 = 0x3330_0303;
 pub const ATTACH_SCRATCH: u64 = 0xa1;
+pub const NESTED_SCRATCH: u64 = 0xd4;
 pub const ENTRY_SCRATCH: u64 = 0xb2;
 pub const DETACH_SCRATCH: u64 = 0xc3;
 pub const RETURN_CODE: u32 = 42;
@@ -47,8 +56,10 @@ fn file(rva: usize) -> usize {
     (rva / ALIGN) * RAW + rva % ALIGN
 }
 
-pub fn make(code: &[u8], callback: usize, entry: usize) -> [u8; 4 * RAW] {
-    assert!(code.len() <= RAW && callback < code.len() && entry < code.len());
+pub fn make(code: &[u8], callback: usize, entry: usize, nested: usize) -> [u8; 4 * RAW] {
+    assert!(
+        code.len() <= RAW && callback < code.len() && entry < code.len() && nested < code.len()
+    );
     const NT: usize = 0x80;
     const OP: usize = NT + 24;
     const SEC: usize = OP + 240;
@@ -81,7 +92,7 @@ pub fn make(code: &[u8], callback: usize, entry: usize) -> [u8; 4 * RAW] {
     for (i, (name, rva, size, flags)) in [
         (b".text\0\0\0", TEXT, code.len(), 0x6000_0020),
         (b".rdata\0\0", RDATA, RAW, 0x4000_0040),
-        (b".data\0\0\0", DATA, 4, 0xc000_0040),
+        (b".data\0\0\0", DATA, IAT + 16 - DATA, 0xc000_0040),
     ]
     .into_iter()
     .enumerate()
@@ -95,6 +106,18 @@ pub fn make(code: &[u8], callback: usize, entry: usize) -> [u8; 4 * RAW] {
         w32(&mut b, s + 36, flags);
     }
     put(&mut b, file(TEXT), code);
+
+    // One named import, with its own lookup and writable IAT. Both thunk
+    // tables and the descriptor table have a zero terminator.
+    w32(&mut b, OP + 112 + 8, IMPORTS);
+    w32(&mut b, OP + 116 + 8, 40);
+    w32(&mut b, file(IMPORTS), LOOKUP);
+    w32(&mut b, file(IMPORTS) + 12, DLL);
+    w32(&mut b, file(IMPORTS) + 16, IAT);
+    w64(&mut b, file(LOOKUP), IMPORT_BY_NAME as u64);
+    w64(&mut b, file(IAT), IMPORT_BY_NAME as u64);
+    put(&mut b, file(DLL), IMPORT_DLL.as_bytes());
+    put(&mut b, file(IMPORT_BY_NAME) + 2, IMPORT_NAME.as_bytes());
 
     // TLS directory, null-terminated callback array, relocated template, and
     // 8 bytes of zero fill. Force a real DWORD index write from a nonzero seed.

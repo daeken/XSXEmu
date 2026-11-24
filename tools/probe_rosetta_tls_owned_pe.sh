@@ -23,7 +23,7 @@ except subprocess.TimeoutExpired:
 print(child.stdout, end='', flush=True)
 print(f'owned PE: subprocess status {child.returncode}', flush=True)
 passed = child.returncode == 0 and (
-    'owned PE PASS: host GS and signal mask restored' in child.stdout.splitlines()
+    'owned PE PASS: bounded import and nested callback; GS and mask restored' in child.stdout.splitlines()
 )
 sys.exit(0 if passed else 1)
 PY
