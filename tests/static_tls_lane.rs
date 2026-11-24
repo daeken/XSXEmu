@@ -9,6 +9,9 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
+#[path = "../tools/build-sync-facade.rs"]
+mod sync_facade;
+
 const OPT: &str = "--experimental-static-tls";
 const TRUSTED: &str = "--trusted-offline";
 const WARNING: &str = "neither signature nor catalog is verified; Xbox policy is not evaluated";
@@ -1524,6 +1527,8 @@ fn mapped_sync_facade_exports_must_already_be_callable_cfg_entries() {
     };
     let mut exe = image(Kind::Guarded);
     set_module_name(&mut exe, DLL);
+    w32(&mut exe, file(MODULE_PATHS) + 0x80, sleep);
+    w32(&mut exe, file(MODULE_PATHS) + 0x84, wake);
     w32(&mut exe, OP + 16, TEXT + f.sync_entry as usize);
     // Libraryloader and critical-section bridges plus one static PE import
     // to root the facade. No special API-set lookup rule.
@@ -1611,11 +1616,21 @@ fn mapped_sync_facade_exports_must_already_be_callable_cfg_entries() {
 
     // By default a file under the API-set basename is not a mapped module.
     // Explicit rooting uses that actual basename without changing resolution.
-    const CONTRACT: &str = "api-ms-win-core-synch-l1-2-0.dll";
-    let contract_path = scratch.write(CONTRACT, &dll);
+    const CONTRACT: &str = sync_facade::BASENAME;
+    let contract_path = scratch.write(CONTRACT, &sync_facade::image());
     let contract_path = contract_path.to_str().unwrap();
     let mut rooted = exe.clone();
     set_module_name(&mut rooted, CONTRACT);
+    w32(
+        &mut rooted,
+        file(MODULE_PATHS) + 0x80,
+        sync_facade::SLEEP as usize,
+    );
+    w32(
+        &mut rooted,
+        file(MODULE_PATHS) + 0x84,
+        sync_facade::WAKE as usize,
+    );
     w32(&mut rooted, file(MODE), 3);
     let static_desc = file(LINK) + 40;
     rooted[static_desc..static_desc + 20].fill(0);
@@ -1642,6 +1657,14 @@ fn mapped_sync_facade_exports_must_already_be_callable_cfg_entries() {
         contract_path,
     ];
     expect(run(&rooted_path, &opt_in), 46, "Guest entry returned 46");
+    w32(&mut rooted, file(MODE), 4);
+    scratch.write("explicit-sync.exe", &rooted);
+    expect(
+        run(&rooted_path, &opt_in),
+        1,
+        "child terminated by signal 4",
+    );
+    w32(&mut rooted, file(MODE), 3);
     rooted[static_desc..static_desc + 20].copy_from_slice(&exe[static_desc..static_desc + 20]);
     dir(&mut rooted, 1, LINK, 80);
     put(&mut rooted, file(LINK) + 0x100, CONTRACT.as_bytes());

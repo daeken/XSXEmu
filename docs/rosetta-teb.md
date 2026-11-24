@@ -290,6 +290,26 @@ delay imports or TLS. It uses the file's actual basename and mapped base;
 duplicate mapped basenames are refused. The extra PE is appended after
 static binding, so the option does not change API-set routing or static
 imports. The usual mapping and CFG validation still apply.
+
+To build the owned synchronization facade into a fresh directory (no SDK or
+external DLL required):
+
+```sh
+out=$(mktemp -d)
+rustc --edition 2024 tools/build-sync-facade.rs -o "$out/build-sync-facade"
+"$out/build-sync-facade" "$out/api-ms-win-core-synch-l1-2-0.dll"
+```
+
+Pass the generated DLL's path to `--map-extra-dll` along with the usual
+`--rust-providers --experimental-static-tls --trusted-offline` flags. The PE
+has exactly two GuardCF-admitted exports. With a zero-initialized condition
+variable and no possible guest peer threads, `WakeAllConditionVariable` has
+no waiters and preserves LastError. `SleepConditionVariableCS` requires a
+caller-held critical section; a zero-duration poll returns false and sets
+`ERROR_TIMEOUT` (there is no peer to observe a release/reacquire). Nonzero
+waits or a nonzero condition-variable state hit `UD2`; no blocking, wakeup,
+or lock-ownership validation is implemented by this diagnostic facade.
+
 `GetModuleFileNameW` reads the registered UTF-16 guest path: a null handle
 selects the root EXE, and a non-null handle must exactly match a mapped image
 base. It performs no filesystem lookup. Success preserves `LastError`;

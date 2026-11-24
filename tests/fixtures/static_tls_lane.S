@@ -986,7 +986,9 @@ Lsync_entry:
     leaq Lsync_wake_name(%rip), %rdx
     movl $0x23456789, %gs:0x68
     callq *{iat_delta}+8(%r11)
-    leaq {text_rva}+Lsync_wake-Ltext(%rbx), %rcx
+    leaq Ltext(%rip), %r11
+    movl {module_paths_delta}+0x84(%r11), %ecx
+    addq %rbx, %rcx
     cmpq %rcx, %rax
     jne Lbad
     cmpl $0x23456789, %gs:0x68
@@ -1003,7 +1005,8 @@ Lsync_entry:
     leaq Ltext(%rip), %r11
     cmpl $1, {mode_delta}(%r11)
     je Lsync_refused
-    leaq {text_rva}+Lsync_sleep-Ltext(%rbx), %rcx
+    movl {module_paths_delta}+0x80(%r11), %ecx
+    addq %rbx, %rcx
     cmpq %rcx, %rax
     jne Lbad
     cmpl $0x23456789, %gs:0x68
@@ -1013,6 +1016,9 @@ Lsync_entry:
     xorl %r9d, %r9d                      /* Poll except in mode 2. */
     cmpl $2, {mode_delta}(%r11)
     sete %r9b
+    cmpl $4, {mode_delta}(%r11)
+    sete %r10b
+    orb %r10b, %r9b
     callq *{dispatch_delta}(%r11)
     testl %eax, %eax
     jne Lbad
