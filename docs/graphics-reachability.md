@@ -20,6 +20,8 @@ The walk starts at stored-span offset `+40` as an explicit hypothesis. It follow
 
 The message classification requires the public four-byte SOPP opcode and recognized immediate fields to agree with LLVM's symbolic operands. Unrecognized cases stay grouped, with no operands printed. Only the first rejection is counted; neither the operation names nor the reported stream encoding establish how the Xbox schedules or couples stages. No message is treated as fallthrough or exit. The owned fixture also rejects noncanonical bits and a numeric-only operand presentation.
 
+None of the 158 stage-2 or 788 stage-4 first `s_swappc_b64` blockers matches the tested adjacent local `GETPC` + literal `ADD`/carry or `SUB`/borrow window with distinct ordinary source/destination register pairs, under either CPU or wave test. The classifier inspects only the immediately preceding checked fallthrough decode sequence; it does not rule out nonadjacent setup or other control-flow paths. It adds no successor and does not model a call, return, or link register.
+
 Every complete graph has at least one reachable eight-byte `exp` checked against LLVM and the public GFX10 encoding prefix. No export result is attributed to an incomplete graph. An owned fixture distinguishes reachable, branch-skipped, and seen-before-rejection exports under all four decoder configurations. This census does not establish payload coupling, message semantics, native linkage, authenticated entry, or executable Metal coverage. No title shader was executed or modified.
 
 ## Native VS export projection

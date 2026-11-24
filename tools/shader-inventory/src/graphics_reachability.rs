@@ -4,7 +4,7 @@ use crate::{
     cfg::{self, Flow, Instruction},
     coverage::code,
     llvm::{Cpu, Disassembler, Llvm},
-    reachable::control,
+    reachable::{IndirectShape, PcPattern, control},
     word,
 };
 use std::{
@@ -60,6 +60,7 @@ enum ResultClass {
     CompleteWithExp,
     Decode,
     UnmodeledPc(String),
+    SwapPc(IndirectShape),
     SendMsg(SendMsgClass),
     OtherControl(String),
     BadSuccessor,
@@ -117,13 +118,16 @@ struct Exports {
 fn checked_exports(dis: &mut Disassembler, bytes: &[u8]) -> Result<Exports, ResultClass> {
     let mut scratch = [0; 1024];
     let mut unsupported = ResultClass::Decode;
+    let mut pattern = PcPattern::default();
     match cfg::walk_extent(bytes.len() / 4, |pc| {
         let tail = bytes.get(pc * 4..)?;
         let (len, text) = dis.one(tail, pc * 4, &mut scratch)?;
         let name = text.split_ascii_whitespace().next()?;
         let first = word(tail, 0)? as u32;
         let Some(flow) = control(name, first, len) else {
-            unsupported = if name.starts_with("s_setpc") || name.starts_with("s_swappc") {
+            unsupported = if name == "s_swappc_b64" {
+                ResultClass::SwapPc(pattern.classify_swap(pc, len, first, bytes.len()))
+            } else if name.starts_with("s_setpc") || name.starts_with("s_swappc") {
                 ResultClass::UnmodeledPc(name.to_owned())
             } else if name == "s_sendmsg" {
                 ResultClass::SendMsg(sendmsg_class(first, len, text))
@@ -132,6 +136,7 @@ fn checked_exports(dis: &mut Disassembler, bytes: &[u8]) -> Result<Exports, Resu
             };
             return None;
         };
+        pattern.observe(pc, len, name, first, tail, flow);
         Some(Instruction {
             width: len / 4,
             flow,

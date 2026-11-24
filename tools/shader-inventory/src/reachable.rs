@@ -136,7 +136,7 @@ fn compare_linear(
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum IndirectShape {
+pub(crate) enum IndirectShape {
     Unmatched,
     RelativeLiteralUnaligned,
     RelativeLiteralOutsideSpan,
@@ -168,13 +168,21 @@ enum PcStep {
 // the reference walker. A matching window does not prove it dominates SETPC
 // or that a second path cannot enter its middle.
 #[derive(Default)]
-struct PcPattern {
+pub(crate) struct PcPattern {
     next: Option<usize>,
     step: PcStep,
 }
 
 impl PcPattern {
-    fn observe(&mut self, pc: usize, size: usize, name: &str, first: u32, tail: &[u8], flow: Flow) {
+    pub(crate) fn observe(
+        &mut self,
+        pc: usize,
+        size: usize,
+        name: &str,
+        first: u32,
+        tail: &[u8],
+        flow: Flow,
+    ) {
         let prior = if self.next == Some(pc) {
             self.step
         } else {
@@ -249,6 +257,33 @@ impl PcPattern {
         let Some((base, delta)) = self.literal(pc, size, first) else {
             return IndirectShape::Unmatched;
         };
+        Self::classify_delta(base, delta, extent)
+    }
+
+    pub(crate) fn classify_swap(
+        &self,
+        pc: usize,
+        size: usize,
+        first: u32,
+        extent: usize,
+    ) -> IndirectShape {
+        let PcStep::High { pair, base, delta } = self.step else {
+            return IndirectShape::Unmatched;
+        };
+        let dst = (first >> 16) & 127;
+        if self.next != Some(pc)
+            || size != 4
+            || first & 0xff80_ffff != (0xbe80_2100 | pair)
+            || dst > 100
+            || !dst.is_multiple_of(2)
+            || dst == pair
+        {
+            return IndirectShape::Unmatched;
+        }
+        Self::classify_delta(base, delta, extent)
+    }
+
+    fn classify_delta(base: usize, delta: i64, extent: usize) -> IndirectShape {
         // Carry/borrow propagates from an unsigned literal low-word operand.
         // The opcode selects addition or subtraction, not the literal sign bit.
         if delta % 4 != 0 {
@@ -1071,6 +1106,21 @@ mod tests {
         );
         assert_eq!(p.classify(7, 4, 0xbe80_2014, 32), IndirectShape::Unmatched);
         assert_eq!(p.classify(6, 4, 0xbe80_2016, 32), IndirectShape::Unmatched);
+        assert_eq!(
+            p.classify_swap(6, 4, 0xbe84_2114, 32),
+            IndirectShape::RelativeLiteralInSpan
+        );
+        assert_eq!(
+            p.classify_swap(6, 4, 0xbe84_2114, 28),
+            IndirectShape::RelativeLiteralOutsideSpan
+        );
+        for first in [0xbe84_2014, 0xbe94_2114, 0xbe85_2114, 0xbe84_2116] {
+            assert_eq!(p.classify_swap(6, 4, first, 32), IndirectShape::Unmatched);
+        }
+        assert_eq!(
+            p.classify_swap(7, 4, 0xbe84_2114, 32),
+            IndirectShape::Unmatched
+        );
         assert_eq!(
             materialize(19).classify(6, 4, 0xbe80_2014, 32),
             IndirectShape::RelativeLiteralUnaligned
