@@ -442,6 +442,14 @@ fn dormant_profile_rejects_metadata_slot_and_relocation_near_misses() {
     }
     let dir = Scratch::new();
     let original = dormant_image(Kind::Solo);
+    // The initial qword interpretation put the 1 in CatalogOffset instead
+    // of Flags. Even with every slot and relocation otherwise exact, reject it.
+    let mut misdecoded = original.clone();
+    w32(&mut misdecoded, file(LOAD) + 0x94, 0);
+    w32(&mut misdecoded, file(LOAD) + 0x98, 1);
+    let exe = dir.write("misdecoded.exe", &misdecoded);
+    expect(run(&exe, &[OPT]), 1, "not dormant linker layout");
+
     for (at, value, error) in [
         (OP + 71, 0x40, "CFG without instrumentation"), // GUARD_CF
         (file(LOAD) + 4, 1, "not dormant linker layout"),

@@ -272,9 +272,15 @@ general import bridge nor a sandbox for other images.
 `run <trusted-fixture.exe> --experimental-static-tls --rust-providers` permits
 30 exact Win32 provider identities based on the observed pinned UCRT fixture
 trace. Registry aliases are accepted only if they resolve to an audited
-identity; ntdll `Rtl*LastWin32Error` identities are distinct. The lane's
-`LoadLibraryExW` validates the request but searches an intentionally empty
-namespace. `GetProcAddress` and `FreeLibrary` aren't bridged. Unbridged
+identity; ntdll `Rtl*LastWin32Error` identities are distinct. Win32 `Tls*`
+slots are provider-managed and separate from the PE static TLS vector at
+`GS:[0x58]`.
+
+`LoadLibraryExW` keeps the ordinary provider's argument validation but
+searches an intentionally empty namespace, even for DLLs in the static
+import graph. Well-formed requests return `NULL` with `ERROR_MOD_NOT_FOUND`;
+invalid or unsupported requests return their validation errors instead.
+`GetProcAddress` and `FreeLibrary` aren't bridged. Unbridged
 providers fail before entry unless `--trace-missing-imports` is enabled,
 which treats well-formed unavailable or unbridged slots as callable, not
 as data: PE import records don't distinguish the two.
@@ -293,11 +299,11 @@ no nested guest calls, dynamic lookup, unwind, or additional guest threads
 in this bridge lane.
 
 `cargo test --target x86_64-apple-darwin --test static_tls_lane` runs an
-original no-CRT PE that uses the static TLS vector and imports the pair
-through its IAT. The callback uses direct calls and the entry uses both
-GuardCF thunks. The fixture checks direct TEB stores against API reads,
-API writes against direct reads, persistence through detach, and Win64
-nonvolatile register sentinels. It does not execute a game or UCRT.
+original no-CRT PE that uses the static TLS vector and calls a subset of the
+audited providers. The callback uses direct calls and the entry uses both
+GuardCF thunks. The fixture checks last-error coherence through detach,
+Win64 nonvolatile register sentinels, and six- and eight-argument text
+conversions. It does not execute a game or UCRT.
 
 The trace thunks are sealed RX before guest entry. GuardCF admits the exact
 bound thunk addresses, not their interior, common assembly gate or reporter.
