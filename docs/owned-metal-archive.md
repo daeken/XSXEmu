@@ -20,6 +20,15 @@ On Apple M4, API-validation bake and strict replay passed in separate processes,
 
 The source-based archive replay above still compiles the owned MSL in memory. The separate workflow below persists the library as well as the PSO archive.
 
+## Owned mesh-stage render probe
+
+```sh
+MTL_DEBUG_LAYER=1 cargo run --locked --manifest-path tools/shader-inventory/Cargo.toml \
+  --features metal-probe --bin shader-metal-mesh-probe
+```
+
+On Apple M4 (macOS 27.0.1), the source-compiled, no-object-stage mesh/fragment pipeline matched all 64 `RGBA8Unorm` pixels with primitive count zero (only the red clear color survives) and all 64 with count one (cyan from separate vertex green and flat per-primitive blue inputs). The same mesh threadgroup, triangle vertices, indices and primitive payload are supplied in both draws; only the explicit primitive count changes. This checks a local Metal lowering target for distinct vertex and primitive outputs and for suppressing rasterization by emitting zero primitives. It does not map the title's `PRIM` word, infer an Xbox message effect, or bake a mesh PSO archive.
+
 ## Offline library and strict PSO replay
 
 Requires `xcrun -sdk macosx metal --version` and `xcrun -sdk macosx --find metallib` to succeed. Xcode may ship a `metal` stub before its optional component is installed; check `xcodebuild -showComponent MetalToolchain -json`. If needed, check scratch free space first and install with `DEVELOPER_DIR="$XCODE/Contents/Developer" xcodebuild -downloadComponent MetalToolchain`, where `XCODE` is the chosen app bundle. No global `xcode-select` change is needed.

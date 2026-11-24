@@ -27,3 +27,8 @@ required-features = ["metal-probe"]
 name = "shader-metal-render-probe"
 path = "src/metal_render_probe.rs"
 required-features = ["metal-probe"]
+
+[[bin]]
+name = "shader-metal-mesh-probe"
+path = "src/metal_mesh_probe.rs"
+required-features = ["metal-probe"]
