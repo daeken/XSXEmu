@@ -165,9 +165,23 @@ pub(crate) mod native {
             }
             registry.next += registry.slots.len();
         }
+        use crate::providers::native::{get_last_error, set_last_error, with_tls_child_last_error};
+        const HOST_SENTINEL: u32 = 0x1234_abcd;
+        const GUEST_SENTINEL: u32 = 0xdead_beef;
+        let previous_host_error = get_last_error();
+        set_last_error(HOST_SENTINEL);
+        let mut teb_error = GUEST_SENTINEL;
         output = usize::MAX;
-        assert_eq!(unsafe { register_state(1, 0, &mut output) }, 8);
+        // Exercise the LastError swap shared by the audited TLS adapters.
+        let status = unsafe {
+            with_tls_child_last_error(&mut teb_error, || register_state(1, 0, &mut output))
+        };
+        let host_error = get_last_error();
+        set_last_error(previous_host_error);
+        assert_eq!(status, 8);
         assert_eq!(output, 0);
+        assert_eq!(teb_error, GUEST_SENTINEL);
+        assert_eq!(host_error, HOST_SENTINEL);
         REGISTRY.lock().unwrap().slots.fill(None);
     }
 }
