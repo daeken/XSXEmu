@@ -154,12 +154,13 @@ enum PcStep {
     Low {
         pair: u32,
         base: usize,
-        literal: usize,
+        delta: i64,
+        subtract: bool,
     },
     High {
         pair: u32,
         base: usize,
-        literal: usize,
+        delta: i64,
     },
 }
 
@@ -191,13 +192,25 @@ impl PcPattern {
                     base: (pc + 1) * 4,
                 }
             }
-            (Flow::Next, PcStep::Get { pair, base }, "s_add_u32", 8)
-                if first >> 23 == 0x100 && dst == pair && matches_pair(src, pair, 255) =>
+            (Flow::Next, PcStep::Get { pair, base }, op, 8)
+                if dst == pair
+                    && ((op == "s_add_u32"
+                        && first >> 23 == 0x100
+                        && matches_pair(src, pair, 255))
+                        || (op == "s_sub_u32"
+                            && first >> 23 == 0x101
+                            && src == (pair | (255 << 8)))) =>
             {
+                let subtract = op == "s_sub_u32";
                 word(tail, 4).map_or(PcStep::None, |literal| PcStep::Low {
                     pair,
                     base,
-                    literal,
+                    delta: if subtract {
+                        -(literal as i64)
+                    } else {
+                        literal as i64
+                    },
+                    subtract,
                 })
             }
             (
@@ -205,52 +218,51 @@ impl PcPattern {
                 PcStep::Low {
                     pair,
                     base,
-                    literal,
+                    delta,
+                    subtract,
                 },
-                "s_addc_u32",
+                op,
                 4,
-            ) if first >> 23 == 0x104 && dst == pair + 1 && matches_pair(src, pair + 1, 128) => {
-                PcStep::High {
-                    pair,
-                    base,
-                    literal,
-                }
+            ) if dst == pair + 1
+                && (if subtract {
+                    op == "s_subb_u32" && first >> 23 == 0x105 && src == ((pair + 1) | (128 << 8))
+                } else {
+                    op == "s_addc_u32" && first >> 23 == 0x104 && matches_pair(src, pair + 1, 128)
+                }) =>
+            {
+                PcStep::High { pair, base, delta }
             }
             (Flow::Next, _, "s_waitcnt", 4) if first >> 16 == 0xbf8c => prior,
             _ => PcStep::None,
         };
     }
 
-    fn literal(&self, pc: usize, size: usize, first: u32) -> Option<(usize, usize)> {
-        let PcStep::High {
-            pair,
-            base,
-            literal,
-        } = self.step
-        else {
+    fn literal(&self, pc: usize, size: usize, first: u32) -> Option<(usize, i64)> {
+        let PcStep::High { pair, base, delta } = self.step else {
             return None;
         };
         (self.next == Some(pc) && size == 4 && first == (0xbe80_2000 | pair))
-            .then_some((base, literal))
+            .then_some((base, delta))
     }
 
     fn classify(&self, pc: usize, size: usize, first: u32, extent: usize) -> IndirectShape {
-        let Some((base, literal)) = self.literal(pc, size, first) else {
+        let Some((base, delta)) = self.literal(pc, size, first) else {
             return IndirectShape::Unmatched;
         };
-        // Public reference arithmetic: a literal low word plus a carry into
-        // a zero-addend high word, not a sign-extended 32-bit displacement.
-        if !literal.is_multiple_of(4) {
+        // Carry/borrow propagates from an unsigned literal low-word operand.
+        // The opcode selects addition or subtraction, not the literal sign bit.
+        if delta % 4 != 0 {
             IndirectShape::RelativeLiteralUnaligned
-        } else if base
-            .checked_add(literal)
-            .is_some_and(|target| target < extent)
-        {
+        } else if offset_target(base, delta).is_some_and(|target| target < extent) {
             IndirectShape::RelativeLiteralInSpan
         } else {
             IndirectShape::RelativeLiteralOutsideSpan
         }
     }
+}
+
+fn offset_target(base: usize, delta: i64) -> Option<usize> {
+    base.checked_add_signed(isize::try_from(delta).ok()?)
 }
 
 fn matches_pair(src: u32, reg: u32, other: u32) -> bool {
@@ -399,13 +411,11 @@ impl IndirectFrontier {
             let first = u32::from_le_bytes(tail[..4].try_into().ok()?);
             let name = line.split_ascii_whitespace().next()?;
             let (flow, cut) = if name == "s_setpc_b64" {
-                let candidate = pattern
-                    .literal(pc, size, first)
-                    .and_then(|(base, literal)| {
-                        let target = base.checked_add(literal)?;
-                        (target.is_multiple_of(4) && target < bytes.len())
-                            .then_some((base / 4 - 1, target / 4))
-                    });
+                let candidate = pattern.literal(pc, size, first).and_then(|(base, delta)| {
+                    let target = offset_target(base, delta)?;
+                    (target.is_multiple_of(4) && target < bytes.len())
+                        .then_some((base / 4 - 1, target / 4))
+                });
                 (Flow::Stop, Some(candidate))
             } else {
                 let Some(flow) = control(name, first, size) else {
@@ -939,6 +949,34 @@ mod tests {
         assert_eq!(
             materialize(19).classify(6, 4, 0xbe80_2014, 32),
             IndirectShape::RelativeLiteralUnaligned
+        );
+    }
+
+    #[test]
+    fn local_pc_subtraction_checks_borrow_order_and_underflow() {
+        let materialize = |literal: u32, low: u32, high: u32| {
+            let mut p = PcPattern::default();
+            p.observe(8, 4, "s_getpc_b64", 0xbe94_1f00, &[], Flow::Next);
+            let tail = [low, literal].map(u32::to_le_bytes).concat();
+            p.observe(9, 8, "s_sub_u32", low, &tail, Flow::Next);
+            p.observe(11, 4, "s_subb_u32", high, &[], Flow::Next);
+            p.classify(12, 4, 0xbe80_2014, 52)
+        };
+        assert_eq!(
+            materialize(36, 0x8094_ff14, 0x8295_8015),
+            IndirectShape::RelativeLiteralInSpan
+        );
+        assert_eq!(
+            materialize(40, 0x8094_ff14, 0x8295_8015),
+            IndirectShape::RelativeLiteralOutsideSpan
+        );
+        assert_eq!(
+            materialize(36, 0x8094_14ff, 0x8295_8015),
+            IndirectShape::Unmatched
+        );
+        assert_eq!(
+            materialize(36, 0x8094_ff14, 0x8295_1580),
+            IndirectShape::Unmatched
         );
     }
 
