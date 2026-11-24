@@ -8,6 +8,7 @@ enum Stage {
     Vertex,
     Pixel,
     PackedPixel,
+    PackedRgPixel,
     DepthPixel,
 }
 
@@ -50,6 +51,8 @@ const PACKED_PS: &[u32] = &[
     0xbf81_0000,
 ];
 
+const PACKED_RG_PS: &[u32] = &[0xf800_1c03, 1, 0xbf81_0000];
+
 const DEPTH_PS: &[u32] = &[
     0xf800_040f,
     1, // exp mrt0 v1, v1, v0, v0 compr
@@ -64,6 +67,7 @@ impl Stage {
             Stage::Vertex => 8,
             Stage::Pixel => 4,
             Stage::PackedPixel => 2,
+            Stage::PackedRgPixel => 2,
             Stage::DepthPixel => 3,
         }
     }
@@ -72,13 +76,13 @@ impl Stage {
         match self {
             Stage::Vertex => &[(Target::Parameter, false), (Target::Position, true)],
             Stage::Pixel => &[(Target::Color, true)],
-            Stage::PackedPixel | Stage::DepthPixel => &[],
+            Stage::PackedPixel | Stage::PackedRgPixel | Stage::DepthPixel => &[],
         }
     }
 
     fn export_count(self) -> usize {
         match self {
-            Stage::PackedPixel => 1,
+            Stage::PackedPixel | Stage::PackedRgPixel => 1,
             Stage::DepthPixel => 2,
             _ => self.exports().len(),
         }
@@ -152,6 +156,13 @@ fn lift(stage: Stage, words: &[u32]) -> Result<Vec<Op>, Reject> {
                 for r in src {
                     require(r)?;
                 }
+                exported += 1;
+            }
+            Op::FinalPackedRg0 { src } => {
+                if stage != Stage::PackedRgPixel || exported != 0 {
+                    return Err(Reject::BadExports(pc));
+                }
+                require(src)?;
                 exported += 1;
             }
             Op::FinalPixelDepth { src } => {
@@ -245,6 +256,10 @@ fn emit_body(out: &mut String, ops: &[Op], packed_color_lvalue: &str) {
                 ..
             } => {
                 writeln!(out, "  {packed_color_lvalue} = float4(float(as_type<half>(ushort(r[{rg}]))), float(as_type<half>(ushort(r[{rg}] >> 16))), float(as_type<half>(ushort(r[{ba}]))), float(as_type<half>(ushort(r[{ba}] >> 16))));").unwrap();
+            }
+            Op::FinalPackedRg0 { src: Vgpr(rg) } => {
+                // B/A placeholders are never written by the owned RG-only descriptor.
+                writeln!(out, "  {packed_color_lvalue} = float4(float(as_type<half>(ushort(r[{rg}]))), float(as_type<half>(ushort(r[{rg}] >> 16))), 0.0f, 0.0f);").unwrap();
             }
             Op::FinalPixelDepth { src: Vgpr(r) } => {
                 writeln!(out, "  out.depth = as_type<float>(r[{r}]);").unwrap();
@@ -356,12 +371,21 @@ pub fn translate_fixture(literal_bits: Option<u32>) -> Result<String, Reject> {
 }
 
 #[allow(dead_code)] // Separate owned render probe, not the keyed graphics fixture.
-pub fn translate_packed_color_fixture() -> Result<String, Reject> {
+pub fn translate_packed_color_fixture(partial: bool) -> Result<String, Reject> {
     let vs = lift(Stage::Vertex, VS)?;
-    let ps = lift(Stage::PackedPixel, PACKED_PS)?;
+    let ps = if partial {
+        lift(Stage::PackedRgPixel, PACKED_RG_PS)?
+    } else {
+        lift(Stage::PackedPixel, PACKED_PS)?
+    };
     let mut msl = vertex_module(&vs);
+    msl.push_str(if partial {
+        "fragment float4 packed_rg_ps"
+    } else {
+        "fragment float4 packed_ps"
+    });
     msl.push_str(
-        "fragment float4 packed_ps(constant uint2 &input [[buffer(0)]]) {\n\
+        "(constant uint2 &input [[buffer(0)]]) {\n\
   uint r[256]; float4 out;\n\
   r[0] = input.x; r[1] = input.y;\n",
     );
@@ -415,7 +439,7 @@ mod tests {
             io::Write,
             process::{Command, Stdio},
         };
-        let asm = "v_mov_b32_e32 v8, v4\nexp param0 v8, v5, v6, v7\nexp pos0 v0, v1, v2, v3 done\ns_endpgm\nv_add_f32_e32 v4, 0.25, v0\nv_fma_f32 v5, v1, v2, v3\nv_mul_legacy_f32_e32 v6, v5, v4\nv_mul_legacy_f32_e32 v6, 0.5, v6\nv_mul_legacy_f32_e32 v7, 0, v3\nexp mrt0 v4, v5, v6, v7 done\ns_endpgm\nv_mul_legacy_f32_e32 v2, v0, v1\nv_mul_legacy_f32_e32 v3, 0.25, v1\nv_fmac_f32_e32 v4, v0, v1\nv_cvt_pkrtz_f16_f32_e32 v5, v0, v1\ns_inst_prefetch 3\nv_mov_b32_e32 v6, 0\ns_nop 0\nv_mov_b32_e32 v7, 0.5\nv_mov_b32_e32 v8, 1.0\nv_mov_b32_e32 v9, 0x7fc12345\nexp mrt0 v1, v1, v0, v0 done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrtz v2, off, off, off done vm\ns_endpgm\n";
+        let asm = "v_mov_b32_e32 v8, v4\nexp param0 v8, v5, v6, v7\nexp pos0 v0, v1, v2, v3 done\ns_endpgm\nv_add_f32_e32 v4, 0.25, v0\nv_fma_f32 v5, v1, v2, v3\nv_mul_legacy_f32_e32 v6, v5, v4\nv_mul_legacy_f32_e32 v6, 0.5, v6\nv_mul_legacy_f32_e32 v7, 0, v3\nexp mrt0 v4, v5, v6, v7 done\ns_endpgm\nv_mul_legacy_f32_e32 v2, v0, v1\nv_mul_legacy_f32_e32 v3, 0.25, v1\nv_fmac_f32_e32 v4, v0, v1\nv_cvt_pkrtz_f16_f32_e32 v5, v0, v1\ns_inst_prefetch 3\nv_mov_b32_e32 v6, 0\ns_nop 0\nv_mov_b32_e32 v7, 0.5\nv_mov_b32_e32 v8, 1.0\nv_mov_b32_e32 v9, 0x7fc12345\nexp mrt0 v1, v1, v0, v0 done compr vm\ns_endpgm\nexp mrt0 v1, v1, off, off done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrtz v2, off, off, off done vm\ns_endpgm\n";
         let expected: Vec<u8> = VS
             .iter()
             .chain(PS)
@@ -425,6 +449,7 @@ mod tests {
             .chain(EDGE_RTZ)
             .chain(EDGE_MOV_HINTS)
             .chain(PACKED_PS)
+            .chain(PACKED_RG_PS)
             .chain(DEPTH_PS)
             .flat_map(|w| w.to_le_bytes())
             .collect();
@@ -474,7 +499,7 @@ mod tests {
         for header in [
             0xf800_0c0f,
             0xf800_140f,
-            0xf800_1c03,
+            0xf800_0403,
             0xf800_1c1f,
             0xf800_3c0f,
         ] {
@@ -482,6 +507,30 @@ mod tests {
         }
         assert_eq!(
             decode(&[PACKED_PS[0], 0x10001], 0),
+            Err(DecodeError::Unsupported(0))
+        );
+    }
+
+    #[test]
+    fn partial_packed_color_requires_rg_profile_and_only_reads_rg() {
+        assert_eq!(lift(Stage::PackedRgPixel, PACKED_RG_PS).unwrap().len(), 2);
+        assert_eq!(
+            lift(Stage::PackedPixel, PACKED_RG_PS),
+            Err(Reject::BadExports(0))
+        );
+        assert_eq!(
+            lift(Stage::PackedRgPixel, PACKED_PS),
+            Err(Reject::BadExports(0))
+        );
+        assert_eq!(
+            lift(Stage::PackedRgPixel, &[0xf800_1c03, 7, 0xbf81_0000]),
+            Err(Reject::Uninitialized(0, 7))
+        );
+        for header in [0xf800_1c0c, 0xf800_1c13, 0xf800_3c03] {
+            assert_eq!(decode(&[header, 1], 0), Err(DecodeError::Unsupported(0)));
+        }
+        assert_eq!(
+            decode(&[0xf800_1c03, 0x0101], 0),
             Err(DecodeError::Unsupported(0))
         );
     }

@@ -68,8 +68,8 @@ mod gpu {
 
     enum Mode<'a> {
         Source,
-        PackedSource,
-        PackedLoad(&'a Path),
+        PackedSource(bool),
+        PackedLoad(&'a Path, bool),
         DepthSource,
         DepthLoad(&'a Path),
         Load(&'a Path, bool),
@@ -105,10 +105,10 @@ mod gpu {
                 print!("{}", graphics_lift::translate_depth_fixture().map_err(|e| format!("depth lift rejected: {e:?}"))?);
                 return Ok(());
             }
-            [mode] if mode == "--packed-source" => Mode::PackedSource,
-            [mode, lib] if mode == "--load-packed-metallib" => Mode::PackedLoad(Path::new(lib)),
-            [mode] if mode == "--emit-packed-msl" => {
-                print!("{}", graphics_lift::translate_packed_color_fixture().map_err(|e| format!("packed lift rejected: {e:?}"))?);
+            [mode] if mode == "--packed-source" || mode == "--packed-rg-source" => Mode::PackedSource(mode == "--packed-rg-source"),
+            [mode, lib] if mode == "--load-packed-metallib" || mode == "--load-packed-rg-metallib" => Mode::PackedLoad(Path::new(lib), mode == "--load-packed-rg-metallib"),
+            [mode] if mode == "--emit-packed-msl" || mode == "--emit-packed-rg-msl" => {
+                print!("{}", graphics_lift::translate_packed_color_fixture(mode == "--emit-packed-rg-msl").map_err(|e| format!("packed lift rejected: {e:?}"))?);
                 return Ok(());
             }
             [mode] if mode == "--emit-msl" || mode == "--emit-mutated-msl" => {
@@ -119,7 +119,7 @@ mod gpu {
             [mode, lib] if mode == "--load-metallib" || mode == "--load-mutated-metallib" => Mode::Load(Path::new(lib), mode == "--load-mutated-metallib"),
             [mode, lib, archive] if mode == "--expect-owned-metal-miss" => Mode::ExpectStrictMiss(Path::new(lib), Path::new(archive)),
             [mode, lib, archive, compiler] if mode == "--bake-archive" || mode == "--replay-archive" || mode == "--replay-mutated-archive" => Mode::Archive(Path::new(lib), Path::new(archive), mode == "--bake-archive", mode == "--replay-mutated-archive", owned_graphics_artifact::compiler_profile(compiler)?),
-            _ => return Err("usage: shader-metal-graphics-lift [--depth-source | --emit-depth-msl | --load-depth-metallib LIB | --packed-source | --emit-packed-msl | --load-packed-metallib LIB | --emit-msl | --emit-mutated-msl | --load-metallib LIB | --load-mutated-metallib LIB | {--bake-archive|--replay-archive|--replay-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-owned-metal-miss MUTATED_LIB ARCHIVE]".into()),
+            _ => return Err("usage: shader-metal-graphics-lift [--packed-rg-source | --emit-packed-rg-msl | --load-packed-rg-metallib LIB | --depth-source | --emit-depth-msl | --load-depth-metallib LIB | --packed-source | --emit-packed-msl | --load-packed-metallib LIB | --emit-msl | --emit-mutated-msl | --load-metallib LIB | --load-mutated-metallib LIB | {--bake-archive|--replay-archive|--replay-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-owned-metal-miss MUTATED_LIB ARCHIVE]".into()),
         };
         if matches!(mode, Mode::Archive(..) | Mode::ExpectStrictMiss(..))
             && std::env::var_os("MTL_SHADER_VALIDATION").is_some()
@@ -141,14 +141,15 @@ mod gpu {
         } else {
             None
         };
-        let packed = matches!(mode, Mode::PackedSource | Mode::PackedLoad(_));
+        let packed = matches!(mode, Mode::PackedSource(_) | Mode::PackedLoad(..));
+        let partial = matches!(mode, Mode::PackedSource(true) | Mode::PackedLoad(_, true));
         let depth = matches!(mode, Mode::DepthSource | Mode::DepthLoad(_));
         let lib = match mode {
-            Mode::Source | Mode::PackedSource | Mode::DepthSource => {
+            Mode::Source | Mode::PackedSource(_) | Mode::DepthSource => {
                 let msl = if depth {
                     graphics_lift::translate_depth_fixture()
                 } else if packed {
-                    graphics_lift::translate_packed_color_fixture()
+                    graphics_lift::translate_packed_color_fixture(partial)
                 } else {
                     graphics_lift::translate_fixture(None)
                 }
@@ -157,7 +158,7 @@ mod gpu {
                 options.set_fast_math_enabled(false);
                 dev.new_library_with_source(&msl, &options)?
             }
-            Mode::PackedLoad(path)
+            Mode::PackedLoad(path, _)
             | Mode::DepthLoad(path)
             | Mode::Load(path, _)
             | Mode::Archive(path, _, _, _, _)
@@ -172,7 +173,11 @@ mod gpu {
             desc.set_depth_attachment_pixel_format(DEPTH_FORMAT);
             (MTLPixelFormat::RGBA32Float, 16, "depth_ps")
         } else if packed {
-            (MTLPixelFormat::RGBA32Float, 16, "packed_ps")
+            (
+                MTLPixelFormat::RGBA32Float,
+                16,
+                if partial { "packed_rg_ps" } else { "packed_ps" },
+            )
         } else {
             (MTLPixelFormat::RGBA8Unorm, 4, "translated_ps")
         };
@@ -194,7 +199,11 @@ mod gpu {
             .object_at(0)
             .ok_or("no color slot")?;
         color_attachment.set_pixel_format(format);
-        color_attachment.set_write_mask(MTLColorWriteMask::All);
+        color_attachment.set_write_mask(if partial {
+            MTLColorWriteMask::Red | MTLColorWriteMask::Green
+        } else {
+            MTLColorWriteMask::All
+        });
         color_attachment.set_blending_enabled(false);
         // Independent owned negative control. No sidecar is read or written;
         // success is possible only for the specific Metal archive-miss error.
@@ -261,7 +270,12 @@ mod gpu {
             .object_at(0)
             .ok_or("no pass color slot")?;
         attachment.set_texture(Some(&color));
-        attachment.set_clear_color(MTLClearColor::new(1., 0., 1., 0.));
+        attachment.set_clear_color(MTLClearColor::new(
+            1.,
+            0.,
+            1.,
+            if partial { 0.75 } else { 0. },
+        ));
         attachment.set_load_action(MTLLoadAction::Clear);
         attachment.set_store_action(MTLStoreAction::Store);
         let depth_texture = depth.then(|| {
@@ -380,9 +394,13 @@ mod gpu {
                 } else if packed {
                     // Independent numeric oracle; this does not unpack input dwords.
                     let rgba: [f32; 4] = if (2..6).contains(&x) && (1..6).contains(&y) {
-                        [-2., 0.25, 1.5, -0.5]
+                        if partial {
+                            [-2., 0.25, 1., 0.75]
+                        } else {
+                            [-2., 0.25, 1.5, -0.5]
+                        }
                     } else {
-                        [1., 0., 1., 0.]
+                        [1., 0., 1., if partial { 0.75 } else { 0. }]
                     };
                     fp32 = rgba.map(f32::to_le_bytes).as_flattened().to_owned();
                     &fp32
@@ -402,7 +420,7 @@ mod gpu {
             println!("published owned graphics artifact identity");
         }
         println!(
-            "{} translated GFX10 VS+PS (mutated={mutated}, packed={packed}, depth={depth}): {n}/{n} pixels matched",
+            "{} translated GFX10 VS+PS (mutated={mutated}, packed={packed}, partial={partial}, depth={depth}): {n}/{n} pixels matched",
             dev.name(),
             n = SIDE * SIDE
         );

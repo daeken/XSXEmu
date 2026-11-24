@@ -67,6 +67,12 @@ expect_mismatch --replay-archive "$d/owned.metallib" "$d/owned.metalar" "$compil
 compile packed
 "$p" --load-packed-metallib "$d/packed.metallib"
 
+# Partial export preserves nonzero B/A in the explicit RG-write descriptor.
+"$p" --packed-rg-source
+"$p" --emit-packed-rg-msl > "$d/packed-rg.metal"
+compile packed-rg
+"$p" --load-packed-rg-metallib "$d/packed-rg.metallib"
+
 # Scalar depth with explicit Depth32Float and overlapping draws.
 "$p" --depth-source
 "$p" --emit-depth-msl > "$d/depth.metal"

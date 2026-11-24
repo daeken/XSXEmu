@@ -53,6 +53,9 @@ pub(crate) enum Op {
         done: bool,
         vm: bool,
     },
+    FinalPackedRg0 {
+        src: Vgpr,
+    },
     FinalPixelDepth {
         src: Vgpr,
     },
@@ -204,6 +207,19 @@ pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeErro
         return Ok((
             2,
             Op::FinalPixelDepth {
+                src: Vgpr(fields as u8),
+            },
+        ));
+    }
+    // EN3 enables the packed RG word only; all unused selectors are canonical zero.
+    if w == 0xf800_1c03 {
+        let fields = ext()?;
+        if fields >> 8 != 0 {
+            return Err(DecodeError::Unsupported(pc));
+        }
+        return Ok((
+            2,
+            Op::FinalPackedRg0 {
                 src: Vgpr(fields as u8),
             },
         ));
