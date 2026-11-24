@@ -141,7 +141,7 @@ pub(crate) fn lookup(dll: &[u8], name: &[u8]) -> Option<HostExport> {
 pub(crate) use native::init_process;
 
 #[cfg(target_arch = "x86_64")]
-mod native {
+pub(crate) mod native {
     use crate::providers::set_last_error;
     use std::{
         collections::{BTreeMap, HashMap},
@@ -201,7 +201,7 @@ mod native {
     }
 
     #[repr(C)]
-    pub(super) struct StartupInfoW {
+    pub(crate) struct StartupInfoW {
         cb: u32,
         reserved: *mut u16,
         desktop: *mut u16,
@@ -222,7 +222,7 @@ mod native {
         stderr: usize,
     }
 
-    pub(super) unsafe extern "win64" fn get_startup_info_w(out: *mut StartupInfoW) {
+    pub(crate) unsafe extern "win64" fn get_startup_info_w(out: *mut StartupInfoW) {
         if out.is_null() {
             set_last_error(ERROR_INVALID_PARAMETER);
             return;
@@ -303,13 +303,13 @@ mod native {
         }
     }
 
-    pub(super) extern "win64" fn get_command_line_w() -> *const u16 {
+    pub(crate) extern "win64" fn get_command_line_w() -> *const u16 {
         COMMAND
             .get()
             .map_or(ptr::null(), |command| command.wide.as_ptr())
     }
 
-    pub(super) extern "win64" fn get_command_line_a() -> *const u8 {
+    pub(crate) extern "win64" fn get_command_line_a() -> *const u8 {
         COMMAND
             .get()
             .map_or(ptr::null(), |command| command.ansi.as_ptr())
@@ -427,7 +427,7 @@ mod native {
         unsafe { copy_string(value, out, capacity) }
     }
 
-    pub(super) extern "win64" fn get_environment_strings_w() -> *mut u16 {
+    pub(crate) extern "win64" fn get_environment_strings_w() -> *mut u16 {
         let mut env = lock(&ENVIRONMENT);
         let mut buffer = Vec::new();
         let units = env.vars.values().try_fold(1usize, |n, (key, value)| {
@@ -457,7 +457,7 @@ mod native {
         result
     }
 
-    pub(super) extern "win64" fn free_environment_strings_w(block: *mut u16) -> i32 {
+    pub(crate) extern "win64" fn free_environment_strings_w(block: *mut u16) -> i32 {
         if lock(&ENVIRONMENT).copies.remove(&block.addr()).is_some() {
             1
         } else {
@@ -580,7 +580,7 @@ mod native {
     const QPC_HZ: i64 = 1_000_000_000;
     static QPC_ORIGIN: OnceLock<Instant> = OnceLock::new();
 
-    pub(super) unsafe extern "win64" fn query_performance_counter(out: *mut i64) -> i32 {
+    pub(crate) unsafe extern "win64" fn query_performance_counter(out: *mut i64) -> i32 {
         if out.is_null() {
             return fail(ERROR_INVALID_PARAMETER);
         }
@@ -589,7 +589,7 @@ mod native {
         1
     }
 
-    pub(super) unsafe extern "win64" fn query_performance_frequency(out: *mut i64) -> i32 {
+    pub(crate) unsafe extern "win64" fn query_performance_frequency(out: *mut i64) -> i32 {
         if out.is_null() {
             return fail(ERROR_INVALID_PARAMETER);
         }

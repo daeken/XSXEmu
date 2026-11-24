@@ -320,6 +320,56 @@ Lbridge_entry:
     movq (%rax), %rax
     cmpq 72(%rsp), %rax
     jne Lbad
+    /* Scalar stack arguments: one register and up to three stack slots
+     * after adjusting for the adapter's extra LastError pointer. */
+    movl $1252, %ecx
+    xorl %edx, %edx
+    leaq Lmb_input(%rip), %r8
+    movl $-1, %r9d
+    leaq 64(%rsp), %rax
+    movq %rax, 32(%rsp)
+    movq $2, 40(%rsp)
+    leaq Ltext(%rip), %r11
+    callq *{iat_delta}+112(%r11) /* MultiByteToWideChar */
+    cmpl $2, %eax
+    jne Lbad
+    cmpl $0x20ac, 64(%rsp)       /* Euro + NUL */
+    jne Lbad
+
+    movl $1252, %ecx
+    xorl %edx, %edx
+    leaq Lwc_input(%rip), %r8
+    movl $1, %r9d
+    leaq 72(%rsp), %rax
+    movq %rax, 32(%rsp)
+    movq $1, 40(%rsp)
+    leaq Lwc_default(%rip), %rax
+    movq %rax, 48(%rsp)
+    leaq 76(%rsp), %rax
+    movl $0, (%rax)
+    movq %rax, 56(%rsp)
+    leaq Ltext(%rip), %r11
+    movq {iat_delta}+120(%r11), %rax
+    callq *{dispatch_delta}(%r11) /* WideCharToMultiByte via CFG */
+    cmpl $1, %eax
+    jne Lbad
+    cmpb $33, 72(%rsp)
+    jne Lbad
+    cmpl $1, 76(%rsp)            /* used supplied default */
+    jne Lbad
+
+    leaq Ltext(%rip), %r11
+    callq *{iat_delta}+128(%r11) /* GetCommandLineW initialized before entry */
+    testq %rax, %rax
+    je Lbad
+    cmpw $34, (%rax)            /* quoted argv[0] */
+    jne Lbad
+    leaq Ltext(%rip), %r11
+    callq *{iat_delta}+136(%r11) /* GetCommandLineA */
+    testq %rax, %rax
+    je Lbad
+    cmpb $34, (%rax)
+    jne Lbad
     bridge_cfg 8                /* restore detach sentinel */
     cmpq $0x11111111, %rdi
     jne Lbad
@@ -371,6 +421,14 @@ Ltrace_dispatch:
 Ltrace_dispatch_call:
     callq *{dispatch_delta}(%r11)
     ud2
+Lmb_input:
+    .byte 0x80, 0
+.p2align 1
+Lwc_input:
+    .short 0x2603               /* snowman, not expressible in CP1252 */
+Lwc_default:
+    .byte 33
+.p2align 1
 Lkernelbase:
     .short 107,101,114,110,101,108,98,97,115,101,46,100,108,108,0
 Lbad:

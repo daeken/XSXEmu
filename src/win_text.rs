@@ -182,7 +182,7 @@ pub(crate) fn lookup(dll: &[u8], name: &[u8]) -> Option<HostExport> {
 }
 
 #[cfg(target_arch = "x86_64")]
-mod native {
+pub(crate) mod native {
     use crate::providers::set_last_error;
     use std::{
         cmp::Ordering,
@@ -539,7 +539,7 @@ const CASE_CHANGES: [(u16, u16, u16); 121] = [
         }
     }
 
-    pub(super) unsafe extern "win64" fn multi_byte_to_wide_char(
+    pub(crate) unsafe extern "win64" fn multi_byte_to_wide_char(
         cp: u32,
         flags: u32,
         source: *const u8,
@@ -588,7 +588,7 @@ const CASE_CHANGES: [(u16, u16, u16); 121] = [
         unsafe { output(&wide, target, capacity) }
     }
 
-    pub(super) unsafe extern "win64" fn wide_char_to_multi_byte(
+    pub(crate) unsafe extern "win64" fn wide_char_to_multi_byte(
         cp: u32,
         flags: u32,
         source: *const u16,
@@ -671,14 +671,14 @@ const CASE_CHANGES: [(u16, u16, u16); 121] = [
     }
 
     #[repr(C)]
-    pub(super) struct CpInfo {
+    pub(crate) struct CpInfo {
         max_char_size: u32,
         default_char: [u8; 2],
         lead_byte: [u8; 12],
     }
     const _: () = assert!(size_of::<CpInfo>() == 20);
 
-    pub(super) unsafe extern "win64" fn get_cp_info(cp: u32, out: *mut CpInfo) -> i32 {
+    pub(crate) unsafe extern "win64" fn get_cp_info(cp: u32, out: *mut CpInfo) -> i32 {
         if !good(out) {
             return fail(INVALID);
         }
@@ -695,7 +695,7 @@ const CASE_CHANGES: [(u16, u16, u16); 121] = [
         1
     }
 
-    pub(super) extern "win64" fn get_acp() -> u32 {
+    pub(crate) extern "win64" fn get_acp() -> u32 {
         ACP
     }
     pub(super) extern "win64" fn get_oemcp() -> u32 {
@@ -704,7 +704,7 @@ const CASE_CHANGES: [(u16, u16, u16); 121] = [
     pub(super) extern "win64" fn get_user_default_lcid() -> u32 {
         EN_US
     }
-    pub(super) extern "win64" fn is_valid_code_page(cp: u32) -> i32 {
+    pub(crate) extern "win64" fn is_valid_code_page(cp: u32) -> i32 {
         // Pseudo code pages are request aliases, not installed code page IDs.
         i32::from(matches!(cp, ACP | OEM | UTF8))
     }
@@ -743,7 +743,7 @@ const CASE_CHANGES: [(u16, u16, u16); 121] = [
         1
     }
 
-    pub(super) unsafe extern "win64" fn get_string_type_w(
+    pub(crate) unsafe extern "win64" fn get_string_type_w(
         info_type: u32,
         source: *const u16,
         length: i32,
@@ -779,7 +779,7 @@ const CASE_CHANGES: [(u16, u16, u16); 121] = [
         1
     }
 
-    pub(super) unsafe extern "win64" fn lc_map_string_w(
+    pub(crate) unsafe extern "win64" fn lc_map_string_w(
         lcid: u32,
         flags: u32,
         source: *const u16,

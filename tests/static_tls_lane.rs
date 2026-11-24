@@ -235,9 +235,9 @@ fn image(kind: Kind) -> Vec<u8> {
     if matches!(kind, Kind::Bridge) {
         dir(&mut b, 1, LINK, 40);
         w32(&mut b, file(LINK), LINK + 0x30);
-        w32(&mut b, file(LINK) + 12, LINK + 0xb0);
+        w32(&mut b, file(LINK) + 12, LINK + 0xd0);
         w32(&mut b, file(LINK) + 16, IAT);
-        put(&mut b, file(LINK) + 0xb0, b"kernel32.dll\0");
+        put(&mut b, file(LINK) + 0xd0, b"kernel32.dll\0");
         for (i, name) in [
             &b"GetLastError\0"[..],
             &b"SetLastError\0"[..],
@@ -253,6 +253,10 @@ fn image(kind: Kind) -> Vec<u8> {
             &b"TlsSetValue\0"[..],
             &b"TlsGetValue\0"[..],
             &b"TlsFree\0"[..],
+            &b"MultiByteToWideChar\0"[..],
+            &b"WideCharToMultiByte\0"[..],
+            &b"GetCommandLineW\0"[..],
+            &b"GetCommandLineA\0"[..],
         ]
         .into_iter()
         .enumerate()
@@ -385,7 +389,7 @@ fn unaudited_exports_and_raw_address_aliases_are_refused_before_entry() {
     );
 
     let mut aliased = image(Kind::Bridge);
-    put(&mut aliased, file(LINK) + 0xb0, b"ntdll.dll\0");
+    put(&mut aliased, file(LINK) + 0xd0, b"ntdll.dll\0");
     put(&mut aliased, file(LINK) + 0xe2, b"RtlGetLastWin32Error\0");
     put(&mut aliased, file(LINK) + 0x112, b"RtlSetLastWin32Error\0");
     // Only the renamed ntdll imports belong to this descriptor.

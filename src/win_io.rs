@@ -166,7 +166,7 @@ pub(super) use native::{console_attached, win_err, with_console};
 
 #[cfg(target_arch = "x86_64")]
 #[allow(non_snake_case)]
-mod native {
+pub(crate) mod native {
     use crate::providers::set_last_error;
     #[cfg(target_os = "macos")]
     use crate::providers::win_console::native::Terminal;
@@ -909,7 +909,7 @@ mod native {
     fn host_stream(_: usize) -> Result<Option<Entry>> {
         Err(UNSUPPORTED)
     }
-    pub(super) extern "win64" fn GetStdHandle(n: u32) -> usize {
+    pub(crate) extern "win64" fn GetStdHandle(n: u32) -> usize {
         ret(
             std_slot(n).and_then(|i| {
                 let mut st = lock(&STATE);
@@ -1143,7 +1143,7 @@ mod native {
             f.set_len(p).map_err(win_err)
         }))
     }
-    pub(super) extern "win64" fn GetFileType(h: usize) -> u32 {
+    pub(crate) extern "win64" fn GetFileType(h: usize) -> u32 {
         ret(
             entry(h).and_then(|e| match &*e.obj {
                 Object::File(f) => {

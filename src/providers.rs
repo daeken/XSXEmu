@@ -40,7 +40,7 @@ macro_rules! export {
 #[path = "win_console.rs"]
 mod win_console;
 #[path = "win_io.rs"]
-mod win_io;
+pub(crate) mod win_io;
 #[path = "win_loader.rs"]
 pub(crate) mod win_loader;
 #[path = "win_proc.rs"]
@@ -48,7 +48,7 @@ pub(crate) mod win_proc;
 #[path = "win_sync.rs"]
 pub(crate) mod win_sync;
 #[path = "win_text.rs"]
-mod win_text;
+pub(crate) mod win_text;
 #[path = "win_unwind.rs"]
 pub(crate) mod win_unwind;
 

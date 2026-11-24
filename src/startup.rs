@@ -300,6 +300,9 @@ mod native {
             }
         }
         if let Some(tls) = tls {
+            if rust_providers {
+                win_proc::init_process(images[0].0)?;
+            }
             // The existing check/dispatch thunks are GS-neutral leaf assembly.
             // Only exact PE GFIDs and explicitly bound bridge/trace entries are
             // registered. No loader or unwind provider is installed.

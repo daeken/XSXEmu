@@ -267,25 +267,25 @@ There are no external PE inputs, extra guest threads, or Wine dependency.
 Default startup still rejects static TLS. This standalone proof is neither a
 general import bridge nor a sandbox for other images.
 
-## Opt-in child: audited LastError pair
+## Opt-in child: audited provider bridges
 
 `run <trusted-fixture.exe> --experimental-static-tls --rust-providers` permits
-only the exact Rust `GetLastError` and `SetLastError` export identities,
-including registry aliases that resolve to those same entries. The ntdll
-`Rtl*LastWin32Error` aliases are not accepted, even though their raw Rust
-addresses match. Unbridged provider bindings fail before entry, and
-`--trace-missing-imports` can be combined with `--experimental-static-tls`.
-This opts into treating every traced slot as a function call target, not as
-data: the unresolved PE import itself does not distinguish the two. Only
-well-formed static slots with an absent provider or export may be traced.
+30 exact Win32 provider identities based on the observed pinned UCRT fixture
+trace. Registry aliases are accepted only if they resolve to an audited
+identity; ntdll `Rtl*LastWin32Error` identities are distinct. The lane's
+`LoadLibraryExW` validates the request but searches an intentionally empty
+namespace. `GetProcAddress` and `FreeLibrary` aren't bridged. Unbridged
+providers fail before entry unless `--trace-missing-imports` is enabled,
+which treats well-formed unavailable or unbridged slots as callable, not
+as data: PE import records don't distinguish the two.
 Their writes participate in the same TLS layout and overlap checks as resolved
 IAT writes.
 
 The startup binder patches and registers the actual Win64 bridge entries,
 not the raw Rust exports. Using the `c800404` frame/GS proof, the thunks
 preserve Win64 nonvolatiles across SysV calls, check host GS before Rust, and
-check guest GS before returning. Only the fixed `DWORD(void)` and
-`void(DWORD)` signatures are supported. The guest DWORD at `GS:[0x68]` is
+check guest GS before returning. Only explicitly audited fixed scalar
+signatures are supported, with up to eight argument slots. The guest DWORD at `GS:[0x68]` is
 initially zero and authoritative: the adapters transfer it to/from the
 ordinary provider's thread-local cell as needed and restore the previous
 host value. The guest signal mask remains in place throughout. There are

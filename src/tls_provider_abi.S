@@ -1,32 +1,33 @@
 /* Fixed Win64 -> SysV adapters for integer/pointer prototypes only.
  * The first SysV argument is the guest LastErrorValue pointer. The remaining
- * five fit in registers; Win64's fifth argument is above its home space.
+ * five fit in registers; arguments 6–8 occupy the outgoing SysV stack.
+ * Incoming Win64 arguments 5–8 are above its return slot and home space.
  * Rust owns the exact-width ABI and never runs under guest GS. */
-.set TLS_BRIDGE_FRAME, 216
+.set TLS_BRIDGE_FRAME, 248
 .macro bridge entry, adapter, argc
-    .if \argc > 5
-        .error "static TLS bridge supports at most five scalar arguments"
+    .if \argc > 8
+        .error "static TLS bridge supports at most eight scalar arguments"
     .endif
     .globl \entry
 \entry:
     subq $TLS_BRIDGE_FRAME, %rsp       /* 16-byte aligned before calls */
     .irp n,6,7,8,9,10,11,12,13,14,15
-        movaps %xmm\n, 16*(\n-6)(%rsp)
+        movaps %xmm\n, 32+16*(\n-6)(%rsp)
     .endr
-    movq %rdi, 160(%rsp)
-    movq %rsi, 168(%rsp)
-    movq %r12, 176(%rsp)
+    movq %rdi, 192(%rsp)
+    movq %rsi, 200(%rsp)
+    movq %r12, 208(%rsp)
     .if \argc >= 1
-        movq %rcx, 184(%rsp)
+        movq %rcx, 216(%rsp)
     .endif
     .if \argc >= 2
-        movq %rdx, 192(%rsp)
+        movq %rdx, 224(%rsp)
     .endif
     .if \argc >= 3
-        movq %r8, 200(%rsp)
+        movq %r8, 232(%rsp)
     .endif
     .if \argc >= 4
-        movq %r9, 208(%rsp)
+        movq %r9, 240(%rsp)
     .endif
 
     movq %gs:{context_slot}, %r12
@@ -36,33 +37,45 @@
     movq {guest_base}(%r12), %rdi
     addq ${last_error}, %rdi
     .if \argc >= 1
-        movq 184(%rsp), %rsi
+        movq 216(%rsp), %rsi
     .endif
     .if \argc >= 2
-        movq 192(%rsp), %rdx
+        movq 224(%rsp), %rdx
     .endif
     .if \argc >= 3
-        movq 200(%rsp), %rcx
+        movq 232(%rsp), %rcx
     .endif
     .if \argc >= 4
-        movq 208(%rsp), %r8
+        movq 240(%rsp), %r8
     .endif
     .if \argc >= 5
         movq TLS_BRIDGE_FRAME+40(%rsp), %r9
     .endif
+    .if \argc >= 6
+        movq TLS_BRIDGE_FRAME+48(%rsp), %rax
+        movq %rax, 0(%rsp)
+    .endif
+    .if \argc >= 7
+        movq TLS_BRIDGE_FRAME+56(%rsp), %rax
+        movq %rax, 8(%rsp)
+    .endif
+    .if \argc >= 8
+        movq TLS_BRIDGE_FRAME+64(%rsp), %rax
+        movq %rax, 16(%rsp)
+    .endif
     callq \adapter
-    movq %rax, 184(%rsp)
+    movq %rax, 216(%rsp)
     check_host %r12
     switch_to {guest_base}, %r12
     check_guest %r12
-    movq 184(%rsp), %rax
+    movq 216(%rsp), %rax
 
     .irp n,6,7,8,9,10,11,12,13,14,15
-        movaps 16*(\n-6)(%rsp), %xmm\n
+        movaps 32+16*(\n-6)(%rsp), %xmm\n
     .endr
-    movq 160(%rsp), %rdi
-    movq 168(%rsp), %rsi
-    movq 176(%rsp), %r12
+    movq 192(%rsp), %rdi
+    movq 200(%rsp), %rsi
+    movq 208(%rsp), %r12
     addq $TLS_BRIDGE_FRAME, %rsp
     retq
 .endm

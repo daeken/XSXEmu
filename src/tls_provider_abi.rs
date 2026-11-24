@@ -5,7 +5,10 @@ use super::{CONTEXT_OFFSET, Context, LAST_ERROR_OFFSET};
 use crate::{
     Result,
     import_traps::called_missing_import_tls,
-    providers::{self, HostExport, native, win_loader::native as loader, win_sync::native as sync},
+    providers::{
+        self, HostExport, native, win_io::native as io, win_loader::native as loader,
+        win_proc::native as proc, win_sync::native as sync, win_text::native as text,
+    },
 };
 use std::{arch::global_asm, ffi::c_void, mem::offset_of};
 
@@ -108,4 +111,36 @@ audited_bridges! {
         sync::leave_cs, (cs: *mut sync::CriticalSection) -> ();
     xsxemu_tls_delete_cs, delete_cs: b"kernelbase.dll", b"DeleteCriticalSection",
         sync::delete_cs, (cs: *mut sync::CriticalSection) -> ();
+    xsxemu_tls_get_startup_info_w, get_startup_info_w: b"kernelbase.dll", b"GetStartupInfoW",
+        proc::get_startup_info_w, (out: *mut proc::StartupInfoW) -> ();
+    xsxemu_tls_getstdhandle, getstdhandle: b"kernelbase.dll", b"GetStdHandle",
+        io::GetStdHandle, (slot: u32) -> usize;
+    xsxemu_tls_getfiletype, getfiletype: b"kernelbase.dll", b"GetFileType",
+        io::GetFileType, (handle: usize) -> u32;
+    xsxemu_tls_get_command_line_a, get_command_line_a: b"kernelbase.dll", b"GetCommandLineA",
+        proc::get_command_line_a, () -> *const u8;
+    xsxemu_tls_get_command_line_w, get_command_line_w: b"kernelbase.dll", b"GetCommandLineW",
+        proc::get_command_line_w, () -> *const u16;
+    xsxemu_tls_get_acp, get_acp: b"kernelbase.dll", b"GetACP",
+        text::get_acp, () -> u32;
+    xsxemu_tls_is_valid_code_page, is_valid_code_page: b"kernelbase.dll", b"IsValidCodePage",
+        text::is_valid_code_page, (cp: u32) -> i32;
+    xsxemu_tls_get_cp_info, get_cp_info: b"kernelbase.dll", b"GetCPInfo",
+        text::get_cp_info, (cp: u32, out: *mut text::CpInfo) -> i32;
+    xsxemu_tls_multi_byte_to_wide_char, multi_byte_to_wide_char: b"kernelbase.dll", b"MultiByteToWideChar",
+        text::multi_byte_to_wide_char, (cp: u32, flags: u32, source: *const u8, length: i32, target: *mut u16, capacity: i32) -> i32;
+    xsxemu_tls_get_string_type_w, get_string_type_w: b"kernelbase.dll", b"GetStringTypeW",
+        text::get_string_type_w, (kind: u32, source: *const u16, length: i32, target: *mut u16) -> i32;
+    xsxemu_tls_lc_map_string_w, lc_map_string_w: b"kernelbase.dll", b"LCMapStringW",
+        text::lc_map_string_w, (lcid: u32, flags: u32, source: *const u16, length: i32, target: *mut u16, capacity: i32) -> i32;
+    xsxemu_tls_wide_char_to_multi_byte, wide_char_to_multi_byte: b"kernelbase.dll", b"WideCharToMultiByte",
+        text::wide_char_to_multi_byte, (cp: u32, flags: u32, source: *const u16, length: i32, target: *mut u8, capacity: i32, default: *const u8, used: *mut i32) -> i32;
+    xsxemu_tls_get_environment_strings_w, get_environment_strings_w: b"kernelbase.dll", b"GetEnvironmentStringsW",
+        proc::get_environment_strings_w, () -> *mut u16;
+    xsxemu_tls_free_environment_strings_w, free_environment_strings_w: b"kernelbase.dll", b"FreeEnvironmentStringsW",
+        proc::free_environment_strings_w, (block: *mut u16) -> i32;
+    xsxemu_tls_query_performance_frequency, query_performance_frequency: b"kernelbase.dll", b"QueryPerformanceFrequency",
+        proc::query_performance_frequency, (out: *mut i64) -> i32;
+    xsxemu_tls_query_performance_counter, query_performance_counter: b"kernelbase.dll", b"QueryPerformanceCounter",
+        proc::query_performance_counter, (out: *mut i64) -> i32;
 }
