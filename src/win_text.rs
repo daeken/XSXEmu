@@ -36,6 +36,7 @@ const KERNELBASE: &[u8] = b"kernelbase.dll";
 const KERNEL32: &[u8] = b"kernel32.dll";
 const STRING: &[u8] = b"api-ms-win-core-string-l1-1-0.dll";
 const LOCALIZATION: &[u8] = b"api-ms-win-core-localization-l1-2-0.dll";
+const LOCALIZATION_1_2_3: &[u8] = b"api-ms-win-core-localization-l1-2-3.dll";
 const DATETIME: &[u8] = b"api-ms-win-core-datetime-l1-1-0.dll";
 const SYSINFO: &[u8] = b"api-ms-win-core-sysinfo-l1-1-0.dll";
 const SYSINFO_1_2: &[u8] = b"api-ms-win-core-sysinfo-l1-2-0.dll";
@@ -46,7 +47,15 @@ const TIMEZONE: &[u8] = b"api-ms-win-core-timezone-l1-1-0.dll";
 pub(crate) fn has_dll(dll: &[u8]) -> bool {
     matches!(
         dll,
-        KERNELBASE | KERNEL32 | STRING | LOCALIZATION | DATETIME | SYSINFO | SYSINFO_1_2 | TIMEZONE
+        KERNELBASE
+            | KERNEL32
+            | STRING
+            | LOCALIZATION
+            | LOCALIZATION_1_2_3
+            | DATETIME
+            | SYSINFO
+            | SYSINFO_1_2
+            | TIMEZONE
     )
 }
 
@@ -79,6 +88,11 @@ pub(crate) fn lookup(dll: &[u8], name: &[u8]) -> Option<HostExport> {
         (KERNELBASE | KERNEL32 | LOCALIZATION, b"LCMapStringW") => {
             export!("kernelbase.dll", "LCMapStringW", native::lc_map_string_w)
         }
+        (KERNELBASE | KERNEL32 | LOCALIZATION_1_2_3, b"GetUserDefaultGeoName") => export!(
+            "kernelbase.dll",
+            "GetUserDefaultGeoName",
+            native::get_user_default_geo_name
+        ),
         (KERNELBASE | KERNEL32 | LOCALIZATION, b"GetUserDefaultLCID") => {
             export!(
                 "kernelbase.dll",
@@ -716,6 +730,13 @@ const CASE_CHANGES: [(u16, u16, u16); 121] = [
     }
     pub(super) extern "win64" fn get_oemcp() -> u32 {
         OEM
+    }
+    // Same explicit US region as the guest's en-US locale, not host location.
+    pub(crate) unsafe extern "win64" fn get_user_default_geo_name(
+        target: *mut u16,
+        capacity: i32,
+    ) -> i32 {
+        unsafe { output(&[b'U' as u16, b'S' as u16, 0], target, capacity) }
     }
     pub(super) extern "win64" fn get_user_default_lcid() -> u32 {
         EN_US

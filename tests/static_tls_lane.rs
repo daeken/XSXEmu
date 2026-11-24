@@ -1765,6 +1765,49 @@ fn sleep_bridge_delays_and_preserves_guest_last_error() {
     expect(output, 57, "Guest entry returned 57");
 }
 
+const GEO_CODE_CAPACITY: usize = 0x200;
+
+#[repr(C)]
+struct GeoFixture {
+    entry: u32,
+    code: [u8; GEO_CODE_CAPACITY],
+}
+
+global_asm!(include_str!("fixtures/static_tls_geo_name.S"),
+    capacity = const GEO_CODE_CAPACITY,
+    iat_delta = const IAT - TEXT,
+    options(att_syntax),
+);
+
+unsafe extern "C" {
+    static static_tls_geo_fixture: GeoFixture;
+}
+
+#[test]
+fn guest_geo_name_bridge_sizes_and_writes_fixed_utf16_region() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let mut exe = image(Kind::Solo);
+    let fixture = unsafe { &static_tls_geo_fixture };
+    exe[file(TEXT)..file(TEXT) + RAW].fill(0xcc);
+    put(&mut exe, file(TEXT), &fixture.code);
+    w32(&mut exe, OP + 16, TEXT + fixture.entry as usize);
+    w64(&mut exe, file(ARRAY), PREFERRED + TEXT);
+    dir_import_one(
+        &mut exe,
+        b"api-ms-win-core-localization-l1-2-3.dll\0",
+        b"GetUserDefaultGeoName\0",
+    );
+    let path = scratch.write("geo-name.exe", &exe);
+    expect(
+        run(&path, &[OPT, "--rust-providers"]),
+        50,
+        "Guest entry returned 50",
+    );
+}
+
 #[test]
 fn system_file_time_bridge_writes_eight_bytes_and_preserves_last_error() {
     if !rosetta() {
