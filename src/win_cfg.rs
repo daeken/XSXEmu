@@ -86,7 +86,6 @@ pub struct OfflineGuardSlots {
 #[derive(Clone, Copy)]
 enum Profile {
     Standard,
-    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
     TlsChild,
     OfflineCatalog,
     OfflineGuardSlots,
@@ -196,7 +195,6 @@ impl DormantSlots {
                 ));
             }
             match profile {
-                #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
                 Profile::TlsChild => DormantLayout::InstrumentedNoPolicy,
                 _ => DormantLayout::Legacy,
             }
@@ -601,7 +599,7 @@ impl<'a> CfgProfile<'a> {
         Self::parse_profile(pe, Profile::Standard)
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    /// File-only CFG checks for the experimental TLS child startup profile.
     pub fn parse_tls_child(pe: &Pe<'a>) -> Result<Self> {
         Self::parse_profile(pe, Profile::TlsChild)
     }
@@ -797,11 +795,7 @@ impl<'a> CfgMetadata<'a> {
             }
         }
         validate_auxiliary(pe, declared, rva, flags, stride, &mut ranges)?;
-        let static_tls = match profile {
-            #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-            Profile::TlsChild => true,
-            _ => false,
-        };
+        let static_tls = matches!(profile, Profile::TlsChild);
         let address_taken_iat =
             AddressTakenIat::parse(pe, declared, flags, stride, static_tls, &mut ranges)?;
         let one_hop = matches!(profile, Profile::OfflineGuardSlots);

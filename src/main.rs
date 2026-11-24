@@ -37,6 +37,7 @@ const USAGE: &str = "Usage: xsxemu <inspect|map|audit|run> <image.exe> [options]
     inspect option: --offline-guard-slots  Check the one-hop CFG linker slot form on a trusted PE\n\
     map [--base ADDRESS]   Materialize a non-executable image and apply relocations\n\
     audit [--dll-dir DIR] [--symbols]  Resolve the static import graph without executing\n\
+    audit option: --startup-profile standard|static-tls-child  Report per-image startup checks\n\
     run [--dll-dir DIR]    Start a trusted image (x86-64 macOS/Rosetta only; not sandboxed)\n\
     run option: --trace-missing-imports  Treat missing static imports as callable and stop on first call (not data imports)\n\
     run option: --experimental-static-tls  Trusted PE-only startup in a disposable Rosetta child\n\
@@ -74,6 +75,7 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
     let mut rust_providers = false;
     let mut trace_missing_imports = false;
     let mut experimental_tls = false;
+    let mut startup_profile = None;
     let mut options = args.iter();
     while let Some(arg) = options.next() {
         match (command, arg.to_str()) {
@@ -89,6 +91,17 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
                 ));
             }
             ("audit" | "run", Some("--rust-providers")) => rust_providers = true,
+            ("audit", Some("--startup-profile")) if startup_profile.is_none() => {
+                startup_profile = Some(match options.next().and_then(|arg| arg.to_str()) {
+                    Some("standard") => startup::Profile::Standard,
+                    Some("static-tls-child") => startup::Profile::StaticTlsChild,
+                    _ => {
+                        return Err(
+                            "--startup-profile requires standard or static-tls-child".into()
+                        );
+                    }
+                });
+            }
             ("run", Some("--trace-missing-imports")) => trace_missing_imports = true,
             ("run", Some("--experimental-static-tls")) => experimental_tls = true,
             ("map", Some("--base")) if base.is_none() => {
@@ -146,6 +159,7 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
                     trace_missing_imports,
                 },
                 tls_child,
+                startup_profile,
             );
         }
         _ => return Err(USAGE.into()),
@@ -371,6 +385,7 @@ fn resolve(
         allow(unused_variables)
     )]
     tls_child: bool,
+    startup_profile: Option<startup::Profile>,
 ) -> Result<ExitCode> {
     use std::collections::BTreeMap;
     let trace = launch && options.trace_missing_imports;
@@ -425,8 +440,16 @@ fn resolve(
         total - missing,
         total
     );
+    let refused = if let Some(profile) = startup_profile {
+        report_startup_profile(&plan, profile, std::io::stdout().lock())?
+    } else {
+        0
+    };
     if !can_launch || descriptor_failures != 0 {
         return Err("incomplete dependency graph; no guest code ran".into());
+    }
+    if refused != 0 {
+        return Err("startup profile structural refusals; no guest code ran".into());
     }
     if !launch {
         return Ok(ExitCode::SUCCESS);
@@ -494,6 +517,38 @@ fn resolve(
         println!("Guest entry returned {status}");
         Ok(ExitCode::from(status as u8))
     }
+}
+
+fn report_startup_profile(
+    plan: &link::LinkPlan,
+    profile: startup::Profile,
+    mut out: impl std::io::Write,
+) -> Result<usize> {
+    writeln!(
+        out,
+        "Startup profile ({}): per-image structural validation of discovered PE images",
+        profile.name()
+    )?;
+    let mut refused = 0;
+    for (index, module) in plan.modules.iter().enumerate() {
+        match startup::validate_image(&module.image, index != 0, profile) {
+            Ok(_) => writeln!(out, "  {}: structural checks passed", module.path.display())?,
+            Err(e) => {
+                refused += 1;
+                writeln!(out, "  {}: refused: {e}", module.path.display())?;
+            }
+        }
+    }
+    writeln!(
+        out,
+        "Startup profile: {refused}/{} discovered images refused (first refusal per image)",
+        plan.modules.len()
+    )?;
+    writeln!(
+        out,
+        "Static resolution is reported separately; no startup binding checks or IAT writes, mapping/relocation application, TLS layout/setup, initialization-order checks, or host/guest runtime checks performed. This is not startup admission."
+    )?;
+    Ok(refused)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]

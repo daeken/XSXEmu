@@ -871,6 +871,68 @@ mod tests {
     }
 
     #[test]
+    fn startup_profile_reports_all_discovered_images_despite_unresolved_imports() {
+        use crate::startup::Profile;
+
+        let temp = TempDir::new();
+        let exe = temp.0.join("Owned.exe");
+        let mut root = image(
+            &[
+                ("front.dll", &[Slot::Ord(1)]),
+                ("plain.dll", &[Slot::Ord(1)]),
+                ("missing.dll", &[Slot::Ord(1)]),
+            ],
+            None,
+        );
+        let directory = |buf: &mut [u8], index: usize, size| {
+            put16(buf, 0x94, 240); // room for all 16 PE32+ directories
+            put32(buf, 0x98 + 108, 16);
+            put32(buf, 0x98 + 112 + index * 8, 0xc00);
+            put32(buf, 0x98 + 116 + index * 8, size);
+        };
+        directory(&mut root, 9, 40); // zeroed TLS directory, sufficient for standard refusal
+        fs::write(&exe, root).unwrap();
+
+        let mut front = dll_image(&[], Some((1, &[], Some("Leaf.#1"))));
+        put16(&mut front, 0x98 + 70, 0x0080); // FORCE_INTEGRITY takes precedence
+        directory(&mut front, 13, 32);
+        fs::write(temp.0.join("front.dll"), front).unwrap();
+        let mut leaf = dll_image(&[], Some((1, &[], None)));
+        directory(&mut leaf, 13, 32);
+        fs::write(temp.0.join("leaf.dll"), leaf).unwrap();
+        fs::write(
+            temp.0.join("plain.dll"),
+            dll_image(&[], Some((1, &[], None))),
+        )
+        .unwrap();
+
+        let plan = build_plan(&exe, &[]).unwrap();
+        assert_eq!(plan.unresolved().count(), 1);
+        for (profile, expected_root, expected_refused) in [
+            (Profile::Standard, "Owned.exe: refused: static TLS", 3),
+            (
+                Profile::StaticTlsChild,
+                "Owned.exe: structural checks passed",
+                2,
+            ),
+        ] {
+            let mut report = Vec::new();
+            let refused = crate::report_startup_profile(&plan, profile, &mut report).unwrap();
+            assert_eq!(refused, expected_refused);
+            let report = String::from_utf8(report).unwrap();
+            let lines: Vec<_> = report.lines().collect();
+            assert!(lines[0].contains(profile.name()));
+            assert!(lines[1].contains(expected_root));
+            assert!(lines[2].contains("front.dll: refused: FORCE_INTEGRITY"));
+            assert!(lines[3].contains("leaf.dll: refused: unsupported delay imports directory"));
+            assert!(lines[4].contains("plain.dll: structural checks passed"));
+            assert!(lines[5].contains(&format!("{expected_refused}/4 discovered images refused")));
+            assert!(lines[6].contains("This is not startup admission."));
+            assert!(!report.contains("missing.dll"));
+        }
+    }
+
+    #[test]
     fn keeps_loaded_edges_when_forwarder_is_cyclic_or_unresolved() {
         let temp = TempDir::new();
         let exe = temp.0.join("Game.exe");

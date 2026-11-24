@@ -2,8 +2,79 @@
 //! This is not a Windows process or a sandbox. No exception dispatch, Win32
 //! syscalls, dynamic loader, or guest threads are provided by this layer.
 
+use crate::{Result, pe::Pe, win_cfg::CfgProfile};
+
+#[derive(Clone, Copy)]
+pub enum Profile {
+    Standard,
+    StaticTlsChild,
+}
+
+impl Profile {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::StaticTlsChild => "static-tls-child",
+        }
+    }
+}
+
+/// The first, file-only startup validation phase. No graph bindings, mapped
+/// addresses or host runtime state participate in these checks.
+pub fn validate_image(
+    bytes: &[u8],
+    dll: bool,
+    profile: Profile,
+) -> Result<(Pe<'_>, CfgProfile<'_>)> {
+    const DLL_FORCE_INTEGRITY: u16 = 0x0080;
+    let pe = Pe::parse(bytes)?;
+    if pe.is_dll() != dll {
+        return Err("wrong image kind for startup".into());
+    }
+    if pe.dll_characteristics & DLL_FORCE_INTEGRITY != 0 {
+        return Err("FORCE_INTEGRITY requires Windows signature verification, which this loader does not provide".into());
+    }
+    let static_tls = matches!(profile, Profile::StaticTlsChild);
+    if !static_tls && pe.tls()?.is_some() {
+        return Err(
+            "static TLS requires a Windows TEB and is not supported by this startup profile".into(),
+        );
+    }
+    for (dir, label) in [
+        (7, "architecture"),
+        (8, "global pointer"),
+        (11, "bound imports"),
+        (13, "delay imports"),
+        (14, "CLR"),
+        (15, "reserved"),
+    ] {
+        if pe.directory(dir).is_some() {
+            return Err(format!("unsupported {label} directory").into());
+        }
+    }
+    let cfg = if static_tls {
+        CfgProfile::parse_tls_child(&pe)
+    } else {
+        CfgProfile::parse(&pe)
+    }?;
+    if matches!(cfg, CfgProfile::Dormant(_)) && !static_tls {
+        return Err("dormant guard slots require the experimental static TLS child".into());
+    }
+    if matches!(cfg, CfgProfile::None)
+        && let Some(dir) = pe.directory(10)
+    {
+        let raw = pe.rva_slice(dir.rva, dir.size as _)?;
+        // For unguarded images, still reject unrelated extended fields.
+        if raw.get(0x60..).is_some_and(|s| s.iter().any(|&x| x != 0)) {
+            return Err("unsupported extended load-config fields".into());
+        }
+    }
+    Ok((pe, cfg))
+}
+
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 mod native {
+    use super::{Profile, validate_image};
     use crate::{
         MAX_IMAGE, Result,
         apiset::ApiSet,
@@ -21,50 +92,6 @@ mod native {
     const PROCESS_DETACH: u32 = 0;
     const MAX_MAPPED_TOTAL: usize = 1024 * 1024 * 1024;
     const AMD64_DEFAULT_COOKIE: u64 = 0x0000_2b99_2ddf_a232;
-    const DLL_FORCE_INTEGRITY: u16 = 0x0080;
-
-    fn validate_profile<'a>(pe: &Pe<'a>, name: &str, static_tls: bool) -> Result<CfgProfile<'a>> {
-        if pe.dll_characteristics & DLL_FORCE_INTEGRITY != 0 {
-            return Err(format!("{name}: FORCE_INTEGRITY requires Windows signature verification, which this loader does not provide").into());
-        }
-        if !static_tls && pe.tls()?.is_some() {
-            return Err(format!("{name}: static TLS requires a Windows TEB and is not supported by this startup profile").into());
-        }
-        for (dir, label) in [
-            (7, "architecture"),
-            (8, "global pointer"),
-            (11, "bound imports"),
-            (13, "delay imports"),
-            (14, "CLR"),
-            (15, "reserved"),
-        ] {
-            if pe.directory(dir).is_some() {
-                return Err(format!("{name}: unsupported {label} directory").into());
-            }
-        }
-        let cfg = if static_tls {
-            CfgProfile::parse_tls_child(pe)
-        } else {
-            CfgProfile::parse(pe)
-        }
-        .map_err(|e| format!("{name}: {e}"))?;
-        if matches!(cfg, CfgProfile::Dormant(_)) && !static_tls {
-            return Err(format!(
-                "{name}: dormant guard slots require the experimental static TLS child"
-            )
-            .into());
-        }
-        if matches!(cfg, CfgProfile::None)
-            && let Some(dir) = pe.directory(10)
-        {
-            let raw = pe.rva_slice(dir.rva, dir.size as _)?;
-            // For unguarded images, still reject unrelated extended fields.
-            if raw.get(0x60..).is_some_and(|s| s.iter().any(|&x| x != 0)) {
-                return Err(format!("{name}: unsupported extended load-config fields").into());
-            }
-        }
-        Ok(cfg)
-    }
 
     fn patch(mem: &mut GuestMemory, rva: u32, value: u64) -> Result<()> {
         let at = rva as usize;
@@ -229,7 +256,7 @@ mod native {
             attach_order,
             api_set,
             rust_providers,
-            false,
+            Profile::Standard,
         )
     }
 
@@ -247,7 +274,7 @@ mod native {
             attach_order,
             None,
             rust_providers,
-            true,
+            Profile::StaticTlsChild,
         )
     }
 
@@ -258,22 +285,17 @@ mod native {
         attach_order: &[usize],
         api_set: Option<&ApiSet>,
         rust_providers: bool,
-        static_tls: bool,
+        profile: Profile,
     ) -> Result<u32> {
         use crate::tls_runtime;
+        let static_tls = matches!(profile, Profile::StaticTlsChild);
         let (pes, cfgs): (Vec<_>, Vec<_>) = images
             .iter()
             .enumerate()
             .map(|(index, (name, bytes))| {
-                let pe = Pe::parse(bytes)?;
-                let dll = pe.is_dll();
-                if dll != (index != 0) {
-                    return Err(format!("{name}: wrong image kind for startup").into());
-                }
-                let cfg = validate_profile(&pe, name, static_tls)?;
-                Ok((pe, cfg))
+                validate_image(bytes, index != 0, profile).map_err(|e| format!("{name}: {e}"))
             })
-            .collect::<Result<Vec<_>>>()?
+            .collect::<std::result::Result<Vec<_>, _>>()?
             .into_iter()
             .unzip();
         let tls_writes = static_tls
