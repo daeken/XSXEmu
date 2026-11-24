@@ -13,7 +13,7 @@ const UNSET: u64 = 0xdead_beef_dead_beef;
 const CODE_END: [u8; 4] = 0xbf9f0000u32.to_le_bytes();
 const END_PGM: [u8; 4] = 0xbf810000u32.to_le_bytes();
 
-fn qword(blob: &[u8], at: usize) -> Option<u64> {
+pub(crate) fn qword(blob: &[u8], at: usize) -> Option<u64> {
     Some(u64::from_le_bytes(blob.get(at..at + 8)?.try_into().ok()?))
 }
 

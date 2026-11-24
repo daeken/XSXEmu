@@ -1,7 +1,7 @@
 //! Count-only checks for the wrapped DXBC signature profile, not native ABI.
 use crate::{
     BLOB_LIMIT,
-    coverage::{Metadata, code_and_tail},
+    coverage::{Metadata, code_and_tail, qword},
     dxbc_chunks, shader_payloads, stage_name, word,
 };
 use std::{
@@ -319,6 +319,7 @@ struct NativeSpans {
     unaligned_tail: usize,
     tail_kinds: [usize; 4],
     tail_prefix_mismatch: usize,
+    tail_fields: [TailFields; 4],
 }
 
 fn tail_prefix_matches(tail: &[u8]) -> bool {
@@ -334,6 +335,50 @@ fn tail_kind(tail: &[u8], unset_end: bool) -> usize {
         (Some(3), Some(1), false) => 1,
         (Some(0), Some(0xffff_ffff), true) => 2,
         _ => 3,
+    }
+}
+
+#[derive(Default)]
+struct TailFields {
+    truncated: usize,
+    nonzero_28: usize,
+    outside_28: usize,
+    count_fits: [usize; 2],
+    zero_32: usize,
+    eight_32: usize,
+    aligned_32: usize,
+    offset_in_tail: [usize; 3],
+}
+
+impl TailFields {
+    fn add(&mut self, payload: &[u8], tail: &[u8]) {
+        let (Some(x), Some(y), Some(start), Some(end)) = (
+            word(tail, 28),
+            word(tail, 32),
+            qword(payload, 0xc0).and_then(|v| usize::try_from(v).ok()),
+            payload.len().checked_sub(tail.len()),
+        ) else {
+            self.truncated += 1;
+            return;
+        };
+        self.nonzero_28 += usize::from(x != 0);
+        self.outside_28 += usize::from(x >= tail.len());
+        if x != 0 {
+            for (fits, stride) in self.count_fits.iter_mut().zip([1, 4]) {
+                // A raw count at +28 would require at least stride times that many
+                // bytes after the tested 36-byte prefix, without wrapping.
+                *fits += usize::from(x <= tail.len().saturating_sub(36) / stride);
+            }
+        }
+        self.zero_32 += usize::from(y == 0);
+        self.eight_32 += usize::from(y == 8);
+        self.aligned_32 += usize::from(y.is_multiple_of(4));
+        for (hits, base) in self.offset_in_tail.iter_mut().zip([0, start, end]) {
+            *hits += usize::from(
+                base.checked_add(y)
+                    .is_some_and(|at| (end..payload.len()).contains(&at)),
+            );
+        }
     }
 }
 
@@ -364,7 +409,9 @@ fn native_stages(
                 totals.nonempty_tail += usize::from(!tail.is_empty());
                 totals.nonzero_tail += usize::from(tail.iter().any(|&b| b != 0));
                 totals.unaligned_tail += usize::from(!tail.len().is_multiple_of(4));
-                totals.tail_kinds[tail_kind(tail, unset)] += 1;
+                let kind = tail_kind(tail, unset);
+                totals.tail_kinds[kind] += 1;
+                totals.tail_fields[kind].add(payload, tail);
                 totals.tail_prefix_mismatch += usize::from(!tail_prefix_matches(tail));
             } else {
                 totals.unsupported += 1;
@@ -820,6 +867,24 @@ pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
             "  Tail word-pair profile counts [(4,0,set), (3,1,set), (0,all-ones,unset), other/truncated]: {:?}; {} prefix mismatches",
             s.tail_kinds, s.tail_prefix_mismatch
         );
+        for (profile, t) in s
+            .tail_fields
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| s.tail_kinds[*i] != 0)
+        {
+            println!(
+                "  Tail profile {profile}: {} truncated +28/+32; +28 {} nonzero / {} outside tail / {:?} nonzero count fits [1,4] byte strides after prefix; +32 {} zero / {} eight / {} aligned / {:?} offsets in tail [payload, stored start, tail base]",
+                t.truncated,
+                t.nonzero_28,
+                t.outside_28,
+                t.count_fits,
+                t.zero_32,
+                t.eight_32,
+                t.aligned_32,
+                t.offset_in_tail
+            );
+        }
     }
     for (stage, totals) in groups {
         let Stage {
@@ -927,6 +992,28 @@ mod tests {
         c.payload(&bytes, [9, 1, 1], true);
         assert_eq!((c.payloads, c.wave32, c.unsupported_metadata), (4, 1, 1));
         assert_eq!((c.fixed_wave32_mismatch, c.xyz_mismatch), (1, 1));
+    }
+
+    #[test]
+    fn tail_word_hypotheses_use_distinct_bases_and_exclude_one_past_end() {
+        let mut b = [0u8; 0x200];
+        b[0xc0..0xc4].copy_from_slice(&0x100u32.to_le_bytes());
+        let end = 0x1c0;
+        b[end + 28..end + 32].copy_from_slice(&8u32.to_le_bytes());
+        b[end + 32..end + 36].copy_from_slice(&0xc0u32.to_le_bytes());
+        let mut t = TailFields::default();
+        t.add(&b, &b[end..]);
+        assert_eq!(t.offset_in_tail, [0, 1, 0]);
+        assert_eq!(t.count_fits, [1, 0]);
+        b[end + 32..end + 36].copy_from_slice(&0x40u32.to_le_bytes());
+        t.add(&b, &b[end..]);
+        assert_eq!(t.offset_in_tail, [0, 1, 0]);
+        b[end + 32..end + 36].copy_from_slice(&0x3fu32.to_le_bytes());
+        t.add(&b, &b[end..]);
+        assert_eq!(t.offset_in_tail, [0, 1, 1]);
+        assert_eq!(t.aligned_32, 2);
+        t.add(&b[..end + 35], &b[end..end + 35]);
+        assert_eq!(t.truncated, 1);
     }
 
     #[test]

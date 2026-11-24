@@ -67,6 +67,16 @@ The scanner also applies the existing compute raw-span checker to every wrapped 
 
 All 26,698 payloads contain nonempty, nonzero bytes **after** the checked stored extent. For 19,548 payloads, this tail length is not a multiple of a dword. These counts distinguish post-span data from the fill words inside the stored extent; they do not identify the post-span data's format or semantics. The little-endian u32 pair at tail-relative `+16/+24` is `(4, 0)` in 24,767 payloads and `(3, 1)` in 1,914; these account for every payload with a set end word. All 17 unset-end payloads instead have `(0, 0xffffffff)`. The checker keeps unexpected or truncated pairs separate. These are observed correlations, not a basis for inferring an omitted extent or assigning a meaning to either word. In all three profiles the tail begins with four u32 fields in the equality pattern `A, B, B, A`, and tail `+20` is zero. The checker validates those equalities without emitting the field values.
 
+The next two little-endian u32s, at tail `+28/+32`, are present in all payloads. The checker tests only raw bounds hypotheses: whether nonzero `+28` fits as a count of byte or dword rows beginning at `+36`, and whether `+32`, added to each of three candidate bases, lands strictly inside the tail.
+
+| `+16/+24` profile | Nonzero `+28` | Count fits at stride 1 / 4 | `+32` offsets in tail: payload base / stored start / tail base |
+|---|---:|---:|---:|
+| `(4,0)` | 24,723 | 24,723 / 24,723 | 2,876 / 8,228 / 19,883 |
+| `(3,1)` | 1,892 | 1,880 / 1,788 | 0 / 0 / 1,914 |
+| Unset end | 0 | 0 / 0 | 0 / 0 / 0 |
+
+Eight `(3,1)` values at `+28` are already at or beyond tail length; none of the other profiles has such a value. The `+32` field is aligned in every payload, is zero in 580 `(4,0)` tails, and is always eight in `(3,1)`. No tested `+32` base works across the set-end profiles, and `+28` cannot be a universal positive fixed-stride count beginning at `+36`. Passing a bounds test does not establish a table, pointer, or interpretation even within one profile. An owned fixture checks count bounds, distinct offset bases, truncation, and exclusion of one-past-end values.
+
 ## PSV0 resource declarations
 
 After the 52-byte runtime-info block, the payload has a `u32` row count at `+56`. If nonzero, a `u32` stride at `+60` is 24 in every checked file, with rows starting at `+64`. If zero, no stride word is consumed. The six little-endian row words are resource type, register space, lower bound, upper bound, kind and flags. The checker verifies type in 1–8, ordered bounds, and complete table extent. The resource checker stops at the end of this table; the element checker starts there.
