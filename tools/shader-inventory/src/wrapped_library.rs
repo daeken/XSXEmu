@@ -20,6 +20,8 @@ struct Program {
     wrappers: usize,
     stored_equal: bool,
     adjusted_equal: bool,
+    marker_present: bool,
+    conditional_equal: [bool; 3],
 }
 
 #[derive(Default)]
@@ -44,6 +46,26 @@ fn extent(fssm: &[u8]) -> Option<&[u8]> {
         return None;
     }
     fssm.get(start..start.checked_add(len)?)
+}
+
+const STARTS: [usize; 3] = [0, 24, 36];
+const END: [u8; 4] = 0xbf810000u32.to_le_bytes();
+const FSSM_FILL: [u8; 4] = 0xbf9f0000u32.to_le_bytes();
+
+fn fssm_to_marker(mut after_prefix: &[u8]) -> Option<&[u8]> {
+    while let Some(rest) = after_prefix.strip_suffix(&FSSM_FILL) {
+        after_prefix = rest;
+    }
+    (after_prefix.len().is_multiple_of(4) && after_prefix.ends_with(&END)).then_some(after_prefix)
+}
+
+fn library_to_final_marker(span: &[u8]) -> Option<&[u8]> {
+    if !span.len().is_multiple_of(4) {
+        return None;
+    }
+    let tail = &span[span.len().saturating_sub(512)..];
+    let from_end = tail.rchunks_exact(4).position(|word| word == END)?;
+    span.get(..span.len() - 4 * from_end)
 }
 
 fn bounded(path: &Path, limit: usize, bytes: &mut Vec<u8>) -> Result<(), Box<dyn Error>> {
@@ -170,6 +192,7 @@ pub(super) fn run(wrapped: &Path, path: &Path) -> Result<(), Box<dyn Error>> {
                 return;
             };
             count.compared += eligible.len();
+            let fssm_cut = fssm_to_marker(&raw[40..]);
             for (id, lib) in &eligible {
                 // Only length-sensitive, exact byte equality. No candidate selection.
                 let p = candidates
@@ -177,6 +200,14 @@ pub(super) fn run(wrapped: &Path, path: &Path) -> Result<(), Box<dyn Error>> {
                     .expect("eligible IDs came from candidates");
                 p.stored_equal |= raw == *lib;
                 p.adjusted_equal |= raw[40..] == **lib;
+                if let Some(library_cut) = library_to_final_marker(lib) {
+                    p.marker_present = true;
+                    if let Some(fssm_cut) = fssm_cut {
+                        for (k, start) in STARTS.into_iter().enumerate() {
+                            p.conditional_equal[k] |= library_cut.get(start..) == Some(fssm_cut);
+                        }
+                    }
+                }
             }
         };
         shader_payloads(&bytes, &mut inflate, None, Some(&mut compare))
@@ -200,6 +231,19 @@ pub(super) fn run(wrapped: &Path, path: &Path) -> Result<(), Box<dyn Error>> {
             values().filter(|p| p.stored_equal).count(),
             values().filter(|p| p.adjusted_equal).count()
         );
+        let offsets: Vec<_> = STARTS
+            .into_iter()
+            .enumerate()
+            .map(|(i, start)| (start, values().filter(|p| p.conditional_equal[i]).count()))
+            .collect();
+        println!(
+            "  Conditional final-word cut: {} candidate programs with bounded raw marker; {} programs with at least one exact byte window; per tested start {:?}",
+            values().filter(|p| p.marker_present).count(),
+            values()
+                .filter(|p| p.conditional_equal.contains(&true))
+                .count(),
+            offsets
+        );
     }
     Ok(())
 }
@@ -207,6 +251,21 @@ pub(super) fn run(wrapped: &Path, path: &Path) -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn marker_hypothesis_uses_bounded_final_aligned_word_not_execution() {
+        let mut span = [0u8; 520];
+        span[4..8].copy_from_slice(&END);
+        assert!(library_to_final_marker(&span).is_none());
+        span[12..16].copy_from_slice(&END);
+        span[40..44].copy_from_slice(&END);
+        span[51..55].copy_from_slice(&END);
+        assert_eq!(library_to_final_marker(&span), Some(&span[..44]));
+        assert!(library_to_final_marker(&span[..519]).is_none());
+        span[44..48].copy_from_slice(&FSSM_FILL);
+        assert_eq!(fssm_to_marker(&span[36..48]), Some(&span[36..44]));
+        assert!(fssm_to_marker(&span[36..49]).is_none());
+    }
+
     #[test]
     fn raw_extent_supports_two_exact_distinct_windows_and_rejects_bounds() {
         let mut b = [0; 0x160];

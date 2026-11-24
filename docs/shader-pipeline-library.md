@@ -85,6 +85,19 @@ The scanner repeats the stage/digest join directly against the expanded binary l
 
 There were no unbounded candidate windows. The extra VS payloads are retained, not reduced to one per wrapper. The unlabelled slot-6 program is outside the join. These negative results reject direct stored-span aliasing for the two tested views, not related instruction bodies after other framing, layout fixup, or variant selection. No IDs, digests, shader bytes, or instruction listings are printed.
 
+### Conditional marker-bounded equality
+
+The same scanner separately tests a narrower byte window. On the FSSM side it begins at `start + 40`, removes only trailing `0xbf9f0000` words, and requires the resulting aligned bytes to end in `0xbf810000`. On the library side it looks for the last aligned `0xbf810000` in the final 512 stored bytes and compares through that word from each explicit hypothesis (`+0`, `+24`, `+36`). A raw marker can be a literal or data; it is not a verified instruction or proof of entry/exit.
+
+| Stage | Candidate programs with a bounded library marker | Exact at +0 | Exact at +24 | Exact at +36 |
+|---|---:|---:|---:|---:|
+| PS | 9,990 | 0 | 0 | 0 |
+| VS | 1,340 | 0 | 0 | 0 |
+| CS | 2,593 | 0 | 46 | 5 |
+| MS | 7,498 | 0 | 0 | 0 |
+
+The 51 compute positives are distinct programs. These are exact byte-window correspondences within the digest families under the stated cut hypotheses; they do not establish the actual executable extents, a global skip rule, register bindings, or an identity for the remaining candidates. The owned fixture exercises alignment, the backward search bound and last-marker selection.
+
 ## Reproduce the structural census
 
 ```sh
