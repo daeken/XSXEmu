@@ -8,7 +8,9 @@ use crate::{
     llvm::{Cpu, Llvm},
     reachable::reference_walk_result,
     shader_payloads,
-    signatures::{SourceInterface, SourceLinkage, SystemInterface, SystemLinkage},
+    signatures::{
+        Key, SourceInterface, SourceLinkage, SystemInterface, SystemLinkage, key as semantic_key,
+    },
     stage_name, word,
 };
 use std::{
@@ -119,12 +121,13 @@ impl GraphicsCoverage {
     }
 }
 
-fn layout_extent(blob: &[u8]) -> Option<(usize, usize)> {
+fn layout_extent(blob: &[u8]) -> Option<(Vec<Key>, usize)> {
     let count = word(blob, 76)?;
     let mut cursor = 80usize;
     if count > blob.len().checked_sub(cursor)? / 30 {
         return None;
     }
+    let mut keys = Vec::with_capacity(count);
     for _ in 0..count {
         let n = word(blob, cursor)?;
         if !(2..=256).contains(&n) {
@@ -139,10 +142,11 @@ fn layout_extent(blob: &[u8]) -> Option<(usize, usize)> {
             return None;
         }
         cursor = stop.checked_add(24)?;
+        keys.push(semantic_key(name, word(blob, stop)?));
     }
     let rest = blob.get(cursor..)?;
     (rest.len() == (4 - cursor % 4) % 4 && rest.iter().all(|&b| b == 0))
-        .then_some((count, rest.len()))
+        .then_some((keys, rest.len()))
 }
 
 fn digest(blob: &[u8]) -> Option<[u8; 16]> {
@@ -285,7 +289,7 @@ pub(super) fn run(
     }
 
     let mut sources = HashMap::<SourceKey, SourceFamily>::new();
-    let mut vs_counts = HashMap::<SourceKey, Option<usize>>::new();
+    let mut vs_keys = HashMap::<SourceKey, Option<Vec<Key>>>::new();
     let mut counts = BTreeMap::<u16, Payloads>::new();
     let (mut bytes, mut inflate) = (Vec::new(), Vec::new());
     let (mut files, mut joined_wrappers, mut work) = (0, 0, 0usize);
@@ -330,10 +334,10 @@ pub(super) fn run(
                 if inputs.next().is_some() {
                     return Err("duplicate VS input signature".into());
                 }
-                let count = SourceInterface::ordinary_row_count(table)
-                    .ok_or("invalid VS input signature")?;
-                let first = !vs_counts.contains_key(&(stage, key));
-                update_projection(vs_counts.entry((stage, key)).or_default(), count, first);
+                let keys =
+                    SourceInterface::ordinary_keys(table).ok_or("invalid VS input signature")?;
+                let first = !vs_keys.contains_key(&(stage, key));
+                update_projection(vs_keys.entry((stage, key)).or_default(), keys, first);
             }
         }
         let candidates = programs.get_mut(&stage).ok_or("missing program stage")?;
@@ -431,8 +435,8 @@ pub(super) fn run(
     // ever seen for the same program. Unknown slots stay in the grouping key.
     let mut graphics_rows = BTreeMap::<Vec<usize>, GraphicsCoverage>::new();
     let mut state_sizes = BTreeMap::<Vec<usize>, BTreeMap<usize, HashSet<_>>>::new();
-    let mut layouts_seen = HashMap::new();
-    let mut vs_layout = BTreeMap::<Vec<usize>, [usize; 5]>::new();
+    let mut layouts_seen = HashMap::<_, Option<(Vec<Key>, usize)>>::new();
+    let mut vs_layout = BTreeMap::<Vec<usize>, [usize; 6]>::new();
     let mut layout_shapes = BTreeMap::<(usize, usize), usize>::new();
     let mut layout_other = 0;
     let mut source_links = BTreeMap::<(usize, bool), SourceLinkage>::new();
@@ -495,26 +499,36 @@ pub(super) fn run(
             .or_default()
             .insert(pso.state);
         let extent = match layouts_seen.entry(pso.input_layout) {
-            std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut().as_ref(),
             std::collections::hash_map::Entry::Vacant(entry) => {
                 let layout = library
                     .blob(pso.input_layout)
                     .ok_or("missing graphics layout span")?;
                 let shape = layout_extent(layout);
-                if let Some(shape) = shape {
-                    *layout_shapes.entry(shape).or_default() += 1;
+                if let Some((keys, pad)) = &shape {
+                    *layout_shapes.entry((keys.len(), *pad)).or_default() += 1;
                 } else {
                     layout_other += 1;
                 }
-                *entry.insert(shape)
+                entry.insert(shape).as_ref()
             }
         };
         if let Some(key) = vs_key {
-            let bucket = match (extent, vs_counts.get(key)) {
-                (None, _) => 4,
-                (_, None) => 2,
-                (_, Some(None)) => 3,
-                (Some((blocks, _)), Some(Some(rows))) => usize::from(blocks != *rows),
+            let bucket = match (extent, vs_keys.get(key)) {
+                (None, _) => 5,
+                (_, None) => 3,
+                (_, Some(None)) => 4,
+                (Some((layout, _)), Some(Some(source))) => {
+                    if layout == source {
+                        0
+                    } else {
+                        let mut layout = layout.iter().collect::<Vec<_>>();
+                        let mut source = source.iter().collect::<Vec<_>>();
+                        layout.sort_unstable();
+                        source.sort_unstable();
+                        if layout == source { 1 } else { 2 }
+                    }
+                }
             };
             vs_layout.entry(slots.clone()).or_default()[bucket] += 1;
         }
@@ -539,7 +553,7 @@ pub(super) fn run(
     );
     for (slots, counts) in vs_layout {
         println!(
-            "  VS ordinary input row count versus layout record count, slots {slots:?} [equal, different, missing source, divergent source counts, unsupported extent]: {counts:?}"
+            "  VS ordinary input keys versus layout, slots {slots:?} [ordered equal, reordered equal, different, missing source, divergent source, unsupported extent]: {counts:?}"
         );
     }
     for ((slot, multi), c) in source_links {
@@ -683,7 +697,10 @@ mod tests {
         bytes[84..87].copy_from_slice(b"XY\0");
         bytes[111..115].copy_from_slice(&2u32.to_le_bytes());
         bytes[115..117].copy_from_slice(b"Z\0");
-        assert_eq!(layout_extent(&bytes), Some((2, 3)));
+        assert_eq!(
+            layout_extent(&bytes),
+            Some((vec![semantic_key(b"xy", 0), semantic_key(b"z", 0)], 3))
+        );
         assert_eq!(layout_extent(&bytes[..143]), None);
         bytes[143] = 1;
         assert_eq!(layout_extent(&bytes), None);

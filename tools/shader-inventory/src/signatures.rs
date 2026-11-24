@@ -20,9 +20,9 @@ struct Count {
     ps_linkage_system: [usize; 5],
 }
 
-type Key = (Vec<u8>, usize);
+pub(super) type Key = (Vec<u8>, usize);
 
-fn key(name: &[u8], index: usize) -> Key {
+pub(super) fn key(name: &[u8], index: usize) -> Key {
     (name.to_ascii_lowercase(), index)
 }
 
@@ -112,9 +112,14 @@ pub(super) struct SourceInterface {
 }
 
 impl SourceInterface {
-    pub(super) fn ordinary_row_count(bytes: &[u8]) -> Option<usize> {
-        let (count, _) = check(bytes)?;
-        Some(count.entries - count.ps_linkage_system.iter().sum::<usize>())
+    pub(super) fn ordinary_keys(bytes: &[u8]) -> Option<Vec<Key>> {
+        let (_, rows) = check(bytes)?;
+        Some(
+            rows.into_iter()
+                .filter(|r| ps_linkage_system(&r.key.0, r.system_code).is_none())
+                .map(|r| r.key)
+                .collect(),
+        )
     }
 
     pub(super) fn parse(bytes: &[u8]) -> Option<(Self, SystemInterface)> {
