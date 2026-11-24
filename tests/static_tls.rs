@@ -144,12 +144,18 @@ fn root_ga_dense_indices_and_independent_aligned_threads() {
     let no_tls = fixture(true, false);
     let mut dll = fixture(true, true);
     dword(&mut dll, file(TLS) + 36, 14 << 20); // 8192 bytes
+    let mut last_dll = fixture(true, true);
+    dword(&mut last_dll, file(TLS) + 36, 3 << 20); // 4 bytes
+    qword(&mut last_dll, file(ARRAY), PREFERRED + 0x1010);
+    qword(&mut last_dll, file(ARRAY) + 8, 0);
     let root = Pe::parse(&root).unwrap();
     let no_tls = Pe::parse(&no_tls).unwrap();
     let dll = Pe::parse(&dll).unwrap();
+    let last_dll = Pe::parse(&last_dll).unwrap();
     let mut r = root.materialize(REBASED, MAPPED_LEN).unwrap();
     let mut n = mapped(&no_tls);
     let mut d = mapped(&dll);
+    let mut last = mapped(&last_dll);
     let plan = Plan::prepare(
         Some(Image {
             pe: &root,
@@ -164,15 +170,22 @@ fn root_ga_dense_indices_and_independent_aligned_threads() {
                 pe: &dll,
                 mapped: &mut d,
             },
+            Image {
+                pe: &last_dll,
+                mapped: &mut last,
+            },
         ],
         Limits::default(),
     )
     .unwrap();
-    assert_eq!([index(&r), index(&n), index(&d)], [0, SENTINEL, 1]);
+    assert_eq!(
+        [index(&r), index(&n), index(&d), index(&last)],
+        [0, SENTINEL, 1, 2]
+    );
     assert_eq!(&d[INDEX - 4..INDEX], &0xabcd_1234u32.to_le_bytes());
     assert_eq!(&d[INDEX + 4..INDEX + 8], &0xcdef_5678u32.to_le_bytes());
     let m = plan.modules();
-    assert_eq!(m.len(), 2);
+    assert_eq!(m.len(), 3);
     assert_eq!(
         (m[0].image(), m[0].index(), m[0].alignment()),
         (ImageId::Root, 0, 16)
@@ -182,31 +195,40 @@ fn root_ga_dense_indices_and_independent_aligned_threads() {
         (ImageId::Dll(1), 1, 8192)
     );
     assert_eq!(m[1].index_rva(), INDEX as u32);
+    assert_eq!(
+        (m[2].image(), m[2].index(), m[2].alignment()),
+        (ImageId::Dll(2), 2, 4)
+    );
     assert_eq!(m[0].callbacks(), &[0x1020, 0x1010]);
     assert_eq!(m[1].callbacks(), &[0x1020, 0x1010]);
+    assert_eq!(m[2].callbacks(), &[0x1010]);
 
     // Planning retained relocated bytes, not preferred-VA file bytes or borrows.
     r.fill(0xff);
     drop(d);
     let mut t1 = plan.new_thread().unwrap();
     let t2 = plan.new_thread().unwrap();
-    for (i, base) in [REBASED, PREFERRED].into_iter().enumerate() {
-        let block = t1.block(i as u32).unwrap();
-        assert_eq!(&block[..8], &(base + 0x1010).to_le_bytes());
-        assert_eq!(&block[8..], &[0; 9]); // four mapped-tail and five TLS zero-fill bytes
-        assert_eq!(pointer(&t1, i), block.as_ptr() as u64);
+    for (i, base) in [REBASED, PREFERRED, PREFERRED].into_iter().enumerate() {
+        let a = t1.block(i as u32).unwrap();
+        let b = t2.block(i as u32).unwrap();
+        assert_eq!(&a[..8], &(base + 0x1010).to_le_bytes());
+        assert_eq!(&a[8..], &[0; 9]); // four mapped-tail and five TLS zero-fill bytes
+        assert_eq!(a, b);
+        assert_eq!(pointer(&t1, i), a.as_ptr() as u64);
+        assert_eq!(pointer(&t2, i), b.as_ptr() as u64);
         assert_eq!(pointer(&t1, i) % m[i].alignment() as u64, 0);
+        assert_eq!(pointer(&t2, i) % m[i].alignment() as u64, 0);
         assert_ne!(pointer(&t1, i), pointer(&t2, i));
     }
-    assert_eq!(t1.vector_bytes().len(), 16);
+    assert_eq!(t1.vector_bytes().len(), 24);
     assert_eq!(t1.vector_address(), Some(t1.vector_bytes().as_ptr() as u64));
     assert_eq!(t1.vector_address().unwrap() % 8, 0);
     assert_ne!(t1.vector_address(), t2.vector_address());
     t1.block_mut(0).unwrap()[16] = 42;
     assert_eq!(t2.block(0).unwrap()[16], 0);
     assert_eq!(t1.block(1).unwrap()[16], 0);
-    assert_eq!(t1.block(2), None);
-    assert_eq!(t1.block_mut(2), None);
+    assert_eq!(t1.block(3), None);
+    assert_eq!(t1.block_mut(3), None);
 }
 
 #[test]
@@ -323,7 +345,7 @@ fn rejects_bad_index_targets_before_mutating_any_image() {
         let pe = Pe::parse(&bytes).unwrap();
         let mut r = mapped(&root);
         let mut m = mapped(&pe);
-        let before = m.clone();
+        let before = (r.clone(), m.clone());
         let err = Plan::prepare(
             Some(Image {
                 pe: &root,
@@ -342,8 +364,7 @@ fn rejects_bad_index_targets_before_mutating_any_image() {
             _ => Error::Invalid(ImageId::Dll(0), "index slot"),
         };
         assert_eq!(err, expected, "target RVA {slot:#x}");
-        assert_eq!(index(&r), SENTINEL);
-        assert_eq!(m, before);
+        assert_eq!((r, m), before);
     }
 }
 

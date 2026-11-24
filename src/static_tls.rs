@@ -246,6 +246,9 @@ impl Plan {
         })
     }
 
+    /// TLS modules in original input order (root first, then DLL slice order),
+    /// with each module's callback entries in original directory order. This
+    /// ordering describes metadata; it is not an attach or detach schedule.
     pub fn modules(&self) -> &[Module] {
         &self.modules
     }
