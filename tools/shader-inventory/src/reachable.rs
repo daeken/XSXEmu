@@ -351,14 +351,20 @@ pub(crate) fn reference_walk_result(dis: &mut Disassembler, bytes: &[u8]) -> (&'
         Err(Blocker::Overlap) => "overlap",
         Err(Blocker::NoExit) => "no exit",
     };
-    let mut frontier = IndirectFrontier::default();
-    if strict == "indirect PC" {
-        frontier.add(dis, bytes);
-    }
     (
         strict,
-        frontier.closure.contains_key("closed hypothesis with exit"),
+        strict == "indirect PC" && indirect_reference_closure(dis, bytes, 0),
     )
+}
+
+pub(crate) fn indirect_reference_closure(
+    dis: &mut Disassembler,
+    bytes: &[u8],
+    origin: usize,
+) -> bool {
+    let mut frontier = IndirectFrontier::default();
+    frontier.add(dis, bytes, origin);
+    frontier.closure.contains_key("closed hypothesis with exit")
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -468,7 +474,7 @@ struct IndirectFrontier {
 }
 
 impl IndirectFrontier {
-    fn add(&mut self, dis: &mut Disassembler, bytes: &[u8]) {
+    fn add(&mut self, dis: &mut Disassembler, bytes: &[u8], origin: usize) {
         // Separate projection: SETPC is a cut, not an exit or an admitted edge.
         // Do not report from a partially visited projection on another error.
         let mut scratch = [0; 1024];
@@ -476,7 +482,7 @@ impl IndirectFrontier {
         let mut unsupported = "decode";
         let mut decode = |pc: usize, pattern: &mut PcPattern, unsupported: &mut &'static str| {
             let tail = &bytes[pc * 4..];
-            let (size, line) = dis.one(tail, pc * 4, &mut scratch)?;
+            let (size, line) = dis.one(tail, origin.checked_add(pc * 4)?, &mut scratch)?;
             let first = u32::from_le_bytes(tail[..4].try_into().ok()?);
             let name = line.split_ascii_whitespace().next()?;
             let (flow, cut) = if name == "s_setpc_b64" {
@@ -767,7 +773,7 @@ impl Report {
             Err(reason) => {
                 if matches!(reason, Blocker::IndirectPc(_)) {
                     self.indirect_frontier
-                        .add(&mut waves[usize::from(meta.wave32)], bytes);
+                        .add(&mut waves[usize::from(meta.wave32)], bytes, 0);
                 }
                 *self.blockers.entry(reason).or_default() += 1;
             }

@@ -3,7 +3,7 @@ use crate::{
     cfg::{self, Flow, Instruction},
     embedded::has_digest_prefix,
     llvm::{Cpu, Disassembler, Llvm},
-    reachable::control,
+    reachable::{control, indirect_reference_closure},
     span, word,
 };
 use std::{
@@ -66,6 +66,7 @@ struct Hypothesis {
     complete: usize,
     bad_decode: usize,
     indirect_pc: usize,
+    indirect_closed: usize,
     other_control: usize,
     outside: usize,
     invalid: usize,
@@ -102,7 +103,11 @@ impl Hypothesis {
             Err(cfg::Error::UnsupportedEncoding) => {
                 match control_rejection {
                     None => self.bad_decode += 1,
-                    Some(true) => self.indirect_pc += 1,
+                    Some(true) => {
+                        self.indirect_pc += 1;
+                        self.indirect_closed +=
+                            usize::from(indirect_reference_closure(dis, body, entry));
+                    }
                     Some(false) => self.other_control += 1,
                 }
                 return;
@@ -366,11 +371,12 @@ pub fn run(lib: &OsStr, path: &Path) -> Result<(), Box<dyn Error>> {
     for (cpu, per_entry) in cpus.into_iter().zip(walks) {
         for (entry, w) in entries.into_iter().zip(per_entry) {
             println!(
-                "{} conditional entry +{entry}: {} complete, {} decode rejects, {} indirect PC, {} other control rejects, {} outside successors, {} bad width/overlap, {} no exit; in complete graphs {} site starts, {} other sites",
+                "{} conditional entry +{entry}: {} complete, {} decode rejects, {} indirect PC ({} closed reference hypotheses), {} other control rejects, {} outside successors, {} bad width/overlap, {} no exit; in complete graphs {} site starts, {} other sites",
                 cpu.name(),
                 w.complete,
                 w.bad_decode,
                 w.indirect_pc,
+                w.indirect_closed,
                 w.other_control,
                 w.outside,
                 w.invalid,
