@@ -187,12 +187,23 @@ pub(crate) fn graphics_items(blob: &[u8]) -> Option<&[u8]> {
     .then_some(items)
 }
 
+fn prefix_shape(code: &[u8], digest: &[u8]) -> usize {
+    if !has_digest_prefix(code, digest) {
+        0
+    } else if code.get(26..28) == Some(&[0x80, 0xd5]) {
+        2
+    } else {
+        1
+    }
+}
+
 fn graphics(
     library: &PipelineLibrary<'_>,
     refs: &mut [[Disassembler; 2]; 2],
 ) -> Result<(), Box<dyn Error>> {
     let mut pairs = HashSet::new();
     let mut counts = [[0usize; 4]; 3];
+    let mut prefixes = [[[0usize; 3]; 2]; 3];
     let mut text = [0; 1024];
     for row in library.graphics() {
         for (slot, item) in row.slots[..3].iter().enumerate() {
@@ -203,15 +214,17 @@ fn graphics(
             if !pairs.insert((slot, item.program, id)) {
                 continue;
             }
-            let layout = library
-                .blob(id)
-                .and_then(graphics_items)
-                .ok_or("invalid graphics metadata framing")?;
+            let blob = library.blob(id).ok_or("missing graphics metadata")?;
+            let layout = graphics_items(blob).ok_or("invalid graphics metadata framing")?;
+            let end = blob.len();
+            let digest = &blob[end - 28..end - 12];
             let code = library
                 .program(item.program)
                 .ok_or("missing graphics program")?;
+            let mut has_sites = false;
             for item in layout.chunks_exact(32).filter(|i| word(i, 0) == Some(0x42)) {
                 let offset = word(item, 4).unwrap();
+                has_sites |= offset != 0;
                 let class = if offset == 0 {
                     0
                 } else if let Some((bytes, dwords)) = candidate(code, offset) {
@@ -234,6 +247,7 @@ fn graphics(
                 };
                 counts[slot][class] += 1;
             }
+            prefixes[slot][usize::from(has_sites)][prefix_shape(code, digest)] += 1;
         }
     }
     println!(
@@ -243,6 +257,10 @@ fn graphics(
     for (slot, [zero, x4, x8, other]) in counts.into_iter().enumerate() {
         println!(
             "  slot {slot}: {zero} zero fields, {x4} s_load_dwordx4, {x8} s_load_dwordx8, {other} nonzero unconfirmed"
+        );
+        println!(
+            "  slot {slot}: footer fingerprint by nonzero site presence [absent/present][no match, two groups only, also third marker]: {:?}",
+            prefixes[slot]
         );
     }
     Ok(())
@@ -338,15 +356,7 @@ pub fn run(lib: &OsStr, path: &Path) -> Result<(), Box<dyn Error>> {
             }
         }
         let digest = &layout[layout.len() - 28..layout.len() - 12];
-        let shape = if has_digest_prefix(code, digest) {
-            if code.get(26..28) == Some(&[0x80, 0xd5]) {
-                2
-            } else {
-                1
-            }
-        } else {
-            0
-        };
+        let shape = prefix_shape(code, digest);
         prefixes[usize::from(has_sites)][shape] += 1;
         if shape != 0 && !pattern_sites.is_empty() {
             for (i, profiles) in refs.iter_mut().enumerate() {

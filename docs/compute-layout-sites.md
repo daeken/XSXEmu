@@ -51,3 +51,5 @@ The command also validates the 16-byte graphics stage metadata header, item tags
 | MS | 101,762 | 0 | 0 | 0 |
 
 All six nonzero values agree under all four decoder configurations. This supports the offset interpretation in the checked PS and VS examples; the MS rows supply no nonzero example. The graphics check does not assume an entry, reachability, or a patch operation.
+
+The same two-group partial fingerprint matches the exact metadata footer in all **18,837** graphics tuples. The third `0xd580` marker is present in 9,991/9,996 PS, 1,340/1,343 VS, and 7,498/7,498 MS tuples. All three tuples with nonzero sites lack that marker. Unlike the compute set, a missing third marker does not imply nonzero sites: five graphics tuples (three PS, two VS) lack it and have no nonzero sites. This extends evidence for a shared stored-span fingerprint, not a global entry skip or native byte identity with an FSSM payload.
