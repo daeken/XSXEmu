@@ -1196,6 +1196,7 @@ Lxmem_entry:
     xmem_cpu 0x49400000, 0x183, 0x22004, 50
     xmem_cpu 0x89700000, 0x283, 0x2404, 8
     xmem_cpu 0x23300000, 0x183, 0x22004, 8
+    xmem_cpu 0x25400000, 0x183, 0x22004, 8
     /* Unobserved pair swapping size but keeping second flags still fails. */
     movl $0x49400000, %ebx
     xmem 0x283, 0x2404, 0x20003000
