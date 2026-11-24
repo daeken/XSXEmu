@@ -38,6 +38,8 @@ The 52-byte block begins after its size word. Payload offsets `+20` and `+24` ar
 
 Four of 2,689 CS wrappers declare `(32, 32)` wave bounds. All other wrappers have `(0, 0xffffffff)`, the unspecified pair; this is not evidence for wave64 or for a particular native wave mode. All CS and MS wrappers have three nonzero thread dimensions; all PS, VS and GS wrappers have three zero dimensions. These are source declarations, not validated native launch dimensions or Metal device limits.
 
+For the compute wrappers only, the same command walks the checked XDAT/XBCH directory, inflates its FSSM payloads and compares metadata within each container. All 2,689 wrappers have exactly one payload with native stage byte `6` at `+0x100` and readable compute metadata. The XYZ words at FSSM `+0x13c`, `+0x140`, `+0x144` agree with PSV0 in every pair. The FSSM wave32 bit (`+0xd4` bit 5) is set in 1,535 payloads including all four with fixed wave32 source bounds. The unspecified source pair is not compared to a native wave width. This check is not applied to graphics variants and does not validate the launch ABI against a real dispatch.
+
 For PS, payload bytes `+4` and `+5` are the `DepthOutput` and `SampleFrequency` flags. `SampleFrequency` is zero throughout. All 1,171 wrappers with `DepthOutput = 1` have exactly one unallocated PSV0 output element with semantic kind `Depth` (1,156), `DepthLessEqual` (12), or `DepthGreaterEqual` (3). The 10,930 remaining PS wrappers have no depth-kind or unallocated output element. “Unallocated” here means outside the packed vector signature, not absent from shader outputs or proof of native depth export behavior.
 
 ## PSV0 resource declarations

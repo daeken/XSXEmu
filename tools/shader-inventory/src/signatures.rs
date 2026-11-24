@@ -1,5 +1,5 @@
 //! Count-only checks for the wrapped DXBC signature profile, not native ABI.
-use crate::{BLOB_LIMIT, dxbc_chunks, stage_name, word};
+use crate::{BLOB_LIMIT, coverage::Metadata, dxbc_chunks, shader, stage_name, word};
 use std::{
     collections::BTreeMap,
     error::Error,
@@ -170,6 +170,41 @@ impl Runtime {
             3 => self.positive_dims += 1,
             _ => self.partial_dims += 1,
         }
+        Some(())
+    }
+}
+
+#[derive(Default)]
+struct NativeCompute {
+    payloads: usize,
+    non_singleton_wrappers: usize,
+    unsupported_metadata: usize,
+    xyz_mismatch: usize,
+    wave32: usize,
+    fixed_wave32_mismatch: usize,
+}
+
+impl NativeCompute {
+    fn payload(&mut self, bytes: &[u8], source_xyz: [usize; 3], source_fixed_wave32: bool) {
+        self.payloads += 1;
+        let Some(meta) = Metadata::parse(bytes).filter(|_| bytes.get(0x100) == Some(&6)) else {
+            self.unsupported_metadata += 1;
+            return;
+        };
+        self.xyz_mismatch += usize::from(meta.group != source_xyz);
+        self.wave32 += usize::from(meta.wave32);
+        self.fixed_wave32_mismatch += usize::from(source_fixed_wave32 && !meta.wave32);
+    }
+
+    fn wrapper(&mut self, wrapper: &[u8], psv: &[u8], inflate: &mut Vec<u8>) -> Option<()> {
+        let xyz = [word(psv, 40)?, word(psv, 44)?, word(psv, 48)?];
+        let fixed_wave32 = (word(psv, 20)?, word(psv, 24)?) == (32, 32);
+        let (_, _, n) = shader(
+            wrapper,
+            inflate,
+            Some(&mut |payload| self.payload(payload, xyz, fixed_wave32)),
+        )?;
+        self.non_singleton_wrappers += usize::from(n != 1);
         Some(())
     }
 }
@@ -463,6 +498,8 @@ pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
     let (mut count_disagreements, mut patch_rows) = (0, 0);
     let mut correspondence = [Correspondence::default(), Correspondence::default()];
     let mut packing_totals = [PackingTotals::default(), PackingTotals::default()];
+    let mut compute = NativeCompute::default();
+    let mut inflate = Vec::new();
     for entry in fs::read_dir(path)? {
         let entry = entry?;
         if entry.path().extension().and_then(|ext| ext.to_str()) != Some("dxbc")
@@ -492,6 +529,11 @@ pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
         )?;
         let psv = part(b"PSV0").ok_or("missing unique PSV0")?;
         let rows = resource_rows(psv, stage).ok_or("unsupported PSV0 resource table or stage")?;
+        if stage == 5 {
+            compute
+                .wrapper(&bytes, psv, &mut inflate)
+                .ok_or("unsupported wrapped compute XDAT/XBCH framing")?;
+        }
         let elems_at = if rows.is_empty() { 60 } else { 64 + rows.len() };
         let (elements, suffix) =
             psv_elements(psv, elems_at).ok_or("unsupported PSV0 element table")?;
@@ -562,6 +604,15 @@ pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
             c.packed_mask_different
         );
     }
+    println!(
+        "PSV0 vs same-wrapper FSSM compute: {} payloads, {} wrappers with non-singleton payload count, {} unsupported metadata, {} XYZ disagreements, {} native wave32 bits set, {} source fixed-wave32 disagreements",
+        compute.payloads,
+        compute.non_singleton_wrappers,
+        compute.unsupported_metadata,
+        compute.xyz_mismatch,
+        compute.wave32,
+        compute.fixed_wave32_mismatch
+    );
     for (stage, totals) in groups {
         let Stage {
             files,
@@ -620,6 +671,26 @@ pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn compute_comparison_distinguishes_source_unspecified_wave_and_wrong_native_stage() {
+        let mut bytes = [0; 0x148];
+        bytes[0x100] = 6;
+        for offset in [0x13c, 0x140, 0x144] {
+            bytes[offset] = 1;
+        }
+        let mut c = NativeCompute::default();
+        c.payload(&bytes, [1, 1, 1], false);
+        assert_eq!((c.fixed_wave32_mismatch, c.xyz_mismatch), (0, 0));
+        c.payload(&bytes, [1, 2, 1], true);
+        assert_eq!((c.fixed_wave32_mismatch, c.xyz_mismatch), (1, 1));
+        bytes[0xd4] = 32;
+        c.payload(&bytes, [1, 1, 1], true);
+        bytes[0x100] = 2;
+        c.payload(&bytes, [9, 1, 1], true);
+        assert_eq!((c.payloads, c.wave32, c.unsupported_metadata), (4, 1, 1));
+        assert_eq!((c.fixed_wave32_mismatch, c.xyz_mismatch), (1, 1));
+    }
+
     #[test]
     fn runtime_bounds_are_directional_and_entry_name_is_bounded() {
         let mut psv = [0; 56];
