@@ -334,10 +334,25 @@ mod native {
                     .into(),
             );
         }
+        use crate::xgameruntime_compat as compat;
+        let expected_compat_bindings: Vec<_> = compat::bridges().collect();
+        let mut compat_bindings = 0;
         let mut entropy_module = None;
         for &(importer, slot, target) in bindings {
             if let BindingTarget::Rust(export) = target {
                 use crate::providers::{D3D12_VM_CONFIGURE, GUEST_ENTROPY, XMEM_VIRTUAL_ALLOC};
+                if export.provider == win_loader::XGAMERUNTIME {
+                    if importer == 0
+                        || xgameruntime != Some(importer)
+                        || images[importer].0 != compat::GUEST_PATH
+                        || !expected_compat_bindings.contains(&(slot, export))
+                    {
+                        return Err(
+                            "compatibility bridge requires the built-in XGameRuntime PE".into()
+                        );
+                    }
+                    compat_bindings += 1;
+                }
                 if export == GUEST_ENTROPY {
                     use crate::guest_entropy::{BRIDGE_SLOT, GUEST_PATH};
                     if !matches!(profile, Profile::TrustedOfflineTlsChild)
@@ -357,6 +372,12 @@ mod native {
                     return Err(format!("{}!{} not available for this importer/profile; requires the trusted offline static TLS child", export.provider, export.symbol).into());
                 }
             }
+        }
+        if compat_bindings != 0
+            && (compat_bindings != expected_compat_bindings.len()
+                || images[xgameruntime.unwrap()].1 != compat::image())
+        {
+            return Err("incomplete or non-original XGameRuntime compatibility PE".into());
         }
         let slot_thunks = if no_guest_cfg {
             UNCHECKED_SLOT_THUNKS

@@ -2,6 +2,7 @@
 //! target selection. Each row states an exact reviewed Win64 prototype and
 //! emits a typed SysV adapter plus a matching assembly entry in host text.
 use super::{CONTEXT_OFFSET, Context, LAST_ERROR_OFFSET, called_dormant_guard, startup_trace};
+use crate::xgameruntime_compat::native as xgr;
 use crate::{
     Result,
     import_traps::called_missing_import_tls,
@@ -103,6 +104,34 @@ macro_rules! audited_bridges {
 }
 
 audited_bridges! {
+    xsxemu_tls_xgr_dll_main, xgr_dll_main: b"xgameruntime.dll", b"DllMain",
+        xgr::dll_main, (base: usize, reason: u32, reserved: usize) -> i32;
+    xsxemu_tls_xgr_initialize, xgr_initialize: b"xgameruntime.dll", b"InitializeApiImplEx2",
+        xgr::initialize, (api: u64, sdk: u64, flags: u64, options: usize) -> i32;
+    xsxemu_tls_xgr_uninitialize, xgr_uninitialize: b"xgameruntime.dll", b"UninitializeApiImpl",
+        xgr::uninitialize, () -> ();
+    xsxemu_tls_xgr_error_report, xgr_error_report: b"xgameruntime.dll", b"XErrorReport",
+        xgr::error_report, (hr: i32, message: usize) -> ();
+    xsxemu_tls_xgr_query_api, xgr_query_api: b"xgameruntime.dll", b"QueryApiImpl",
+        xgr::query_api, (class: *const [u8; 16], iid: *const [u8; 16], out: *mut usize) -> i32;
+    xsxemu_tls_xgr_qi, xgr_qi: b"xgameruntime.dll", b"QueryInterface",
+        xgr::query_interface, (this: usize, iid: *const [u8; 16], out: *mut usize) -> i32;
+    xsxemu_tls_xgr_add_ref, xgr_add_ref: b"xgameruntime.dll", b"AddRef",
+        xgr::add_ref, (this: usize) -> u32;
+    xsxemu_tls_xgr_release, xgr_release: b"xgameruntime.dll", b"Release",
+        xgr::release, (this: usize) -> u32;
+    xsxemu_tls_xgr_thread_assert, xgr_thread_assert: b"xgameruntime.dll", b"XThreadAssertNotTimeSensitive",
+        xgr::assert_not_time_sensitive, (this: usize) -> ();
+    xsxemu_tls_xgr_queue_create, xgr_queue_create: b"xgameruntime.dll", b"XTaskQueueCreate",
+        xgr::queue_create, (this: usize, work: u32, completion: u32, out: *mut usize) -> i32;
+    xsxemu_tls_xgr_queue_dispatch, xgr_queue_dispatch: b"xgameruntime.dll", b"XTaskQueueDispatch",
+        xgr::queue_dispatch, (this: usize, handle: usize, port: u32, timeout: u32) -> u8;
+    xsxemu_tls_xgr_queue_close, xgr_queue_close: b"xgameruntime.dll", b"XTaskQueueCloseHandle",
+        xgr::queue_close, (this: usize, handle: usize) -> ();
+    xsxemu_tls_xgr_queue_terminate, xgr_queue_terminate: b"xgameruntime.dll", b"XTaskQueueTerminate",
+        xgr::queue_terminate, (this: usize, handle: usize, wait: u8, context: usize, callback: usize) -> i32;
+    xsxemu_tls_xgr_unsupported_slot, xgr_unsupported_slot: b"xgameruntime.dll", b"unsupported-vtable-slot",
+        xgr::unsupported_slot, (slot: u32) -> !;
     xsxemu_tls_system_function_036, system_function_036: b"api-ms-win-security-systemfunctions-l1-1-0.dll", b"SystemFunction036",
         crate::guest_entropy::system_function_036, (buffer: *mut u8, len: u32) -> u8;
     xsxemu_tls_configure_d3d12_vm, configure_d3d12_vm: b"d3d12_xs.dll", b"D3D12ConfigureVirtualMemoryX",

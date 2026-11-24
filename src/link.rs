@@ -52,6 +52,7 @@ impl LinkPlan {
 #[derive(Debug)]
 pub struct ModulePlan {
     pub path: PathBuf,
+    pub built_in: bool,
     /// File basename as found on disk, preserving its case.
     pub name: Vec<u8>,
     /// The exact file bytes parsed while planning.
@@ -284,10 +285,17 @@ fn parse_image(
     kind: ImageKind,
     remaining: &mut usize,
 ) -> Result<(ModulePlan, Tables), LinkError> {
+    decode_image(path, kind, read_image(path, remaining)?)
+}
+
+fn decode_image(
+    path: &Path,
+    kind: ImageKind,
+    image: Vec<u8>,
+) -> Result<(ModulePlan, Tables), LinkError> {
     let name = path
         .file_name()
         .ok_or_else(|| LinkError::new(path, "name image", "no filename"))?;
-    let image = read_image(path, remaining)?;
     let pe = Pe::parse(&image).map_err(|error| LinkError::new(path, "parse image", error))?;
     if pe.characteristics & IMAGE_FILE_EXECUTABLE_IMAGE == 0
         || pe.is_dll() != matches!(kind, ImageKind::Dll)
@@ -339,6 +347,7 @@ fn parse_image(
         ModulePlan {
             path: path.to_owned(),
             name: name.as_encoded_bytes().to_vec(),
+            built_in: false,
             image,
             dependencies: Vec::new(),
             iat: Vec::new(),
@@ -411,6 +420,7 @@ pub struct Options<'a> {
     pub guest_entropy: bool,
     pub map_extra_dll: Option<&'a Path>,
     pub xgameruntime_dll: Option<&'a Path>,
+    pub xgameruntime_compat: bool,
     pub trusted_offline: bool,
 }
 
@@ -594,7 +604,7 @@ impl Builder<'_> {
         }
     }
 
-    fn admit_xgameruntime(&mut self, path: &Path) -> Result<(), LinkError> {
+    fn admit_xgameruntime(&mut self, path: &Path, built_in: bool) -> Result<(), LinkError> {
         use crate::providers::win_loader::XGAMERUNTIME;
         let error = |why: &str| LinkError::new(path, "admit xgameruntime DLL", why);
         let named_runtime = |p: &Path| {
@@ -609,8 +619,12 @@ impl Builder<'_> {
         if !named_runtime(path) {
             return Err(error("expected the exact xgameruntime.dll basename"));
         }
-        let source = fs::canonicalize(path)
-            .map_err(|e| LinkError::new(path, "resolve xgameruntime DLL path", e))?;
+        let source = if built_in {
+            path.to_owned()
+        } else {
+            fs::canonicalize(path)
+                .map_err(|e| LinkError::new(path, "resolve xgameruntime DLL path", e))?
+        };
         if !named_runtime(&source) {
             return Err(error("resolved file must also be named xgameruntime.dll"));
         }
@@ -630,7 +644,28 @@ impl Builder<'_> {
         if index >= self.max_images {
             return Err(error("graph image limit reached"));
         }
-        let (module, tables) = parse_image(&source, ImageKind::Dll, &mut self.remaining_bytes)?;
+        let (mut module, tables) = if built_in {
+            let image = crate::xgameruntime_compat::image();
+            self.remaining_bytes = self
+                .remaining_bytes
+                .checked_sub(image.len())
+                .ok_or_else(|| error("graph byte limit reached"))?;
+            decode_image(&source, ImageKind::Dll, image)?
+        } else {
+            parse_image(&source, ImageKind::Dll, &mut self.remaining_bytes)?
+        };
+        if built_in {
+            module.built_in = true;
+            // Generated thunks are the only consumers of these private slots.
+            module.iat.extend(
+                crate::xgameruntime_compat::bridges().map(|(iat_rva, export)| IatBinding {
+                    iat_rva,
+                    dll: export.provider.as_bytes().to_vec(),
+                    symbol: Symbol::Name(export.symbol.as_bytes().to_vec()),
+                    target: Ok(BindingTarget::Rust(export)),
+                }),
+            );
+        }
         self.plan.xgameruntime = Some(index);
         self.plan.modules.push(module);
         self.tables.push(tables);
@@ -658,8 +693,22 @@ impl Builder<'_> {
 
     fn close(mut self) -> Result<LinkPlan, LinkError> {
         self.close_imports(0);
-        if let Some(path) = self.options.xgameruntime_dll {
-            self.admit_xgameruntime(path)?;
+        match (
+            self.options.xgameruntime_dll,
+            self.options.xgameruntime_compat,
+        ) {
+            (Some(path), true) => {
+                return Err(LinkError::new(
+                    path,
+                    "admit xgameruntime DLL",
+                    "compat and external lanes are mutually exclusive",
+                ));
+            }
+            (Some(path), false) => self.admit_xgameruntime(path, false)?,
+            (None, true) => {
+                self.admit_xgameruntime(Path::new(crate::xgameruntime_compat::GUEST_PATH), true)?
+            }
+            (None, false) => {}
         }
         // The explicit, export-only image is appended only after the static
         // graph closes. It cannot satisfy or redirect any static import.
@@ -721,6 +770,7 @@ impl Builder<'_> {
             self.plan.modules.push(ModulePlan {
                 path: path.to_owned(),
                 name: BASENAME.as_bytes().to_vec(),
+                built_in: true,
                 image,
                 dependencies: Vec::new(),
                 iat: vec![IatBinding {

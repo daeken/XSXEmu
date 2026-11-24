@@ -10,6 +10,14 @@ pub struct HostExport {
 }
 
 impl HostExport {
+    pub const fn private_bridge(provider: &'static str, symbol: &'static str) -> Self {
+        Self {
+            provider,
+            symbol,
+            address: None,
+        }
+    }
+
     /// Win64 function address, available only on hosts that can call it.
     pub fn address(&self) -> Option<usize> {
         self.address

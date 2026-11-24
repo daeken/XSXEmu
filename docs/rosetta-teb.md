@@ -350,9 +350,40 @@ file; neither searches any directory at call time. `FreeLibrary` balances
 guest references without unloading startup's mapping. The TLS `GetProcAddress`
 policy is unchanged: only direct named PE exports admitted by checked CFG
 metadata, not ordinals, unchecked RVAs, forwarded or raw Rust addresses.
-This does not implement XGameRuntime or COM. The owned PE used in the launcher
-tests is only a loader fixture, not a runtime substitute; never supply it to a
-title run. No genuine XGameRuntime DLL was tested.
+That option does not emulate XGameRuntime or COM. The owned PE in its
+regression test is only a loader fixture; no genuine XGameRuntime DLL was tested.
+
+`--xgameruntime-compat` instead builds an original AMD64 PE in memory under
+`C:/Windows/System32/xgameruntime.dll`. It requires the same three run flags
+and is mutually exclusive with `--xgameruntime-dll PATH`. It shares the
+same startup-root admission, attach/ready/detach sequence, loader flags,
+reference counting, and named export checks. Its relocated vtable and its
+exports refer to mapped guest thunks checked by the same GuardCF machinery;
+private slots lead to the audited GS-switching bridges. It is not a static
+import provider, a general GDK replacement, or a substitute for a genuine DLL.
+
+The model accepts only the pinned `InitializeApiImplEx2` packed values
+(`0x633600002712`, `0x65f400001edd`), flags `2`, and null options. Other
+configurations return `E_NOTIMPL`; a repeat while initialized fails. It
+exports `QueryApiImpl`, `UninitializeApiImpl`, and `XErrorReport` (logs the
+HRESULT, does not read the guest message). It exposes only `XThreadingImpl`
+and its `IUnknown` identity (`QueryInterface`, `AddRef`, `Release`). The
+assertion at slot 29 applies to the sole modeled guest thread, which is
+not time sensitive. Uninitialize invalidates methods on existing objects
+but still allows release; detach frees the process-owned storage.
+
+Queue creation accepts the pinned work and completion modes `(1, 1)`
+(`ThreadPool, ThreadPool`), stores both modes, and returns an opaque
+registered queue handle independent of the creating interface's lifetime.
+No workers or submission are implemented. Empty queue cleanup supports
+termination without a callback, zero-timeout polling (returns false, no
+callback ran), and close. Handle values are never reused during the
+process; uninitialize clears outstanding queues. Unsupported modes,
+blocking waits, callbacks and interfaces fail; known vtable slots with
+unmodeled signatures report the slot and stop the child instead of
+inventing a return value. The owned Win64 fixture verifies these behaviors
+and the ordered trace under Rosetta with checked CFG and a rebased runtime.
+No title execution or device progress has been validated by this fixture.
 
 `GetModuleFileNameW` reads the registered UTF-16 guest path: a null handle
 selects the root EXE, and a non-null handle must exactly match a mapped image

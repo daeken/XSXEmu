@@ -24,6 +24,7 @@ mod xbox_d3d12_vm;
 mod xbox_vm;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 mod xbox_xmem;
+mod xgameruntime_compat;
 
 use pe::{ExportTarget, ImportSymbol, Pe};
 use std::{
@@ -49,6 +50,7 @@ const USAGE: &str = "Usage: xsxemu <inspect|map|audit|run> <image.exe> [options]
     run option: --trusted-offline  Ignore opaque CodeIntegrity and volatile hints (requires --experimental-static-tls)\n\
     run option: --no-guest-cfg  Disable guest CFG enforcement (trusted-offline static TLS only)\n\
     run option: --map-extra-dll PATH  Map an extra PE DLL (trusted-offline static TLS only)\n\
+    run option: --xgameruntime-compat  Model pinned XGameRuntime startup (trusted-offline static TLS with Rust providers)\n\
     run option: --xgameruntime-dll PATH  Admit an explicit xgameruntime.dll (trusted-offline static TLS with Rust providers)\n\
     run option: --guest-entropy  Map the built-in entropy DLL (trusted-offline static TLS with Rust providers)\n\
     audit/run options: --api-set SCHEMA.dll, --rust-providers";
@@ -89,6 +91,7 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
     let mut no_guest_cfg = false;
     let mut map_extra_dll = None;
     let mut xgameruntime_dll = None;
+    let mut xgameruntime_compat = false;
     let mut guest_entropy = false;
     let mut startup_profile = None;
     let mut options = args.iter();
@@ -130,6 +133,9 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
                     options.next().ok_or("--map-extra-dll requires a path")?,
                 ));
             }
+            ("run", Some("--xgameruntime-compat")) if !xgameruntime_compat => {
+                xgameruntime_compat = true;
+            }
             ("run", Some("--xgameruntime-dll")) if xgameruntime_dll.is_none() => {
                 xgameruntime_dll = Some(PathBuf::from(
                     options.next().ok_or("--xgameruntime-dll requires a path")?,
@@ -145,6 +151,12 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
     }
     if guest_entropy && !(trusted_offline && experimental_tls && rust_providers) {
         return Err("--guest-entropy requires --trusted-offline, --experimental-static-tls and --rust-providers".into());
+    }
+    if xgameruntime_compat && xgameruntime_dll.is_some() {
+        return Err("--xgameruntime-compat and --xgameruntime-dll are mutually exclusive".into());
+    }
+    if xgameruntime_compat && !(trusted_offline && experimental_tls && rust_providers) {
+        return Err("--xgameruntime-compat requires --trusted-offline, --experimental-static-tls and --rust-providers".into());
     }
     if xgameruntime_dll.is_some() && !(trusted_offline && experimental_tls && rust_providers) {
         return Err("--xgameruntime-dll requires --trusted-offline, --experimental-static-tls and --rust-providers".into());
@@ -209,6 +221,7 @@ fn cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode> {
                     trace_missing_imports,
                     map_extra_dll: map_extra_dll.as_deref(),
                     xgameruntime_dll: xgameruntime_dll.as_deref(),
+                    xgameruntime_compat,
                     guest_entropy,
                     trusted_offline: trusted_offline
                         || matches!(
@@ -521,20 +534,18 @@ fn resolve(
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
     {
         let tls_child = startup_profile.is_some();
-        let paths: Vec<_> =
-            plan.modules
-                .iter()
-                .map(|m| {
-                    if m.iat.iter().any(|b| {
-                        b.target == Ok(link::BindingTarget::Rust(providers::GUEST_ENTROPY))
-                    }) {
-                        // The built-in image has a guest-visible path, no host file.
-                        Ok(m.path.clone())
-                    } else {
-                        fs::canonicalize(&m.path)
-                    }
-                })
-                .collect::<std::io::Result<_>>()?;
+        let paths: Vec<_> = plan
+            .modules
+            .iter()
+            .map(|m| {
+                if m.built_in {
+                    // The built-in image has a guest-visible path, no host file.
+                    Ok(m.path.clone())
+                } else {
+                    fs::canonicalize(&m.path)
+                }
+            })
+            .collect::<std::io::Result<_>>()?;
         let path_names: Vec<_> = paths.iter().map(|path| path.to_string_lossy()).collect();
         let images: Vec<_> = plan
             .modules

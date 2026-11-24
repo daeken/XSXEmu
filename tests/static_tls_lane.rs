@@ -2611,6 +2611,131 @@ fn dir_import_one(b: &mut [u8], dll: &[u8], symbol: &[u8]) {
     put(b, file(imports) + 0x72, symbol);
 }
 
+const XGR_CAPACITY: usize = 0x1000;
+#[repr(C)]
+struct XgrFixture {
+    entry: u32,
+    code: [u8; XGR_CAPACITY],
+}
+
+global_asm!(include_str!("fixtures/static_tls_xgameruntime.S"),
+    capacity = const XGR_CAPACITY,
+    iat_delta = const IAT - TEXT,
+    dispatch_delta = const DISPATCH - TEXT,
+    mode_delta = const MODE - TEXT,
+    options(att_syntax),
+);
+unsafe extern "C" {
+    static static_tls_xgameruntime_fixture: XgrFixture;
+}
+
+#[test]
+fn built_in_xgameruntime_exercises_owned_win64_startup_and_refuses_unsupported_calls() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let fixture = unsafe { &static_tls_xgameruntime_fixture };
+    let mut root = image(Kind::Guarded);
+    // Force relocation of the owned runtime by occupying its preferred base.
+    const BASE: usize = 0x1_8500_0000;
+    w64(&mut root, OP + 24, BASE);
+    w64(&mut root, file(ARRAY), BASE + TEXT);
+    w64(&mut root, file(LOAD) + 88, BASE + COOKIE);
+    for (field, rva) in [(0x70, CHECK), (0x78, DISPATCH), (0x80, GFIDS)] {
+        w64(&mut root, file(LOAD) + field, BASE + rva);
+    }
+    for (i, rva) in [TEMPLATE, TEMPLATE + 8, INDEX, ARRAY]
+        .into_iter()
+        .enumerate()
+    {
+        w64(&mut root, file(RO) + 8 * i, BASE + rva);
+    }
+    w64(&mut root, file(TEMPLATE), BASE + COOKIE);
+    let target = TEXT + fixture.entry as usize;
+    w32(&mut root, OP + 16, target);
+    w32(&mut root, file(GFIDS), target);
+    put(&mut root, file(TEXT), &fixture.code);
+    let imp = LINK + 0x780;
+    dir(&mut root, 1, imp, 40);
+    w32(&mut root, file(imp), imp + 0x30);
+    w32(&mut root, file(imp) + 12, imp + 0x60);
+    w32(&mut root, file(imp) + 16, IAT);
+    put(&mut root, file(imp) + 0x60, b"kernel32.dll\0");
+    for (i, name) in [
+        b"LoadLibraryExW\0".as_slice(),
+        b"GetProcAddress\0",
+        b"FreeLibrary\0",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let slot = imp + 0x80 + i * 0x20;
+        w64(&mut root, file(imp) + 0x30 + i * 8, slot);
+        put(&mut root, file(slot) + 2, name);
+    }
+    let exe = scratch.write("xgameruntime-compat-probe.exe", &root);
+    expect(
+        run(&exe, &[OPT, TRUSTED, "--rust-providers"]),
+        76,
+        "Guest entry returned 76",
+    );
+    expect(
+        run(&exe, &[OPT, "--rust-providers", "--xgameruntime-compat"]),
+        1,
+        "--xgameruntime-compat requires",
+    );
+    expect(
+        run(
+            &exe,
+            &[
+                OPT,
+                TRUSTED,
+                "--rust-providers",
+                "--xgameruntime-dll",
+                "xgameruntime.dll",
+                "--xgameruntime-compat",
+            ],
+        ),
+        1,
+        "mutually exclusive",
+    );
+    let flags = [OPT, TRUSTED, "--rust-providers", "--xgameruntime-compat"];
+    let trace = || {
+        launcher(&exe, &flags)
+            .env("XSXEMU_TRACE_STARTUP", "1")
+            .output()
+            .unwrap()
+    };
+    let output = trace();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    expect(output, 77, "Guest entry returned 77");
+    let mut log = stderr.as_str();
+    for milestone in [
+        "DLL process attach",
+        "bridge dispatch kernelbase.dll!LoadLibraryExW",
+        "bridge dispatch kernelbase.dll!GetProcAddress",
+        "initialized Ex2",
+        "XErrorReport HRESULT=0x80004002",
+        "query XThreadingImpl",
+        "assert-not-time-sensitive",
+        "queue create work=1 completion=1",
+        "queue terminate wait=1",
+        "queue poll port=1 mode=1 terminated=true",
+        "queue close",
+        "uninitialize queues=1",
+        "DLL process detach queues=0 live_interfaces=0",
+    ] {
+        log = log
+            .split_once(milestone)
+            .unwrap_or_else(|| panic!("missing ordered milestone {milestone}:\n{stderr}"))
+            .1;
+    }
+    w32(&mut root, file(MODE), 1);
+    scratch.write("xgameruntime-compat-probe.exe", &root);
+    expect(trace(), 87, "unsupported XThreadingImpl vtable slot 15");
+}
+
 #[test]
 fn explicit_xgameruntime_uses_normal_pe_lifecycle_and_audited_lookups() {
     if !rosetta() {
