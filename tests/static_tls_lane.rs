@@ -2320,6 +2320,7 @@ global_asm!(include_str!("fixtures/static_tls_srw.S"),
     capacity = const SRW_CODE_CAPACITY,
     iat_delta = const IAT - TEXT,
     lock_delta = const DATA + 0x350 - TEXT,
+    mode_delta = const MODE - TEXT,
     options(att_syntax),
 );
 
@@ -2372,6 +2373,20 @@ fn exclusive_srw_bridges_record_and_clear_owner_in_guest_storage() {
         );
     }
     expect(output, 53, "Guest entry returned 53");
+    for (mode, diagnostic) in [
+        (1, "recursive exclusive acquire"),
+        (2, "contended exclusive acquire is unsupported"),
+        (3, "exclusive release by a non-owner"),
+    ] {
+        w32(&mut exe, file(MODE), mode);
+        scratch.write("srw.exe", &exe);
+        let failure = run(&path, &flags);
+        assert!(
+            String::from_utf8_lossy(&failure.stderr).contains("child terminated by signal 6"),
+            "{failure:?}"
+        );
+        expect(failure, 1, diagnostic);
+    }
 }
 
 const EXCEPTION_FILTER_CODE_CAPACITY: usize = 0x200;

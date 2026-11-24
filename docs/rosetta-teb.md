@@ -400,11 +400,11 @@ This implements creation only, not release, waits, or abandoned mutexes.
 one-pointer void bridge. The startup acquire through IAT RVA `0x6793aa8`
 and its paired release through `0x6793b00` address an aligned, zero-filled
 word at RVA `0x6e04e80`. The provider uses an opaque eight-byte lock word
-for modeled guest ownership and a host condition variable for contended
-acquires. Release clears ownership and wakes contenders. Both preserve
-LastError. Recursive acquisition and non-owner release are terminal misuse;
-shared mode, try-lock, and condition-variable APIs remain unsupported. Do not
-mix this word encoding with other SRW implementations.
+for modeled guest ownership with atomic acquire/release transitions. Both
+preserve LastError on success. Recursive acquisition, contention, and
+non-owner release terminate with a diagnostic instead of waiting or
+pretending to succeed. Shared mode, try-lock, and condition-variable APIs
+remain unsupported. Do not mix this word encoding with other SRW implementations.
 
 `IsProcessorFeaturePresent` uses the ordinary provider's AMD64 baseline and
 runtime x86 feature detection, preserving `LastError`. It reports

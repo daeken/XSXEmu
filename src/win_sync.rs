@@ -211,7 +211,10 @@ pub(crate) mod native {
     use std::{
         collections::HashMap,
         ptr,
-        sync::{Condvar, LazyLock, Mutex, MutexGuard},
+        sync::{
+            Condvar, LazyLock, Mutex, MutexGuard,
+            atomic::{AtomicUsize, Ordering},
+        },
         thread::{self, ThreadId},
         time::Duration,
     };
@@ -400,12 +403,7 @@ pub(crate) mod native {
     // implementations or copy/reinitialize a live lock. A zero word is
     // unowned; a nonzero word is the modeled ID of its exclusive owner.
     #[repr(transparent)]
-    pub(crate) struct SrwLock(usize);
-
-    // Serialize word access and pair the predicate with the condvar's wait.
-    // The host mutex also publishes writes from the prior critical region.
-    static SRW_GATE: Mutex<()> = Mutex::new(());
-    static SRW_UNLOCKED: Condvar = Condvar::new();
+    pub(crate) struct SrwLock(AtomicUsize);
 
     fn bad_srw(reason: &str) -> ! {
         eprintln!("xsxemu: exclusive SRW lock: {reason}");
@@ -417,19 +415,13 @@ pub(crate) mod native {
             bad_srw("null or misaligned SRWLOCK");
         }
         let me = crate::providers::native::current_thread_id() as usize;
-        let mut guard = lock(&SRW_GATE);
-        loop {
-            // SAFETY: caller supplies live, initialized writable lock storage;
-            // providers read and write the word only under SRW_GATE.
-            let owner = unsafe { (*srw).0 };
-            if owner == 0 {
-                unsafe { (*srw).0 = me };
-                return;
-            }
-            if owner == me {
-                bad_srw("recursive exclusive acquire");
-            }
-            guard = SRW_UNLOCKED.wait(guard).unwrap_or_else(|e| e.into_inner());
+        // SAFETY: caller supplies live, initialized writable lock storage,
+        // without concurrent non-atomic access.
+        let owner = unsafe { &(*srw).0 };
+        match owner.compare_exchange(0, me, Ordering::Acquire, Ordering::Relaxed) {
+            Ok(_) => (),
+            Err(owner) if owner == me => bad_srw("recursive exclusive acquire"),
+            Err(_) => bad_srw("contended exclusive acquire is unsupported"),
         }
     }
 
@@ -438,16 +430,14 @@ pub(crate) mod native {
             bad_srw("null or misaligned SRWLOCK");
         }
         let me = crate::providers::native::current_thread_id() as usize;
-        let _guard = lock(&SRW_GATE);
-        // SAFETY: same live-storage and serialization contract as acquire.
-        unsafe {
-            if (*srw).0 != me {
-                bad_srw("exclusive release by a non-owner");
-            }
-            (*srw).0 = 0;
+        // SAFETY: same live-storage and access contract as acquire.
+        let owner = unsafe { &(*srw).0 };
+        if owner
+            .compare_exchange(me, 0, Ordering::Release, Ordering::Relaxed)
+            .is_err()
+        {
+            bad_srw("exclusive release by a non-owner");
         }
-        // A single condvar is shared across guest lock addresses.
-        SRW_UNLOCKED.notify_all();
     }
 
     pub(super) extern "win64" fn sleep(ms: u32) {
@@ -570,51 +560,7 @@ pub(crate) mod native {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use std::{
-            cell::UnsafeCell,
-            mem::MaybeUninit,
-            sync::{Arc, mpsc},
-            time::Instant,
-        };
-
-        #[test]
-        fn exclusive_srw_serializes_contenders_and_restores_zero() {
-            struct Storage(UnsafeCell<SrwLock>);
-            // SAFETY: concurrent word accesses are made through the providers;
-            // the direct reads are before spawning or under SRW_GATE.
-            unsafe impl Sync for Storage {}
-
-            let storage = Arc::new(Storage(UnsafeCell::new(SrwLock(0))));
-            let srw = storage.0.get();
-            let me = crate::providers::native::current_thread_id() as usize;
-            unsafe { acquire_srw_exclusive(srw) };
-            assert_eq!(unsafe { (*srw).0 }, me);
-            let worker_storage = Arc::clone(&storage);
-            let (notice, recv) = mpsc::channel();
-            let worker = thread::spawn(move || {
-                let srw = worker_storage.0.get();
-                notice.send(0).unwrap();
-                unsafe {
-                    acquire_srw_exclusive(srw);
-                    let owner = {
-                        let _guard = lock(&SRW_GATE);
-                        (*srw).0
-                    };
-                    notice.send(owner).unwrap();
-                    release_srw_exclusive(srw);
-                }
-            });
-            let started = recv.recv_timeout(Duration::from_secs(2));
-            let blocked = recv.recv_timeout(Duration::from_millis(20));
-            unsafe { release_srw_exclusive(srw) };
-            assert_eq!(started.unwrap(), 0);
-            assert_eq!(blocked, Err(mpsc::RecvTimeoutError::Timeout));
-            let other = recv.recv_timeout(Duration::from_secs(2)).unwrap();
-            assert_ne!(other, 0);
-            assert_ne!(other, me);
-            worker.join().unwrap();
-            assert_eq!(unsafe { (*srw).0 }, 0);
-        }
+        use std::{mem::MaybeUninit, sync::mpsc, time::Instant};
 
         #[test]
         fn critical_section_is_recursive_and_thread_owned() {
