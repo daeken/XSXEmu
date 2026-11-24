@@ -259,13 +259,61 @@ impl NativeCompute {
     }
 }
 
+#[derive(Default)]
+struct NativeMesh {
+    payloads: usize,
+    unsupported: usize,
+    xyz32: usize,
+    xyz16: usize,
+    limits16: usize,
+}
+
+impl NativeMesh {
+    fn add(&mut self, payload: &[u8], psv: &[u8]) -> Option<()> {
+        self.payloads += 1;
+        let end = usize::try_from(u64::from_le_bytes(
+            payload.get(0xc0..0xc8)?.try_into().ok()?,
+        ))
+        .ok()?;
+        if payload.get(0x100) != Some(&7) || end > payload.len() || end < 0x10c {
+            return None;
+        }
+        let xyz32 = psv.get(40..52)?;
+        let xyz16 = [40, 44, 48].map(|at| word(psv, at).and_then(|v| u16::try_from(v).ok()));
+        let xyz16: Option<[u8; 6]> = if let [Some(x), Some(y), Some(z)] = xyz16 {
+            Some(
+                [x.to_le_bytes(), y.to_le_bytes(), z.to_le_bytes()]
+                    .as_flattened()
+                    .try_into()
+                    .ok()?,
+            )
+        } else {
+            None
+        };
+        let limits = psv.get(16..20)?;
+        let header = payload.get(0x100..end.min(0x240))?;
+        let mut hits = [false; 3];
+        for b in header.windows(12).step_by(4) {
+            hits[0] |= b == xyz32;
+            hits[1] |= xyz16.as_ref().is_some_and(|v| v == &b[..6]);
+            hits[2] |= &b[..4] == limits;
+        }
+        self.xyz32 += usize::from(hits[0]);
+        self.xyz16 += usize::from(hits[1]);
+        self.limits16 += usize::from(hits[2]);
+        Some(())
+    }
+}
+
 fn native_stages(
     wrapper: &[u8],
     psv: &[u8],
     inflate: &mut Vec<u8>,
     compute: &mut NativeCompute,
+    mesh: &mut NativeMesh,
 ) -> Option<Vec<Option<u8>>> {
-    let is_compute = *psv.get(28)? == 5;
+    let stage = *psv.get(28)?;
+    let is_compute = stage == 5;
     let xyz = [word(psv, 40)?, word(psv, 44)?, word(psv, 48)?];
     let fixed_wave32 = (word(psv, 20)?, word(psv, 24)?) == (32, 32);
     let mut stages = Vec::new();
@@ -277,6 +325,9 @@ fn native_stages(
             stages.push(payload.get(0x100).copied());
             if is_compute {
                 compute.payload(payload, xyz, fixed_wave32);
+            }
+            if stage == 13 && mesh.add(payload, psv).is_none() {
+                mesh.unsupported += 1;
             }
         }),
     )?;
@@ -575,6 +626,7 @@ pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
     let mut correspondence = [Correspondence::default(), Correspondence::default()];
     let mut packing_totals = [PackingTotals::default(), PackingTotals::default()];
     let mut compute = NativeCompute::default();
+    let mut mesh = NativeMesh::default();
     let mut inflate = Vec::new();
     for entry in fs::read_dir(path)? {
         let entry = entry?;
@@ -605,7 +657,7 @@ pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
         )?;
         let psv = part(b"PSV0").ok_or("missing unique PSV0")?;
         let rows = resource_rows(psv, stage).ok_or("unsupported PSV0 resource table or stage")?;
-        let native = native_stages(&bytes, psv, &mut inflate, &mut compute)
+        let native = native_stages(&bytes, psv, &mut inflate, &mut compute, &mut mesh)
             .ok_or("unsupported wrapped XDAT/XBCH framing")?;
         let elems_at = if rows.is_empty() { 60 } else { 64 + rows.len() };
         let (elements, suffix) =
@@ -700,6 +752,10 @@ pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
         compute.xyz_mismatch,
         compute.wave32,
         compute.fixed_wave32_mismatch
+    );
+    println!(
+        "PSV0 vs same-wrapper FSSM mesh: {} payloads, {} unsupported pre-body spans, {} XYZ32, {} XYZ16, {} u16 limit-pair raw hits",
+        mesh.payloads, mesh.unsupported, mesh.xyz32, mesh.xyz16, mesh.limits16
     );
     for (stage, totals) in groups {
         let Stage {
@@ -807,6 +863,26 @@ mod tests {
         c.payload(&bytes, [9, 1, 1], true);
         assert_eq!((c.payloads, c.wave32, c.unsupported_metadata), (4, 1, 1));
         assert_eq!((c.fixed_wave32_mismatch, c.xyz_mismatch), (1, 1));
+    }
+
+    #[test]
+    fn mesh_raw_header_probe_does_not_scan_past_declared_window() {
+        let mut payload = [0u8; 0x160];
+        let mut psv = [0u8; 52];
+        psv[40] = 32;
+        psv[44] = 1;
+        psv[48] = 1;
+        psv[16] = 3;
+        psv[18] = 4;
+        payload[0x100] = 7;
+        payload[0xc0..0xc8].copy_from_slice(&0x140u64.to_le_bytes());
+        payload[0x110..0x11c].copy_from_slice(&psv[40..52]);
+        payload[0x140..0x144].copy_from_slice(&psv[16..20]);
+        let mut got = NativeMesh::default();
+        got.add(&payload, &psv).unwrap();
+        assert_eq!((got.xyz32, got.xyz16, got.limits16), (1, 0, 0));
+        payload[0xc0..0xc8].copy_from_slice(&0x161u64.to_le_bytes());
+        assert!(got.add(&payload, &psv).is_none());
     }
 
     #[test]

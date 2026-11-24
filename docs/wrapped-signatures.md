@@ -46,6 +46,8 @@ For GS, the runtime-info union has little-endian u32 input primitive, output top
 
 For MS, the runtime-info union has little-endian u32 group-shared, view-dependent group-shared, and payload byte counts at `+4/+8/+12`, then u16 maximum vertex and primitive counts at `+16/+18`. Bytes `+30/+31` hold the primitive signature vector count and the mesh output topology. All 9,282 wrappers have both maxima in `1..=256` and topology value `2`. Five have nonzero group-shared bytes; none declares view-dependent group-shared bytes, a nonzero payload size, or primitive signature vectors. The primitive vector count and maximum output primitive count are different fields; zero vectors does not imply no output primitives. These are source declarations, not Metal limits or a native mesh launch contract.
 
+A bounded negative check looked for these MS source tuples verbatim in each same-wrapper FSSM payload. The scanner tests dword-aligned starts from `+0x100` whose 12-byte window ends by the smaller of the checked `+0xc0` start word and `+0x240`. Across all 9,282 mesh payloads there were no matches for a contiguous u32 XYZ tuple, u16 XYZ tuple, or u16 vertex/primitive limit pair. This does not rule out other offsets, packed fields, or pipeline-supplied state; it rejects only these direct encodings in this window.
+
 ## Wrapped stage labels versus FSSM stage bytes
 
 The scanner uses the bounded XDAT/XBCH reader for every wrapper and groups the FSSM byte at `+0x100` in native payload directory order. The observed raw sequences account for all 26,698 native payloads in 26,503 wrappers:
