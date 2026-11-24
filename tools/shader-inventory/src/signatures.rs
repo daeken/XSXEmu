@@ -149,6 +149,7 @@ struct Runtime {
     partial_dims: usize,
     depth: PixelDepth,
     mesh: MeshRuntime,
+    geometry: GeometryRuntime,
 }
 
 impl Runtime {
@@ -196,6 +197,41 @@ impl MeshRuntime {
         self.payload += usize::from(word(psv, 12)? != 0);
         self.primitive_vectors += usize::from(*psv.get(30)? != 0);
         *self.topology.entry(*psv.get(31)?).or_default() += 1;
+        Some(())
+    }
+}
+
+#[derive(Default)]
+struct GeometryRuntime {
+    profiles: BTreeMap<(usize, usize, usize), usize>,
+    position: usize,
+    out_of_bounds: usize,
+    vectors_without_stream: usize,
+}
+
+impl GeometryRuntime {
+    fn add(&mut self, psv: &[u8]) -> Option<()> {
+        let primitive = word(psv, 4)?;
+        let topology = word(psv, 8)?;
+        let stream_mask = word(psv, 12)?;
+        let position = *psv.get(16)?;
+        if stream_mask & !15 != 0 || position > 1 {
+            return None;
+        }
+        let max_vertices = u16::from_le_bytes(psv.get(30..32)?.try_into().ok()?);
+        let vectors = psv.get(36..40)?;
+        self.vectors_without_stream += usize::from(
+            vectors
+                .iter()
+                .enumerate()
+                .any(|(i, &v)| v != 0 && stream_mask & (1 << i) == 0),
+        );
+        *self
+            .profiles
+            .entry((primitive, topology, stream_mask))
+            .or_default() += 1;
+        self.position += usize::from(position);
+        self.out_of_bounds += usize::from(!(1..=1024).contains(&max_vertices));
         Some(())
     }
 }
@@ -579,6 +615,13 @@ pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
         *totals.native_stage_sequences.entry(native).or_default() += 1;
         totals.resources.add(rows);
         totals.runtime.add(psv).ok_or("invalid PSV0 runtime info")?;
+        if stage == 2 {
+            totals
+                .runtime
+                .geometry
+                .add(psv)
+                .ok_or("invalid PSV0 geometry runtime info")?;
+        }
         if stage == 13 {
             totals
                 .runtime
@@ -694,6 +737,13 @@ pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
                 p.declared, p.sample_frequency, p.kinds, p.files_disagreeing
             );
         }
+        if stage == 2 {
+            let g = runtime.geometry;
+            println!(
+                "  PSV0 geometry: {} position outputs, {} outside 1–1024 max vertices, {} files with vectors on disabled streams; (primitive, topology, stream mask) {:?}",
+                g.position, g.out_of_bounds, g.vectors_without_stream, g.profiles
+            );
+        }
         if stage == 13 {
             let m = runtime.mesh;
             println!(
@@ -757,6 +807,25 @@ mod tests {
         c.payload(&bytes, [9, 1, 1], true);
         assert_eq!((c.payloads, c.wave32, c.unsupported_metadata), (4, 1, 1));
         assert_eq!((c.fixed_wave32_mismatch, c.xyz_mismatch), (1, 1));
+    }
+
+    #[test]
+    fn geometry_output_vector_checks_respect_the_declared_stream_mask() {
+        let mut psv = [0; 40];
+        psv[12] = 4;
+        psv[16] = 1;
+        psv[31] = 4; // 1024.
+        psv[38] = 1;
+        let mut got = GeometryRuntime::default();
+        got.add(&psv).unwrap();
+        assert_eq!(
+            (got.position, got.out_of_bounds, got.vectors_without_stream),
+            (1, 0, 0)
+        );
+        psv[37] = 1;
+        psv[30] = 1;
+        got.add(&psv).unwrap();
+        assert_eq!((got.out_of_bounds, got.vectors_without_stream), (1, 1));
     }
 
     #[test]
