@@ -1885,20 +1885,35 @@ pub(crate) mod native {
             Ok(())
         }))
     }
-    pub(super) unsafe extern "win64" fn GetFileSizeEx(h: usize, out: *mut i64) -> i32 {
-        boolean(disk(h, 0, |f| {
-            if out.is_null() {
-                return Err(INVALID_PARAM);
+    unsafe fn file_size(f: &File, out: *mut i64) -> Result<()> {
+        if out.is_null() {
+            return Err(INVALID_PARAM);
+        }
+        let m = f.metadata().map_err(win_err)?;
+        if !m.is_file() {
+            return Err(ACCESS);
+        }
+        unsafe { out.write_unaligned(m.len() as i64) };
+        Ok(())
+    }
+    pub(crate) unsafe extern "win64" fn GetFileSizeEx(h: usize, out: *mut i64) -> i32 {
+        boolean(disk(h, 0, |f| unsafe { file_size(f, out) }))
+    }
+    #[cfg(target_os = "macos")]
+    pub(crate) unsafe extern "win64" fn tls_child_get_file_size_ex(h: usize, out: *mut i64) -> i32 {
+        boolean((|| {
+            let e = entry(h)?;
+            let Object::File(file) = &*e.obj else {
+                return Err(BAD_HANDLE);
+            };
+            if !file.title_data {
+                return Err(BAD_HANDLE);
             }
-            let m = f.metadata().map_err(win_err)?;
-            if !m.is_file() {
+            if e.access & R == 0 {
                 return Err(ACCESS);
             }
-            unsafe {
-                out.write_unaligned(m.len() as i64);
-            }
-            Ok(())
-        }))
+            unsafe { file_size(&lock(&file.file), out) }
+        })())
     }
     pub(super) extern "win64" fn SetEndOfFile(h: usize) -> i32 {
         boolean(disk(h, W, |f| {
@@ -2934,6 +2949,13 @@ mod native_tests {
             let mut size = 0;
             assert_eq!(GetFileSizeEx(h, &mut size), 1);
             assert_eq!(size, 6);
+            #[cfg(target_os = "macos")]
+            {
+                size = -1;
+                assert_eq!(tls_child_get_file_size_ex(h, &mut size), 0);
+                assert_eq!(get_last_error(), 6); // ERROR_INVALID_HANDLE
+                assert_eq!(size, -1);
+            }
             let mut copy = 0;
             assert_eq!(DuplicateHandle(invalid, h, invalid, &mut copy, 0, 0, 2), 1);
             #[cfg(target_os = "macos")]

@@ -683,8 +683,10 @@ read bridge accepts only readable title-data handles, requires a byte-count
 output and null `OVERLAPPED`, and does not admit pipes or consoles. Each read
 advances the descriptor cursor by the actual byte count; a short read or zero
 bytes at EOF is a success. `FILE_FLAG_NO_BUFFERING` alignment and cache policy
-remain unmodeled. A separate fallback queries file size through `GetFileSizeEx`
-(IAT RVA `0x6793958`), which is not added to the audited lane here.
+remain unmodeled. The header fallback calls `GetFileSizeEx` (IAT RVA
+`0x6793958`) with a `LARGE_INTEGER` output and uses zero if the query fails.
+The audited bridge writes the open descriptor's 64-bit byte length for
+readable title-data handles only, without changing the read cursor.
 
 **Scarlett XGameRuntime startup.** The trace at `8eb79ce` reaches
 `GetFileAttributesW`, `LoadLibraryExW`, and `ReleaseSRWLockExclusive`, then

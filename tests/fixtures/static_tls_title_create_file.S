@@ -84,6 +84,30 @@ Lcreate_entry:
     jne Lcreate_bad
     cmpl $0x41414141, {buffer_delta}+4092(%r11)
     jne Lcreate_bad
+    // Query size between reads: it must not change the cursor.
+    movq $-1, 33(%rsp)
+    movb $0x5a, 41(%rsp)
+    movq 48(%rsp), %rcx
+    leaq 33(%rsp), %rdx
+    callq *{iat_delta}+24(%r11)
+    cmpl $1, %eax
+    jne Lcreate_bad
+    cmpq $4101, 33(%rsp)
+    jne Lcreate_bad
+    cmpb $0x5a, 41(%rsp)
+    jne Lcreate_bad
+    cmpl $0x87654321, %gs:0x68
+    jne Lcreate_bad
+    leaq Lcreate_text(%rip), %r11
+    movq 48(%rsp), %rcx
+    xorl %edx, %edx
+    callq *{iat_delta}+24(%r11)
+    testl %eax, %eax
+    jne Lcreate_bad
+    cmpl $87, %gs:0x68
+    jne Lcreate_bad
+    movl $0x87654321, %gs:0x68
+    leaq Lcreate_text(%rip), %r11
     movb $0x5a, {buffer_delta}+4101(%r11)
     title_read 4096, 0
     cmpl $1, %eax
@@ -105,7 +129,7 @@ Lcreate_entry:
 
     movq 48(%rsp), %rcx
     leaq Lcreate_text(%rip), %r11
-    callq *{iat_delta}+32(%r11)
+    callq *{iat_delta}+40(%r11)
     cmpl $1, %eax
     jne Lcreate_bad
     title_read 0, 0
@@ -130,9 +154,20 @@ Lcreate_entry:
     movabsq $116444736012340000, %rax
     cmpq %rax, 33(%rsp)
     jne Lcreate_bad
+    movq $-1, 33(%rsp)
+    movq 48(%rsp), %rcx
+    leaq 33(%rsp), %rdx
+    leaq Lcreate_text(%rip), %r11
+    callq *{iat_delta}+24(%r11)
+    testl %eax, %eax
+    jne Lcreate_bad
+    cmpl $6, %gs:0x68
+    jne Lcreate_bad
+    cmpq $-1, 33(%rsp)
+    jne Lcreate_bad
     movq 48(%rsp), %rcx
     leaq Lcreate_text(%rip), %r11
-    callq *{iat_delta}+32(%r11)
+    callq *{iat_delta}+40(%r11)
     testl %eax, %eax
     jne Lcreate_bad
     cmpl $6, %gs:0x68

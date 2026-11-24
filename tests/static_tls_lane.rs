@@ -1826,7 +1826,7 @@ fn title_data_mount_is_explicit_and_confines_guest_attributes() {
     }
 }
 
-const TITLE_CREATE_CAPACITY: usize = 0x400;
+const TITLE_CREATE_CAPACITY: usize = 0x600;
 const TITLE_CREATE_ARGS: usize = MODULE_PATHS + 0x200;
 
 #[repr(C)]
@@ -1888,12 +1888,12 @@ fn title_data_file_open_metadata_read_and_close() {
     .enumerate()
     {
         let row = file(imports) + 20 * i;
-        let lookup = imports + 0x40 + i * 0x20;
+        let lookup = imports + 0x40 + i * 0x28;
         let name = imports + 0x80 + i * 0x30;
         let hint_name = imports + 0xe0 + i * 0x20;
         w32(&mut exe, row, lookup);
         w32(&mut exe, row + 12, name);
-        w32(&mut exe, row + 16, IAT + i * 32);
+        w32(&mut exe, row + 16, IAT + i * 40);
         w64(&mut exe, file(lookup), hint_name);
         put(&mut exe, file(name), dll);
         put(&mut exe, file(hint_name) + 2, symbol);
@@ -1904,6 +1904,9 @@ fn title_data_file_open_metadata_read_and_close() {
             let read_hint = imports + 0x140;
             w64(&mut exe, file(lookup) + 16, read_hint);
             put(&mut exe, file(read_hint) + 2, b"ReadFile\0");
+            let size_hint = imports + 0x160;
+            w64(&mut exe, file(lookup) + 24, size_hint);
+            put(&mut exe, file(size_hint) + 2, b"GetFileSizeEx\0");
         }
     }
     let write = |name: &str, args: [usize; 4]| {
