@@ -918,7 +918,7 @@ impl LiftGaps {
         }
         if self.profile_vertex.is_some() {
             println!(
-                "    owned straight-line profile audit (not bindings): {:?}; non-linear={}",
+                "    historical owned straight-line profile audit (not bindings): {:?}; non-linear={}",
                 self.profiles, self.profile_non_linear
             );
             let (mut local, mut no_entry_regs, mut no_fp_or_domain, mut fully_proven) =

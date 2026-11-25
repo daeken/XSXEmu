@@ -81,6 +81,14 @@ for variant in constant-rtz constant-rtz-rg; do
     "$p" "--load-$variant-metallib" "$d/$variant.metallib"
 done
 
+# Explicitly bound raw input, no PS live-ins, and full/RG export contracts.
+for variant in bound bound-rg; do
+    "$p" "--$variant-source"
+    "$p" "--emit-$variant-msl" > "$d/$variant.metal"
+    compile "$variant"
+    "$p" "--load-$variant-metallib" "$d/$variant.metallib"
+done
+
 # Scalar depth with explicit Depth32Float and overlapping draws.
 "$p" --depth-source
 "$p" --emit-depth-msl > "$d/depth.metal"

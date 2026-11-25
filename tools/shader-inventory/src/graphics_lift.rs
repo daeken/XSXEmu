@@ -3,6 +3,9 @@ use std::fmt::Write;
 
 use crate::graphics_decode::{DecodeError, FloatSource, Op, Target, Vgpr, decode};
 
+#[path = "graphics_bound.rs"]
+pub(crate) mod bound;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Stage {
     Vertex,
@@ -1314,6 +1317,8 @@ mod tests {
         asm.push_str("v_mov_b32_e32 v0, 0x3f801800\nv_mov_b32_e32 v1, 0xc0001800\nv_cvt_pkrtz_f16_f32_e32 v2, v0, v1\nv_mov_b32_e32 v0, 0x80000000\nv_mov_b32_e32 v1, 0x38800000\nv_cvt_pkrtz_f16_f32_e32 v3, v0, v1\nexp mrt0 v2, v2, v3, v3 done compr vm\ns_endpgm\n");
         asm.push_str("v_mov_b32_e32 v0, 0x3f801800\nv_mov_b32_e32 v1, 0xc0001800\nv_cvt_pkrtz_f16_f32_e32 v2, v0, v1\nexp mrt0 v2, v2, off, off done compr vm\ns_endpgm\n");
         asm.push_str("exp pos0 v0, v1, v2, v3 done\nv_add_f32_e32 v8, 0.25, v4\nexp param0 v8, v5, v6, v7\ns_endpgm\n");
+        asm.push_str("v_mov_b32_e32 v9, v10\nexp pos0 v9, v11, v12, v13 done\nv_mov_b32_e32 v0, 0\nexp param2 v0, v0, v0, v0\ns_endpgm\n");
+        asm.push_str("v_mov_b32_e32 v0, 0x3f801800\nv_mov_b32_e32 v1, 0xc0001800\nv_cvt_pkrtz_f16_f32_e32 v2, v0, v1\nv_mov_b32_e32 v0, 0x80000000\nv_mov_b32_e32 v1, 0x38800000\nv_cvt_pkrtz_f16_f32_e32 v3, v0, v1\nexp mrt1 v2, v2, v3, v3 done compr vm\ns_endpgm\n");
         for uint in [false, true] {
             let (mask, cvt) = if uint {
                 ("-2", "v_cvt_f32_u32_e32")
@@ -1351,6 +1356,8 @@ mod tests {
             .chain(CONSTANT_RTZ_PS)
             .chain(CONSTANT_RTZ_RG_PS)
             .chain(POS_FIRST_VS)
+            .chain(bound::VS_WORDS)
+            .chain(&bound::owned_full_ps())
             .chain(&UNPACK_BYTE_VS)
             .chain(&UNPACK_UINT_VS)
             .chain(MULTI_VS)

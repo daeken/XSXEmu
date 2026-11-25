@@ -115,6 +115,8 @@ mod gpu {
         InterpLoad(&'a Path, InterpFixture),
         ConstantRtzSource(bool),
         ConstantRtzLoad(&'a Path, bool),
+        BoundSource(bool),
+        BoundLoad(&'a Path, bool),
         PosFirstSource,
         PosFirstLoad(&'a Path),
         WaitPosSource(bool),
@@ -183,6 +185,12 @@ mod gpu {
                 print!("{}", graphics_lift::translate_constant_rtz_fixture(mode == "--emit-constant-rtz-rg-msl").map_err(|e| format!("constant RTZ rejected: {e:?}"))?);
                 return Ok(());
             }
+            [mode] if mode == "--bound-source" || mode == "--bound-rg-source" => Mode::BoundSource(mode == "--bound-rg-source"),
+            [mode, lib] if mode == "--load-bound-metallib" || mode == "--load-bound-rg-metallib" => Mode::BoundLoad(Path::new(lib), mode == "--load-bound-rg-metallib"),
+            [mode] if mode == "--emit-bound-msl" || mode == "--emit-bound-rg-msl" => {
+                print!("{}", graphics_lift::bound::owned_pair(mode == "--emit-bound-rg-msl").map_err(|e| format!("explicit binding rejected: {e:?}"))?.source);
+                return Ok(());
+            }
             [mode] if mode == "--pos-first-source" => Mode::PosFirstSource,
             [mode, lib] if mode == "--load-pos-first-metallib" => Mode::PosFirstLoad(Path::new(lib)),
             [mode] if mode == "--emit-pos-first-msl" => {
@@ -233,7 +241,7 @@ mod gpu {
             [mode, lib] if mode == "--load-metallib" || mode == "--load-mutated-metallib" => Mode::Load(Path::new(lib), mode == "--load-mutated-metallib"),
             [mode, lib, archive] if mode == "--expect-owned-metal-miss" => Mode::ExpectStrictMiss(Path::new(lib), Path::new(archive)),
             [mode, lib, archive, compiler] if mode == "--bake-archive" || mode == "--replay-archive" || mode == "--replay-mutated-archive" => Mode::Archive(Path::new(lib), Path::new(archive), mode == "--bake-archive", mode == "--replay-mutated-archive", owned_graphics_artifact::compiler_profile(compiler)?),
-            _ => return Err("usage: shader-metal-graphics-lift [--expect-swapped-triple | --triple-rg-source | --emit-triple-rg-msl | --load-triple-rg-metallib LIB | --triple-source | --emit-triple-msl | --load-triple-metallib LIB | --dual-source | --emit-dual-msl | --load-dual-metallib LIB | --interp-x-source | --interp-z-source | --expect-interp-wrong-mode | --expect-interp-wrong-channel | --emit-interp-x-msl | --emit-interp-z-msl | --load-interp-x-metallib LIB | --load-interp-z-metallib LIB | --constant-rtz[-rg]-source | --emit-constant-rtz[-rg]-msl | --load-constant-rtz[-rg]-metallib LIB | --pos-first-source | --emit-pos-first-msl | --load-pos-first-metallib LIB | --wait-pos-source | --emit-wait-pos-msl | --load-wait-pos-metallib LIB | --expect-late-pos-read | --unpack-{byte,uint}-source | --emit-unpack-{byte,uint}-msl | --load-unpack-{byte,uint}-metallib LIB | --multi-source | --emit-multi-msl | --load-multi-metallib LIB | --packed-rg-source | --emit-packed-rg-msl | --load-packed-rg-metallib LIB | --wait-depth-source | --emit-wait-depth-msl | --load-wait-depth-metallib LIB | --expect-late-depth-read | --early-depth-source | --emit-early-depth-msl | --load-early-depth-metallib LIB | --depth-source | --emit-depth-msl | --load-depth-metallib LIB | --packed-source | --emit-packed-msl | --load-packed-metallib LIB | --emit-msl | --emit-mutated-msl | --load-metallib LIB | --load-mutated-metallib LIB | {--bake-archive|--replay-archive|--replay-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-owned-metal-miss MUTATED_LIB ARCHIVE]".into()),
+            _ => return Err("usage: shader-metal-graphics-lift [--expect-swapped-triple | --triple-rg-source | --emit-triple-rg-msl | --load-triple-rg-metallib LIB | --triple-source | --emit-triple-msl | --load-triple-metallib LIB | --dual-source | --emit-dual-msl | --load-dual-metallib LIB | --interp-x-source | --interp-z-source | --expect-interp-wrong-mode | --expect-interp-wrong-channel | --emit-interp-x-msl | --emit-interp-z-msl | --load-interp-x-metallib LIB | --load-interp-z-metallib LIB | --constant-rtz[-rg]-source | --emit-constant-rtz[-rg]-msl | --load-constant-rtz[-rg]-metallib LIB | --bound[-rg]-source | --emit-bound[-rg]-msl | --load-bound[-rg]-metallib LIB | --pos-first-source | --emit-pos-first-msl | --load-pos-first-metallib LIB | --wait-pos-source | --emit-wait-pos-msl | --load-wait-pos-metallib LIB | --expect-late-pos-read | --unpack-{byte,uint}-source | --emit-unpack-{byte,uint}-msl | --load-unpack-{byte,uint}-metallib LIB | --multi-source | --emit-multi-msl | --load-multi-metallib LIB | --packed-rg-source | --emit-packed-rg-msl | --load-packed-rg-metallib LIB | --wait-depth-source | --emit-wait-depth-msl | --load-wait-depth-metallib LIB | --expect-late-depth-read | --early-depth-source | --emit-early-depth-msl | --load-early-depth-metallib LIB | --depth-source | --emit-depth-msl | --load-depth-metallib LIB | --packed-source | --emit-packed-msl | --load-packed-metallib LIB | --emit-msl | --emit-mutated-msl | --load-metallib LIB | --load-mutated-metallib LIB | {--bake-archive|--replay-archive|--replay-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-owned-metal-miss MUTATED_LIB ARCHIVE]".into()),
         };
         if matches!(mode, Mode::Archive(..) | Mode::ExpectStrictMiss(..))
             && std::env::var_os("MTL_SHADER_VALIDATION").is_some()
@@ -269,7 +277,17 @@ mod gpu {
             Mode::ConstantRtzSource(rg) | Mode::ConstantRtzLoad(_, rg) => Some(rg),
             _ => None,
         };
-        let partial = partial || constant_rtz == Some(true);
+        let bound_pair = match mode {
+            Mode::BoundSource(rg) | Mode::BoundLoad(_, rg) => Some(
+                graphics_lift::bound::owned_pair(rg)
+                    .map_err(|e| format!("explicit binding rejected: {e:?}"))?,
+            ),
+            _ => None,
+        };
+        let bound_rg = bound_pair
+            .as_ref()
+            .map(|plan| plan.color.mask == graphics_lift::bound::Mask::Rg);
+        let partial = partial || constant_rtz == Some(true) || bound_rg == Some(true);
         let wait_pos = matches!(mode, Mode::WaitPosSource(_) | Mode::WaitPosLoad(_));
         let pos_first = matches!(mode, Mode::PosFirstSource | Mode::PosFirstLoad(_));
         let late_pos = matches!(mode, Mode::WaitPosSource(true));
@@ -298,6 +316,7 @@ mod gpu {
             | Mode::WaitDepthSource(_)
             | Mode::InterpSource(_)
             | Mode::ConstantRtzSource(_)
+            | Mode::BoundSource(_)
             | Mode::PosFirstSource
             | Mode::WaitPosSource(_)
             | Mode::UnpackSource(_)
@@ -308,6 +327,8 @@ mod gpu {
                     graphics_lift::translate_mrt_fixture(fixture)
                 } else if let Some(interp) = interp {
                     graphics_lift::translate_interp_fixture(interp)
+                } else if let Some(plan) = &bound_pair {
+                    Ok(plan.source.clone())
                 } else if let Some(rg) = constant_rtz {
                     graphics_lift::translate_constant_rtz_fixture(rg)
                 } else if pos_first {
@@ -335,6 +356,7 @@ mod gpu {
             Mode::PackedLoad(path, _)
             | Mode::InterpLoad(path, _)
             | Mode::ConstantRtzLoad(path, _)
+            | Mode::BoundLoad(path, _)
             | Mode::PosFirstLoad(path)
             | Mode::WaitPosLoad(path)
             | Mode::UnpackLoad(path, _)
@@ -353,6 +375,8 @@ mod gpu {
         const DEPTH_FORMAT: MTLPixelFormat = MTLPixelFormat::Depth32Float;
         let (format, pixel_bytes, default_ps) = if let Some(fixture) = fixture {
             (MTLPixelFormat::RGBA32Float, 16, fixture.entry())
+        } else if bound_pair.is_some() {
+            (MTLPixelFormat::RGBA32Float, 16, "bound_ps")
         } else if constant_rtz.is_some() {
             (MTLPixelFormat::RGBA32Float, 16, "constant_rtz_ps")
         } else if pos_first {
@@ -551,6 +575,13 @@ mod gpu {
             std::mem::size_of_val(&vertices) as u64,
             vertices.as_ptr().cast(),
         );
+        if bound_pair.is_some() {
+            // Raw uint4 records [w,y,x,z] at the explicitly bound slot 5.
+            let data: [[u32; 4]; 3] =
+                [[1.0f32, -1., -1., 0.], [1., -1., 1., 0.], [1., 3., -1., 0.]]
+                    .map(|record| record.map(f32::to_bits));
+            enc.set_vertex_bytes(5, std::mem::size_of_val(&data) as u64, data.as_ptr().cast());
+        }
         if interp.is_some() {
             // Equal NDC positions to the baseline, but W varies across vertices.
             let data: [[f32; 8]; 3] = [
@@ -701,6 +732,42 @@ mod gpu {
         }
         // The GPU writes have completed and the owned buffer remains alive through the last read.
         let pixels = unsafe { std::slice::from_raw_parts(ptr, extent) };
+        if let Some(rg) = bound_rg {
+            // The diagonal in Metal screen space joins (0,-8) to (8,8).
+            let written: [u32; 4] = if rg {
+                [0x3f80_0000, 0xc000_0000, 0x3f80_0000, 0x3f40_0000]
+            } else {
+                [0x3f80_0000, 0xc000_0000, 0x8000_0000, 0x3880_0000]
+            };
+            let clear = [
+                0x3f80_0000,
+                0,
+                0x3f80_0000,
+                if rg { 0x3f40_0000 } else { 0 },
+            ];
+            let mut covered = 0;
+            for y in 0..SIDE {
+                for x in 0..SIDE {
+                    let inside = 2 * (2 * x + 1) < 16 + (2 * y + 1);
+                    covered += usize::from(inside);
+                    let want = if inside { written } else { clear };
+                    let at = y * STRIDE + x * 16;
+                    let got = std::array::from_fn(|i| {
+                        u32::from_le_bytes(pixels[at + 4 * i..at + 4 * i + 4].try_into().unwrap())
+                    });
+                    if got != want {
+                        return Err(format!(
+                            "explicitly bound pair ({x},{y}): expected {want:08x?}, got {got:08x?}"
+                        ));
+                    }
+                }
+            }
+            println!(
+                "{} explicitly bound pair (RG={rg}): 64/64 pixels bit-exact; {covered} covered",
+                dev.name()
+            );
+            return Ok(());
+        }
         if let Some(rg) = constant_rtz {
             // RTZ not RNE for ±normal inputs above the half midpoint.
             // Full writes include -0 and minimum half normal; RG preserves clear B/A.
