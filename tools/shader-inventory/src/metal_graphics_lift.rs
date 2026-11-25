@@ -1532,8 +1532,11 @@ fn main() {
 
 #[test]
 fn oracle_endpoints_and_gradient() {
-    assert_eq!(4097_i64 * 4097 - 16785408, 1);
-    assert_eq!(4097_f32 * 4097. - 16785408., 0.);
+    // Independent exact integer result vs an explicitly rounded product.
+    let exact = 4097_i64 * 4097 - 16785408;
+    let rounded_product = std::hint::black_box((4097_i64 * 4097) as f32);
+    assert_eq!((exact as f32).to_bits(), 0x3f80_0000);
+    assert_eq!((rounded_product - 16785408.0_f32).to_bits(), 0x0000_0000);
     assert_eq!(expected(0, false), [72, 255, 36, 0]);
     assert_eq!(expected(7, false), [183, 255, 92, 0]);
     assert_eq!(expected(0, true), [135, 255, 68, 0]);

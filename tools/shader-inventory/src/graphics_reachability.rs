@@ -280,6 +280,22 @@ fn direct_operand_form(name: &str, words: [u32; 2], len: usize, bucket: &str) ->
     let [first, sources] = words;
     let attr = (first >> 10) & 63;
     match name {
+        "v_fma_f32" if len == 8 && first & 0xffff_0000 == 0xd54b_0000 => {
+            let classes = [0, 9, 18].map(|shift| match (sources >> shift) & 511 {
+                256..=511 => "VGPR".to_owned(),
+                0..=105 => "SGPR".to_owned(),
+                n => format!("sel{n}"),
+            });
+            format!(
+                "{name}/{}/abs{:x}/neg{:x}/clamp{}/omod{}/opsel{:x}/8B",
+                classes.join("-"),
+                (first >> 8) & 7,
+                sources >> 29,
+                (first >> 15) & 1,
+                (sources >> 27) & 3,
+                (first >> 11) & 15
+            )
+        }
         "s_setprio" if len == 4 && first & 0xffff_fffc == 0xbf8f_0000 => {
             format!("{name}/imm-{}/4B", first & 3)
         }
@@ -371,6 +387,7 @@ pub(super) struct DirectGaps {
     pub ordinary_vgpr_mul: usize,
     pub ordinary_vgpr_add: usize,
     pub signed_vgpr_convert: usize,
+    pub inline_first_fma: [usize; 2],
     pub partial_param0: usize,
     pub partial_param0_noncanonical: usize,
     pub contiguous: bool,
@@ -451,6 +468,13 @@ pub(super) fn direct_gaps(dis: &mut Disassembler, bytes: &[u8], slot: usize) -> 
             ) {
                 gaps.partial_param0 += 1;
                 gaps.partial_param0_noncanonical += usize::from(words[1] >> 16 != 0);
+            }
+            if matches!(
+                decoded,
+                Some((2, crate::graphics_decode::Op::FmaUnpack { .. }))
+            ) && let Some(negative) = crate::graphics_decode::inline_first_unpack_fma(words[1])
+            {
+                gaps.inline_first_fma[usize::from(negative)] += 1;
             }
             gaps.signed_vgpr_convert += usize::from(matches!(
                 decoded,

@@ -573,6 +573,7 @@ fn emit_body(out: &mut String, ops: &[Op], packed_color_lvalue: &str, multi: boo
                 src: Vgpr(s),
                 negative,
             } => {
+                // Normalize multiplicand order only in the finite owned unpack contract.
                 let (a, b) = if negative {
                     ("-2.0f", "1.0f")
                 } else {
@@ -1419,6 +1420,9 @@ const UNPACK_UINT_VS: [u32; 14] = {
     let mut words = UNPACK_BYTE_VS;
     words[1] = 0x3612_08c2;
     words[3] = 0x7e16_0d09;
+    // The finite owned contract also admits inline constants in SRC0.
+    words[6] = 0x03ce_16f4;
+    words[8] = 0x03ca_18f5;
     words
 };
 
@@ -1567,7 +1571,12 @@ mod tests {
             } else {
                 ("2", "v_cvt_f32_ubyte0_e32")
             };
-            writeln!(asm, "v_lshlrev_b32_e32 v8, 1, v5\nv_and_b32_e32 v9, {mask}, v4\nv_and_b32_e32 v10, 2, v8\n{cvt} v11, v9\nv_cvt_f32_ubyte0_e32 v12, v10\nv_fma_f32 v13, v11, 2.0, -1.0\nv_fma_f32 v14, v12, -2.0, 1.0\nexp param0 v13, v14, v11, v12\nexp pos0 v0, v1, v2, v3 done\ns_endpgm").unwrap();
+            let (a, b) = if uint {
+                ("2.0, v11", "-2.0, v12")
+            } else {
+                ("v11, 2.0", "v12, -2.0")
+            };
+            writeln!(asm, "v_lshlrev_b32_e32 v8, 1, v5\nv_and_b32_e32 v9, {mask}, v4\nv_and_b32_e32 v10, 2, v8\n{cvt} v11, v9\nv_cvt_f32_ubyte0_e32 v12, v10\nv_fma_f32 v13, {a}, -1.0\nv_fma_f32 v14, {b}, 1.0\nexp param0 v13, v14, v11, v12\nexp pos0 v0, v1, v2, v3 done\ns_endpgm").unwrap();
         }
         for n in 0..7 {
             let r = 4 + 4 * n;
@@ -1854,6 +1863,40 @@ mod tests {
             Err(Reject::Uninitialized(0, 8))
         );
         assert!(decode(&[0xd585_0008, 0x104], 0).is_err());
+    }
+
+    #[test]
+    fn inline_first_fma_rejects_modifier_and_selector_neighbors() {
+        let header = UNPACK_UINT_VS[5];
+        for (index, (src, negative)) in [(11, false), (12, true)].into_iter().enumerate() {
+            let fields = UNPACK_UINT_VS[6 + 2 * index];
+            assert_eq!(
+                decode(&[header, fields], 0),
+                Ok((
+                    2,
+                    Op::FmaUnpack {
+                        dst: Vgpr(13),
+                        src: Vgpr(src),
+                        negative,
+                    }
+                ))
+            );
+            for bit in 8..16 {
+                // ABS, OP_SEL, CLAMP
+                assert!(decode(&[header ^ (1 << bit), fields], 0).is_err());
+            }
+            for bit in [0, 8, 17, 18, 27, 28, 29, 30, 31] {
+                // selectors and output/source modifiers
+                assert!(decode(&[header, fields ^ (1 << bit)], 0).is_err());
+            }
+            assert!(decode(&[header], 0).is_err());
+        }
+        let mut words = UNPACK_UINT_VS;
+        words[6] = (words[6] & !0x0001_fe00) | (42 << 9);
+        assert_eq!(
+            lift(Stage::UnpackVertex, &words),
+            Err(Reject::Uninitialized(5, 42))
+        );
     }
 
     #[test]

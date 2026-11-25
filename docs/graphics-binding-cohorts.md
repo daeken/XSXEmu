@@ -164,6 +164,22 @@ The shared decoder accepts only header `0xf8000203` for this form: PARAM0, EN=3,
 
 At +36 and +40, each CPU/wave profile contains one site in each of the same 119 distinct VS spans (of 1,304 qualified), all with nonzero disabled selector bytes. None at +0/+24. The 59 nearest VS now have two remaining buckets and at least three sites: SETPRIO imm3 and unclassified VOP3 FMA. Whole-window closure remains 0 VS and 225 PS per applicable profile. Native PARAM linkage, interpolant state, priority, waits and entry are not inferred.
 
+### Inline-first VOP3 single-precision FMA
+
+Each of the same 59 nearest VS spans has one each of `v_fma_f32(+2, VGPR, -1)` and `v_fma_f32(-2, VGPR, +1)`. They are the operand-commuted versions of the two previously validated unpack operations, not three-VGPR VOP3 FMA or VOP2 FMAC (which reads its old destination). The inline selectors are 244/243 and 245/242 in SRC0/SRC2, respectively. Negative constants come from the selectors, not NEG bits. Only the modifier-free 8-byte encodings were added: ABS, NEG, OP_SEL, CLAMP and OMOD must be zero, and SRC1 must be an ordinary VGPR. Other forms, including SGPR sources, remain out of scope. RDNA 2's VOP3 opcode 331 specifies fused single-precision `S0 * S1 + S2`; a modifier-free encoding does not establish the title's rounding or denormal mode.
+
+Both LLVM MC references verify the owned unsigned unpack stream with inline-first encodings and the byte stream with the original operand order. Under the finite owned round-to-nearest-even contract, the lift still emits explicit `fma` and rejects undefined sources. An independent literal table for the unsigned unpack stream checks RGBA32Float raw bits, including conversion ties in both directions at 2^25 and carry to 2^32. Apple M4 source and offline metallib each match 64/64 pixels for each order. The fixed `±2` multiply is exact for finite binary32 inputs except overflow, and `±1` cannot distinguish the two evaluation paths at the overflow boundary under round-to-nearest-even. The separate three-VGPR VOP3 graphics control provides the fusion discriminator: exact integer `4097 * 4097 - 16785408` yields fused `0x3f800000` vs split `0x00000000` with an explicitly rounded product. Its GPU green-channel oracle (including strict archive replay) distinguishes the outcomes. The VOP2 FMAC bit-readback remains a separate regression. No guest FP mode or NaN payload propagation is inferred.
+
+Both LLVM 21.1.6 CPUs agree on the site and window counts below, separately at +36 and +40. Entries are sites / windows, not additive across start or wave hypotheses. Neither form occurs in qualifying +0/+24 windows.
+
+| Stage / wave | `(+2, VGPR, -1)` | `(-2, VGPR, +1)` |
+|---|---:|---:|
+| VS, either wave | 739 / 270 | 105 / 89 |
+| PS, wave64 | 17,364 / 2,471 | 114 / 67 |
+| PS, wave32 | 17,587 / 2,501 | 114 / 67 |
+
+Across starts and waves, 280 distinct VS spans and 2,502 distinct PS spans have either form. The 59 nearest VS lose 118 unsupported sites per profile and now have exactly one gap each, `s_setprio` imm3, which remains unsupported. **Whole-window encoding closure gains zero**: still 0/1,304 VS and 225/6,161 or 225/6,191 PS at +36/+40. No priority, wait, entry, binding, or title-runtime admission change.
+
 ## Independent evidence for distinguishing starts
 
 `--graphics-entry-evidence "$INFLATED_LIBRARY" "$TRUSTED_LLVM_21_DYLIB"` uses the exact 13,383 two-slot rows (2,921 distinct checked PS spans, 1,322 VS). It does not repeat the closure census or use wrapper joins. It checks the stage metadata footer fingerprint, then tests the third-group marker at `+26` as in [compute layout sites](compute-layout-sites.md). The marker supports interpreting the group at `+24` as part of the stored prefix, not a global execution rule. The comparisons beginning at `+24` are withheld for marked groups. Nonzero `0x42` sites are tested independently as aligned in-span scalar loads, without assuming they are reachable from any entry.

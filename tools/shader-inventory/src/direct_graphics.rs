@@ -225,6 +225,7 @@ struct GapCounts {
     ordinary_mul: (usize, usize),
     ordinary_add: (usize, usize),
     signed_convert: (usize, usize),
+    inline_first_fma: [(usize, usize); 2], // (sites, windows), positive/negative pair
     partial_param0: [usize; 3],
     bfrev_depth: BTreeMap<[usize; 7], usize>,
     packed_cleared: [usize; 2],
@@ -247,6 +248,10 @@ impl GapCounts {
         self.partial_param0[2] += gaps.partial_param0_noncanonical;
         self.signed_convert.0 += gaps.signed_vgpr_convert;
         self.signed_convert.1 += usize::from(gaps.signed_vgpr_convert > 0);
+        for (total, n) in self.inline_first_fma.iter_mut().zip(gaps.inline_first_fma) {
+            total.0 += n;
+            total.1 += usize::from(n > 0);
+        }
         self.ordinary_mul.0 += gaps.ordinary_vgpr_mul;
         self.ordinary_mul.1 += usize::from(gaps.ordinary_vgpr_mul > 0);
         let contiguous = gaps.contiguous;
@@ -324,6 +329,10 @@ impl GapCounts {
         println!(
             "    exact signed VGPR e32 conversion: {} sites in {} windows",
             self.signed_convert.0, self.signed_convert.1
+        );
+        println!(
+            "    exact inline-first VOP3 FMA (sites, windows) for (+2,v,-1) / (-2,v,+1): {:?}",
+            self.inline_first_fma
         );
         if stage == "VS" {
             println!(
@@ -445,6 +454,7 @@ pub(super) fn run_gaps(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), B
     let mut distinct = HashSet::new();
     let mut interp_spans = HashSet::new();
     let mut partial_param_spans = HashSet::new();
+    let mut inline_first_fma_spans = [HashSet::new(), HashSet::new()];
     let mut packed_spans = [HashSet::new(), HashSet::new()];
     let mut vs_sets = BTreeMap::<Vec<String>, HashMap<_, (usize, u8)>>::new();
     let mut pair_spans = [PairSpans::new(), PairSpans::new()];
@@ -470,6 +480,9 @@ pub(super) fn run_gaps(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), B
                 for (w, wave) in waves.iter_mut().enumerate() {
                     if let Some(gaps) = direct_gaps(wave, window, slot) {
                         counts[slot][i][w].note(&gaps);
+                        if gaps.inline_first_fma != [0, 0] {
+                            inline_first_fma_spans[slot].insert(reference.program);
+                        }
                         if slot == 1 && gaps.partial_param0 != 0 {
                             partial_param_spans.insert(reference.program);
                         }
@@ -537,6 +550,10 @@ pub(super) fn run_gaps(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), B
     println!(
         "  Distinct VS spans with exact partial PARAM0 EN3 across hypotheses: {}",
         partial_param_spans.len()
+    );
+    println!(
+        "  Distinct spans with either exact inline-first VOP3 FMA across hypotheses (PS / VS): {:?}",
+        inline_first_fma_spans.map(|spans| spans.len())
     );
     let mut vs_sets: Vec<_> = vs_sets.into_iter().collect();
     vs_sets.sort_unstable_by(|(a, x), (b, y)| {

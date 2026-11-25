@@ -162,6 +162,15 @@ pub(crate) fn bfrev_inline_60(w: u32) -> Option<Vgpr> {
     (w & 0xfe01_ffff == 0x7e00_70bc).then_some(Vgpr((w >> 17) as u8))
 }
 
+pub(crate) fn inline_first_unpack_fma(fields: u32) -> Option<bool> {
+    // Permit only variation in the eight VGPR index bits of SRC1.
+    match fields & !0x0001_fe00 {
+        0x03ce_00f4 => Some(false), // SRC0/SRC2 selectors 244 (+2) / 243 (-1)
+        0x03ca_00f5 => Some(true),  // SRC0/SRC2 selectors 245 (-2) / 242 (+1)
+        _ => None,
+    }
+}
+
 pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeError> {
     let w = words[pc];
     let ext = || words.get(pc + 1).copied().ok_or(DecodeError::Truncated(pc));
@@ -357,7 +366,8 @@ pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeErro
             },
         ));
     }
-    // VOP3 v_fma_f32: ordinary VGPRs only. No abs, neg, clamp or output modifier.
+    // VOP3 v_fma_f32: three VGPRs, or the verified unpack constants in
+    // either multiplicand order. No abs, neg, op_sel, clamp or output modifier.
     if w & 0xffff_ff00 == 0xd54b_0000 {
         let fields = ext()?;
         if matches!(fields & 0xffff_ff00, 0x03cd_e900 | 0x03c9_eb00) {
@@ -367,6 +377,16 @@ pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeErro
                     dst: Vgpr(w as u8),
                     src: Vgpr(fields as u8),
                     negative: fields & 0x0000_0200 != 0,
+                },
+            ));
+        }
+        if let Some(negative) = inline_first_unpack_fma(fields) {
+            return Ok((
+                2,
+                Op::FmaUnpack {
+                    dst: Vgpr(w as u8),
+                    src: Vgpr((fields >> 9) as u8),
+                    negative,
                 },
             ));
         }
