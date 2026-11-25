@@ -236,7 +236,7 @@ fn exact_opcode(
                 Op::FmaUnpack { .. } => name == "v_fma_f32",
                 Op::NopOneCycle => name == "s_nop",
                 Op::PrefetchThreeLines => name == "s_inst_prefetch",
-                Op::AddF32Literal { .. } => name == "v_add_f32_e32",
+                Op::AddF32Literal { .. } | Op::AddF32 { .. } => name == "v_add_f32_e32",
                 Op::MulF32 { .. } => name == "v_mul_f32_e32",
                 Op::MulLegacyF32 { .. } => name == "v_mul_legacy_f32_e32",
                 Op::FmaF32 {
@@ -262,6 +262,7 @@ fn exact_opcode(
 pub(super) struct DirectGaps {
     pub missing: BTreeMap<String, usize>,
     pub ordinary_vgpr_mul: usize,
+    pub ordinary_vgpr_add: usize,
     pub contiguous: bool,
 }
 
@@ -281,6 +282,10 @@ pub(super) fn direct_gaps(dis: &mut Disassembler, bytes: &[u8], slot: usize) -> 
         let words = [first, word(tail, 4).unwrap_or_default() as u32];
         let decoded = words.get(..len / 4).and_then(|w| decode(w, 0).ok());
         if exact_opcode(decoded, len, name) {
+            gaps.ordinary_vgpr_add += usize::from(matches!(
+                decoded,
+                Some((1, crate::graphics_decode::Op::AddF32 { .. }))
+            ));
             gaps.ordinary_vgpr_mul += usize::from(matches!(
                 decoded,
                 Some((1, crate::graphics_decode::Op::MulF32 { .. }))
@@ -557,7 +562,8 @@ fn export_shape(first: u32, len: usize, text: &str) -> Option<ExportShape> {
 fn nearest_form(name: &str, w: u32, len: usize, text: &str) -> String {
     let source = w & 0x1ff;
     match name {
-        "v_mul_f32_e32"
+        "v_add_f32_e32"
+        | "v_mul_f32_e32"
         | "v_mov_b32_e32"
         | "v_cvt_pkrtz_f16_f32_e32"
         | "v_cmp_ne_u32_e32"

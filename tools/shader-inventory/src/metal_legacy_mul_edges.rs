@@ -97,6 +97,20 @@ mod gpu {
         inputs.extend(rtz.iter().map(|([a, b], _)| [*a, *b, 0, 0]));
         let nan_zero_row = inputs.len();
         inputs.push([NAN, P0, 0, 0]);
+        // At magnitude one, half an ULP is 2^-24. Include ties in both
+        // rounding directions, signed zeros and exact cancellation.
+        let add_cases = [
+            ([0x3f80_0000, 0x3380_0000], 0x3f80_0000),
+            ([0x3f80_0001, 0x3380_0000], 0x3f80_0002),
+            ([0xbf80_0001, 0xb380_0000], 0xbf80_0002),
+            ([0x3f80_0000, 0x3380_0001], 0x3f80_0001),
+            ([N0, N0], N0),
+            ([P0, N0], P0),
+            ([N0, P0], P0),
+            ([N2, 0x4000_0000], P0),
+        ];
+        let add_start = inputs.len();
+        inputs.extend(add_cases.iter().map(|([a, b], _)| [*a, *b, 0, 0]));
         let bytes = std::mem::size_of_val(inputs.as_slice());
         let usage = MTLResourceOptions::StorageModeShared;
         let input = dev.new_buffer_with_data(inputs.as_ptr().cast(), bytes as u64, usage);
@@ -218,8 +232,16 @@ mod gpu {
                 format!("ordinary multiply signed zero: expected -0, got {got:08x}").into(),
             );
         }
+        for (i, (_, want)) in add_cases.into_iter().enumerate() {
+            let got = unsafe { out.add(4 * (add_start + i) + 3).read() }[1];
+            if got != want {
+                return Err(
+                    format!("ordinary add row {i}: expected {want:08x}, got {got:08x}").into(),
+                );
+            }
+        }
         println!(
-            "{}: strict arithmetic archive, 16/16 legacy words, 2/2 FMAC words, 3/3 packed RTZ words, {mov_words}/{mov_words} raw MOV words 8/8 select words, 8/8 subtract words and 11/11 ordinary multiply checks",
+            "{}: strict arithmetic archive, 16/16 legacy words, 2/2 FMAC words, 3/3 packed RTZ words, {mov_words}/{mov_words} raw MOV words 8/8 select words, 8/8 subtract words 11/11 ordinary multiply checks and 8/8 ordinary add words",
             dev.name(),
             mov_words = 4 * inputs.len()
         );

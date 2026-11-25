@@ -99,9 +99,15 @@ The census also ranks sole gap buckets by number of windows, reporting the conti
 | +36 | 6,161 | 6,191 | 212 |
 | +40 | 6,161 | 6,191 | 212 |
 
-The bounded owned red-only lowering reads only VSRC0 and requires the exact MRT0/DONE/VM/EN header. LLVM MC assembles the canonical word on both CPUs; disassembly still reports GBA `off` when those disabled selector bytes are nonzero. With a single-sample no-blend RGBA32Float target and red-only write mask, Apple M4 readback matched 64/64 pixels bit-for-bit from source and from an offline metallib: 20 pixels wrote red only, and all retained nonzero GBA clears. Existing keyed graphics replay is unchanged.
+The bounded owned red-only lowering reads only VSRC0 and requires the exact MRT0/DONE/VM/EN header. LLVM MC assembles the canonical word on both CPUs; disassembly still reports GBA `off` when those disabled selector bytes are nonzero. With a single-sample no-blend RGBA32Float target and red-only write mask, Apple M4 readback matched 64/64 pixels bit-for-bit from source and from an offline metallib: 20 pixels wrote red only, and all retained nonzero GBA clears. Existing keyed graphics replay is unchanged. The owned straight-line profile leaves coverage to the rasterizer and scissor and has no EXEC updates or kills. It does not emulate a general VM validity mask.
 
 Across starts, 212 distinct PS become encoding-complete (do not add the two rows). Of those, 210 have only the attachment format/mask predicate outstanding in the static audit. No VS becomes encoding-complete, and no complete VS+PS pair passes both stages. Neither the closure nor this owned test selects a runtime entry, establishes a title attachment contract, or demonstrates bake readiness.
+
+### Dominant ordinary vertex add form
+
+At each stored start (+36 and +40), both LLVM CPUs and both wave settings see 42,370 exact two-VGPR `v_add_f32_e32` sites in 966 of 1,304 qualified VS windows. For PS, the same form matches 81,268 sites in 3,459 of 6,161 wave64 windows and 82,788 in 3,489 of 6,191 wave32 windows. No additional windows become encoding-complete: VS stays at zero and PS at 212 per hypothesis. The 7,450 ordinary SGPR-source add sites at each VS start still lack a proved scalar source contract; this change supports neither them nor new inline forms. The existing literal form and unsupported waits are unchanged.
+
+LLVM MC verifies the exact two-VGPR VOP2 word on both CPUs. On Apple M4, the owned offline strict arithmetic bake and separate-process replay each match 8/8 raw sum words, covering ties in both rounding directions, an above-tie input, signed zero and cancellation. The static audit still requires both operands and the applicable native FP mode; these tests establish neither a title FP profile nor denormal or NaN-payload behavior.
 
 ## Independent evidence for distinguishing starts
 

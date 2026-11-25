@@ -307,7 +307,7 @@ fn lift(stage: Stage, words: &[u32]) -> Result<Vec<Op>, Reject> {
             // All admitted profiles have no native memory, clocks, or timing-
             // observable operations. Not valid for arbitrary guest instruction streams.
             Op::NopOneCycle | Op::PrefetchThreeLines => {}
-            Op::MulF32 { dst, lhs, rhs } => {
+            Op::MulF32 { dst, lhs, rhs } | Op::AddF32 { dst, lhs, rhs } => {
                 require(lhs)?;
                 require(rhs)?;
                 live[usize::from(dst.0)] = true;
@@ -487,6 +487,13 @@ fn emit_body(out: &mut String, ops: &[Op], packed_color_lvalue: &str, multi: boo
             } => {
                 writeln!(out, "  r[{dst}] = as_type<uint>(as_type<float>(0x{literal_bits:08x}u) + as_type<float>(r[{src}]));").unwrap();
             }
+            Op::AddF32 {
+                dst: Vgpr(dst),
+                lhs: Vgpr(lhs),
+                rhs: Vgpr(rhs),
+            } => {
+                writeln!(out, "  r[{dst}] = as_type<uint>(as_type<float>(r[{lhs}]) + as_type<float>(r[{rhs}]));").unwrap();
+            }
             Op::MulF32 {
                 dst: Vgpr(dst),
                 lhs: Vgpr(lhs),
@@ -644,6 +651,8 @@ const EDGE_LITERAL: &[u32] = &[0x0e06_02ff, 0x3e80_0000]; // v_mul_legacy_f32_e3
 const EDGE_FMAC: &[u32] = &[0x5608_0300]; // v_fmac_f32_e32 v4, v0, v1
 const EDGE_RTZ: &[u32] = &[0x5e0a_0300]; // v_cvt_pkrtz_f16_f32_e32 v5, v0, v1
 
+const EDGE_ADD: &[u32] = &[0x061e_0300]; // v15 = v0 + v1
+
 const EDGE_MUL: &[u32] = &[0x101c_0300]; // v14 = v0 * v1
 
 const EDGE_SUB: &[u32] = &[0x0818_0080, 0x081a_0280]; // v12=+0-v0, v13=+0-v1
@@ -703,8 +712,8 @@ pub fn translate_legacy_edge_fixture() -> Result<String, DecodeError> {
     for pc in 0..EDGE_SUB.len() {
         body(&mut msl, &[decode(EDGE_SUB, pc)?.1]);
     }
-    body(&mut msl, &[decode(EDGE_MUL, 0)?.1]);
-    msl.push_str("  out[4 * id] = uint4(r[2], r[3], r[4], r[5]);\n  out[4 * id + 1] = uint4(r[6], r[7], r[8], r[9]);\n  out[4 * id + 2] = uint4(r[10], r[11], r[12], r[13]);\n  out[4 * id + 3] = uint4(r[14], 0u, 0u, 0u);\n}\n");
+    body(&mut msl, &[decode(EDGE_MUL, 0)?.1, decode(EDGE_ADD, 0)?.1]);
+    msl.push_str("  out[4 * id] = uint4(r[2], r[3], r[4], r[5]);\n  out[4 * id + 1] = uint4(r[6], r[7], r[8], r[9]);\n  out[4 * id + 2] = uint4(r[10], r[11], r[12], r[13]);\n  out[4 * id + 3] = uint4(r[14], r[15], 0u, 0u);\n}\n");
     Ok(msl)
 }
 
@@ -1356,7 +1365,7 @@ mod tests {
         asm.push_str(
             "v_mov_b32_e32 v2, 0x3e800000\nexp mrt0 v2, off, off, off done vm\ns_endpgm\n",
         );
-        asm.push_str("v_mul_f32_e32 v14, v0, v1\n");
+        asm.push_str("v_mul_f32_e32 v14, v0, v1\nv_add_f32_e32 v15, v0, v1\n");
         asm.push_str("v_sub_f32_e32 v12, 0, v0\nv_sub_f32_e32 v13, 0, v1\n");
         for (sgpr, component) in [(9, "x"), (14, "z"), (9, "z")] {
             writeln!(asm, "s_mov_b32 m0, s{sgpr}\nv_interp_p1_f32_e32 v2, v0, attr0.{component}\nv_interp_p2_f32_e32 v2, v1, attr0.{component}\nexp mrt0 v2, v2, v2, v2 done\ns_endpgm").unwrap();
@@ -1402,6 +1411,7 @@ mod tests {
             .chain(TRIPLE_RG_PS)
             .chain(RED_PS)
             .chain(EDGE_MUL)
+            .chain(EDGE_ADD)
             .chain(EDGE_SUB)
             .chain(INTERP_X_PS)
             .chain(INTERP_Z_PS)
@@ -1516,6 +1526,21 @@ mod tests {
             let mut ps = RED_PS.to_vec();
             ps[i] ^= bits;
             assert!(lift(Stage::ConstantRedPixel, &ps).is_err());
+        }
+    }
+
+    #[test]
+    fn ordinary_add_requires_exact_vgpr_form_and_live_inputs() {
+        let word = EDGE_ADD[0];
+        for selector in [0, 128, 240] {
+            assert!(decode(&[(word & !0x1ff) | selector], 0).is_err());
+        }
+        assert!(lift(Stage::Vertex, &[EDGE_ADD, VS].concat()).is_ok());
+        for bad_input in [word | 0x80, word | 0x10000] {
+            assert!(matches!(
+                lift(Stage::Vertex, &[&[bad_input], VS].concat()),
+                Err(Reject::Uninitialized(0, _))
+            ));
         }
     }
 

@@ -63,6 +63,11 @@ pub(crate) enum Op {
     },
     NopOneCycle,
     PrefetchThreeLines,
+    AddF32 {
+        dst: Vgpr,
+        lhs: Vgpr,
+        rhs: Vgpr,
+    },
     AddF32Literal {
         dst: Vgpr,
         src: Vgpr,
@@ -249,6 +254,17 @@ pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeErro
             Op::MulLegacyF32 {
                 dst: Vgpr((w >> 17) as u8),
                 lhs,
+                rhs: Vgpr((w >> 9) as u8),
+            },
+        ));
+    }
+    // Ordinary VOP2 F32 add (opcode 3), two VGPR operands only.
+    if w & 0xfe00_0100 == 0x0600_0100 {
+        return Ok((
+            1,
+            Op::AddF32 {
+                dst: Vgpr((w >> 17) as u8),
+                lhs: Vgpr(w as u8),
                 rhs: Vgpr((w >> 9) as u8),
             },
         ));

@@ -201,6 +201,7 @@ struct GapCounts {
     eligible: usize,
     exact: usize,
     ordinary_mul: (usize, usize),
+    ordinary_add: (usize, usize),
     linear_sole: BTreeMap<String, usize>,
     distances: BTreeMap<usize, usize>,
     forms: BTreeMap<String, (usize, usize)>,
@@ -209,6 +210,8 @@ struct GapCounts {
 
 impl GapCounts {
     fn note(&mut self, gaps: &DirectGaps) {
+        self.ordinary_add.0 += gaps.ordinary_vgpr_add;
+        self.ordinary_add.1 += usize::from(gaps.ordinary_vgpr_add > 0);
         self.ordinary_mul.0 += gaps.ordinary_vgpr_mul;
         self.ordinary_mul.1 += usize::from(gaps.ordinary_vgpr_mul > 0);
         let contiguous = gaps.contiguous;
@@ -242,6 +245,10 @@ impl GapCounts {
         println!(
             "    exact two-VGPR v_mul_f32_e32: {} sites in {} windows",
             self.ordinary_mul.0, self.ordinary_mul.1
+        );
+        println!(
+            "    exact two-VGPR v_add_f32_e32: {} sites in {} windows",
+            self.ordinary_add.0, self.ordinary_add.1
         );
         let distances: Vec<_> = self.distances.into_iter().take(3).collect();
         println!("    nearest (unsupported sites, windows): {distances:?}");
