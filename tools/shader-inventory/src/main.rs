@@ -4,6 +4,8 @@ mod compute_sites;
 mod coverage;
 mod embedded;
 mod graphics_decode;
+#[allow(dead_code)] // Inventory uses validators, not Metal emitters.
+mod graphics_lift;
 mod graphics_reachability;
 mod graphics_semantics;
 mod library_index;

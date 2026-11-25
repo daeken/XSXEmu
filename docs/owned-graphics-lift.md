@@ -222,7 +222,7 @@ Both wave checks agree: the exact form adds 6,117 / 167 matched PS sites and 14 
 
 ### Full-path owned-profile audit and packed constant RTZ
 
-The initial owned-profile experiment recorded a separate histogram for encoding-complete VS and PS graphs. It has since been replaced in the CLI by the no-default static census below. It passes only the contiguous reached prefix through the real `s_endpgm` to the same Rust validator used for the owned fixtures, without decoding trailing storage. Nonlinear graphs are counted separately. It tries the generic straight-line stage profiles with synthetic inputs and exports, not the dedicated interpolation or export-wait fixtures. If no profile passes, the reported blocker is the rejection at the furthest instruction offset among applicable profiles (ties follow the fixed profile order); this is not a census of every missing semantic in a program.
+`--graphics-lift-gaps` keeps the original owned-profile histogram separate from the no-default static census below. The owned-profile audit passes only the contiguous reached prefix through the real `s_endpgm` to the same Rust validator used for the owned fixtures, without decoding trailing storage. Nonlinear graphs are counted separately. It tries the generic straight-line stage profiles with synthetic inputs and exports, not the dedicated interpolation, export-wait, or POS0-first fixtures. If no profile passes, the reported blocker is the rejection at the furthest instruction offset among applicable profiles (ties follow the fixed profile order); this is not a census of every missing semantic in a program.
 
 Before admitting local constant RTZ, none of the encoding-complete graphs fit: the `gfx1013` blocker breakdown was 114 VS export profile mismatches and 333 PS rejections (325 packed RTZ, 8 interpolation). With the new RTZ profiles, both CPU references and both wave checks report the same result:
 
@@ -252,7 +252,7 @@ Both CPU references and both wave checks agree:
 
 The same 10 VS and 321 PS in the two middle columns still require their output contracts. The other 104 VS need VGPR inputs and F32 arithmetic mode evidence; two of those also require full unsigned conversion rounding evidence. Of the other 12 PS, four need entry VGPRs and RTZ operand proof, while eight also need SGPR state, interpolation linkage and F32 mode. There are no nonlinear paths in this cohort. In particular, the six previously rejected PS export profiles are not six violations of the checked native DONE/VM protocol.
 
-All 114 VS have POS0 first, followed by dense PARAM exports with DONE clear: 95 with only PARAM0, six with PARAM0–1, three with PARAM0–2 and ten with PARAM0–6. This is the largest independently testable **owned profile** mismatch, not a native ordering defect. The owned fixture selects the 95-graph single-PARAM shape, not the title's input values or arithmetic.
+All 114 VS have a single full uncompressed POS0 first (EN=15, DONE=1, VM=0), followed by dense full uncompressed PARAM exports (EN=15, DONE=0, VM=0): 95 with only PARAM0, six with PARAM0–1, three with PARAM0–2 and ten with PARAM0–6. This is the largest independently testable **owned profile** mismatch, not a native ordering defect. The owned fixture selects the 95-graph single-PARAM shape, not the title's input values or arithmetic.
 
 ### Owned POS0-first export without overlap
 

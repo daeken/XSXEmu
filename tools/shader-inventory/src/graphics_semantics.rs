@@ -36,6 +36,7 @@ pub(crate) struct Outcome {
     pub(crate) gaps: BTreeSet<Gap>,
     pub(crate) needs: BTreeSet<Need>,
     pub(crate) vertex_order: Option<VertexOrder>,
+    pub(crate) vertex_positions: usize,
     pub(crate) vertex_parameters: Vec<u8>,
 }
 
@@ -247,6 +248,7 @@ pub(crate) fn audit(words: &[u32], vertex: bool) -> Outcome {
                 let done = word & 0x800 != 0;
                 match (vertex, target) {
                     (true, Some(Target::Position)) => {
+                        f.outcome.vertex_positions += 1;
                         pos_done += usize::from(done);
                         last_pos_done = Some(done);
                         f.outcome.needs.insert(VertexOutputLink);

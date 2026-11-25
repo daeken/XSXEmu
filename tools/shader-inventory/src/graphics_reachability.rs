@@ -696,6 +696,7 @@ struct LiftGaps {
     no_encoding_gap: usize,
     profile_vertex: Option<bool>,
     profile_non_linear: usize,
+    profiles: BTreeMap<crate::graphics_lift::ProfileResult, usize>,
     semantics: BTreeMap<crate::graphics_semantics::Outcome, usize>,
     no_exp_gap: usize,
     only_exp_gap: usize,
@@ -839,6 +840,10 @@ impl LiftGaps {
                         .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
                         .collect();
                     *self
+                        .profiles
+                        .entry(crate::graphics_lift::audit_profile(&words, vertex))
+                        .or_default() += 1;
+                    *self
                         .semantics
                         .entry(crate::graphics_semantics::audit(&words, vertex))
                         .or_default() += 1;
@@ -899,6 +904,10 @@ impl LiftGaps {
             );
         }
         if self.profile_vertex.is_some() {
+            println!(
+                "    owned straight-line profile audit (not bindings): {:?}; non-linear={}",
+                self.profiles, self.profile_non_linear
+            );
             let (mut local, mut no_entry_regs, mut no_fp_or_domain, mut fully_proven) =
                 (0, 0, 0, 0);
             use crate::graphics_semantics::Need::*;
@@ -922,8 +931,12 @@ impl LiftGaps {
                 fully_proven +=
                     usize::from(outcome.gaps.is_empty() && outcome.needs.is_empty()) * count;
                 println!(
-                    "      {count}: local gaps={:?}, unresolved predicates={:?}, VS order={:?}, PARAM slots={:?}",
-                    outcome.gaps, outcome.needs, outcome.vertex_order, outcome.vertex_parameters
+                    "      {count}: local gaps={:?}, unresolved predicates={:?}, VS order={:?}, POS0 count={}, PARAM slots={:?}",
+                    outcome.gaps,
+                    outcome.needs,
+                    outcome.vertex_order,
+                    outcome.vertex_positions,
+                    outcome.vertex_parameters
                 );
             }
             println!(

@@ -168,6 +168,64 @@ impl Stage {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ProfileResult {
+    FitsOwnedShape,
+    UnsupportedSemantics,
+    PackedRtzSemantics,
+    InterpolationSemantics,
+    UnboundInput,
+    ExportProfileMismatch,
+    EndProfileMismatch,
+    Extent,
+}
+
+// Compatibility histogram: keep this profile set separate from the no-default census.
+#[allow(dead_code)] // Inventory-only.
+pub(crate) fn audit_profile(words: &[u32], vertex: bool) -> ProfileResult {
+    use ProfileResult::*;
+    let profiles: &[Stage] = if vertex {
+        &[Stage::Vertex, Stage::UnpackVertex, Stage::MultiVertex]
+    } else {
+        &[
+            Stage::Pixel,
+            Stage::PackedPixel,
+            Stage::PackedRgPixel,
+            Stage::ConstantRtzPixel,
+            Stage::ConstantRtzRgPixel,
+            Stage::DualPackedPixel,
+            Stage::TriplePackedPixel,
+            Stage::TriplePackedRgPixel,
+            Stage::DepthPixel,
+            Stage::EarlyDepthPixel,
+        ]
+    };
+    let mut best = (0, Extent);
+    for &stage in profiles {
+        let failure = match lift(stage, words) {
+            Ok(_) => return FitsOwnedShape,
+            Err(Reject::Extent) => (0, Extent),
+            Err(Reject::Unsupported(pc) | Reject::Truncated(pc)) => (
+                pc,
+                match decode(words, pc) {
+                    Ok((_, Op::PackHalfRtz { .. })) => PackedRtzSemantics,
+                    Ok((_, Op::InitInterpM0 { .. } | Op::InterpPhase { .. })) => {
+                        InterpolationSemantics
+                    }
+                    _ => UnsupportedSemantics,
+                },
+            ),
+            Err(Reject::Uninitialized(pc, _)) => (pc, UnboundInput),
+            Err(Reject::BadExports(pc)) => (pc, ExportProfileMismatch),
+            Err(Reject::BadEnd(pc)) => (pc, EndProfileMismatch),
+        };
+        if failure.0 >= best.0 {
+            best = failure;
+        }
+    }
+    best.1
+}
+
 fn lift(stage: Stage, words: &[u32]) -> Result<Vec<Op>, Reject> {
     if words.is_empty() || words.len() > 1024 {
         return Err(Reject::Extent);
@@ -1357,6 +1415,10 @@ mod tests {
         assert_eq!(
             lift(Stage::ConstantRtzRgPixel, &overwritten),
             Err(Reject::Unsupported(5))
+        );
+        assert_eq!(
+            audit_profile(CONSTANT_RTZ_PS, false),
+            ProfileResult::FitsOwnedShape
         );
         for bits in [1, 0x387f_ffff, 0x4780_0000, 0x7f80_0000, 0x7fc0_0000] {
             let mut words = CONSTANT_RTZ_PS.to_vec();
