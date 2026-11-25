@@ -332,6 +332,8 @@ audited_bridges! {
         text::get_system_time_as_file_time, (out: *mut text::FileTime) -> ();
     xsxemu_tls_get_user_default_geo_name, get_user_default_geo_name: b"kernelbase.dll", b"GetUserDefaultGeoName",
         text::get_user_default_geo_name, (target: *mut u16, capacity: i32) -> i32;
+    xsxemu_tls_get_user_default_locale_name, get_user_default_locale_name: b"kernelbase.dll", b"GetUserDefaultLocaleName",
+        text::get_user_default_locale_name, (target: *mut u16, capacity: i32) -> i32;
     xsxemu_tls_get_acp, get_acp: b"kernelbase.dll", b"GetACP",
         text::get_acp, () -> u32;
     xsxemu_tls_is_valid_code_page, is_valid_code_page: b"kernelbase.dll", b"IsValidCodePage",

@@ -2004,6 +2004,49 @@ fn guest_geo_name_bridge_sizes_and_writes_fixed_utf16_region() {
 }
 
 #[test]
+fn guest_locale_name_bridge_matches_kernelbase_copy_semantics() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let mut exe = image(Kind::Solo);
+    let fixture = unsafe { &static_tls_locale_fixture };
+    exe[file(TEXT)..file(TEXT) + RAW].fill(0xcc);
+    put(&mut exe, file(TEXT), &fixture.code);
+    w32(&mut exe, OP + 16, TEXT + fixture.entry as usize);
+    w64(&mut exe, file(ARRAY), PREFERRED + TEXT);
+    dir_import_one(
+        &mut exe,
+        b"api-ms-win-core-localization-l1-2-0.dll\0",
+        b"GetUserDefaultLocaleName\0",
+    );
+    let path = scratch.write("locale-name.exe", &exe);
+    expect(
+        run(&path, &[OPT, "--rust-providers"]),
+        51,
+        "Guest entry returned 51",
+    );
+}
+
+const LOCALE_CODE_CAPACITY: usize = 0x200;
+
+#[repr(C)]
+struct LocaleFixture {
+    entry: u32,
+    code: [u8; LOCALE_CODE_CAPACITY],
+}
+
+global_asm!(include_str!("fixtures/static_tls_locale_name.S"),
+    capacity = const LOCALE_CODE_CAPACITY,
+    iat_delta = const IAT - TEXT,
+    options(att_syntax),
+);
+
+unsafe extern "C" {
+    static static_tls_locale_fixture: LocaleFixture;
+}
+
+#[test]
 fn system_file_time_bridge_writes_eight_bytes_and_preserves_last_error() {
     if !rosetta() {
         return;

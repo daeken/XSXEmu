@@ -93,6 +93,11 @@ pub(crate) fn lookup(dll: &[u8], name: &[u8]) -> Option<HostExport> {
             "GetUserDefaultGeoName",
             native::get_user_default_geo_name
         ),
+        (KERNELBASE | KERNEL32 | LOCALIZATION, b"GetUserDefaultLocaleName") => export!(
+            "kernelbase.dll",
+            "GetUserDefaultLocaleName",
+            native::get_user_default_locale_name
+        ),
         (KERNELBASE | KERNEL32 | LOCALIZATION, b"GetUserDefaultLCID") => {
             export!(
                 "kernelbase.dll",
@@ -221,6 +226,7 @@ pub(crate) mod native {
     const OEM: u32 = 437;
     const UTF8: u32 = 65001;
     const EN_US: u32 = 0x0409;
+    const USER_LOCALE_NAME: &str = "en-US";
 
     fn fail(error: u32) -> i32 {
         set_last_error(error);
@@ -738,6 +744,34 @@ const CASE_CHANGES: [(u16, u16, u16); 121] = [
     ) -> i32 {
         unsafe { output(&[b'U' as u16, b'S' as u16, 0], target, capacity) }
     }
+    pub(crate) unsafe extern "win64" fn get_user_default_locale_name(
+        target: *mut u16,
+        capacity: i32,
+    ) -> i32 {
+        const ERROR_CANNOT_COPY: u32 = 266;
+        // Unlike GetLocaleInfoW, the reference KernelBase implementation
+        // rejects zero capacity and copies a terminated prefix on short buffers.
+        if capacity == 0 {
+            return fail(ERROR_CANNOT_COPY);
+        }
+        if capacity < 0 || !good(target) {
+            return fail(INVALID);
+        }
+        let name = USER_LOCALE_NAME.encode_utf16();
+        let len = name.clone().count();
+        let written = len.min(capacity as usize - 1);
+        unsafe {
+            for (i, unit) in name.take(written).enumerate() {
+                target.add(i).write(unit);
+            }
+            target.add(written).write(0);
+        }
+        if written < len {
+            fail(ERROR_CANNOT_COPY)
+        } else {
+            (written + 1) as i32
+        }
+    }
     pub(super) extern "win64" fn get_user_default_lcid() -> u32 {
         EN_US
     }
@@ -994,7 +1028,7 @@ const CASE_CHANGES: [(u16, u16, u16); 121] = [
             0x59 => Text("en"),
             0x5a => Text("US"),
             0x5b => Number("244", 244),
-            0x5c => Text("en-US"),
+            0x5c => Text(USER_LOCALE_NAME),
             0x78 => Text("MMMM d"),
             0x79 => Text("h:mm tt"),
             0x1003 => Text(LONG_TIME),
