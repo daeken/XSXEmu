@@ -1,7 +1,7 @@
 //! Experimental host-only import of an already owned Mach mapping.
 //! Not linked by the guest runtime; never copies or replaces the mapping.
 
-use crate::host_backing::{Error as BackingError, Mapping, View};
+use crate::host_backing::{Error as BackingError, PAGE, View};
 use block::{Block, ConcreteBlock};
 use metal::foreign_types::ForeignType;
 use metal::{Buffer, DeviceRef, MTLResourceOptions, MTLStorageMode, NSUInteger};
@@ -26,7 +26,7 @@ pub enum Error {
     },
 }
 
-fn keep_mapping(_: &Mapping) {}
+fn keep_lease<T>(_: &T) {}
 
 /// Consumes an owned CPU view, including on failure. Imports only the selected
 /// 64 KiB-aligned range; Metal pins the entire view until it releases the block.
@@ -45,6 +45,30 @@ pub unsafe fn import(
 ) -> Result<Buffer, Error> {
     let mapping = view.into_mapping();
     let (address, length) = mapping.aligned_range(offset, len).map_err(Error::Range)?;
+    // SAFETY: The checked extent belongs to `mapping`, which pins the VA;
+    // the caller is responsible for ordering all conflicting accesses.
+    unsafe { import_pinned(device, address, length, mapping) }
+}
+
+/// # Safety
+/// The entire exact range must be live shared RW VM owned by `lease`, protected
+/// against rebind/unmap until the lease drops. The caller must order accesses
+/// across all aliases. The lease can be destroyed by Metal on any thread.
+pub(crate) unsafe fn import_pinned<T: Send + Sync + 'static>(
+    device: &DeviceRef,
+    address: usize,
+    length: usize,
+    lease: T,
+) -> Result<Buffer, Error> {
+    if address == 0
+        || length == 0
+        || !address.is_multiple_of(PAGE as usize)
+        || !length.is_multiple_of(PAGE as usize)
+        || address.checked_add(length).is_none()
+    {
+        return Err(Error::Range(BackingError::InvalidRange));
+    }
+    let len = length as u64;
     let max = device.max_buffer_length();
     if len > max {
         return Err(Error::DeviceLimit { len, max });
@@ -54,7 +78,7 @@ pub unsafe fn import(
     // heap block owns it even if Metal disposes the block on another thread.
     // Block disposal also handles a nil result without relying on invocation.
     let deallocator = ConcreteBlock::new(move |_: *mut c_void, _: NSUInteger| {
-        keep_mapping(&mapping);
+        keep_lease(&lease);
     })
     .copy();
     let callback: &Block<(*mut c_void, NSUInteger), ()> = &deallocator;

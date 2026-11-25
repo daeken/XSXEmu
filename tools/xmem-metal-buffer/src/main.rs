@@ -22,3 +22,5 @@ fn main() -> std::process::ExitCode {
         std::process::ExitCode::FAILURE
     }
 }
+#[cfg(all(test, target_os = "macos"))]
+mod fixed;

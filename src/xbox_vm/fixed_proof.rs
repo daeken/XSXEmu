@@ -1,7 +1,11 @@
 //! Owned Mach fixed-placement fixture, not a runtime allocator or token ABI.
 
 use super::*;
-use std::{collections::BTreeMap, ops::Range};
+use std::{
+    collections::BTreeMap,
+    ops::Range,
+    sync::{Arc, Weak},
+};
 
 const SLOTS: u64 = 6;
 const NONE: i32 = 0;
@@ -9,8 +13,9 @@ const NONE: i32 = 0;
 const FIXED_OVERWRITE: i32 = 0x4000;
 
 #[derive(Debug, PartialEq, Eq)]
-enum Refusal {
+pub(crate) enum Refusal {
     Outside,
+    Unmapped,
     Occupied,
     NotExactView,
     InvalidTokens,
@@ -22,10 +27,29 @@ struct Batch {
     tokens: Range<u64>,
 }
 
+/// An immutable lease has no CPU-access API. Its last release can occur on
+/// another thread, and the VM stays live even if the arena handle goes away.
+pub(crate) struct Pin {
+    mapping: Arc<Mapping>,
+    slots: Range<u64>,
+}
+
+impl Pin {
+    pub(crate) fn extent(&self) -> (usize, usize) {
+        self.mapping
+            .aligned_range(
+                self.slots.start * PAGE,
+                (self.slots.end - self.slots.start) * PAGE,
+            )
+            .unwrap()
+    }
+}
+
 /// All six slots stay reserved for this owner, including those with no view.
 /// A view is only bookkeeping; there is never a second unmap owner for a slot.
-struct Arena {
-    mapping: Mapping,
+pub(crate) struct Arena {
+    mapping: Arc<Mapping>,
+    pins: Vec<Weak<Pin>>,
     views: BTreeMap<u64, u64>, // disjoint [slot, end_slot) ranges
     batch: Option<Batch>,
     next_token: u64,
@@ -33,11 +57,11 @@ struct Arena {
 }
 
 impl Arena {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let len = SLOTS * PAGE;
         let mut base = 0;
         // SAFETY: The kernel chooses unoccupied VA. The whole range is ours
-        // until Drop; no other fixture ever changes it or receives a pointer.
+        // until the arena and any pins are dropped. Only this owner mutates it.
         let task = unsafe { mach_task_self_ };
         let status = unsafe {
             mach_vm_map(
@@ -57,7 +81,8 @@ impl Arena {
         check("reserve fixture arena", status).unwrap();
         assert!(base != 0 && base.is_multiple_of(PAGE) && base.checked_add(len).is_some());
         Self {
-            mapping: Mapping { task, base, len },
+            mapping: Arc::new(Mapping { task, base, len }),
+            pins: Vec::new(),
             views: BTreeMap::new(),
             batch: None,
             next_token: 1,
@@ -65,7 +90,7 @@ impl Arena {
         }
     }
 
-    fn address(&self, slot: u64) -> u64 {
+    pub(crate) fn address(&self, slot: u64) -> u64 {
         self.mapping.base + slot * PAGE
     }
 
@@ -81,6 +106,40 @@ impl Arena {
         Ok(start..end)
     }
 
+    pub(crate) fn pin(&mut self, address: u64, count: u64) -> Result<Arc<Pin>, Refusal> {
+        let slots = self.slots(address, count)?;
+        if !slots.clone().all(|slot| self.is_mapped(slot)) {
+            return Err(Refusal::Unmapped);
+        }
+        self.pins.retain(|p| p.strong_count() != 0);
+        let pin = Arc::new(Pin {
+            mapping: self.mapping.clone(),
+            slots,
+        });
+        self.pins.push(Arc::downgrade(&pin));
+        Ok(pin)
+    }
+
+    fn check_unpinned(&self, slots: &Range<u64>) -> Result<(), Refusal> {
+        if self
+            .pins
+            .iter()
+            .filter_map(Weak::upgrade)
+            .any(|p| p.slots.start < slots.end && slots.start < p.slots.end)
+        {
+            Err(Refusal::Busy)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn is_mapped(&self, slot: u64) -> bool {
+        self.views
+            .range(..=slot)
+            .next_back()
+            .is_some_and(|(_, &end)| slot < end)
+    }
+
     fn vacant(&self, slots: &Range<u64>) -> Result<(), Refusal> {
         if self
             .views
@@ -92,7 +151,7 @@ impl Arena {
         Ok(())
     }
 
-    fn allocate(&mut self, count: u64) -> Range<u64> {
+    pub(crate) fn allocate(&mut self, count: u64) -> Range<u64> {
         assert!(self.batch.is_none() && (1..=SLOTS).contains(&count));
         let end = self.next_token.checked_add(count).unwrap();
         let tokens = self.next_token..end;
@@ -104,7 +163,7 @@ impl Arena {
         tokens
     }
 
-    fn free(&mut self, tokens: Range<u64>) -> Result<(), Refusal> {
+    pub(crate) fn free(&mut self, tokens: Range<u64>) -> Result<(), Refusal> {
         if self
             .batch
             .as_ref()
@@ -119,8 +178,9 @@ impl Arena {
         Ok(())
     }
 
-    fn map(&mut self, address: u64, tokens: &[u64]) -> Result<(), Refusal> {
+    pub(crate) fn map(&mut self, address: u64, tokens: &[u64]) -> Result<(), Refusal> {
         let slots = self.slots(address, tokens.len() as u64)?;
+        self.check_unpinned(&slots)?;
         self.vacant(&slots)?;
         let batch = self.batch.as_ref().ok_or(Refusal::InvalidTokens)?;
         let first = tokens[0]; // slots rejects empty lists
@@ -135,8 +195,9 @@ impl Arena {
         Ok(())
     }
 
-    fn unmap(&mut self, address: u64, count: u64) -> Result<(), Refusal> {
+    pub(crate) fn unmap(&mut self, address: u64, count: u64) -> Result<(), Refusal> {
         let slots = self.slots(address, count)?;
+        self.check_unpinned(&slots)?;
         if self.views.get(&slots.start) != Some(&slots.end) {
             return Err(Refusal::NotExactView);
         }
@@ -189,26 +250,21 @@ impl Arena {
 
     fn byte_ptr(&self, address: u64) -> *mut u8 {
         let slot = address.checked_sub(self.mapping.base).unwrap() / PAGE;
-        assert!(
-            self.views
-                .range(..=slot)
-                .next_back()
-                .is_some_and(|(_, &end)| slot < end)
-        );
+        assert!(self.is_mapped(slot));
         without_provenance_mut(address as usize)
     }
 
-    fn byte(&self, address: u64) -> u8 {
+    pub(crate) fn byte(&self, address: u64) -> u8 {
         // SAFETY: byte_ptr checks the live shared RW view; no references exist.
         unsafe { self.byte_ptr(address).read_volatile() }
     }
 
-    fn write(&self, address: u64, byte: u8) {
+    pub(crate) fn write(&self, address: u64, byte: u8) {
         // SAFETY: As for byte, and all aliases are thread-bound.
         unsafe { self.byte_ptr(address).write_volatile(byte) }
     }
 
-    fn assert_parked(&self, slot: u64) {
+    pub(crate) fn assert_parked(&self, slot: u64) {
         const KERN_INVALID_ADDRESS: i32 = 1;
         const KERN_PROTECTION_FAILURE: i32 = 2;
         const KERN_NO_SPACE: i32 = 3;
@@ -325,6 +381,12 @@ fn exact_shared_replacement_restore_and_live_token_reuse() {
     assert_eq!(arena.byte(a + PAGE), 0x31);
     assert_eq!(arena.byte(b + PAGE - 1), 0x42);
 
+    assert_eq!(arena.pin(a + PAGE, 2).err(), Some(Refusal::Unmapped));
+    let pin = arena.pin(a, 2).unwrap();
+    assert_eq!(pin.extent(), (a as usize, (2 * PAGE) as usize));
+    assert_eq!(arena.unmap(a, 2), Err(Refusal::Busy));
+    assert_eq!(arena.map(a + PAGE, &[q]), Err(Refusal::Busy));
+    drop(pin);
     arena.unmap(a, 2).unwrap();
     for slot in [0, 1, 2, 3, 5] {
         arena.assert_parked(slot);

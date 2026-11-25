@@ -12,7 +12,7 @@
 
 #[cfg(test)]
 #[path = "fixed_proof.rs"]
-mod fixed_proof;
+pub(crate) mod fixed_proof;
 
 use std::{marker::PhantomData, ptr::without_provenance_mut, rc::Rc};
 
