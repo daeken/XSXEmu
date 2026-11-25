@@ -130,6 +130,25 @@ pub(super) fn run(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), Box<dy
                     c.pairs.len()
                 );
             }
+            let mut rejects = Vec::new();
+            ranked_forms.retain(|form, (spans, _, rows, attachment)| {
+                let Some(shape) = form.strip_prefix("decode-first/") else {
+                    return true;
+                };
+                rejects.push((shape, spans.len(), *rows, *attachment));
+                false
+            });
+            rejects.sort_by(|a, b| {
+                b.1.cmp(&a.1)
+                    .then_with(|| b.2.cmp(&a.2))
+                    .then_with(|| a.0.cmp(b.0))
+            });
+            println!("    first reference decode rejects (not decoded instructions):");
+            for (shape, spans, rows, attachment) in rejects {
+                println!(
+                    "      {shape}: {rows} rows ({attachment} PS attachment-only), {spans} MS spans"
+                );
+            }
             println!("    local wait-use witnesses in closed message projections (adjacent only):");
             ranked_forms.retain(|form, (spans, sites, rows, attachment)| {
                 let Some(shape) = form.strip_prefix("wait-use/") else { return true };

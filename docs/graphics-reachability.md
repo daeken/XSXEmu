@@ -44,6 +44,17 @@ Run `xsx-shader-inventory --direct-ps-mesh "$INFLATED_LIBRARY" "$TRUSTED_LLVM_21
 | Decode | Not attempted | 7 | 7 |
 | `MSG_GS_ALLOC_REQ` | Decode still stops | 1 | 1 |
 
+The first reference decode failures rank as follows by distinct MS span (also the row count here). Both CPUs, wave settings and starts agree; all eight are in the PS attachment-only subset, and all failures occur later than the assumed window head. “First” is the existing CFG walk's first failure, not lowest stored offset or dynamic path order.
+
+| Walk | Rejected SMEM bit shape | MS spans / rows |
+| --- | --- | ---: |
+| Strict, before any projected message | op 10, buffer x4, resource quad crosses `s105`; SGPR offset, immediate zero | 4 |
+| Strict, before any projected message | op 3, load x8, destination tuple crosses `s105`; SGPR offset, immediate zero | 2 |
+| Strict, before any projected message | op 12, buffer x16, destination tuple crosses `s105`; SGPR offset, nonzero immediate | 1 |
+| Message-projected only | op 12, buffer x16, same destination/offset class | 1 |
+
+These are raw field classifications using RDNA2 §13.2.1, not LLVM-decoded instructions or evidence of a wider Xbox register file. Independently, both LLVM MC CPUs assemble legal in-range forms. Owned controls that change just the resource or destination field to cross `s105` are rejected at the same checked start on both CPUs and waves. This isolates a reference operand boundary worth investigating, not a missing opcode implementation to add. Do not continue at an extension word, remap registers or admit the window without target-specific evidence. The strict first blocker is unchanged in every row.
+
 The 311 closed projections each contain one checked allocation message and one static PRIM site with raw EN=1 and raw bit 11 set (bits 10/12 clear). This follows reference control flow after checked messages **only in the diagnostic**. It does not model resource allocation, primitive counts or payload, the number of dynamic exports, export completion, or native linkage. Zero mesh companions clear strict reachability. The two-PRIM observation in the wrapped survey is a different corpus and must not be assumed here.
 
 The PS attachment-only subset is 348 rows, 211 PS spans, and 314 MS spans/pairs; 340 of those rows have a closed message projection. The ranking uses checked instruction starts in closed projections, deduplicating sites by MS span and keeping row occurrences separate. Both CPUs/waves and starts agree: all 311 projected MS spans contain the exact allocation message and PRIM form above, `s_waitcnt 0xc07f` (LGKMCNT(0), 4,317 sites), and `s_waitcnt 0x3f70` (VMCNT(0), 2,256 sites). The two wait names were independently checked with LLVM MC on both CPUs. High-volume operand buckets also include SGPR-source VOP2 F32 MUL (4,623 sites) and ADD (2,498), and unresolved scalar operations including 8-byte `s_and_b32` (4,819). These are not fully resolved operand forms. They do not establish scalar inputs, outstanding operations, wait semantics in this context, or a safe standalone lowering. No lowering was selected.

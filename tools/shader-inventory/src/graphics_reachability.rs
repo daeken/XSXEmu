@@ -640,14 +640,33 @@ fn project_exports_observe(
     dis: &mut Disassembler,
     bytes: &[u8],
     allow_checked_message_fallthrough: bool,
+    observe: impl FnMut(&[u8], usize, &str),
+) -> Result<Exports, ResultClass> {
+    project_exports_diagnose(
+        dis,
+        bytes,
+        allow_checked_message_fallthrough,
+        observe,
+        |_| (),
+    )
+}
+
+fn project_exports_diagnose(
+    dis: &mut Disassembler,
+    bytes: &[u8],
+    allow_checked_message_fallthrough: bool,
     mut observe: impl FnMut(&[u8], usize, &str),
+    mut rejected: impl FnMut(&[u8]),
 ) -> Result<Exports, ResultClass> {
     let mut scratch = [0; 1024];
     let mut unsupported = ResultClass::Decode;
     let mut pattern = PcPattern::default();
     match cfg::walk_extent(bytes.len() / 4, |pc| {
         let tail = bytes.get(pc * 4..)?;
-        let (len, text) = dis.one(tail, pc * 4, &mut scratch)?;
+        let Some((len, text)) = dis.one(tail, pc * 4, &mut scratch) else {
+            rejected(tail);
+            return None;
+        };
         let name = text.split_ascii_whitespace().next()?;
         let first = word(tail, 0)? as u32;
         let msg = (name == "s_sendmsg").then(|| sendmsg_class(first, len, text));
@@ -1721,59 +1740,113 @@ pub(super) struct MeshGate {
     projected_allocs: usize,
 }
 
+// Public RDNA2 SMEM fields (§13.2.1). Name the rejected bit shape, not an
+// instruction successfully decoded by LLVM, and never use it to advance the walk.
+fn rejected_mesh_form(bytes: &[u8]) -> &'static str {
+    let unknown = "unclassified-decode-reject";
+    let (Some(a), Some(b)) = (word(bytes, 0), word(bytes, 4)) else {
+        return "less-than-two-dwords";
+    };
+    let (a, b) = (a as u32, b as u32);
+    if a & 0xfc03_e000 != 0xf400_0000 || b & 0x01e0_0000 != 0 || b >> 25 >= 106 {
+        return unknown;
+    }
+    let dst = (a >> 6) & 127;
+    let base = (a & 63) * 2;
+    let imm = b & 0x001f_ffff;
+    let crosses = |start, count| start < 106 && start + count > 106 && start + count <= 128;
+    match ((a >> 18) & 255, imm == 0) {
+        (10, true) if base % 4 == 0 && crosses(base, 4) && dst % 4 == 0 && dst + 4 <= 106 => {
+            "SMEM-op10/buffer-x4/resource-quad-crosses-s105/soffset-sgpr/imm0"
+        }
+        (3, true) if dst % 4 == 0 && crosses(dst, 8) && base + 2 <= 106 => {
+            "SMEM-op3/load-x8/dst-tuple-crosses-s105/soffset-sgpr/imm0"
+        }
+        (12, false) if dst % 4 == 0 && crosses(dst, 16) && base % 4 == 0 && base + 4 <= 106 => {
+            "SMEM-op12/buffer-x16/dst-tuple-crosses-s105/soffset-sgpr/imm-nonzero"
+        }
+        _ => unknown,
+    }
+}
+
 pub(super) fn direct_mesh_gate(
     dis: &mut Disassembler,
     bytes: &[u8],
 ) -> (MeshGate, BTreeMap<String, usize>) {
     let mut forms = BTreeMap::new();
-    let strict = result_class(checked_exports(dis, bytes));
+    let mut strict_reject = None;
+    let mut projected_reject = None;
+    let shape = |tail: &[u8]| (rejected_mesh_form(tail), tail.len() == bytes.len());
+    let strict = result_class(project_exports_diagnose(
+        dis,
+        bytes,
+        false,
+        |_, _, _| (),
+        |tail| {
+            strict_reject = Some(shape(tail));
+        },
+    ));
     let mut wait_nodes = BTreeMap::new();
     let mut projected_allocs = 0;
     let projected = matches!(strict, ResultClass::SendMsg(SendMsgClass::GsAllocReq)).then(|| {
-        project_exports_observe(dis, bytes, true, |tail, len, text| {
-            if sendmsg_class(word(tail, 0).unwrap_or_default() as u32, len, text)
-                == SendMsgClass::GsAllocReq
-            {
-                projected_allocs += 1;
-            }
-            let name = text.split_ascii_whitespace().next().unwrap_or_default();
-            let first = word(tail, 0).unwrap_or_default() as u32;
-            let pair = [first, word(tail, 4).unwrap_or_default() as u32];
-            // The observer runs only at accepted starts; checked messages use projected Next.
-            wait_nodes.insert(
-                (bytes.len() - tail.len()) / 4,
-                crate::mesh_waits::Node::new(
-                    name,
-                    pair,
+        project_exports_diagnose(
+            dis,
+            bytes,
+            true,
+            |tail, len, text| {
+                if sendmsg_class(word(tail, 0).unwrap_or_default() as u32, len, text)
+                    == SendMsgClass::GsAllocReq
+                {
+                    projected_allocs += 1;
+                }
+                let name = text.split_ascii_whitespace().next().unwrap_or_default();
+                let first = word(tail, 0).unwrap_or_default() as u32;
+                let pair = [first, word(tail, 4).unwrap_or_default() as u32];
+                // The observer runs only at accepted starts; checked messages use projected Next.
+                wait_nodes.insert(
+                    (bytes.len() - tail.len()) / 4,
+                    crate::mesh_waits::Node::new(
+                        name,
+                        pair,
+                        len,
+                        control(name, first, len).unwrap_or(Flow::Next),
+                    ),
+                );
+                if !exact_opcode(
+                    pair.get(..len / 4)
+                        .and_then(|w| crate::graphics_decode::decode(w, 0).ok()),
                     len,
-                    control(name, first, len).unwrap_or(Flow::Next),
-                ),
-            );
-            if !exact_opcode(
-                pair.get(..len / 4)
-                    .and_then(|w| crate::graphics_decode::decode(w, 0).ok()),
-                len,
-                name,
-            ) {
-                let form = match (name, len) {
-                    ("s_sendmsg", 4) => {
-                        format!("s_sendmsg/{:?}/4B", sendmsg_class(first, len, text))
-                    }
-                    ("exp", 8)
-                        if matches!(export(first, len, text), Some(Export::Primitive { .. })) =>
-                    {
-                        format!("exp/PRIM/EN{}/flags{:x}/8B", first & 15, (first >> 10) & 7)
-                    }
-                    ("s_waitcnt", 4) if first >> 16 == 0xbf8c => {
-                        format!("s_waitcnt/imm-{:#06x}/4B", first as u16)
-                    }
-                    _ => {
-                        direct_operand_form(name, pair, len, &nearest_form(name, first, len, text))
-                    }
-                };
-                *forms.entry(form).or_default() += 1;
-            }
-        })
+                    name,
+                ) {
+                    let form = match (name, len) {
+                        ("s_sendmsg", 4) => {
+                            format!("s_sendmsg/{:?}/4B", sendmsg_class(first, len, text))
+                        }
+                        ("exp", 8)
+                            if matches!(
+                                export(first, len, text),
+                                Some(Export::Primitive { .. })
+                            ) =>
+                        {
+                            format!("exp/PRIM/EN{}/flags{:x}/8B", first & 15, (first >> 10) & 7)
+                        }
+                        ("s_waitcnt", 4) if first >> 16 == 0xbf8c => {
+                            format!("s_waitcnt/imm-{:#06x}/4B", first as u16)
+                        }
+                        _ => direct_operand_form(
+                            name,
+                            pair,
+                            len,
+                            &nearest_form(name, first, len, text),
+                        ),
+                    };
+                    *forms.entry(form).or_default() += 1;
+                }
+            },
+            |tail| {
+                projected_reject = Some(shape(tail));
+            },
+        )
     });
     let projected_prim_shape = projected.as_ref().and_then(|r| r.as_ref().ok()).map(|e| {
         (
@@ -1787,6 +1860,15 @@ pub(super) fn direct_mesh_gate(
     } else {
         for (shape, n) in crate::mesh_waits::audit(&wait_nodes) {
             forms.insert(format!("wait-use/{shape}"), n);
+        }
+    }
+    for (phase, rejected) in [
+        ("strict", strict_reject),
+        ("message-projected", projected_reject),
+    ] {
+        if let Some((shape, head)) = rejected {
+            let position = if head { "window-head" } else { "later" };
+            forms.insert(format!("decode-first/{phase}/{shape}/{position}"), 1);
         }
     }
     (
@@ -2173,6 +2255,80 @@ mod tests {
             sendmsg_class(0xbf90_0009, 4, "s_sendmsg 9"),
             SendMsgClass::Unclassified
         );
+    }
+
+    #[test]
+    fn owned_smem_boundary_mutations_are_rejected_without_advancing_the_walk() {
+        // Canonical words independently assembled on both CPUs. The mutations
+        // change only one register field, so the tuple crosses ordinary s105.
+        let cases: [(u32, u32, u32, &str, &str); 3] = [
+            (
+                0xf40c_1802,
+                0xf40c_1902,
+                0x1000_0000,
+                "s_load_dwordx8",
+                "SMEM-op3/load-x8/dst-tuple-crosses-s105/soffset-sgpr/imm0",
+            ),
+            (
+                0xf428_0232,
+                0xf428_0234,
+                0x2000_0000,
+                "s_buffer_load_dwordx4",
+                "SMEM-op10/buffer-x4/resource-quad-crosses-s105/soffset-sgpr/imm0",
+            ),
+            (
+                0xf430_1602,
+                0xf430_1702,
+                0x1000_0010,
+                "s_buffer_load_dwordx16",
+                "SMEM-op12/buffer-x16/dst-tuple-crosses-s105/soffset-sgpr/imm-nonzero",
+            ),
+        ];
+        let encode = |words: &[u32]| {
+            words
+                .iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect::<Vec<_>>()
+        };
+        for (canonical, mutant, b, _, form) in cases {
+            assert_eq!(
+                rejected_mesh_form(&encode(&[canonical, b])),
+                "unclassified-decode-reject"
+            );
+            assert_eq!(rejected_mesh_form(&encode(&[mutant, b])), form);
+            assert_eq!(
+                rejected_mesh_form(&encode(&[mutant])),
+                "less-than-two-dwords"
+            );
+        }
+        let Some(path) = std::env::var_os("LLVM_DISASM_LIB") else {
+            return;
+        };
+        let _serial_llvm = crate::llvm::test_lock();
+        let llvm = Llvm::load(&path).unwrap();
+        for cpu in [Cpu::Gfx1013, Cpu::Gfx1030] {
+            for wave32 in [false, true] {
+                let mut dis = llvm.context(cpu, wave32).unwrap();
+                for (canonical, mutant, b, name, form) in cases {
+                    let mut scratch = [0; 1024];
+                    let (len, text) = dis.one(&encode(&[canonical, b]), 0, &mut scratch).unwrap();
+                    assert_eq!((len, text.split_ascii_whitespace().next()), (8, Some(name)));
+                    let (gate, forms) =
+                        direct_mesh_gate(&mut dis, &encode(&[mutant, b, 0xbf81_0000]));
+                    assert_eq!(gate.strict, ResultClass::Decode);
+                    assert_eq!(gate.projection, None);
+                    assert_eq!(forms[&format!("decode-first/strict/{form}/window-head")], 1);
+                    let (gate, forms) =
+                        direct_mesh_gate(&mut dis, &encode(&[0xbf90_0009, mutant, b, 0xbf81_0000]));
+                    assert_eq!(gate.strict, ResultClass::SendMsg(SendMsgClass::GsAllocReq));
+                    assert_eq!(gate.projection, Some(ResultClass::Decode));
+                    assert_eq!(
+                        forms[&format!("decode-first/message-projected/{form}/later")],
+                        1
+                    );
+                }
+            }
+        }
     }
 
     #[test]
