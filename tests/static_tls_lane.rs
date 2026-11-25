@@ -3396,15 +3396,163 @@ fn window_class_registration_owns_name_and_validates_guest_inputs() {
     expect(output, 53, "Guest entry returned 53");
 }
 
+const CREATE_WINDOW_CAPACITY: usize = 0x800;
+#[repr(C)]
+struct CreateWindowFixture {
+    entry: u32,
+    callback: u32,
+    code: [u8; CREATE_WINDOW_CAPACITY],
+}
+global_asm!(include_str!("fixtures/static_tls_create_window.S"),
+    capacity = const CREATE_WINDOW_CAPACITY,
+    iat_delta = const IAT - TEXT,
+    mode_delta = const MODE - TEXT,
+    text = const TEXT,
+    options(att_syntax),
+);
+unsafe extern "C" {
+    static static_tls_create_window_fixture: CreateWindowFixture;
+}
+
 #[test]
-fn window_creation_and_def_window_proc_stay_unbound() {
+fn owned_appkit_window_uses_checked_synchronous_creation_callbacks() {
+    if !rosetta() {
+        return;
+    }
+    #[link(name = "CoreGraphics", kind = "framework")]
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CGSessionCopyCurrentDictionary() -> usize;
+        fn CFRelease(object: usize);
+    }
+    let session = unsafe { CGSessionCopyCurrentDictionary() };
+    if session == 0 {
+        eprintln!("skipping AppKit fixture: no WindowServer session");
+        return;
+    }
+    unsafe { CFRelease(session) };
+    let scratch = Scratch::new();
+    let exe = create_window_fixture(true, false);
+    let path = scratch.write("owned-real-window.exe", &exe);
+    let output = run(&path, &[OPT, TRUSTED, "--rust-providers"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr
+            .matches("created hidden AppKit-backed guest window")
+            .count(),
+        1,
+        "{stderr}"
+    );
+    assert_eq!(
+        stderr.matches("failed (guest error 1223)").count(),
+        32,
+        "{stderr}"
+    );
+    expect(output, 54, "Guest entry returned 54");
+}
+
+#[test]
+fn window_callback_missing_from_active_cfg_is_rejected_without_host_window() {
     if !rosetta() {
         return;
     }
     let scratch = Scratch::new();
-    for symbol in [b"CreateWindowExA\0".as_slice(), b"DefWindowProcA\0"] {
+    let path = scratch.write(
+        "owned-excluded-window-proc.exe",
+        &create_window_fixture(false, false),
+    );
+    let output = run(&path, &[OPT, TRUSTED, "--rust-providers"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("failed (guest error 87)"), "{stderr}");
+    assert!(
+        !stderr.contains("created AppKit-backed guest window"),
+        "{stderr}"
+    );
+    expect(output, 54, "Guest entry returned 54");
+}
+
+fn create_window_fixture(admit_callback: bool, import_show: bool) -> Vec<u8> {
+    let mut exe = image(Kind::Guarded);
+    let fixture = unsafe { &static_tls_create_window_fixture };
+    w32(
+        &mut exe,
+        file(GFIDS),
+        TEXT + if admit_callback {
+            fixture.callback
+        } else {
+            fixture.entry
+        } as usize,
+    );
+    w32(&mut exe, file(MODE) + 4, usize::from(!admit_callback));
+    exe[file(TEXT)..file(TEXT) + RAW].fill(0xcc);
+    put(&mut exe, file(TEXT), &fixture.code);
+    w32(&mut exe, OP + 16, TEXT + fixture.entry as usize);
+    w64(&mut exe, file(ARRAY), PREFERRED + TEXT);
+    let imports = LINK + 0x780;
+    dir(&mut exe, 1, imports, if import_show { 60 } else { 40 });
+    w32(&mut exe, file(imports), imports + 0x40);
+    w32(&mut exe, file(imports) + 12, imports + 0x80);
+    w32(&mut exe, file(imports) + 16, IAT);
+    put(&mut exe, file(imports) + 0x80, WINDOW_CLASS_DLL);
+    if import_show {
+        w32(&mut exe, file(imports) + 20, imports + 0x60);
+        w32(&mut exe, file(imports) + 32, imports + 0xc0);
+        w32(&mut exe, file(imports) + 36, IAT + 32);
+        put(
+            &mut exe,
+            file(imports) + 0xc0,
+            b"ext-ms-win-rtcore-ntuser-window-l1-1-0.dll\0",
+        );
+        w64(&mut exe, file(imports) + 0x60, imports + 0x1c0);
+        put(&mut exe, file(imports) + 0x1c2, b"ShowWindow\0");
+    }
+    for (i, name) in [
+        b"RegisterClassExA\0".as_slice(),
+        b"CreateWindowExA\0",
+        b"DefWindowProcA\0",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let rva = imports + 0x100 + i * 0x40;
+        w64(&mut exe, file(imports) + 0x40 + i * 8, rva);
+        put(&mut exe, file(rva) + 2, name);
+    }
+    exe
+}
+
+#[test]
+fn exact_show_window_stays_unbound_even_with_creation_imports() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let path = scratch.write(
+        "owned-no-show-window.exe",
+        &create_window_fixture(true, true),
+    );
+    let output = run(&path, &[OPT, TRUSTED, "--rust-providers"]);
+    let diagnostic = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        diagnostic.contains("ext-ms-win-rtcore-ntuser-window-l1-1-0.dll"),
+        "{diagnostic}"
+    );
+    expect(output, 1, "incomplete dependency graph");
+}
+
+#[test]
+fn guest_message_pump_stays_unbound() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    for symbol in [b"PeekMessageA\0".as_slice(), b"DispatchMessageA\0"] {
         let mut exe = image(Kind::Solo);
-        dir_import_one(&mut exe, WINDOW_CLASS_DLL, symbol);
+        dir_import_one(
+            &mut exe,
+            b"ext-ms-win-rtcore-ntuser-message-ansi-l1-1-0.dll\0",
+            symbol,
+        );
         let path = scratch.write("window-frontier.exe", &exe);
         expect(
             run(&path, &[OPT, TRUSTED, "--rust-providers"]),

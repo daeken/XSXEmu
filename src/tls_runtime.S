@@ -63,6 +63,39 @@ _xsxemu_tls_call:
     popq %r12
     retq
 
+/* Synchronous WNDPROC only: SysV(ctx, validated target, hwnd, message, lparam).
+ * WPARAM is zero for the two supported creation messages. No host UI callbacks
+ * enter this thunk. The guest runs on its originating thread/TEB. */
+.globl _xsxemu_tls_creation_wndproc
+_xsxemu_tls_creation_wndproc:
+    pushq %r12
+    pushq %r13
+    pushq %r14
+    subq $48, %rsp
+    movq %rdi, %r12
+    movq %rsi, %r13
+    movq %rdx, %r14
+    movl %ecx, 32(%rsp)
+    movq %r8, 40(%rsp)
+    check_host %r12
+    switch_to {guest_base}, %r12
+    check_guest %r12
+    movq %r14, %rcx
+    movl 32(%rsp), %edx
+    xorl %r8d, %r8d
+    movq 40(%rsp), %r9
+    callq *%r13
+    movq %rax, 32(%rsp)
+    check_guest %r12
+    switch_to {host_base}, %r12
+    check_host %r12
+    movq 32(%rsp), %rax
+    addq $48, %rsp
+    popq %r14
+    popq %r13
+    popq %r12
+    retq
+
 Lbad_tls_boundary:
     ud2                     /* default SIGILL, no recovery */
 /* Entered from an exact bound Win64 trap thunk with MissingImport in RCX and

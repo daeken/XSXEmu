@@ -93,6 +93,13 @@ unsafe extern "C" {
     fn pthread_get_stackaddr_np(thread: *mut c_void) -> *mut c_void;
     fn pthread_get_stacksize_np(thread: *mut c_void) -> usize;
     fn xsxemu_tls_thread_call(ctx: *const Context, target: u64, parameter: u64) -> u32;
+    fn xsxemu_tls_creation_wndproc(
+        ctx: *const Context,
+        target: usize,
+        hwnd: usize,
+        message: u32,
+        lparam: usize,
+    ) -> isize;
     fn xsxemu_tls_call(ctx: *const Context, target: u64, image: u64, reason: u32) -> u32;
 }
 
@@ -468,6 +475,35 @@ pub(crate) unsafe fn run_owned_bridge_fixture(memory: &GuestMemory, entry: usize
     })
 }
 
+thread_local! {
+    static ACTIVE_CONTEXT: std::cell::Cell<*const Context> = const { std::cell::Cell::new(null_mut()) };
+}
+
+/// Only from the synchronous creation adapter, with a sealed callback already
+/// validated against PE provenance and (if enabled) the active CFG policy.
+/// The pointed-to CREATESTRUCTA must remain live through this call.
+pub(crate) unsafe fn call_creation_wndproc(
+    target: usize,
+    hwnd: usize,
+    message: u32,
+    lparam: usize,
+) -> Option<isize> {
+    use crate::providers::native::{get_last_error, set_last_error};
+    let ctx = ACTIVE_CONTEXT.get();
+    if ctx.is_null() || !matches!(message, 0x81 | 1) {
+        return None;
+    }
+    // The outer bridge owns the host shadow; publish it to the TEB before
+    // switching, then recover the guest's current error for the outer bridge.
+    Some(unsafe {
+        let teb_error = ((*ctx).guest_base as usize + LAST_ERROR_OFFSET) as *mut u32;
+        teb_error.write(get_last_error());
+        let result = xsxemu_tls_creation_wndproc(ctx, target, hwnd, message, lparam);
+        set_last_error(teb_error.read());
+        result
+    })
+}
+
 fn with_context<T>(vector: u64, trace: bool, run: impl FnOnce(&Context, u32) -> T) -> Result<T> {
     let mut teb = [0u64; 32];
     let teb_ptr = teb.as_mut_ptr();
@@ -495,7 +531,9 @@ fn with_context<T>(vector: u64, trace: bool, run: impl FnOnce(&Context, u32) -> 
             .cast::<*const Context>()
             .write(&raw const ctx);
     }
+    assert!(ACTIVE_CONTEXT.replace(&raw const ctx).is_null());
     let result = run(&ctx, id);
+    ACTIVE_CONTEXT.set(null_mut());
     // Assembly reaches this memory indirectly through the published TEB
     // address, not an ordinary Rust borrow. Keep its initialized storage live.
     std::hint::black_box(teb_ptr);

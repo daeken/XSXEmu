@@ -29,6 +29,9 @@ mod win_cfg;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 mod win_cfg_runtime;
 mod win_class;
+mod win_window;
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+mod window_host;
 mod winsock_init;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 mod xbox_d3d12_vm;
@@ -632,16 +635,26 @@ fn resolve(
         }
         let order = attach_order(&plan)?;
         let status = if let Some(profile) = startup_profile {
-            startup::run_tls_child(
-                &images,
-                &bindings,
-                &traps,
-                &order,
-                startup_options.1,
-                profile,
-                _no_guest_cfg,
-                plan.xgameruntime,
-            )?
+            let start = || {
+                startup::run_tls_child(
+                    &images,
+                    &bindings,
+                    &traps,
+                    &order,
+                    startup_options.1,
+                    profile,
+                    _no_guest_cfg,
+                    plan.xgameruntime,
+                )
+            };
+            if bindings
+                .iter()
+                .any(|&(_, _, target)| target == link::BindingTarget::Rust(win_window::CREATE))
+            {
+                window_host::serve(start)?
+            } else {
+                start()?
+            }
         } else {
             startup::run(
                 &images,

@@ -531,15 +531,18 @@ impl Builder<'_> {
             return Ok(BindingTarget::Rust(startup));
         }
 
-        // Class registration is a direct-root IAT bridge, not a USER32 alias.
-        let register_class = crate::win_class::REGISTER;
-        if importer == 0
-            && self.options.rust_providers
-            && self.options.trusted_offline
-            && dll.eq_ignore_ascii_case(register_class.provider.as_bytes())
-            && matches!(symbol, Symbol::Name(name) if name == register_class.symbol.as_bytes())
-        {
-            return Ok(BindingTarget::Rust(register_class));
+        // The bounded window bridges are direct-root IAT only, not USER32 aliases.
+        if importer == 0 && self.options.rust_providers && self.options.trusted_offline {
+            for export in [crate::win_class::REGISTER]
+                .into_iter()
+                .chain(crate::win_window::BRIDGES)
+            {
+                if dll.eq_ignore_ascii_case(export.provider.as_bytes())
+                    && matches!(symbol, Symbol::Name(name) if name == export.symbol.as_bytes())
+                {
+                    return Ok(BindingTarget::Rust(export));
+                }
+            }
         }
 
         // Match only the original root ordinal, not names, API-set aliases,

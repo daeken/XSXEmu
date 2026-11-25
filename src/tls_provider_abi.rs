@@ -45,7 +45,8 @@ macro_rules! target_for_child {
 // token (FlsAlloc, SetUnhandledExceptionFilter), including returning a
 // previous guest token. GetProcAddress may return only a direct mapped PE
 // export already admitted by GuardCF. Do not return host function pointers, invoke
-// callbacks, re-enter guest code, unwind, or add aggregate, float or varargs.
+// callbacks or re-enter guest code except for the synchronous CreateWindowExA
+// pair; do not unwind or add aggregate, float or varargs.
 macro_rules! audited_bridges {
     ($($entry:ident, $adapter:ident : $dll:literal, $symbol:literal,
         $target:path $(=> $restricted:path)?, ($($arg:ident: $ty:ty),*) $([$pc:ident : $pc_ty:ty])? -> $ret:ty;)*) => {
@@ -58,7 +59,8 @@ macro_rules! audited_bridges {
             let target: unsafe extern "win64" fn($($ty),* $(, $pc_ty)?) -> $ret = target_for_child!($target $(=> $restricted)?);
             // SAFETY: bridge assembly checked host GS, and passed the live
             // calling thread's LastError DWORD. Each target was reviewed to
-            // take only its declared arguments and never re-enter the guest.
+            // take only its declared arguments. CreateWindowExA uses its own
+            // checked synchronous guest callback thunk with TEB error handoff.
             unsafe { native::with_tls_child_last_error(teb_error, || target($($arg),* $(, $pc)?)) }
         })*
 
@@ -159,6 +161,10 @@ audited_bridges! {
         gi::unsupported, (slot: u32) -> !;
     xsxemu_tls_wsa_startup, wsa_startup: b"ws2_32.dll", b"#115",
         crate::winsock_init::native::startup, (requested: u16, out: *mut crate::winsock_init::native::WsaData) -> i32;
+    xsxemu_tls_create_window_ex_a, create_window_ex_a: b"ext-ms-win-rtcore-ntuser-window-ansi-l1-1-0.dll", b"CreateWindowExA",
+        crate::win_window::native::create_window_ex_a, (ex: u32, class: usize, title: usize, style: u32, x: i32, y: i32, width: i32, height: i32, parent: usize, menu: usize, instance: usize, param: usize) -> usize;
+    xsxemu_tls_def_window_proc_a, def_window_proc_a: b"ext-ms-win-rtcore-ntuser-window-ansi-l1-1-0.dll", b"DefWindowProcA",
+        crate::win_window::native::def_window_proc_a, (hwnd: usize, msg: u32, wp: usize, lp: usize) -> isize;
     xsxemu_tls_register_class_ex_a, register_class_ex_a: b"ext-ms-win-rtcore-ntuser-window-ansi-l1-1-0.dll", b"RegisterClassExA",
         crate::win_class::native::register_class_ex_a, (class: usize) -> u16;
     xsxemu_tls_register_app_state, register_app_state: b"api-ms-win-core-psm-appnotify-l1-1-0.dll", b"RegisterAppStateChangeNotification",

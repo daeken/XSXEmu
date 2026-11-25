@@ -336,8 +336,9 @@ pub(crate) mod native {
     }
 
     // Only called on checked host GS by fixed-signature adapters. The guest
-    // DWORD is authoritative between calls. No provider here may re-enter
-    // the guest. A terminal diagnostic may hard-exit without returning.
+    // DWORD is authoritative between calls. The narrow CreateWindowExA
+    // callback thunk explicitly hands it back to the TEB before re-entry.
+    // A terminal diagnostic may hard-exit without returning.
     #[cfg(target_os = "macos")]
     pub(crate) unsafe fn with_tls_child_last_error<R>(
         teb_error: *mut u32,

@@ -958,6 +958,20 @@ pub(crate) mod native {
         })
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) fn window_proc(instance: usize, name: &[u8]) -> Result<usize, u32> {
+        const ERROR_CANNOT_FIND_WND_CLASS: u32 = 1407;
+        graph(|graph| {
+            graph
+                .ok_or(ERROR_CANNOT_FIND_WND_CLASS)?
+                .window_classes
+                .lock()
+                .map_err(|_| crate::win_class::native::ERROR_NOT_ENOUGH_MEMORY)?
+                .lookup(instance, name)
+                .ok_or(ERROR_CANNOT_FIND_WND_CLASS)
+        })
+    }
+
     fn graph<T>(f: impl FnOnce(Option<&Graph>) -> T) -> T {
         GRAPH.with(|slot| f(slot.borrow().as_deref()))
     }

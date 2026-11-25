@@ -35,12 +35,21 @@ pub(crate) mod native {
     pub(crate) struct Registry(Vec<Class>);
 
     impl Registry {
+        pub(crate) fn lookup(&self, instance: usize, name: &[u8]) -> Option<usize> {
+            self.0
+                .iter()
+                .find(|stored| {
+                    stored.instance == instance
+                        && stored.name[..stored.name_len].eq_ignore_ascii_case(name)
+                })
+                .map(|class| class.wndproc)
+        }
+
         pub(crate) fn insert(&mut self, class: Class) -> Result<u16, u32> {
-            if self.0.iter().any(|stored| {
-                stored.instance == class.instance
-                    && stored.name[..stored.name_len]
-                        .eq_ignore_ascii_case(&class.name[..class.name_len])
-            }) {
+            if self
+                .lookup(class.instance, &class.name[..class.name_len])
+                .is_some()
+            {
                 return Err(ERROR_CLASS_ALREADY_EXISTS);
             }
             if self.0.len() == MAX_CLASSES {
@@ -98,7 +107,7 @@ pub(crate) mod native {
         ) -> i32;
     }
 
-    fn read(address: usize, dst: &mut [u8]) -> Result<(), u32> {
+    pub(crate) fn read(address: usize, dst: &mut [u8]) -> Result<(), u32> {
         let len = dst.len() as u64;
         address.checked_add(dst.len()).ok_or(ERROR_NOACCESS)?;
         let mut copied = 0;

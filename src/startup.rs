@@ -411,14 +411,13 @@ mod native {
                 {
                     return Err("Winsock bridge requires the trusted offline root image".into());
                 }
-                if export == crate::win_class::REGISTER
+                if (export == crate::win_class::REGISTER
+                    || crate::win_window::BRIDGES.contains(&export))
                     && (!matches!(profile, Profile::TrustedOfflineTlsChild)
                         || !rust_providers
                         || importer != 0)
                 {
-                    return Err(
-                        "window class bridge requires the trusted offline root image".into(),
-                    );
+                    return Err("window bridge requires the trusted offline root image".into());
                 }
                 if crate::appnotify::BRIDGES.contains(&export)
                     && (!matches!(profile, Profile::TrustedOfflineTlsChild)
