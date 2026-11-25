@@ -25,7 +25,11 @@ The [fixed-placement fixture](../src/xbox_vm/fixed_proof.rs) reserves six 64 KiB
 
 The fixture checks writes through two fixed views of the same object offset in both directions, retention after removing one alias, and remapping a live token after **all** views are removed. Free refuses a live view; after freeing and allocating a new object, the revoked ID stays invalid and the new object reads as zero. Misaligned, foreign, out-of-range, occupied/mixed, malformed-token, and partial-unmap requests are refused before fixed mapping. One deliberate kernel rejection (offset just beyond the end of a valid named entry) leaves the parked target and neighboring live view intact. This is evidence for that failure case, not general Mach rollback or a multi-call transaction. An unexpected host transition failure terminates the test process rather than assuming its VM state is still safe.
 
+A separate synthetic case reserves five contiguous 64 KiB slots and splits only the ownership ledger into A–E. The original no-access kernel region remains intact. A fresh token from this arena maps only D (`base + 0x30000`) at its exact address, with current and maximum host CPU RW/NX protections; a distinct view of the same object offset observes writes in both directions. Misaligned, cross-partition, overlapping, stale and foreign-token requests are checked before mutation. Unmap restores D to an occupied no-access slot without disturbing A/B/C/E, then owner drop releases the entire original range. This is not the title's partition lengths, flag semantics, or a resource/GPU visibility proof.
+
 ```sh
+cargo test --offline --bin xsxemu split_five_owned_partitions_map_only_d
+cargo test --offline --target x86_64-apple-darwin --bin xsxemu split_five_owned_partitions_map_only_d
 cargo test --offline --bin xsxemu exact_shared_replacement_restore_and_live_token_reuse
 cargo test --offline --target x86_64-apple-darwin --bin xsxemu exact_shared_replacement_restore_and_live_token_reuse
 ```

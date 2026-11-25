@@ -4,10 +4,15 @@ use super::*;
 use std::{
     collections::BTreeMap,
     ops::Range,
-    sync::{Arc, Weak},
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 const SLOTS: u64 = 6;
+const TOKEN_NAMESPACE: u64 = 1 << 32;
+static NEXT_NAMESPACE: AtomicU64 = AtomicU64::new(TOKEN_NAMESPACE);
 const NONE: i32 = 0;
 // Darwin SDK mach/vm_statistics.h: VM_FLAGS_FIXED (zero) | VM_FLAGS_OVERWRITE.
 const FIXED_OVERWRITE: i32 = 0x4000;
@@ -20,6 +25,7 @@ pub(crate) enum Refusal {
     NotExactView,
     InvalidTokens,
     Busy,
+    Partition,
 }
 
 struct Batch {
@@ -45,11 +51,12 @@ impl Pin {
     }
 }
 
-/// All six slots stay reserved for this owner, including those with no view.
+/// All slots stay reserved for this owner, including those with no view.
 /// A view is only bookkeeping; there is never a second unmap owner for a slot.
 pub(crate) struct Arena {
     mapping: Arc<Mapping>,
     pins: Vec<Weak<Pin>>,
+    partitions: Option<[Range<u64>; 5]>,
     views: BTreeMap<u64, u64>, // disjoint [slot, end_slot) ranges
     batch: Option<Batch>,
     next_token: u64,
@@ -58,7 +65,12 @@ pub(crate) struct Arena {
 
 impl Arena {
     pub(crate) fn new() -> Self {
-        let len = SLOTS * PAGE;
+        Self::with_slots(SLOTS)
+    }
+
+    fn with_slots(slots: u64) -> Self {
+        assert!((1..=SLOTS).contains(&slots));
+        let len = slots * PAGE;
         let mut base = 0;
         // SAFETY: The kernel chooses unoccupied VA. The whole range is ours
         // until the arena and any pins are dropped. Only this owner mutates it.
@@ -83,11 +95,37 @@ impl Arena {
         Self {
             mapping: Arc::new(Mapping { task, base, len }),
             pins: Vec::new(),
+            partitions: None,
             views: BTreeMap::new(),
             batch: None,
-            next_token: 1,
+            next_token: NEXT_NAMESPACE
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                    next.checked_add(TOKEN_NAMESPACE)
+                })
+                .unwrap(),
             _thread: PhantomData,
         }
+    }
+
+    #[cfg(test)]
+    fn split_five(&mut self) -> Result<(), Refusal> {
+        if self.mapping.len != 5 * PAGE || !self.views.is_empty() || self.partitions.is_some() {
+            return Err(Refusal::Partition);
+        }
+        // Ownership and the kernel reservation are unchanged by this transition.
+        self.partitions = Some(std::array::from_fn(|i| i as u64..i as u64 + 1));
+        Ok(())
+    }
+
+    fn owned_partition(&self, slots: &Range<u64>) -> Result<(), Refusal> {
+        if self
+            .partitions
+            .as_ref()
+            .is_some_and(|parts| !parts.contains(slots))
+        {
+            return Err(Refusal::Partition);
+        }
+        Ok(())
     }
 
     pub(crate) fn address(&self, slot: u64) -> u64 {
@@ -100,7 +138,7 @@ impl Arena {
             .ok_or(Refusal::Outside)?;
         let start = offset / PAGE;
         let end = start.checked_add(count).ok_or(Refusal::Outside)?;
-        if count == 0 || !offset.is_multiple_of(PAGE) || end > SLOTS {
+        if count == 0 || !offset.is_multiple_of(PAGE) || end > self.mapping.len / PAGE {
             return Err(Refusal::Outside);
         }
         Ok(start..end)
@@ -152,8 +190,9 @@ impl Arena {
     }
 
     pub(crate) fn allocate(&mut self, count: u64) -> Range<u64> {
-        assert!(self.batch.is_none() && (1..=SLOTS).contains(&count));
+        assert!(self.batch.is_none() && (1..=self.mapping.len / PAGE).contains(&count));
         let end = self.next_token.checked_add(count).unwrap();
+        assert_eq!(self.next_token / TOKEN_NAMESPACE, end / TOKEN_NAMESPACE);
         let tokens = self.next_token..end;
         self.batch = Some(Batch {
             backing: Backing::new(count * PAGE).unwrap(),
@@ -180,6 +219,7 @@ impl Arena {
 
     pub(crate) fn map(&mut self, address: u64, tokens: &[u64]) -> Result<(), Refusal> {
         let slots = self.slots(address, tokens.len() as u64)?;
+        self.owned_partition(&slots)?;
         self.check_unpinned(&slots)?;
         self.vacant(&slots)?;
         let batch = self.batch.as_ref().ok_or(Refusal::InvalidTokens)?;
@@ -197,6 +237,7 @@ impl Arena {
 
     pub(crate) fn unmap(&mut self, address: u64, count: u64) -> Result<(), Refusal> {
         let slots = self.slots(address, count)?;
+        self.owned_partition(&slots)?;
         self.check_unpinned(&slots)?;
         if self.views.get(&slots.start) != Some(&slots.end) {
             return Err(Refusal::NotExactView);
@@ -214,7 +255,7 @@ impl Arena {
         offset: u64,
         prot: i32,
     ) -> (i32, u64) {
-        assert!(slots.start < slots.end && slots.end <= SLOTS);
+        assert!(slots.start < slots.end && slots.end <= self.mapping.len / PAGE);
         let mut address = self.address(slots.start);
         // SAFETY: Exclusive arena ownership, validated nonempty extent of
         // whole slots, and no Rust references into the mappings. All entries
@@ -268,7 +309,7 @@ impl Arena {
         const KERN_INVALID_ADDRESS: i32 = 1;
         const KERN_PROTECTION_FAILURE: i32 = 2;
         const KERN_NO_SPACE: i32 = 3;
-        assert!(slot < SLOTS);
+        assert!(slot < self.mapping.len / PAGE);
         let mut address = self.address(slot);
         for endpoint in [address, address + PAGE - 1] {
             let (mut byte, mut copied) = (0_u8, 0_u64);
@@ -411,4 +452,105 @@ fn exact_shared_replacement_restore_and_live_token_reuse() {
     let mut sentinel = [0];
     foreign.read(0, &mut sentinel).unwrap();
     assert_eq!(sentinel, [0xAA]);
+}
+
+#[test]
+fn split_five_owned_partitions_map_only_d() {
+    unsafe extern "C" {
+        fn mach_vm_region(
+            task: u32,
+            addr: *mut u64,
+            len: *mut u64,
+            flavor: i32,
+            info: *mut i32,
+            count: *mut u32,
+            object: *mut u32,
+        ) -> i32;
+    }
+    let mut arena = Arena::with_slots(5);
+    let task = arena.mapping.task;
+    let base = arena.address(0);
+    let d = arena.address(3);
+    assert_eq!(d, base + 0x30000);
+    assert!(base.is_multiple_of(PAGE));
+    let region = |addr: u64| {
+        let (mut start, mut len, mut object) = (addr, 0, 0);
+        let mut info = [0; 1024];
+        let mut count = info.len() as u32;
+        // SAFETY: valid output storage; kernel metadata query only.
+        let status = unsafe {
+            mach_vm_region(
+                task,
+                &mut start,
+                &mut len,
+                9,
+                info.as_mut_ptr(),
+                &mut count,
+                &mut object,
+            )
+        };
+        if status == 1 {
+            return None;
+        }
+        assert_eq!(status, 0);
+        if object != 0 && object != u32::MAX {
+            // SAFETY: this query owns the returned send right.
+            assert_eq!(unsafe { mach_port_deallocate(task, object) }, 0);
+        }
+        assert!(count >= 2);
+        Some((start, len, info[0], info[1]))
+    };
+    assert_eq!(region(base), Some((base, 5 * PAGE, NONE, NONE)));
+    arena.split_five().unwrap();
+    assert_eq!(arena.split_five(), Err(Refusal::Partition));
+    assert_eq!(region(base), Some((base, 5 * PAGE, NONE, NONE)));
+    let stale = arena.allocate(1);
+    arena.free(stale.clone()).unwrap();
+    let fresh = arena.allocate(2);
+    let mut foreign = Arena::new();
+    let foreign_token = foreign.allocate(1).start;
+    let token = fresh.start;
+    assert_eq!(arena.map(d, &[stale.start]), Err(Refusal::InvalidTokens));
+    assert_eq!(arena.map(d, &[foreign_token]), Err(Refusal::InvalidTokens));
+    assert_eq!(arena.map(d - 1, &[token]), Err(Refusal::Outside));
+    assert_eq!(arena.map(d + 1, &[token]), Err(Refusal::Outside));
+    assert_eq!(arena.map(d, &[token, token + 1]), Err(Refusal::Partition));
+    assert_eq!(arena.map(base + 5 * PAGE, &[token]), Err(Refusal::Outside));
+    assert!(arena.views.is_empty());
+    for slot in 0..5 {
+        arena.assert_parked(slot);
+    }
+
+    let alias = arena.batch.as_ref().unwrap().backing.map(0, PAGE).unwrap();
+    assert!(alias.base_address() + PAGE <= base || alias.base_address() >= base + 5 * PAGE);
+    arena.map(d, &[token]).unwrap();
+    assert_eq!(region(d), Some((d, PAGE, READ_WRITE, READ_WRITE)));
+    assert_eq!(arena.byte(d), 0);
+    assert_eq!(arena.byte(d + PAGE - 1), 0);
+    arena.write(d, 0xa5);
+    alias.write(PAGE - 1, &[0x6b]).unwrap();
+    let mut byte = [0];
+    alias.read(0, &mut byte).unwrap();
+    assert_eq!(byte, [0xa5]);
+    assert_eq!(arena.byte(d + PAGE - 1), 0x6b);
+    assert_eq!(arena.map(d, &[token]), Err(Refusal::Occupied));
+    assert_eq!(arena.unmap(d, 2), Err(Refusal::Partition));
+    assert_eq!(arena.views, BTreeMap::from([(3, 4)]));
+    for slot in [0, 1, 2, 4] {
+        arena.assert_parked(slot);
+    }
+
+    arena.unmap(d, 1).unwrap();
+    assert!(arena.views.is_empty());
+    for slot in 0..5 {
+        arena.assert_parked(slot);
+    }
+    alias.read(PAGE - 1, &mut byte).unwrap();
+    assert_eq!(byte, [0x6b]);
+    drop(alias);
+    arena.free(fresh).unwrap();
+    drop(arena);
+    for i in 0..5 {
+        assert!(region(base + i * PAGE).is_none_or(|(next, ..)| next >= base + 5 * PAGE));
+    }
 }
