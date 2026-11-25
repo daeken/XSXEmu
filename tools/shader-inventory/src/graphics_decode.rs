@@ -133,6 +133,10 @@ pub(crate) enum Op {
         src: [Vgpr; 2],
         neg_first: bool,
     },
+    PackHalfRtzZeroLow {
+        dst: Vgpr,
+        hi: Vgpr,
+    },
     CompareZeroLtF32 {
         rhs: Vgpr,
     },
@@ -380,6 +384,8 @@ pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeErro
     let dst = Vgpr((w >> 17) as u8);
     let vsrc1 = Vgpr((w >> 9) as u8);
     match w & 0xfe00_01ff {
+        // Exact VOP2 opcode 47, SRC0 selector 128 is inline +0.
+        0x5e00_0080 => return Ok((1, Op::PackHalfRtzZeroLow { dst, hi: vsrc1 })),
         // VOP2 SUB (not SUBREV), SRC0 +0 or +1, VSRC1 ordinary VGPR.
         0x0800_0080 | 0x0800_00f2 => {
             return Ok((

@@ -253,7 +253,9 @@ pub(crate) fn audit_profile(words: &[u32], vertex: bool) -> ProfileResult {
             Err(Reject::Unsupported(pc) | Reject::Truncated(pc)) => (
                 pc,
                 match decode(words, pc) {
-                    Ok((_, Op::PackHalfRtz { .. })) => PackedRtzSemantics,
+                    Ok((_, Op::PackHalfRtz { .. } | Op::PackHalfRtzZeroLow { .. })) => {
+                        PackedRtzSemantics
+                    }
                     Ok((_, Op::InitInterpM0 { .. } | Op::InterpPhase { .. })) => {
                         InterpolationSemantics
                     }
@@ -463,6 +465,8 @@ fn lift(stage: Stage, words: &[u32]) -> Result<Vec<Op>, Reject> {
                 require(src)?;
                 exported += 1;
             }
+            // New form is validated only in the explicit arithmetic-word probe.
+            Op::PackHalfRtzZeroLow { .. } => return Err(Reject::Unsupported(pc)),
             Op::PackHalfRtz { dst, src, .. } => {
                 if !matches!(stage, Stage::ConstantRtzPixel | Stage::ConstantRtzRgPixel)
                     || !src.into_iter().all(|r| {
@@ -725,6 +729,12 @@ fn emit_body(out: &mut String, ops: &[Op], packed_color_lvalue: &str, multi: boo
                 )
                 .unwrap();
             }
+            Op::PackHalfRtzZeroLow {
+                dst: Vgpr(dst),
+                hi: Vgpr(hi),
+            } => {
+                writeln!(out, "  r[{dst}] = half_rtz_bits(r[{hi}]) << 16;").unwrap();
+            }
             Op::InitInterpM0 { .. } | Op::InterpPhase { .. } => {
                 unreachable!("interpolation phases require a verified pair")
             }
@@ -757,6 +767,7 @@ const EDGE_LITERAL: &[u32] = &[0x0e06_02ff, 0x3e80_0000]; // v_mul_legacy_f32_e3
 const EDGE_FMAC: &[u32] = &[0x5608_0300]; // v_fmac_f32_e32 v4, v0, v1
 const EDGE_RTZ: &[u32] = &[0x5e0a_0300]; // v_cvt_pkrtz_f16_f32_e32 v5, v0, v1
 const EDGE_RTZ_NEG: &[u32] = &[0xd52f_0016, 0x2002_0300]; // v22, -v0, v1
+const EDGE_RTZ_ZERO: [u32; 2] = [0x5e32_3080, 0x5e30_3080]; // v25 then v24, inline +0, v24
 
 const EDGE_ADD: &[u32] = &[0x061e_0300]; // v15 = v0 + v1
 const EDGE_ADD_INLINE: &[u32] = &[0x0620_00f3]; // v16 = -1.0 + v0
@@ -839,7 +850,7 @@ pub fn translate_legacy_edge_fixture() -> Result<String, DecodeError> {
     }
     let mut msl = MSL_HEADER.to_owned();
     msl.push_str(RTZ_HELPER);
-    msl.push_str("kernel void legacy_edges(const device uint4 *in [[buffer(0)]], device uint4 *out [[buffer(1)]], device uint2 *extra [[buffer(2)]], uint id [[thread_position_in_grid]]) {\n  uint r[256]; r[0] = in[id].x; r[1] = in[id].y; r[4] = in[id].z;\n");
+    msl.push_str("kernel void legacy_edges(const device uint4 *in [[buffer(0)]], device uint4 *out [[buffer(1)]], device uint4 *extra [[buffer(2)]], uint id [[thread_position_in_grid]]) {\n  uint r[256]; r[0] = in[id].x; r[1] = in[id].y; r[4] = in[id].z;\n");
     body(&mut msl, &[a, b, c, d]);
     body(&mut msl, &[decode(EDGE_RTZ_NEG, 0)?.1]);
     let cmp = decode(EDGE_CMP_LT, 0)?;
@@ -861,7 +872,11 @@ pub fn translate_legacy_edge_fixture() -> Result<String, DecodeError> {
     }
     msl.push_str("  {\n");
     body(&mut msl, &[cmp.1, select.1]);
-    msl.push_str("  }\n  extra[id] = uint2(r[22], r[23]);\n");
+    msl.push_str("  }\n  r[24] = in[id].w; r[25] = 0xdeadbeefu;\n");
+    for pc in 0..EDGE_RTZ_ZERO.len() {
+        body(&mut msl, &[decode(&EDGE_RTZ_ZERO, pc)?.1]);
+    }
+    msl.push_str("  extra[id] = uint4(r[22], r[23], r[24], r[25]);\n");
     let mut pc = 0;
     while pc < EDGE_MOV_HINTS.len() {
         let (width, op) = decode(EDGE_MOV_HINTS, pc)?;
@@ -2969,6 +2984,34 @@ mod tests {
         let mut ps = vec![0xbfa0_0003, 0xbf80_0000, 0x7e00_0280];
         ps.extend_from_slice(PACKED_PS);
         assert_eq!(lift(Stage::PackedPixel, &ps).unwrap().len(), 5);
+    }
+
+    #[test]
+    fn inline_zero_low_rtz_checks_selector_width_and_exact_registers() {
+        for (pc, dst) in [Vgpr(25), Vgpr(24)].into_iter().enumerate() {
+            assert_eq!(
+                decode(&EDGE_RTZ_ZERO, pc),
+                Ok((1, Op::PackHalfRtzZeroLow { dst, hi: Vgpr(24) }))
+            );
+        }
+        for selector in [0, 127, 129, 192, 240, 248, 255] {
+            assert_eq!(
+                decode(&[(EDGE_RTZ_ZERO[1] & !0x1ff) | selector], 0),
+                Err(DecodeError::Unsupported(0))
+            );
+        }
+        assert_ne!(
+            decode(&[EDGE_RTZ_ZERO[1] | 0x100], 0),
+            decode(&EDGE_RTZ_ZERO, 1)
+        );
+        assert_eq!(
+            lift(Stage::ConstantRtzPixel, &EDGE_RTZ_ZERO),
+            Err(Reject::Unsupported(0))
+        );
+        let source = translate_legacy_edge_fixture().unwrap();
+        assert!(source.contains(
+            "r[25] = half_rtz_bits(r[24]) << 16;\n  r[24] = half_rtz_bits(r[24]) << 16;"
+        ));
     }
 
     #[test]

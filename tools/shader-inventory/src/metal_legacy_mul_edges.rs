@@ -179,13 +179,31 @@ mod gpu {
         ];
         let cmp_start = inputs.len();
         inputs.extend(cmp_cases.iter().map(|(x, _)| [TRUE_WORD, *x, 0, 0]));
+        // Literal packed-word oracle, independent of the MSL converter. Values
+        // on each side of a half step distinguish RTZ from nearest rounding.
+        let rtz_zero = [
+            (P0, 0x0000_0000),
+            (N0, 0x8000_0000),
+            (0x3f80_1fff, 0x3c00_0000),
+            (0x3f80_2000, 0x3c01_0000),
+            (0xbf80_1fff, 0xbc00_0000),
+            (0xbf80_2000, 0xbc01_0000),
+            (0x3880_0000, 0x0400_0000),
+            (0xc77f_e000, 0xfbff_0000),
+        ];
+        let rtz_zero_start = inputs.len();
+        inputs.extend(
+            rtz_zero
+                .iter()
+                .map(|(hi, _)| [0x3f00_0000, 0x4000_0000, 0, *hi]),
+        );
         let bytes = std::mem::size_of_val(inputs.as_slice());
         let usage = MTLResourceOptions::StorageModeShared;
         let input = dev.new_buffer_with_data(inputs.as_ptr().cast(), bytes as u64, usage);
         let output = dev.new_buffer(5 * bytes as u64, usage);
         let out = output.contents().cast::<[u32; 4]>();
-        let extra_output = dev.new_buffer((inputs.len() * 8) as u64, usage);
-        let extra_out = extra_output.contents().cast::<[u32; 2]>();
+        let extra_output = dev.new_buffer(bytes as u64, usage);
+        let extra_out = extra_output.contents().cast::<[u32; 4]>();
         if out.is_null() || extra_out.is_null() {
             return Err("unmapped readback".into());
         }
@@ -350,8 +368,14 @@ mod gpu {
                 );
             }
         }
+        for (i, (_, want)) in rtz_zero.into_iter().enumerate() {
+            let actual = unsafe { extra_out.add(rtz_zero_start + i).read() };
+            if actual[2..] != [want, want] {
+                return Err(format!("inline +0 RTZ row {i}: expected {want:08x} for in-place and separate destinations, got {:08x?}", &actual[2..]).into());
+            }
+        }
         println!(
-            "{}: {profile}, 16/16 legacy words, 2/2 FMAC words, 5/5 e32 packed RTZ words, 5/5 e64 NEG0 packed RTZ words, {mov_words}/{mov_words} raw MOV words 8/8 select words, 10/10 ordered CMP LT words, 8/8 subtract words 11/11 ordinary multiply checks 8/8 ordinary add words 7/7 inline -1 add words 7/7 inline +1 subtract words and 36/36 mode-dependent CVT words",
+            "{}: {profile}, 16/16 legacy words, 2/2 FMAC words, 5/5 e32 packed RTZ words, 5/5 e64 NEG0 packed RTZ words, 16/16 inline +0 packed RTZ words (in-place and separate), {mov_words}/{mov_words} raw MOV words 8/8 select words, 10/10 ordered CMP LT words, 8/8 subtract words 11/11 ordinary multiply checks 8/8 ordinary add words 7/7 inline -1 add words 7/7 inline +1 subtract words and 36/36 mode-dependent CVT words",
             dev.name(),
             mov_words = 4 * inputs.len()
         );

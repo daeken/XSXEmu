@@ -208,6 +208,12 @@ pub(crate) fn audit(words: &[u32], vertex: bool) -> Outcome {
                 }
                 f.write(dst, None);
             }
+            Op::PackHalfRtzZeroLow { dst, hi } => {
+                if !f.read(hi).is_some_and(normal_half_or_zero) {
+                    f.outcome.needs.insert(PackedRtzDomain);
+                }
+                f.write(dst, None);
+            }
             Op::CompareZeroLtF32 { rhs } => {
                 let bits = f.read(rhs);
                 // This result-only comparison is mode-independent for known

@@ -261,6 +261,7 @@ fn exact_opcode(
                         "v_cvt_pkrtz_f16_f32_e32"
                     }
                 }
+                Op::PackHalfRtzZeroLow { .. } => name == "v_cvt_pkrtz_f16_f32_e32",
                 Op::CompareZeroLtF32 { .. } => name == "v_cmp_lt_f32_e32",
                 Op::CompareNonzero { .. } => name == "v_cmp_ne_u32_e32",
                 Op::SelectBits { .. } => name == "v_cndmask_b32_e32",
