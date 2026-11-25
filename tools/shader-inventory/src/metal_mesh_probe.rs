@@ -7,22 +7,143 @@ mod gpu {
     use metal::*;
     use std::path::Path;
 
+    // Authored fixture ABI, not an M0 or native PRIM payload layout.
+    #[derive(Clone, Copy)]
+    struct MeshInput {
+        vertices: u32,
+        allocated: u32,
+        valid: bool,
+        indices: [u32; 3],
+    }
+
+    impl MeshInput {
+        fn checked_words(self) -> Result<[u32; 6], String> {
+            let [a, b, c] = self.indices;
+            if self.vertices > 4 || self.allocated > 1 || (self.valid && self.allocated == 0) {
+                return Err("invalid owned mesh counts or validity".into());
+            }
+            if self.valid
+                && (a >= self.vertices
+                    || b >= self.vertices
+                    || c >= self.vertices
+                    || a == b
+                    || b == c
+                    || a == c)
+            {
+                return Err("invalid owned triangle indices".into());
+            }
+            Ok([
+                self.vertices,
+                self.allocated,
+                u32::from(self.valid),
+                a,
+                b,
+                c,
+            ])
+        }
+    }
+
+    const FULL: MeshInput = MeshInput {
+        vertices: 4,
+        allocated: 1,
+        valid: true,
+        indices: [0, 1, 2],
+    };
+    const CASES: [(&str, MeshInput, [usize; 8]); 4] = [
+        (
+            "no allocation",
+            MeshInput {
+                allocated: 0,
+                valid: false,
+                ..FULL
+            },
+            [0; 8],
+        ),
+        (
+            "allocated, invalid",
+            MeshInput {
+                valid: false,
+                ..FULL
+            },
+            [0; 8],
+        ),
+        ("valid full triangle", FULL, [8; 8]),
+        // Top-down pixel centers, x < -(y+1)/4; no centers land on the sloped edge.
+        (
+            "valid redirected index",
+            MeshInput {
+                indices: [0, 3, 2],
+                ..FULL
+            },
+            [2, 2, 3, 3, 3, 3, 4, 4],
+        ),
+    ];
+
+    #[test]
+    fn owned_mesh_contract_checks_counts_and_indices() {
+        for (_, input, _) in CASES {
+            assert!(input.checked_words().is_ok());
+        }
+        assert_eq!(FULL.checked_words().unwrap(), [4, 1, 1, 0, 1, 2]);
+        assert!(
+            MeshInput {
+                vertices: 3,
+                ..FULL
+            }
+            .checked_words()
+            .is_ok()
+        );
+        for input in [
+            MeshInput {
+                allocated: 0,
+                ..FULL
+            },
+            MeshInput {
+                allocated: 2,
+                ..FULL
+            },
+            MeshInput {
+                vertices: 5,
+                ..FULL
+            },
+            MeshInput {
+                vertices: 3,
+                indices: [0, 3, 2],
+                ..FULL
+            },
+            MeshInput {
+                indices: [0, 0, 2],
+                ..FULL
+            },
+        ] {
+            assert!(input.checked_words().is_err());
+        }
+    }
+
     const SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 struct Vertex { float4 position [[position]]; float green; };
 struct Primitive { float blue [[flat]]; };
 struct Fragment { float green; float blue [[flat]]; };
-[[mesh]] void owned_mesh(mesh<Vertex, Primitive, 3, 1, topology::triangle> out,
-                         constant uint &count [[buffer(0)]]) {
-    out.set_vertex(0, Vertex{float4(-1, -1, 0, 1), 1});
-    out.set_vertex(1, Vertex{float4( 3, -1, 0, 1), 1});
-    out.set_vertex(2, Vertex{float4(-1,  3, 0, 1), 1});
-    out.set_index(0, 0);
-    out.set_index(1, 1);
-    out.set_index(2, 2);
+[[mesh]] void owned_mesh(mesh<Vertex, Primitive, 4, 1, topology::triangle> out,
+                         constant uint *input [[buffer(0)]]) {
+    if (input[1] == 0 || input[2] == 0) {
+        out.set_primitive_count(0);
+        return;
+    }
+    const float4 positions[4] = {
+        float4(-1, -1, 0, 1), float4(3, -1, 0, 1),
+        float4(-1, 3, 0, 1), float4(0, -1, 0, 1)
+    };
+    for (uint i = 0; i < input[0]; ++i) {
+        out.set_vertex(i, Vertex{positions[i], 1});
+    }
+    out.set_index(0, input[3]);
+    out.set_index(1, input[4]);
+    out.set_index(2, input[5]);
     out.set_primitive(0, Primitive{1});
-    out.set_primitive_count(count);
+    out.set_primitive_count(1);
 }
 fragment float4 owned_mesh_fragment(Fragment in [[stage_in]]) {
     return float4(0, in.green, in.blue, 1);
@@ -180,7 +301,8 @@ fragment float4 owned_mesh_fragment(Fragment in [[stage_in]]) {
         tex_desc.set_usage(MTLTextureUsage::RenderTarget);
         let color = dev.new_texture(&tex_desc);
         let blue = if mutate_expected { 0 } else { 255 };
-        for (count, expected) in [(0u32, [255, 0, 0, 255]), (1, [0, 255, blue, 255])] {
+        for (case, input, row_coverage) in CASES {
+            let words = input.checked_words()?;
             let pass = RenderPassDescriptor::new();
             let c = pass
                 .color_attachments()
@@ -193,7 +315,12 @@ fragment float4 owned_mesh_fragment(Fragment in [[stage_in]]) {
             let cmd = queue.new_command_buffer();
             let enc = cmd.new_render_command_encoder(pass);
             enc.set_render_pipeline_state(&pipeline);
-            enc.set_mesh_bytes(0, 4, (&raw const count).cast());
+            enc.set_cull_mode(MTLCullMode::None);
+            enc.set_mesh_bytes(
+                0,
+                std::mem::size_of_val(&words) as u64,
+                words.as_ptr().cast(),
+            );
             let one = MTLSize::new(1, 1, 1);
             enc.draw_mesh_threadgroups(one, one, one);
             enc.end_encoding();
@@ -225,20 +352,26 @@ fragment float4 owned_mesh_fragment(Fragment in [[stage_in]]) {
             }
             // The owned buffer remains alive until after all completed GPU writes are read.
             let bytes = unsafe { std::slice::from_raw_parts(ptr, BYTES) };
-            for y in 0..SIDE {
+            for (y, covered) in row_coverage.into_iter().enumerate() {
                 for x in 0..SIDE {
+                    let expected = if x < covered {
+                        [0, 255, blue, 255]
+                    } else {
+                        [255, 0, 0, 255]
+                    };
                     let at = STRIDE * y + 4 * x;
                     let actual = &bytes[at..at + 4];
                     if actual != expected {
                         return Err(format!(
-                            "primitive count {count}, pixel ({x},{y}): expected {expected:?}, got {actual:?}"
+                            "{case}, pixel ({x},{y}): expected {expected:?}, got {actual:?}"
                         ));
                     }
                 }
             }
             println!(
-                "{} owned mesh, primitive count {count}: {pixels}/{pixels} pixels matched",
+                "{} owned mesh, {case}: {pixels}/{pixels} pixels matched ({covered} covered)",
                 dev.name(),
+                covered = row_coverage.iter().sum::<usize>(),
                 pixels = SIDE * SIDE
             );
         }

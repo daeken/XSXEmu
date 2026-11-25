@@ -27,7 +27,18 @@ MTL_DEBUG_LAYER=1 cargo run --locked --manifest-path tools/shader-inventory/Carg
   --features metal-probe --bin shader-metal-mesh-probe
 ```
 
-On Apple M4 (macOS 27.0.1), the source-compiled, no-object-stage mesh/fragment pipeline matched all 64 `RGBA8Unorm` pixels with primitive count zero (only the red clear color survives) and all 64 with count one (cyan from separate vertex green and flat per-primitive blue inputs). The same mesh threadgroup, triangle vertices, indices and primitive payload are supplied in both draws; only the explicit primitive count changes. This checks a local Metal lowering target for distinct vertex and primitive outputs and for suppressing rasterization by emitting zero primitives. It does not map the title's `PRIM` word or infer an Xbox message effect.
+The authored input consists of six `uint` words: vertex count, allocated primitive count (0 or 1), validity (0 or 1), and three triangle indices. The host checks the fixed capacities (four vertices and one triangle), rejects a valid primitive with no allocation, and rejects out-of-range or repeated indices for valid triangles. There is no object stage, and one mesh thread sets the output primitive count to zero if allocation is zero or validity is false; otherwise it writes the vertices, indices and payload and sets count one. Metal's mesh output capacities are static: the input allocation and validity words are fixture controls, not a native allocation operation or `PRIM` encoding.
+
+On Apple M4 (macOS 27.0.1), the source-compiled mesh/fragment pipeline matched every pixel in four 8×8 `RGBA8Unorm` renders:
+
+| Allocation | Valid | Indices | Covered / 64 |
+| --- | --- | --- | ---: |
+| 0 | no | unused | 0 |
+| 1 | no | unused | 0 |
+| 1 | yes | 0, 1, 2 | 64 |
+| 1 | yes | 0, 3, 2 | 24 |
+
+Both empty cases leave red clear; the test distinguishes their inputs, not their identical visible output. Only the middle index changes between the two valid cases. The CPU oracle checks every pixel for cyan (separate vertex green and flat primitive blue) or red; the redirected triangle covers the leftmost `[2,2,3,3,3,3,4,4]` pixels in top-down rows, from the authored positions and pixel centers. This demonstrates an explicit count, validity and index contract on Metal, not Xbox semantics.
 
 For the same owned mesh fixture, run the offline and strict archive smoke with the optional Xcode MetalToolchain installed:
 
@@ -36,7 +47,7 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
   sh tools/shader-inventory/smoke-mesh-metallib.sh
 ```
 
-The script uses the public macOS 15 mesh binary archive API. On Apple M4, the offline metallib and the serialized archive loaded in a fresh process with `FailOnBinaryArchiveMiss` each reproduce the 128/128 pixels. The empty archive misses. An independent offline rebuild changes only the mesh stage's primitive blue payload to zero, preserving both entry names; standalone drawing turns cyan to green for count one, while replay against the original archive fails specifically at the mesh function. Scratch artifacts are not a portable cache, and this is not a title PSO bake.
+The script runs the source, offline metallib, strict archive bake, and fresh-process replay paths. On Apple M4 each checked 256/256 pixels. The public macOS 15 mesh binary archive API rejects the empty archive and the replay uses `FailOnBinaryArchiveMiss`. An independent offline rebuild changes only the mesh stage's primitive blue payload to zero, preserving both entry names; standalone drawing turns all covered cyan pixels green without changing coverage, while strict replay against the original archive fails specifically at the mesh function. Scratch artifacts are not a portable cache, and this is not a title PSO bake.
 
 ## Offline library and strict PSO replay
 

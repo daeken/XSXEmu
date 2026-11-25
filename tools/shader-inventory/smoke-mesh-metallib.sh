@@ -14,6 +14,7 @@ compile() {
     xcrun -sdk macosx metal -std=metal3.1 -c "$d/$1.metal" -o "$d/$1.air"
     xcrun -sdk macosx metallib "$d/$1.air" -o "$d/$1.metallib"
 }
+"$p"
 "$p" --emit-msl > "$d/owned.metal"
 compile owned
 "$p" --load-metallib "$d/owned.metallib"
