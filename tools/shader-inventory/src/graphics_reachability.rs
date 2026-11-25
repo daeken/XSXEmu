@@ -420,6 +420,9 @@ fn nearest_form(name: &str, w: u32, len: usize, text: &str) -> String {
         "s_waitcnt" if len == 4 && w == WAIT_EXPORT_ZERO => {
             "s_waitcnt/expcnt-0/vmcnt-63/lgkmcnt-63".into()
         }
+        "v_sub_f32_e32" if len == 4 && w & 0xfe00_01ff == 0x0800_0080 => {
+            "v_sub_f32_e32/inline-positive-zero-minus-VGPR/4B".into()
+        }
         "exp" => match export_shape(w, len, text) {
             Some(s) => format!(
                 "exp/target-{}/en-{}/flags-{}{}{}",
@@ -610,10 +613,84 @@ fn check_wait_dependency(bytes: &[u8]) -> WaitDependency {
     ShapeUnproven
 }
 
+// Bounded VS suffix proof: one pending POS0, then an exact export drain
+// before a MOV replaces one POS0 operand with a value used by PARAM0.
+// This proves the local hazard, not the vertex value or raster ABI.
+fn has_vertex_export_reuse(bytes: &[u8]) -> bool {
+    use crate::graphics_decode::{Op, Target, decode};
+    let Ok(tail) = <&[u8; 28]>::try_from(
+        bytes
+            .get(bytes.len().saturating_sub(28)..)
+            .unwrap_or_default(),
+    ) else {
+        return false;
+    };
+    let words: [u32; 7] =
+        std::array::from_fn(|i| u32::from_le_bytes(tail[4 * i..4 * i + 4].try_into().unwrap()));
+    let Ok((
+        2,
+        Op::Export {
+            target: Target::Position,
+            src: pos,
+            done: true,
+        },
+    )) = decode(&words, 0)
+    else {
+        return false;
+    };
+    let dst = match decode(&words, 3) {
+        Ok((1, Op::Move { dst, src })) if dst != src => dst,
+        Ok((1, Op::MoveBits { dst, .. })) => dst,
+        _ => return false,
+    };
+    let Ok((
+        2,
+        Op::Export {
+            target: Target::Parameter(0),
+            src: param,
+            done: false,
+        },
+    )) = decode(&words, 4)
+    else {
+        return false;
+    };
+    // Check every preceding boundary; no exports, other waits or branches.
+    let mut pc = 0;
+    let prefix = &bytes[..bytes.len() - 28];
+    if !prefix.len().is_multiple_of(4) || prefix.len() > 512 {
+        return false;
+    }
+    let prefix: Vec<_> = prefix
+        .chunks_exact(4)
+        .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+        .collect();
+    while pc < prefix.len() {
+        match decode(&prefix, pc) {
+            Ok((
+                len,
+                Op::Move { .. }
+                | Op::MoveBits { .. }
+                | Op::ShiftLeftOne { .. }
+                | Op::AndMask { .. }
+                | Op::ConvertUint { .. }
+                | Op::FmaUnpack { .. }
+                | Op::NopOneCycle
+                | Op::PrefetchThreeLines,
+            )) => pc += len,
+            _ => return false,
+        }
+    }
+    words[2] == WAIT_EXPORT_ZERO
+        && pos.contains(&dst)
+        && param.contains(&dst)
+        && decode(&words, 6) == Ok((1, Op::End))
+}
+
 #[derive(Default)]
 struct LiftGaps {
     complete: usize,
     sole_export_wait: usize,
+    vertex_export_reuse: usize,
     wait_dependencies: BTreeMap<WaitDependency, usize>,
     sole_export_wait_with_depth_reuse: usize,
     no_encoding_gap: usize,
@@ -738,6 +815,9 @@ impl LiftGaps {
             self.complete += 1;
             if sites - accepted == 1 && saw_export_wait {
                 self.sole_export_wait += 1;
+                self.vertex_export_reuse += usize::from(
+                    linear && has_vertex_export_reuse(&bytes[..bytes.len() - next_tail_len]),
+                );
                 let context = if linear {
                     check_wait_dependency(&bytes[..bytes.len() - next_tail_len])
                 } else {
@@ -790,6 +870,12 @@ impl LiftGaps {
             println!(
                 "    conditional export snapshot audit (not encoding coverage): {:?}",
                 self.wait_dependencies
+            );
+        }
+        if self.vertex_export_reuse != 0 {
+            println!(
+                "    conditional POS0 snapshot audit (not encoding coverage): {} linear paths overwrite a POS0 source after exact EXPCNT(0) and use it in PARAM0",
+                self.vertex_export_reuse
             );
         }
         self.nearest.report();
@@ -1584,6 +1670,39 @@ mod tests {
         assert_eq!((gaps.no_exp_gap, gaps.only_exp_gap), (1, 0));
         assert!(gaps.observe(&mut dis, &bytes).is_ok());
         assert_eq!((gaps.no_exp_gap, gaps.only_exp_gap), (1, 1));
+    }
+
+    #[test]
+    fn vertex_wait_checks_pos0_operand_reuse_and_no_prior_export() {
+        let exact = [
+            0xf800_08cfu32,
+            0x0302_0100,
+            WAIT_EXPORT_ZERO,
+            0x7e00_0304,
+            0xf800_020f,
+            0x0706_0500,
+            0xbf81_0000,
+        ];
+        let check = |words: &[u32]| {
+            has_vertex_export_reuse(
+                &words
+                    .iter()
+                    .flat_map(|w| w.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert!(check(&exact));
+        for (at, word) in [
+            (2, 0xbf8c_ff1f),
+            (3, 0x7e00_0300),
+            (5, 0x0706_0504),
+            (6, 0xbf80_0000),
+        ] {
+            let mut changed = exact;
+            changed[at] = word;
+            assert!(!check(&changed));
+        }
+        assert!(!check(&[&[0xf800_020f, 0][..], &exact].concat()));
     }
 
     #[test]
