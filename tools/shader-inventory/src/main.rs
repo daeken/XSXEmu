@@ -10,6 +10,7 @@ mod graphics_reachability;
 mod graphics_semantics;
 mod library_index;
 mod llvm;
+mod native_pairs;
 mod reachable;
 mod signatures;
 mod wrapped_library;
@@ -300,6 +301,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args_os().skip(1);
     const USAGE: &str = "usage: xsx-shader-inventory [--header-only | --compute-isa <LLVM shared library> <primary CPU> <reference CPU>] <shaders.rpf> (select gfx1013 and gfx1030, in either order)";
     let first = args.next().ok_or(USAGE)?;
+    if first == "--native-vs-ps" {
+        let usage = "usage: xsx-shader-inventory --native-vs-ps <native FSSM directory> <expanded PS/0/9 library> <trusted LLVM 21 library> <gfx1013|gfx1030>";
+        let native = args.next().ok_or(usage)?;
+        let library = args.next().ok_or(usage)?;
+        let llvm = args.next().ok_or(usage)?;
+        let cpu = llvm::Cpu::parse(&args.next().filter(|_| args.next().is_none()).ok_or(usage)?)
+            .ok_or(usage)?;
+        return native_pairs::run(native.as_ref(), library.as_ref(), &llvm, cpu);
+    }
     if first == "--wrapped-library" {
         let usage = "usage: xsx-shader-inventory --wrapped-library <wrapped DXBC directory> <expanded PS/0/9 library> [<trusted LLVM 21 library> <gfx1013|gfx1030>]";
         let wrapped = args.next().ok_or(usage)?;
