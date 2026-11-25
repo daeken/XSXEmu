@@ -1,10 +1,13 @@
 //! Test byte-equality hypotheses inside stage/digest candidate families, not native ABI equivalence.
+#[path = "binding_cohorts.rs"]
+mod binding_cohorts;
+
 use crate::{
     ARCHIVE_LIMIT, BLOB_LIMIT,
     coverage::Metadata,
     coverage::code,
     dxbc_chunks,
-    graphics_reachability::candidate_ps_colors,
+    graphics_reachability::{candidate_ps_colors, exact_semantics},
     llvm::{Cpu, Llvm},
     reachable::reference_walk_result,
     shader_payloads,
@@ -454,6 +457,7 @@ pub(super) fn run(
         p.nonzero_site_word = site_programs.contains(&id);
     }
 
+    let mut cohorts = binding_cohorts::Cohorts::default();
     let mut sources = HashMap::<SourceKey, SourceFamily>::new();
     let mut vs_keys = HashMap::<SourceKey, Option<Vec<(Key, usize, u32)>>>::new();
     let mut counts = BTreeMap::<u16, Payloads>::new();
@@ -546,6 +550,9 @@ pub(super) fn run(
                 native_targets = candidate_ps_colors(waves, payload);
             }
             let Some(raw) = extent(payload) else {
+                if graphs.is_some() && matches!(stage, 0 | 1) {
+                    cohorts.note_wrapper_payload((stage, key), &[None, None]);
+                }
                 count.invalid += eligible.len();
                 return;
             };
@@ -565,6 +572,22 @@ pub(super) fn run(
             count.unsupported_compute_profiles +=
                 usize::from(stage == 5 && profile.is_none()) * eligible.len();
             let mut walked = None;
+            let semantics = if let (Some(body), Some(waves)) = (graphics_body, &mut graphs)
+                && matches!(stage, 0 | 1)
+            {
+                let outcomes = waves
+                    .each_mut()
+                    .map(|wave| exact_semantics(wave, body, stage == 1).map(std::rc::Rc::new));
+                Some(outcomes)
+            } else {
+                None
+            };
+            if graphs.is_some() && matches!(stage, 0 | 1) {
+                cohorts.note_wrapper_payload(
+                    (stage, key),
+                    semantics.as_ref().unwrap_or(&[None, None]),
+                );
+            }
             for (id, lib) in &eligible {
                 // Only length-sensitive, exact byte equality. No candidate selection.
                 let p = candidates
@@ -579,7 +602,11 @@ pub(super) fn run(
                         && let Some(start) = graphics_suffix_start(library_cut, body)
                     {
                         p.graphics_suffix_eligible = true;
-                        p.graphics_suffix_exact |= library_cut.get(start..) == Some(body);
+                        let exact = library_cut.get(start..) == Some(body);
+                        p.graphics_suffix_exact |= exact;
+                        if exact && let Some(outcomes) = &semantics {
+                            cohorts.note((stage, key), *id, start, outcomes);
+                        }
                     }
                     if let Some(fssm_cut) = fssm_cut {
                         for (k, start) in STARTS.into_iter().enumerate() {
@@ -823,6 +850,11 @@ pub(super) fn run(
             vs_layout.entry(slots.clone()).or_default()[bucket] += 1;
         }
         graphics_rows.entry(slots).or_default().add(candidates);
+    }
+    if graphs.is_some() {
+        cohorts.report(&library, &graphics_keys, |key| {
+            sources.get(&key).map_or(0, |f| f.count)
+        });
     }
     for (slots, c) in graphics_rows {
         println!(

@@ -708,6 +708,19 @@ struct LiftGaps {
     export_shapes: BTreeMap<Option<ExportShape>, (usize, usize)>,
 }
 
+pub(super) fn exact_semantics(
+    dis: &mut Disassembler,
+    bytes: &[u8],
+    vertex: bool,
+) -> Option<crate::graphics_semantics::Outcome> {
+    let mut audit = LiftGaps {
+        profile_vertex: Some(vertex),
+        ..LiftGaps::default()
+    };
+    audit.observe(dis, bytes).ok()?;
+    audit.semantics.into_keys().next()
+}
+
 impl LiftGaps {
     fn observe(&mut self, dis: &mut Disassembler, bytes: &[u8]) -> Result<Exports, ResultClass> {
         use crate::graphics_decode::{Op, decode};
