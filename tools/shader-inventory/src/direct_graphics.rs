@@ -239,6 +239,7 @@ struct GapCounts {
     distances: BTreeMap<usize, usize>,
     forms: BTreeMap<String, (usize, usize)>,
     sole_forms: BTreeMap<String, (usize, usize)>,
+    sole_operands: BTreeMap<Vec<(String, usize)>, usize>,
     pairs: BTreeMap<FormPair, PairCounts>,
     refined_pairs: BTreeMap<FormPair, PairCounts>,
 }
@@ -299,6 +300,15 @@ impl GapCounts {
             let rank = self.sole_forms.entry(name.clone()).or_default();
             rank.0 += 1;
             rank.1 += sites;
+            *self
+                .sole_operands
+                .entry(
+                    gaps.operand_forms
+                        .iter()
+                        .map(|(form, &n)| (form.clone(), n))
+                        .collect(),
+                )
+                .or_default() += 1;
             if contiguous {
                 *self.linear_sole.entry(name.clone()).or_default() += 1;
             }
@@ -405,6 +415,9 @@ impl GapCounts {
                 "    sole gap bucket {form}: {windows} windows, {sites} sites, {} contiguous",
                 self.linear_sole.get(&form).copied().unwrap_or(0)
             );
+        }
+        for (forms, windows) in self.sole_operands {
+            println!("    sole bucket refined operand pattern {forms:?}: {windows} windows");
         }
         let mut rows: Vec<_> = self.forms.into_iter().collect();
         rows.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));

@@ -125,6 +125,7 @@ pub(crate) enum Op {
     PackHalfRtz {
         dst: Vgpr,
         src: [Vgpr; 2],
+        neg_first: bool,
     },
     CompareNonzero {
         src: Vgpr,
@@ -332,6 +333,21 @@ pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeErro
             },
         ));
     }
+    // VOP3 form of opcode 47: two VGPRs, NEG0 only, no other modifiers or SRC2.
+    if w & 0xffff_ff00 == 0xd52f_0000 {
+        let fields = ext()?;
+        if fields & !0x0001_feff == 0x2002_0100 {
+            return Ok((
+                2,
+                Op::PackHalfRtz {
+                    dst: Vgpr(w as u8),
+                    src: [Vgpr(fields as u8), Vgpr((fields >> 9) as u8)],
+                    neg_first: true,
+                },
+            ));
+        }
+        return Err(DecodeError::Unsupported(pc));
+    }
     // VOP2 opcode 47, two ordinary VGPR operands.
     if w & 0xfe00_0100 == 0x5e00_0100 {
         return Ok((
@@ -339,6 +355,7 @@ pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeErro
             Op::PackHalfRtz {
                 dst: Vgpr((w >> 17) as u8),
                 src: [Vgpr(w as u8), Vgpr((w >> 9) as u8)],
+                neg_first: false,
             },
         ));
     }

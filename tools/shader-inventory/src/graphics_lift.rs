@@ -414,7 +414,7 @@ fn lift(stage: Stage, words: &[u32]) -> Result<Vec<Op>, Reject> {
                 require(src)?;
                 exported += 1;
             }
-            Op::PackHalfRtz { dst, src } => {
+            Op::PackHalfRtz { dst, src, .. } => {
                 if !matches!(stage, Stage::ConstantRtzPixel | Stage::ConstantRtzRgPixel)
                     || !src.into_iter().all(|r| {
                         constants[r.0 as usize].is_some_and(|bits| {
@@ -654,10 +654,12 @@ fn emit_body(out: &mut String, ops: &[Op], packed_color_lvalue: &str, multi: boo
             Op::PackHalfRtz {
                 dst: Vgpr(dst),
                 src: [Vgpr(lo), Vgpr(hi)],
+                neg_first,
             } => {
+                let neg = if neg_first { " ^ 0x80000000u" } else { "" };
                 writeln!(
                     out,
-                    "  r[{dst}] = half_rtz_bits(r[{lo}]) | (half_rtz_bits(r[{hi}]) << 16);"
+                    "  r[{dst}] = half_rtz_bits(r[{lo}]{neg}) | (half_rtz_bits(r[{hi}]) << 16);"
                 )
                 .unwrap();
             }
@@ -692,6 +694,7 @@ const EDGE_VGPR: &[u32] = &[0x0e04_0300]; // v_mul_legacy_f32_e32 v2, v0, v1
 const EDGE_LITERAL: &[u32] = &[0x0e06_02ff, 0x3e80_0000]; // v_mul_legacy_f32_e32 v3, 0.25, v1
 const EDGE_FMAC: &[u32] = &[0x5608_0300]; // v_fmac_f32_e32 v4, v0, v1
 const EDGE_RTZ: &[u32] = &[0x5e0a_0300]; // v_cvt_pkrtz_f16_f32_e32 v5, v0, v1
+const EDGE_RTZ_NEG: &[u32] = &[0xd52f_0016, 0x2002_0300]; // v22, -v0, v1
 
 const EDGE_ADD: &[u32] = &[0x061e_0300]; // v15 = v0 + v1
 const EDGE_ADD_INLINE: &[u32] = &[0x0620_00f3]; // v16 = -1.0 + v0
@@ -771,8 +774,10 @@ pub fn translate_legacy_edge_fixture() -> Result<String, DecodeError> {
     }
     let mut msl = MSL_HEADER.to_owned();
     msl.push_str(RTZ_HELPER);
-    msl.push_str("kernel void legacy_edges(const device uint4 *in [[buffer(0)]], device uint4 *out [[buffer(1)]], uint id [[thread_position_in_grid]]) {\n  uint r[256]; r[0] = in[id].x; r[1] = in[id].y; r[4] = in[id].z;\n");
+    msl.push_str("kernel void legacy_edges(const device uint4 *in [[buffer(0)]], device uint4 *out [[buffer(1)]], device uint *out_rtz_neg [[buffer(2)]], uint id [[thread_position_in_grid]]) {\n  uint r[256]; r[0] = in[id].x; r[1] = in[id].y; r[4] = in[id].z;\n");
     body(&mut msl, &[a, b, c, d]);
+    body(&mut msl, &[decode(EDGE_RTZ_NEG, 0)?.1]);
+    msl.push_str("  out_rtz_neg[id] = r[22];\n");
     let mut pc = 0;
     while pc < EDGE_MOV_HINTS.len() {
         let (width, op) = decode(EDGE_MOV_HINTS, pc)?;
@@ -913,7 +918,15 @@ fn lift_depth_snapshot(words: &[u32]) -> Result<DepthSnapshot, Reject> {
     if words[2] != crate::graphics_decode::WAIT_EXPORT_ZERO {
         return Err(Reject::Unsupported(2));
     }
-    let Ok((1, Op::PackHalfRtz { dst, src: pack })) = decode(words, 3) else {
+    let Ok((
+        1,
+        Op::PackHalfRtz {
+            dst,
+            src: pack,
+            neg_first: false,
+        },
+    )) = decode(words, 3)
+    else {
         return Err(Reject::Unsupported(3));
     };
     let Ok((
@@ -1593,6 +1606,12 @@ mod tests {
         };
         let asm = "v_mov_b32_e32 v8, v4\nexp param0 v8, v5, v6, v7\nexp pos0 v0, v1, v2, v3 done\ns_endpgm\nv_add_f32_e32 v4, 0.25, v0\nv_fma_f32 v5, v1, v2, v3\nv_mul_legacy_f32_e32 v6, v5, v4\nv_mul_legacy_f32_e32 v6, 0.5, v6\nv_mul_legacy_f32_e32 v7, 0, v3\nexp mrt0 v4, v5, v6, v7 done\ns_endpgm\nv_mul_legacy_f32_e32 v2, v0, v1\nv_mul_legacy_f32_e32 v3, 0.25, v1\nv_fmac_f32_e32 v4, v0, v1\nv_cvt_pkrtz_f16_f32_e32 v5, v0, v1\ns_inst_prefetch 3\nv_mov_b32_e32 v6, 0\ns_nop 0\nv_mov_b32_e32 v7, 0.5\nv_mov_b32_e32 v8, 1.0\nv_mov_b32_e32 v9, 0x7fc12345\nv_cmp_ne_u32_e32 vcc_lo, 0, v0\nv_cndmask_b32_e32 v10, 0x7fc12345, v1, vcc_lo\nv_cmp_ne_u32_e32 vcc_lo, 0, v1\nv_cndmask_b32_e32 v11, 0x80000000, v0, vcc_lo\nexp mrt0 v1, v1, v0, v0 done compr vm\ns_endpgm\nexp mrt0 v1, v1, off, off done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrtz v2, off, off, off done vm\ns_endpgm\nexp mrtz v2, off, off, off\nexp mrt0 v1, v1, v0, v0 done compr vm\ns_endpgm\nexp mrtz v2, off, off, off\ns_waitcnt expcnt(0)\nv_cvt_pkrtz_f16_f32_e32 v2, v0, v1\nexp mrt0 v2, v2, v3, v3 done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrt1 v0, v0, v1, v1 done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrt1 v0, v0, v1, v1 compr\nexp mrt2 v1, v1, v1, v1 done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrt1 v0, v0, off, off compr\nexp mrt2 v1, v1, v1, v1 done compr vm\ns_endpgm\n";
         let mut asm = asm.to_owned();
+        // Keep the instruction order identical to the fixture word fragments below.
+        asm = asm.replacen(
+            "v_cvt_pkrtz_f16_f32_e32 v5, v0, v1\n",
+            "v_cvt_pkrtz_f16_f32_e32 v5, v0, v1\nv_cvt_pkrtz_f16_f32_e64 v22, -v0, v1\n",
+            1,
+        );
         asm.push_str(
             "v_mov_b32_e32 v2, 0x3e800000\nexp mrt0 v2, off, off, off done vm\ns_endpgm\n",
         );
@@ -1645,6 +1664,7 @@ mod tests {
             .chain(EDGE_LITERAL)
             .chain(EDGE_FMAC)
             .chain(EDGE_RTZ)
+            .chain(EDGE_RTZ_NEG)
             .chain(EDGE_MOV_HINTS)
             .chain(EDGE_SELECT)
             .chain([PACKED_PS[0], 1, PACKED_PS[2]].iter())
@@ -1776,6 +1796,56 @@ mod tests {
         assert_eq!(
             lift(Stage::ConstantRtzPixel, &words),
             Err(Reject::Uninitialized(2, 4))
+        );
+    }
+
+    #[test]
+    fn neg_first_rtz_accepts_only_exact_form_and_local_domain() {
+        // Distinct registers at both selector extremes, with a high destination.
+        assert_eq!(
+            decode(&[0xd52f_00ff, 0x2003_ff00], 0),
+            Ok((
+                2,
+                Op::PackHalfRtz {
+                    dst: Vgpr(255),
+                    src: [Vgpr(0), Vgpr(255)],
+                    neg_first: true,
+                },
+            ))
+        );
+        assert_eq!(
+            decode(&EDGE_RTZ_NEG[..1], 0),
+            Err(DecodeError::Truncated(0))
+        );
+        for (first, second) in [
+            (1 << 15, 0), // CLAMP
+            (1 << 11, 0), // OPSEL
+            (1 << 8, 0),  // ABS0
+            (0, 1 << 29), // no NEG0
+            (0, 1 << 30), // also NEG1
+            (0, 1 << 27), // OMOD
+            (0, 1 << 18), // SRC2
+            (0, 1 << 8),  // SRC0 is not a VGPR
+            (0, 1 << 17), // SRC1 is not a VGPR
+        ] {
+            assert_eq!(
+                decode(&[EDGE_RTZ_NEG[0] ^ first, EDGE_RTZ_NEG[1] ^ second], 0),
+                Err(DecodeError::Unsupported(0))
+            );
+        }
+
+        let mut words = CONSTANT_RTZ_PS.to_vec();
+        words.splice(4..5, [0xd52f_0002, EDGE_RTZ_NEG[1]]);
+        let ops = lift(Stage::ConstantRtzPixel, &words).unwrap();
+        let mut msl = String::new();
+        body(&mut msl, &ops);
+        assert!(
+            msl.contains("r[2] = half_rtz_bits(r[0] ^ 0x80000000u) | (half_rtz_bits(r[1]) << 16);")
+        );
+        words[1] = 0x387f_ffff;
+        assert_eq!(
+            lift(Stage::ConstantRtzPixel, &words),
+            Err(Reject::Unsupported(4))
         );
     }
 

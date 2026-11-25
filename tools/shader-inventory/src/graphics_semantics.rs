@@ -198,7 +198,7 @@ pub(crate) fn audit(words: &[u32], vertex: bool) -> Outcome {
                 f.write(dst, None);
                 f.outcome.needs.insert(F32ArithmeticMode);
             }
-            Op::PackHalfRtz { dst, src } => {
+            Op::PackHalfRtz { dst, src, .. } => {
                 let values = src.map(|r| f.read(r));
                 if !values
                     .into_iter()

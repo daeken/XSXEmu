@@ -289,3 +289,21 @@ This verifies strict replay for one owned, locally trusted pipeline and does not
 `bound::translate` now takes a slice of zero, one, or two affine links. Each link names a distinct VS PARAM producer and a distinct PS attribute (0 or 1). Both retain the same full-precision center no-perspective restrictions, X/Z channels, zero M0 contract, and v0/v1 I/J. Each PS link must appear in its own adjacent M0/P1/P2 group at entry, with a matching attribute, channel, M0 source and distinct result VGPR. The validator matches groups by the encoded attribute, not by contract order or VS export order, and refuses missing or repeated groups and mismatched phases. The context-free decoder still recognizes only the prior attribute-0 forms, so the static census is unchanged.
 
 LLVM MC matches both complete native streams on `gfx1013` and `gfx1030`. The owned PS consumes `attr1.z` from PARAM2 using s14, then `attr0.x` from PARAM0 using s9, and exports `(X,Z,Z,X)` to RGBA32Float. On Apple M4, source compilation and offline metallib each matched 64/64 pixels to the independent unequal-W CPU oracle at `1e-6` tolerance. The harness also swaps just the lookup producers while retaining the two channels; this control matches its own prediction at 64/64 pixels and changes both link values at every pixel. The two-link fixture does not enter the single-link archive profile or title admission.
+
+### Direct PS gap ranking: packed RTZ with NEG0
+
+`--direct-library-graphics-gaps` now reports refined operand patterns for windows with a single missing bucket. Before the decoder change, both LLVM CPU references (`gfx1013`/`gfx1030`) and both wave checks gave the same ranking at the tested +36 and +40 starts. These are stage-export-qualified windows, not recovered entry points.
+
+| Sole missing bucket | Contiguous windows at each start | Sites at +36 / +40 |
+| --- | ---: | ---: |
+| `v_interp_mov_f32_e32`, attr0, P0 selector | 3 | 8 / 7 |
+| `v_cvt_pkrtz_f16_f32_e64`, two VGPRs, NEG0 only | 2 | 2 / 2 |
+| Packed MRT0 EN12, COMPR+DONE+VM | 1 | 1 / 1 |
+| Packed MRT1 EN3, COMPR+DONE+VM | 1 | 1 / 1 |
+| `v_cmp_lt_f32_e32` (operands unclassified) | 1 | 1 / 1 |
+
+The raw P0 probe does not establish native M0/LDS coefficient provenance for the first bucket. The next-ranked bucket has one exact form: `VGPR-VGPR/ctrl00-0800/8B` (second word bit 29 is NEG0). LLVM MC independently checks the owned `v_cvt_pkrtz_f16_f32_e64 v22, -v0, v1` as `0xd52f0016 0x20020300` on both CPUs. The decoder varies only the destination and the two VGPR indices; SGPR sources, nonzero SRC2, absent NEG0 and other modifiers reject. The owned constant-RTZ profiles require the same locally proven signed-zero or finite half-normal input range as before. Lowering flips only source zero's sign bit before the integer RTZ conversion, then packs source zero low and source one high. It does not claim subnormal, NaN, overflow, FP exception, or timing behavior. The explicit bound translator and depth-wait profile remain e32-only for this pack.
+
+Apple M4 matched 5/5 raw packed words for each e32 and e64 form in both strict offline arithmetic archive bake and fresh-process replay. The oracle includes above-tie inputs, both zero signs, and asymmetric halves that distinguish negating the wrong source or swapping the halves. The existing graphics smoke passed separately; it did not draw the new form.
+
+With the exact e64 form, encoding-complete PS counts rise from 225 to 227 at each of +36 and +40 on both references (6,161 qualified at wave64; 6,191 at wave32). The other sole-gap buckets above remain, and +0, +24 and all VS encoding-complete counts are unchanged. A local aggregate cross-check found the same two distinct spans across the tested hypotheses, each with one newly recognized site. Neither has a local dataflow or export-order gap in the no-default audit, but both still require entry VGPR and SGPR state, interpolation linkage, F32 arithmetic mode, RTZ operand-domain evidence, and attachment format/mask. The new counts measure encoding coverage, not attachment reconstruction, bound translation, PSO bake, or title admission.

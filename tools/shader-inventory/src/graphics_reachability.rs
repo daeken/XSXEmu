@@ -253,7 +253,13 @@ fn exact_opcode(
                 | Op::PackedRg { .. }
                 | Op::ExportRed { .. }
                 | Op::PixelDepth { .. } => name == "exp",
-                Op::PackHalfRtz { .. } => name == "v_cvt_pkrtz_f16_f32_e32",
+                Op::PackHalfRtz { neg_first, .. } => {
+                    name == if neg_first {
+                        "v_cvt_pkrtz_f16_f32_e64"
+                    } else {
+                        "v_cvt_pkrtz_f16_f32_e32"
+                    }
+                }
                 Op::CompareNonzero { .. } => name == "v_cmp_ne_u32_e32",
                 Op::SelectBits { .. } => name == "v_cndmask_b32_e32",
                 Op::End => name == "s_endpgm",
@@ -280,6 +286,20 @@ fn direct_operand_form(name: &str, words: [u32; 2], len: usize, bucket: &str) ->
     let [first, sources] = words;
     let attr = (first >> 10) & 63;
     match name {
+        "v_cvt_pkrtz_f16_f32_e64" if len == 8 && first & 0xffff_0000 == 0xd52f_0000 => {
+            let kind = |src| match src {
+                256..=511 => "VGPR".to_string(),
+                0..=105 => "SGPR".to_string(),
+                n => format!("sel{n}"),
+            };
+            format!(
+                "{name}/{}-{}/ctrl{:02x}-{:04x}/8B",
+                kind(sources & 511),
+                kind((sources >> 9) & 511),
+                (first >> 8) & 255,
+                sources >> 18
+            )
+        }
         "v_fma_f32" if len == 8 && first & 0xffff_0000 == 0xd54b_0000 => {
             let classes = [0, 9, 18].map(|shift| match (sources >> shift) & 511 {
                 256..=511 => "VGPR".to_owned(),
@@ -1064,7 +1084,11 @@ fn check_wait_dependency(bytes: &[u8]) -> WaitDependency {
                 };
                 depth = Some((src, z_checked));
             }
-            Op::PackHalfRtz { dst: Vgpr(d), src } if waited && final_color.is_none() => {
+            Op::PackHalfRtz {
+                dst: Vgpr(d),
+                src,
+                neg_first: false,
+            } if waited && final_color.is_none() => {
                 let checked = src.into_iter().all(|r| admissible_f32(read(r)));
                 vgprs[usize::from(d)] = Value::Packed {
                     checked,

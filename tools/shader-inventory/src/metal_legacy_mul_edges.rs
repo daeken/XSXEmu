@@ -90,11 +90,13 @@ mod gpu {
         // First row is above the half-ULP tie in both components: nearest-even
         // would give 0xc0013c01. Golden words are literal and do not use the helper.
         let rtz = [
-            ([0x3f80_1800, 0xc000_1800], 0xc000_3c00),
-            ([N0, 0x3e80_0000], 0x3400_8000),
-            ([0x3e80_0000, P0], 0x0000_3400),
+            ([0x3f80_1800, 0xc000_1800], 0xc000_3c00, 0xc000_bc00),
+            ([N0, 0x3e80_0000], 0x3400_8000, 0x3400_0000),
+            ([0x3e80_0000, P0], 0x0000_3400, 0x0000_b400),
+            ([P0, N0], 0x8000_0000, 0x8000_8000),
+            ([0xc000_1800, 0x3f80_1800], 0x3c00_c000, 0x3c00_4000),
         ];
-        inputs.extend(rtz.iter().map(|([a, b], _)| [*a, *b, 0, 0]));
+        inputs.extend(rtz.iter().map(|([a, b], _, _)| [*a, *b, 0, 0]));
         let nan_zero_row = inputs.len();
         inputs.push([NAN, P0, 0, 0]);
         // At magnitude one, half an ULP is 2^-24. Include ties in both
@@ -155,17 +157,21 @@ mod gpu {
         let input = dev.new_buffer_with_data(inputs.as_ptr().cast(), bytes as u64, usage);
         let output = dev.new_buffer(5 * bytes as u64, usage);
         let out = output.contents().cast::<[u32; 4]>();
-        if out.is_null() {
+        let neg_output = dev.new_buffer((inputs.len() * 4) as u64, usage);
+        let neg_out = neg_output.contents().cast::<u32>();
+        if out.is_null() || neg_out.is_null() {
             return Err("unmapped readback".into());
         }
         // Shared buffer is owned here; no CPU access during execution.
         unsafe { out.write_bytes(0xa5, 5 * inputs.len()) };
+        unsafe { neg_out.write_bytes(0xa5, inputs.len()) };
         let queue = dev.new_command_queue();
         let cmd = queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&pipeline);
         enc.set_buffer(0, Some(&input), 0);
         enc.set_buffer(1, Some(&output), 0);
+        enc.set_buffer(2, Some(&neg_output), 0);
         enc.dispatch_threads(
             MTLSize::new(inputs.len() as u64, 1, 1),
             MTLSize::new(inputs.len() as u64, 1, 1),
@@ -195,10 +201,11 @@ mod gpu {
                 return Err(format!("FMAC row {i} returned {got:08x}").into());
             }
         }
-        for (i, (_, expected)) in rtz.into_iter().enumerate() {
+        for (i, (_, expected, expected_neg)) in rtz.into_iter().enumerate() {
             let got = unsafe { out.add(5 * (rtz_start + i)).read() }[3];
-            if got != expected {
-                return Err(format!("RTZ row {i}: got {got:08x}, expected {expected:08x}").into());
+            let got_neg = unsafe { neg_out.add(rtz_start + i).read() };
+            if got != expected || got_neg != expected_neg {
+                return Err(format!("RTZ row {i}: e32/e64 got {got:08x}/{got_neg:08x}, expected {expected:08x}/{expected_neg:08x}").into());
             }
         }
         let mov_oracle = [0, 0.5_f32.to_bits(), 1_f32.to_bits(), 0x7fc1_2345];
@@ -309,7 +316,7 @@ mod gpu {
             }
         }
         println!(
-            "{}: strict arithmetic archive, 16/16 legacy words, 2/2 FMAC words, 3/3 packed RTZ words, {mov_words}/{mov_words} raw MOV words 8/8 select words, 8/8 subtract words 11/11 ordinary multiply checks 8/8 ordinary add words 7/7 inline -1 add words 7/7 inline +1 subtract words and 36/36 mode-dependent CVT words",
+            "{}: strict arithmetic archive, 16/16 legacy words, 2/2 FMAC words, 5/5 e32 packed RTZ words, 5/5 e64 NEG0 packed RTZ words, {mov_words}/{mov_words} raw MOV words 8/8 select words, 8/8 subtract words 11/11 ordinary multiply checks 8/8 ordinary add words 7/7 inline -1 add words 7/7 inline +1 subtract words and 36/36 mode-dependent CVT words",
             dev.name(),
             mov_words = 4 * inputs.len()
         );

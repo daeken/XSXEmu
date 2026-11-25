@@ -422,7 +422,11 @@ pub(crate) fn translate(vs: &[u32], ps: &[u32], b: Bindings<'_>) -> Result<Metal
         match op {
             Op::Move { dst, src } => f.write(dst, f.read(src, pc)?, pc)?,
             Op::MoveBits { dst, bits } => f.write(dst, Fact::Bits(bits), pc)?,
-            Op::PackHalfRtz { dst, src: [lo, hi] } => {
+            Op::PackHalfRtz {
+                dst,
+                src: [lo, hi],
+                neg_first: false,
+            } => {
                 let lo = half_rtz_normal(f.read(lo, pc)?, pc)?;
                 let hi = half_rtz_normal(f.read(hi, pc)?, pc)?;
                 f.write(dst, Fact::Bits(lo | (hi << 16)), pc)?;
