@@ -219,3 +219,20 @@ Apple M4 matched 64/64 pixels from source and again from offline metallib: 20 co
 LLVM MC confirms `v_sub_f32_e32` with inline positive zero (selector 128) and an ordinary VGPR on both references. The lowerer emits an actual floating-point subtraction, not sign-bit inversion. Apple M4 strict arithmetic archive bake and replay each match 8/8 raw result words against literal goldens for both signed zeros, finite normals and both infinities under the owned compiler mode. The test does not establish denormal, NaN-payload or retail floating-point behavior.
 
 Both wave checks agree: the exact form adds 6,117 / 167 matched PS sites and 14 / 3 VS sites for `gfx1013` / `gfx1030`. Whole encoding-complete PS rises by two each to 333/12,091 and 333/6,188. Whole VS stays at 114 per reference; no wait or title admission changes.
+
+### Full-path owned-profile audit and packed constant RTZ
+
+`--graphics-lift-gaps` now reports a separate profile histogram for encoding-complete VS and PS graphs. It passes only the contiguous reached prefix through the real `s_endpgm` to the same Rust validator used for the owned fixtures, without decoding trailing storage. Nonlinear graphs are counted separately. It tries the generic straight-line stage profiles with synthetic inputs and exports, not the dedicated interpolation or export-wait fixtures. If no profile passes, the reported blocker is the rejection at the furthest instruction offset among applicable profiles (ties follow the fixed profile order); this is not a census of every missing semantic in a program.
+
+Before admitting local constant RTZ, none of the encoding-complete graphs fit: the `gfx1013` blocker breakdown was 114 VS export profile mismatches and 333 PS rejections (325 packed RTZ, 8 interpolation). With the new RTZ profiles, both CPU references and both wave checks report the same result:
+
+| Stage | Encoding-complete (`gfx1013` / `gfx1030`) | Fits owned shape | Remaining profile blockers |
+|---|---:|---:|---|
+| VS | 114/1,448 / 114/1,242 | 0 | 114 export profile mismatches |
+| PS | 333/12,091 / 333/6,188 | 315 | 4 packed RTZ value/provenance, 8 interpolation, 6 export profile mismatches |
+
+None of these encoding-complete graphs is nonlinear; encoding counts are unchanged. A fit means the full path passes a synthetic stage contract. It is not a title input, output, or interpolation binding, an actual floating-point mode check, a translated title shader, or a pipeline bake.
+
+The two RTZ pixel profiles assume no live-in VGPRs. Each pack needs two values proven by local raw moves to be signed zeros or to have magnitudes from the minimum normal half through the maximum finite half, inclusive. A pack invalidates its destination's constant fact. The validator rejects unknown values, subnormal-domain inputs, overflow-domain inputs, infinities, NaNs, and wrong export shapes. It uses the existing integer RTZ helper and explicit packed MRT0 format and write-mask contracts, with no new decoder encodings.
+
+LLVM MC matches both complete owned pixel streams on both references. Apple M4 readback matched 64/64 bit-exact `RGBA32Float` pixels for each full and RG-only shader, both from generated source and offline metallib. The positive and negative normal inputs above the half midpoint distinguish truncation from nearest rounding. The full output also checks negative zero and minimum positive normal half; the RG-only descriptor preserves nonzero clear B/A. The owned keyed archive and live admission are unchanged.

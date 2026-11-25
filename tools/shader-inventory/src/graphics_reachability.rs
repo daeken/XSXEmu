@@ -694,6 +694,9 @@ struct LiftGaps {
     wait_dependencies: BTreeMap<WaitDependency, usize>,
     sole_export_wait_with_depth_reuse: usize,
     no_encoding_gap: usize,
+    profile_vertex: Option<bool>,
+    profile_non_linear: usize,
+    profiles: BTreeMap<crate::graphics_lift::ProfileResult, usize>,
     no_exp_gap: usize,
     only_exp_gap: usize,
     sites: usize,
@@ -827,6 +830,22 @@ impl LiftGaps {
                 *self.wait_dependencies.entry(context).or_default() += 1;
                 self.sole_export_wait_with_depth_reuse += usize::from(linear && depth_reused);
             }
+            if missing.is_empty()
+                && let Some(vertex) = self.profile_vertex
+            {
+                if linear {
+                    let words: Vec<_> = bytes[..bytes.len() - next_tail_len]
+                        .chunks_exact(4)
+                        .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+                        .collect();
+                    *self
+                        .profiles
+                        .entry(crate::graphics_lift::audit_profile(&words, vertex))
+                        .or_default() += 1;
+                } else {
+                    self.profile_non_linear += 1;
+                }
+            }
             self.no_encoding_gap += usize::from(missing.is_empty());
             self.no_exp_gap += usize::from(export_shapes.is_empty());
             self.only_exp_gap += usize::from(!export_shapes.is_empty() && missing.len() == 1);
@@ -877,6 +896,12 @@ impl LiftGaps {
             println!(
                 "    conditional POS0 snapshot audit (not encoding coverage): {} linear paths overwrite a POS0 source after exact EXPCNT(0) and use it in PARAM0",
                 self.vertex_export_reuse
+            );
+        }
+        if self.profile_vertex.is_some() {
+            println!(
+                "    owned straight-line profile audit (not bindings): {:?}; non-linear={}",
+                self.profiles, self.profile_non_linear
             );
         }
         self.nearest.report();
@@ -962,6 +987,9 @@ pub fn run(lib: &OsStr, cpu: Cpu, root: &Path, lift_gaps: bool) -> Result<(), Bo
         };
         let [wave64, wave32] = waves.each_mut();
         let outcomes = if lift_gaps {
+            for g in &mut c.lift_gaps {
+                g.profile_vertex = Some(stage == 4);
+            }
             [
                 c.lift_gaps[0].observe(wave64, bytes),
                 c.lift_gaps[1].observe(wave32, bytes),

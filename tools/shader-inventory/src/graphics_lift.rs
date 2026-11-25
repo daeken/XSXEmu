@@ -10,6 +10,8 @@ enum Stage {
     MultiVertex,
     Pixel,
     PackedPixel,
+    ConstantRtzPixel,
+    ConstantRtzRgPixel,
     PackedRgPixel,
     DualPackedPixel,
     TriplePackedPixel,
@@ -117,6 +119,7 @@ impl Stage {
             Stage::Vertex | Stage::UnpackVertex => 8,
             Stage::MultiVertex => 32,
             Stage::Pixel => 4,
+            Stage::ConstantRtzPixel | Stage::ConstantRtzRgPixel => 0,
             Stage::PackedPixel => 2,
             Stage::PackedRgPixel => 2,
             Stage::DualPackedPixel | Stage::TriplePackedPixel | Stage::TriplePackedRgPixel => 2,
@@ -141,6 +144,8 @@ impl Stage {
             ],
             Stage::Pixel => &[(Target::Color, true)],
             Stage::PackedPixel
+            | Stage::ConstantRtzPixel
+            | Stage::ConstantRtzRgPixel
             | Stage::PackedRgPixel
             | Stage::DepthPixel
             | Stage::EarlyDepthPixel
@@ -152,7 +157,10 @@ impl Stage {
 
     fn export_count(self) -> usize {
         match self {
-            Stage::PackedPixel | Stage::PackedRgPixel => 1,
+            Stage::PackedPixel
+            | Stage::PackedRgPixel
+            | Stage::ConstantRtzPixel
+            | Stage::ConstantRtzRgPixel => 1,
             Stage::TriplePackedPixel | Stage::TriplePackedRgPixel => 3,
             Stage::DepthPixel | Stage::EarlyDepthPixel | Stage::DualPackedPixel => 2,
             _ => self.exports().len(),
@@ -160,11 +168,70 @@ impl Stage {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ProfileResult {
+    FitsOwnedShape,
+    UnsupportedSemantics,
+    PackedRtzSemantics,
+    InterpolationSemantics,
+    UnboundInput,
+    ExportProfileMismatch,
+    EndProfileMismatch,
+    Extent,
+}
+
+// Longest validated prefix across existing owned profiles; no guessing extra live-ins.
+#[allow(dead_code)] // Inventory-only.
+pub(crate) fn audit_profile(words: &[u32], vertex: bool) -> ProfileResult {
+    use ProfileResult::*;
+    let profiles: &[Stage] = if vertex {
+        &[Stage::Vertex, Stage::UnpackVertex, Stage::MultiVertex]
+    } else {
+        &[
+            Stage::Pixel,
+            Stage::PackedPixel,
+            Stage::PackedRgPixel,
+            Stage::ConstantRtzPixel,
+            Stage::ConstantRtzRgPixel,
+            Stage::DualPackedPixel,
+            Stage::TriplePackedPixel,
+            Stage::TriplePackedRgPixel,
+            Stage::DepthPixel,
+            Stage::EarlyDepthPixel,
+        ]
+    };
+    let mut best = (0, Extent);
+    for &stage in profiles {
+        let failure = match lift(stage, words) {
+            Ok(_) => return FitsOwnedShape,
+            Err(Reject::Extent) => (0, Extent),
+            Err(Reject::Unsupported(pc) | Reject::Truncated(pc)) => (
+                pc,
+                match decode(words, pc) {
+                    Ok((_, Op::PackHalfRtz { .. })) => PackedRtzSemantics,
+                    Ok((_, Op::InitInterpM0 { .. } | Op::InterpPhase { .. })) => {
+                        InterpolationSemantics
+                    }
+                    _ => UnsupportedSemantics,
+                },
+            ),
+            Err(Reject::Uninitialized(pc, _)) => (pc, UnboundInput),
+            Err(Reject::BadExports(pc)) => (pc, ExportProfileMismatch),
+            Err(Reject::BadEnd(pc)) => (pc, EndProfileMismatch),
+        };
+        if failure.0 >= best.0 {
+            best = failure;
+        }
+    }
+    best.1
+}
+
 fn lift(stage: Stage, words: &[u32]) -> Result<Vec<Op>, Reject> {
     if words.is_empty() || words.len() > 1024 {
         return Err(Reject::Extent);
     }
     let mut live = [false; 256];
+    let mut constants = [None; 256];
     live[..stage.input_registers()].fill(true);
     let mut ops = Vec::new();
     let mut pc = 0;
@@ -182,6 +249,18 @@ fn lift(stage: Stage, words: &[u32]) -> Result<Vec<Op>, Reject> {
         };
         if exported == stage.export_count() && op != Op::End {
             return Err(Reject::BadEnd(pc));
+        }
+        let copy_bits = match op {
+            Op::Move { dst, src } => Some((dst, constants[src.0 as usize])),
+            Op::MoveBits { dst, bits } => Some((dst, Some(bits))),
+            _ => None,
+        };
+        // Only a raw move proves an exact FP operand. Conservatively forget
+        // all facts at other computations (except RTZ, which kills its dst).
+        match op {
+            Op::Move { .. } | Op::MoveBits { .. } | Op::NopOneCycle | Op::PrefetchThreeLines => {}
+            Op::PackHalfRtz { .. } => {}
+            _ => constants.fill(None),
         }
         match op {
             Op::ShiftLeftOne { dst, src }
@@ -252,7 +331,9 @@ fn lift(stage: Stage, words: &[u32]) -> Result<Vec<Op>, Reject> {
                 // An explicit FP16_ABGR target. Neither profile changes EXEC;
                 // the final export must communicate ordinary raster coverage.
                 let valid = match stage {
-                    Stage::PackedPixel => exported == 0 && slot == 0 && done && vm,
+                    Stage::PackedPixel | Stage::ConstantRtzPixel => {
+                        exported == 0 && slot == 0 && done && vm
+                    }
                     Stage::DepthPixel => exported == 0 && slot == 0 && !done && !vm,
                     Stage::EarlyDepthPixel => exported == 1 && slot == 0 && done && vm,
                     Stage::DualPackedPixel => matches!(
@@ -280,7 +361,8 @@ fn lift(stage: Stage, words: &[u32]) -> Result<Vec<Op>, Reject> {
             Op::PackedRg { slot, src } => {
                 if !matches!(
                     (stage, exported, slot),
-                    (Stage::PackedRgPixel, 0, 0) | (Stage::TriplePackedRgPixel, 1, 1)
+                    (Stage::PackedRgPixel | Stage::ConstantRtzRgPixel, 0, 0)
+                        | (Stage::TriplePackedRgPixel, 1, 1)
                 ) {
                     return Err(Reject::BadExports(pc));
                 }
@@ -297,8 +379,21 @@ fn lift(stage: Stage, words: &[u32]) -> Result<Vec<Op>, Reject> {
                 require(src)?;
                 exported += 1;
             }
-            // The separate owned raw-bit probe establishes the value domain.
-            Op::PackHalfRtz { .. } | Op::InitInterpM0 { .. } | Op::InterpPhase { .. } => {
+            Op::PackHalfRtz { dst, src } => {
+                if !matches!(stage, Stage::ConstantRtzPixel | Stage::ConstantRtzRgPixel)
+                    || !src.into_iter().all(|r| {
+                        constants[r.0 as usize].is_some_and(|bits| {
+                            let magnitude = bits & 0x7fff_ffff;
+                            magnitude == 0 || (0x3880_0000..=0x477f_e000).contains(&magnitude)
+                        })
+                    })
+                {
+                    return Err(Reject::Unsupported(pc));
+                }
+                live[dst.0 as usize] = true;
+                constants[dst.0 as usize] = None;
+            }
+            Op::InitInterpM0 { .. } | Op::InterpPhase { .. } => {
                 return Err(Reject::Unsupported(pc));
             }
             Op::End => {
@@ -308,6 +403,9 @@ fn lift(stage: Stage, words: &[u32]) -> Result<Vec<Op>, Reject> {
                 ops.push(op);
                 return Ok(ops);
             }
+        }
+        if let Some((dst, bits)) = copy_bits {
+            constants[dst.0 as usize] = bits;
         }
         ops.push(op);
         pc += width;
@@ -931,6 +1029,48 @@ pub(crate) fn translate_interp_fixture(fixture: InterpFixture) -> Result<String,
     Ok(msl)
 }
 
+const CONSTANT_RTZ_PS: &[u32] = &[
+    0x7e00_02ff,
+    0x3f80_1800,
+    0x7e02_02ff,
+    0xc000_1800,
+    0x5e04_0300,
+    0x7e00_02ff,
+    0x8000_0000,
+    0x7e02_02ff,
+    0x3880_0000,
+    0x5e06_0300,
+    0xf800_1c0f,
+    0x302,
+    0xbf81_0000,
+];
+
+const CONSTANT_RTZ_RG_PS: &[u32] = &[
+    CONSTANT_RTZ_PS[0],
+    CONSTANT_RTZ_PS[1],
+    CONSTANT_RTZ_PS[2],
+    CONSTANT_RTZ_PS[3],
+    CONSTANT_RTZ_PS[4],
+    0xf800_1c03,
+    2,
+    0xbf81_0000,
+];
+
+#[allow(dead_code)]
+pub(crate) fn translate_constant_rtz_fixture(rg: bool) -> Result<String, Reject> {
+    let vs = lift(Stage::Vertex, VS)?;
+    let ps = if rg {
+        lift(Stage::ConstantRtzRgPixel, CONSTANT_RTZ_RG_PS)?
+    } else {
+        lift(Stage::ConstantRtzPixel, CONSTANT_RTZ_PS)?
+    };
+    let mut msl = vertex_module(&vs);
+    msl.push_str(RTZ_HELPER);
+    msl.push_str("fragment float4 constant_rtz_ps() { uint r[256]; float4 out;\n");
+    body(&mut msl, &ps);
+    Ok(msl)
+}
+
 const WAIT_POS_VS: &[u32] = &[
     0xf800_08cf,
     0x0302_0100,
@@ -1089,6 +1229,8 @@ mod tests {
             writeln!(asm, "s_mov_b32 m0, s{sgpr}\nv_interp_p1_f32_e32 v2, v0, attr0.{component}\nv_interp_p2_f32_e32 v2, v1, attr0.{component}\nexp mrt0 v2, v2, v2, v2 done\ns_endpgm").unwrap();
         }
         asm.push_str("exp pos0 v0, v1, v2, v3 done\ns_waitcnt expcnt(0)\nv_mov_b32_e32 v0, v4\nexp param0 v0, v5, v6, v7\ns_endpgm\n");
+        asm.push_str("v_mov_b32_e32 v0, 0x3f801800\nv_mov_b32_e32 v1, 0xc0001800\nv_cvt_pkrtz_f16_f32_e32 v2, v0, v1\nv_mov_b32_e32 v0, 0x80000000\nv_mov_b32_e32 v1, 0x38800000\nv_cvt_pkrtz_f16_f32_e32 v3, v0, v1\nexp mrt0 v2, v2, v3, v3 done compr vm\ns_endpgm\n");
+        asm.push_str("v_mov_b32_e32 v0, 0x3f801800\nv_mov_b32_e32 v1, 0xc0001800\nv_cvt_pkrtz_f16_f32_e32 v2, v0, v1\nexp mrt0 v2, v2, off, off done compr vm\ns_endpgm\n");
         for uint in [false, true] {
             let (mask, cvt) = if uint {
                 ("-2", "v_cvt_f32_u32_e32")
@@ -1123,6 +1265,8 @@ mod tests {
             .chain(INTERP_X_PS)
             .chain(INTERP_Z_PS)
             .chain(WAIT_POS_VS)
+            .chain(CONSTANT_RTZ_PS)
+            .chain(CONSTANT_RTZ_RG_PS)
             .chain(&UNPACK_BYTE_VS)
             .chain(&UNPACK_UINT_VS)
             .chain(MULTI_VS)
@@ -1152,6 +1296,43 @@ mod tests {
                 .collect();
             assert_eq!(bytes, expected, "{cpu}");
         }
+    }
+
+    #[test]
+    fn constant_rtz_requires_local_normal_or_zero_operands() {
+        assert!(lift(Stage::ConstantRtzPixel, CONSTANT_RTZ_PS).is_ok());
+        assert!(lift(Stage::ConstantRtzRgPixel, CONSTANT_RTZ_RG_PS).is_ok());
+        assert_eq!(
+            lift(Stage::ConstantRtzPixel, CONSTANT_RTZ_RG_PS),
+            Err(Reject::BadExports(5))
+        );
+        // Overwrite v0 with a packed result, then try to use it as an FP input.
+        let mut overwritten = CONSTANT_RTZ_RG_PS.to_vec();
+        overwritten[4] = 0x5e00_0300;
+        overwritten.insert(5, 0x5e04_0300);
+        assert_eq!(
+            lift(Stage::ConstantRtzRgPixel, &overwritten),
+            Err(Reject::Unsupported(5))
+        );
+        assert_eq!(
+            audit_profile(CONSTANT_RTZ_PS, false),
+            ProfileResult::FitsOwnedShape
+        );
+        for bits in [1, 0x387f_ffff, 0x4780_0000, 0x7f80_0000, 0x7fc0_0000] {
+            let mut words = CONSTANT_RTZ_PS.to_vec();
+            words[1] = bits;
+            assert_eq!(
+                lift(Stage::ConstantRtzPixel, &words),
+                Err(Reject::Unsupported(4))
+            );
+        }
+        let mut words = CONSTANT_RTZ_PS.to_vec();
+        words[2] = 0x7e02_0304;
+        words.remove(3);
+        assert_eq!(
+            lift(Stage::ConstantRtzPixel, &words),
+            Err(Reject::Uninitialized(2, 4))
+        );
     }
 
     #[test]

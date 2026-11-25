@@ -73,6 +73,14 @@ compile packed
 compile packed-rg
 "$p" --load-packed-rg-metallib "$d/packed-rg.metallib"
 
+# Locally proven packed RTZ constants, including above-midpoint and signed zero.
+for variant in constant-rtz constant-rtz-rg; do
+    "$p" "--$variant-source"
+    "$p" "--emit-$variant-msl" > "$d/$variant.metal"
+    compile "$variant"
+    "$p" "--load-$variant-metallib" "$d/$variant.metallib"
+done
+
 # Scalar depth with explicit Depth32Float and overlapping draws.
 "$p" --depth-source
 "$p" --emit-depth-msl > "$d/depth.metal"

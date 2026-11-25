@@ -113,6 +113,8 @@ mod gpu {
         MrtLoad(&'a Path, MrtFixture),
         InterpSource(InterpFixture),
         InterpLoad(&'a Path, InterpFixture),
+        ConstantRtzSource(bool),
+        ConstantRtzLoad(&'a Path, bool),
         WaitPosSource(bool),
         WaitPosLoad(&'a Path),
         UnpackSource(bool),
@@ -173,6 +175,12 @@ mod gpu {
                 print!("{}", graphics_lift::translate_interp_fixture(fixture).map_err(|e| format!("interpolation lift rejected: {e:?}"))?);
                 return Ok(());
             }
+            [mode] if mode == "--constant-rtz-source" || mode == "--constant-rtz-rg-source" => Mode::ConstantRtzSource(mode == "--constant-rtz-rg-source"),
+            [mode, lib] if mode == "--load-constant-rtz-metallib" || mode == "--load-constant-rtz-rg-metallib" => Mode::ConstantRtzLoad(Path::new(lib), mode == "--load-constant-rtz-rg-metallib"),
+            [mode] if mode == "--emit-constant-rtz-msl" || mode == "--emit-constant-rtz-rg-msl" => {
+                print!("{}", graphics_lift::translate_constant_rtz_fixture(mode == "--emit-constant-rtz-rg-msl").map_err(|e| format!("constant RTZ rejected: {e:?}"))?);
+                return Ok(());
+            }
             [mode] if mode == "--wait-pos-source" || mode == "--expect-late-pos-read" => Mode::WaitPosSource(mode == "--expect-late-pos-read"),
             [mode, lib] if mode == "--load-wait-pos-metallib" => Mode::WaitPosLoad(Path::new(lib)),
             [mode] if mode == "--emit-wait-pos-msl" => {
@@ -217,7 +225,7 @@ mod gpu {
             [mode, lib] if mode == "--load-metallib" || mode == "--load-mutated-metallib" => Mode::Load(Path::new(lib), mode == "--load-mutated-metallib"),
             [mode, lib, archive] if mode == "--expect-owned-metal-miss" => Mode::ExpectStrictMiss(Path::new(lib), Path::new(archive)),
             [mode, lib, archive, compiler] if mode == "--bake-archive" || mode == "--replay-archive" || mode == "--replay-mutated-archive" => Mode::Archive(Path::new(lib), Path::new(archive), mode == "--bake-archive", mode == "--replay-mutated-archive", owned_graphics_artifact::compiler_profile(compiler)?),
-            _ => return Err("usage: shader-metal-graphics-lift [--expect-swapped-triple | --triple-rg-source | --emit-triple-rg-msl | --load-triple-rg-metallib LIB | --triple-source | --emit-triple-msl | --load-triple-metallib LIB | --dual-source | --emit-dual-msl | --load-dual-metallib LIB | --interp-x-source | --interp-z-source | --expect-interp-wrong-mode | --expect-interp-wrong-channel | --emit-interp-x-msl | --emit-interp-z-msl | --load-interp-x-metallib LIB | --load-interp-z-metallib LIB | --wait-pos-source | --emit-wait-pos-msl | --load-wait-pos-metallib LIB | --expect-late-pos-read | --unpack-{byte,uint}-source | --emit-unpack-{byte,uint}-msl | --load-unpack-{byte,uint}-metallib LIB | --multi-source | --emit-multi-msl | --load-multi-metallib LIB | --packed-rg-source | --emit-packed-rg-msl | --load-packed-rg-metallib LIB | --wait-depth-source | --emit-wait-depth-msl | --load-wait-depth-metallib LIB | --expect-late-depth-read | --early-depth-source | --emit-early-depth-msl | --load-early-depth-metallib LIB | --depth-source | --emit-depth-msl | --load-depth-metallib LIB | --packed-source | --emit-packed-msl | --load-packed-metallib LIB | --emit-msl | --emit-mutated-msl | --load-metallib LIB | --load-mutated-metallib LIB | {--bake-archive|--replay-archive|--replay-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-owned-metal-miss MUTATED_LIB ARCHIVE]".into()),
+            _ => return Err("usage: shader-metal-graphics-lift [--expect-swapped-triple | --triple-rg-source | --emit-triple-rg-msl | --load-triple-rg-metallib LIB | --triple-source | --emit-triple-msl | --load-triple-metallib LIB | --dual-source | --emit-dual-msl | --load-dual-metallib LIB | --interp-x-source | --interp-z-source | --expect-interp-wrong-mode | --expect-interp-wrong-channel | --emit-interp-x-msl | --emit-interp-z-msl | --load-interp-x-metallib LIB | --load-interp-z-metallib LIB | --constant-rtz[-rg]-source | --emit-constant-rtz[-rg]-msl | --load-constant-rtz[-rg]-metallib LIB | --wait-pos-source | --emit-wait-pos-msl | --load-wait-pos-metallib LIB | --expect-late-pos-read | --unpack-{byte,uint}-source | --emit-unpack-{byte,uint}-msl | --load-unpack-{byte,uint}-metallib LIB | --multi-source | --emit-multi-msl | --load-multi-metallib LIB | --packed-rg-source | --emit-packed-rg-msl | --load-packed-rg-metallib LIB | --wait-depth-source | --emit-wait-depth-msl | --load-wait-depth-metallib LIB | --expect-late-depth-read | --early-depth-source | --emit-early-depth-msl | --load-early-depth-metallib LIB | --depth-source | --emit-depth-msl | --load-depth-metallib LIB | --packed-source | --emit-packed-msl | --load-packed-metallib LIB | --emit-msl | --emit-mutated-msl | --load-metallib LIB | --load-mutated-metallib LIB | {--bake-archive|--replay-archive|--replay-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-owned-metal-miss MUTATED_LIB ARCHIVE]".into()),
         };
         if matches!(mode, Mode::Archive(..) | Mode::ExpectStrictMiss(..))
             && std::env::var_os("MTL_SHADER_VALIDATION").is_some()
@@ -249,6 +257,11 @@ mod gpu {
             Mode::InterpSource(f) | Mode::InterpLoad(_, f) => Some(f),
             _ => None,
         };
+        let constant_rtz = match mode {
+            Mode::ConstantRtzSource(rg) | Mode::ConstantRtzLoad(_, rg) => Some(rg),
+            _ => None,
+        };
+        let partial = partial || constant_rtz == Some(true);
         let wait_pos = matches!(mode, Mode::WaitPosSource(_) | Mode::WaitPosLoad(_));
         let late_pos = matches!(mode, Mode::WaitPosSource(true));
         let unpack = match mode {
@@ -275,6 +288,7 @@ mod gpu {
             | Mode::DepthSource(_)
             | Mode::WaitDepthSource(_)
             | Mode::InterpSource(_)
+            | Mode::ConstantRtzSource(_)
             | Mode::WaitPosSource(_)
             | Mode::UnpackSource(_)
             | Mode::MultiSource
@@ -284,6 +298,8 @@ mod gpu {
                     graphics_lift::translate_mrt_fixture(fixture)
                 } else if let Some(interp) = interp {
                     graphics_lift::translate_interp_fixture(interp)
+                } else if let Some(rg) = constant_rtz {
+                    graphics_lift::translate_constant_rtz_fixture(rg)
                 } else if wait_pos {
                     graphics_lift::translate_wait_pos_fixture(late_pos)
                 } else if let Some(uint) = unpack {
@@ -306,6 +322,7 @@ mod gpu {
             }
             Mode::PackedLoad(path, _)
             | Mode::InterpLoad(path, _)
+            | Mode::ConstantRtzLoad(path, _)
             | Mode::WaitPosLoad(path)
             | Mode::UnpackLoad(path, _)
             | Mode::MultiLoad(path)
@@ -323,6 +340,8 @@ mod gpu {
         const DEPTH_FORMAT: MTLPixelFormat = MTLPixelFormat::Depth32Float;
         let (format, pixel_bytes, default_ps) = if let Some(fixture) = fixture {
             (MTLPixelFormat::RGBA32Float, 16, fixture.entry())
+        } else if constant_rtz.is_some() {
+            (MTLPixelFormat::RGBA32Float, 16, "constant_rtz_ps")
         } else if wait_pos {
             (MTLPixelFormat::RGBA32Float, 16, "wait_pos_ps")
         } else if unpack.is_some() {
@@ -666,6 +685,33 @@ mod gpu {
         }
         // The GPU writes have completed and the owned buffer remains alive through the last read.
         let pixels = unsafe { std::slice::from_raw_parts(ptr, extent) };
+        if let Some(rg) = constant_rtz {
+            // RTZ not RNE for ±normal inputs above the half midpoint.
+            // Full writes include -0 and minimum half normal; RG preserves clear B/A.
+            let want = if rg {
+                [0x3f80_0000, 0xc000_0000, 0x3f80_0000, 0x3f40_0000]
+            } else {
+                [0x3f80_0000, 0xc000_0000, 0x8000_0000, 0x3880_0000]
+            };
+            for y in 0..SIDE {
+                for x in 0..SIDE {
+                    let at = y * STRIDE + x * 16;
+                    let got: [u32; 4] = std::array::from_fn(|i| {
+                        u32::from_le_bytes(pixels[at + 4 * i..at + 4 * i + 4].try_into().unwrap())
+                    });
+                    if got != want {
+                        return Err(format!(
+                            "constant RTZ ({x},{y}): expected {want:08x?}, got {got:08x?}"
+                        ));
+                    }
+                }
+            }
+            println!(
+                "{} owned constant packed RTZ (RG-only={rg}): 64/64 pixels bit-exact",
+                dev.name()
+            );
+            return Ok(());
+        }
         if wait_pos {
             let mut writes = 0;
             for y in 0..SIDE {
