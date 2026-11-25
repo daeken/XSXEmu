@@ -894,10 +894,37 @@ fragment DepthOutputs wait_depth_ps(constant uint4 &input [[buffer(0)]]) {\n\
     Ok(msl)
 }
 
+// Owned only: full nonfinal packed MRT0, final scalar MRT1, real END.
+// Disabled selectors are deliberately nonzero; none is an input binding.
+const DUAL_RED_PS: &[u32] = &[
+    0xf800_040f,
+    0x7e53_0001,
+    0xf800_1811,
+    0x7291_4f00,
+    0xbf81_0000,
+];
+
+fn dual_red_exports(words: &[u32]) -> Result<([Vgpr; 2], Vgpr), Reject> {
+    match *words {
+        [0xf800_040f, packed, 0xf800_1811, scalar, 0xbf81_0000] => {
+            let [rg, ba, _, _] = packed.to_le_bytes();
+            let red = scalar as u8;
+            for (pc, r) in [(0, rg), (0, ba), (2, red)] {
+                if r > 1 {
+                    return Err(Reject::Uninitialized(pc, r));
+                }
+            }
+            Ok(([Vgpr(rg), Vgpr(ba)], Vgpr(red)))
+        }
+        _ => Err(Reject::BadExports(0)),
+    }
+}
+
 #[allow(dead_code)] // Separate MRT render probe.
 #[derive(Clone, Copy)]
 pub(crate) enum MrtFixture {
     Dual,
+    DualRed,
     Triple,
     TripleRg,
 }
@@ -907,6 +934,7 @@ impl MrtFixture {
     pub(crate) fn entry(self) -> &'static str {
         match self {
             Self::Dual => "dual_ps",
+            Self::DualRed => "dual_red_ps",
             Self::Triple => "triple_ps",
             Self::TripleRg => "triple_rg_ps",
         }
@@ -918,6 +946,12 @@ pub(crate) fn translate_mrt_fixture(fixture: MrtFixture) -> Result<String, Rejec
     let vs = lift(Stage::Vertex, VS)?;
     let ps = match fixture {
         MrtFixture::Dual => lift(Stage::DualPackedPixel, DUAL_PS)?,
+        MrtFixture::DualRed => {
+            let ([Vgpr(rg), Vgpr(ba)], Vgpr(red)) = dual_red_exports(DUAL_RED_PS)?;
+            let mut msl = vertex_module(&vs);
+            writeln!(msl, "struct Colors {{ float4 color0 [[color(0)]]; float4 color1 [[color(1)]]; }};\nfragment Colors dual_red_ps(constant uint2 &r [[buffer(0)]]) {{\n  return {{ float4(float2(as_type<half2>(r[{rg}])), float2(as_type<half2>(r[{ba}]))), float4(as_type<float>(r[{red}]), 0.0f, 0.0f, 0.0f) }};\n}}").unwrap();
+            return Ok(msl);
+        }
         MrtFixture::Triple => lift(Stage::TriplePackedPixel, TRIPLE_PS)?,
         MrtFixture::TripleRg => lift(Stage::TriplePackedRgPixel, TRIPLE_RG_PS)?,
     };
@@ -1424,6 +1458,9 @@ mod tests {
             writeln!(asm, "exp param{n} v{r}, v{}, v{}, v{}", r + 1, r + 2, r + 3).unwrap();
         }
         asm.push_str("exp pos0 v0, v1, v2, v3 done\ns_endpgm\n");
+        asm.push_str(
+            "exp mrt0 v1, v1, v0, v0 compr\nexp mrt1 v0, off, off, off done vm\ns_endpgm\n",
+        );
         let expected: Vec<u8> = VS
             .iter()
             .chain(PS)
@@ -1462,6 +1499,7 @@ mod tests {
             .chain(&UNPACK_BYTE_VS)
             .chain(&UNPACK_UINT_VS)
             .chain(MULTI_VS)
+            .chain(&[DUAL_RED_PS[0], 1, DUAL_RED_PS[2], 0, DUAL_RED_PS[4]])
             .flat_map(|w| w.to_le_bytes())
             .collect();
         for cpu in ["gfx1013", "gfx1030"] {
@@ -1786,6 +1824,34 @@ mod tests {
             decode(&[TRIPLE_PS[4], 0x0100_0101], 0),
             Err(DecodeError::Unsupported(0))
         );
+    }
+
+    #[test]
+    fn owned_dual_red_checks_enabled_sources_order_and_extent() {
+        let expected = Ok(([Vgpr(1), Vgpr(0)], Vgpr(0)));
+        assert_eq!(dual_red_exports(DUAL_RED_PS), expected);
+        let mut words = DUAL_RED_PS.to_vec();
+        words[1] ^= 0xffff_0000;
+        words[3] ^= 0xffff_ff00;
+        assert_eq!(dual_red_exports(&words), expected);
+        for (index, bit) in [
+            (0, 0x800),
+            (0, 0x20),
+            (0, 0x2000),
+            (1, 2),
+            (1, 0x200),
+            (2, 0x1),
+            (2, 0x1000),
+            (3, 2),
+            (4, 1),
+        ] {
+            let mut changed = words.clone();
+            changed[index] ^= bit;
+            assert!(dual_red_exports(&changed).is_err());
+        }
+        assert!(dual_red_exports(&words[..4]).is_err());
+        words.push(0);
+        assert!(dual_red_exports(&words).is_err());
     }
 
     #[test]

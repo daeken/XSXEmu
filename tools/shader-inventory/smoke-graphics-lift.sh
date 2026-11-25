@@ -195,6 +195,13 @@ compile bound-two-affine
 compile dual
 "$p" --load-dual-metallib "$d/dual.metallib"
 
+# Full nonfinal MRT0 plus red-only final MRT1. Full-mask control uses the same metallib.
+"$p" --dual-red-source
+"$p" --emit-dual-red-msl > "$d/dual-red.metal"
+compile dual-red
+"$p" --load-dual-red-metallib "$d/dual-red.metallib"
+"$p" --expect-dual-red-all-mask "$d/dual-red.metallib"
+
 # Three distinct full-mask FP16_ABGR outputs, including nonfinal MRT1.
 "$p" --triple-source
 "$p" --emit-triple-msl > "$d/triple.metal"

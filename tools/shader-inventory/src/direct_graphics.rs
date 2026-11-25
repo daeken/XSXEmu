@@ -198,6 +198,26 @@ pub(super) fn run(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), Box<dy
     Ok(())
 }
 
+type FormPair = (String, String);
+type SiteCounts = (usize, usize);
+
+fn two_forms(missing: &BTreeMap<String, usize>) -> Option<(FormPair, SiteCounts)> {
+    if missing.len() != 2 {
+        return None;
+    }
+    let mut forms = missing.iter();
+    let (a, &n) = forms.next()?;
+    let (b, &m) = forms.next()?;
+    Some(((a.clone(), b.clone()), (n, m)))
+}
+
+#[derive(Default)]
+struct PairCounts {
+    sites: BTreeMap<SiteCounts, usize>,
+    contiguous: usize,
+    details: BTreeMap<Vec<(String, usize)>, usize>,
+}
+
 #[derive(Default)]
 struct GapCounts {
     eligible: usize,
@@ -211,6 +231,8 @@ struct GapCounts {
     distances: BTreeMap<usize, usize>,
     forms: BTreeMap<String, (usize, usize)>,
     sole_forms: BTreeMap<String, (usize, usize)>,
+    pairs: BTreeMap<FormPair, PairCounts>,
+    refined_pairs: BTreeMap<FormPair, PairCounts>,
 }
 
 impl GapCounts {
@@ -220,14 +242,14 @@ impl GapCounts {
         self.ordinary_mul.0 += gaps.ordinary_vgpr_mul;
         self.ordinary_mul.1 += usize::from(gaps.ordinary_vgpr_mul > 0);
         let contiguous = gaps.contiguous;
-        let gaps = &gaps.missing;
+        let missing = &gaps.missing;
         self.eligible += 1;
-        self.exact += usize::from(gaps.is_empty());
-        if !gaps.is_empty() {
-            *self.distances.entry(gaps.values().sum()).or_default() += 1;
+        self.exact += usize::from(missing.is_empty());
+        if !missing.is_empty() {
+            *self.distances.entry(missing.values().sum()).or_default() += 1;
         }
-        if gaps.len() == 1 {
-            let (name, &sites) = gaps.first_key_value().unwrap();
+        if missing.len() == 1 {
+            let (name, &sites) = missing.first_key_value().unwrap();
             let rank = self.sole_forms.entry(name.clone()).or_default();
             rank.0 += 1;
             rank.1 += sites;
@@ -235,7 +257,25 @@ impl GapCounts {
                 *self.linear_sole.entry(name.clone()).or_default() += 1;
             }
         }
-        for (name, &sites) in gaps {
+        if let Some((pair, sites)) = two_forms(missing) {
+            let row = self.pairs.entry(pair).or_default();
+            *row.sites.entry(sites).or_default() += 1;
+            row.contiguous += usize::from(contiguous);
+            *row.details
+                .entry(
+                    gaps.operand_forms
+                        .iter()
+                        .map(|(name, &n)| (name.clone(), n))
+                        .collect(),
+                )
+                .or_default() += 1;
+        }
+        if let Some((pair, sites)) = two_forms(&gaps.operand_forms) {
+            let row = self.refined_pairs.entry(pair).or_default();
+            *row.sites.entry(sites).or_default() += 1;
+            row.contiguous += usize::from(contiguous);
+        }
+        for (name, &sites) in missing {
             let form = self.forms.entry(name.clone()).or_default();
             form.0 += sites;
             form.1 += 1;
@@ -277,7 +317,10 @@ impl GapCounts {
         }
         let distances: Vec<_> = self.distances.into_iter().take(3).collect();
         println!("    nearest (unsupported sites, windows): {distances:?}");
+        Self::report_pairs("gap buckets", self.pairs);
+        Self::report_pairs("operand forms", self.refined_pairs);
         let mut leverage: Vec<_> = self.sole_forms.into_iter().collect();
+
         leverage.sort_unstable_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| a.0.cmp(&b.0)));
         for (form, (windows, sites)) in leverage {
             println!(
@@ -289,6 +332,60 @@ impl GapCounts {
         rows.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         for (form, (sites, windows)) in rows.into_iter().take(16) {
             println!("    {form}: {sites} sites in {windows} windows");
+        }
+    }
+
+    fn report_pairs(label: &str, rows: BTreeMap<FormPair, PairCounts>) {
+        let mut pairs: Vec<_> = rows.into_iter().collect();
+        pairs.sort_unstable_by(|a, b| {
+            let total = |row: &PairCounts| row.sites.values().sum::<usize>();
+            total(&b.1).cmp(&total(&a.1)).then_with(|| a.0.cmp(&b.0))
+        });
+        for ((a, b), row) in pairs {
+            let total: usize = row.sites.values().sum();
+            let two_sites = row.sites.get(&(1, 1)).copied().unwrap_or(0);
+            println!(
+                "    two {label} {a} + {b}: {total} windows, {two_sites} exactly two sites, {} contiguous, site multiplicities {:?}",
+                row.contiguous, row.sites
+            );
+            for (shape, count) in row.details {
+                println!("      {count} windows with operand pattern {shape:?}");
+            }
+        }
+    }
+}
+
+struct PairSpans<K> {
+    pairs: BTreeMap<FormPair, HashMap<K, bool>>,
+}
+
+impl<K: Copy + Eq + std::hash::Hash> PairSpans<K> {
+    fn new() -> Self {
+        Self {
+            pairs: BTreeMap::new(),
+        }
+    }
+
+    fn note(&mut self, span: K, missing: &BTreeMap<String, usize>) {
+        if let Some((pair, sites)) = two_forms(missing) {
+            *self.pairs.entry(pair).or_default().entry(span).or_default() |= sites == (1, 1);
+        }
+    }
+
+    fn report(self, stage: &str, label: &str) {
+        let union: HashSet<_> = self.pairs.values().flat_map(|spans| spans.keys()).collect();
+        println!(
+            "  {stage} two {label}: {} distinct spans in the union across starts/waves",
+            union.len()
+        );
+        let mut pairs: Vec<_> = self.pairs.into_iter().collect();
+        pairs.sort_unstable_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
+        for ((a, b), spans) in pairs {
+            let two_sites = spans.values().filter(|&&two| two).count();
+            println!(
+                "    {a} + {b}: {} distinct spans across starts/waves, {two_sites} with exactly two sites in at least one hypothesis",
+                spans.len()
+            );
         }
     }
 }
@@ -306,6 +403,8 @@ pub(super) fn run_gaps(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), B
     let mut distinct = HashSet::new();
     let mut interp_spans = HashSet::new();
     let mut packed_spans = [HashSet::new(), HashSet::new()];
+    let mut pair_spans = [PairSpans::new(), PairSpans::new()];
+    let mut refined_spans = [PairSpans::new(), PairSpans::new()];
     let mut counts: [[[GapCounts; 2]; STARTS.len()]; 2] = Default::default();
     for row in lib.graphics() {
         for (slot, reference) in row.slots.into_iter().take(2).enumerate() {
@@ -327,6 +426,8 @@ pub(super) fn run_gaps(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), B
                 for (w, wave) in waves.iter_mut().enumerate() {
                     if let Some(gaps) = direct_gaps(wave, window, slot) {
                         counts[slot][i][w].note(&gaps);
+                        pair_spans[slot].note(reference.program, &gaps.missing);
+                        refined_spans[slot].note(reference.program, &gaps.operand_forms);
                         if slot == 0
                             && gaps.contiguous
                             && gaps.missing.len() == 1
@@ -368,6 +469,13 @@ pub(super) fn run_gaps(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), B
         "  Distinct PS spans with sole prior packed-selector blocker across hypotheses (RG / RGBA): {:?}",
         packed_spans.map(|spans| spans.len())
     );
+    for (stage, (buckets, operands)) in STAGES
+        .into_iter()
+        .zip(pair_spans.into_iter().zip(refined_spans))
+    {
+        buckets.report(stage, "gap buckets");
+        operands.report(stage, "operand forms");
+    }
     for (s, stage) in counts.into_iter().enumerate() {
         for (i, start) in stage.into_iter().enumerate() {
             for (w, wave) in start.into_iter().enumerate() {
@@ -444,6 +552,24 @@ mod tests {
         );
         assert!(direct_gaps(&mut wave, &bytes(&ps), 1).is_none());
         assert!(direct_gaps(&mut wave, &bytes(&ps[..4]), 0).is_none());
+    }
+
+    #[test]
+    fn pair_counts_distinguish_sites_forms_and_duplicate_hypotheses() {
+        let shape = |n, m| BTreeMap::from([("a".into(), n), ("b".into(), m)]);
+        let mut spans = PairSpans::new();
+        let repeated = shape(2, 1);
+        assert_eq!(two_forms(&repeated).unwrap().1, (2, 1));
+        assert!(two_forms(&BTreeMap::from([("a".into(), 2)])).is_none());
+        spans.note(0, &repeated);
+        spans.note(0, &shape(1, 1));
+        spans.note(0, &repeated);
+        spans.note(1, &repeated);
+        assert_eq!(spans.pairs.len(), 1);
+        assert_eq!(
+            spans.pairs.values().next(),
+            Some(&HashMap::from([(0, true), (1, false)]))
+        );
     }
 
     #[test]

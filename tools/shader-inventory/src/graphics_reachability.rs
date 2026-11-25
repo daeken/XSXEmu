@@ -271,9 +271,79 @@ fn interp_mov_fields(w: u32) -> Option<(u8, u8, u8)> {
     ))
 }
 
+// Refine the nearby direct cohorts by public encoding fields, without
+// publishing register numbers, literal payloads, or program offsets.
+fn direct_operand_form(name: &str, words: [u32; 2], len: usize, bucket: &str) -> String {
+    let [first, sources] = words;
+    let attr = (first >> 10) & 63;
+    match name {
+        "v_interp_p1_f32_e32" | "v_interp_p2_f32_e32"
+            if len == 4
+                && attr <= 32
+                && first & 0xfc03_0000
+                    == if name == "v_interp_p1_f32_e32" {
+                        0xc800_0000
+                    } else {
+                        0xc801_0000
+                    } =>
+        {
+            let channel = (first >> 8) & 3;
+            format!(
+                "{name}/attr{attr}.{}/VGPR/4B",
+                ["x", "y", "z", "w"][channel as usize]
+            )
+        }
+        "v_interp_mov_f32_e32" if len == 4 => interp_mov_fields(first).map_or_else(
+            || bucket.to_owned(),
+            |(selector, attr, channel)| {
+                format!(
+                    "{name}/attr{attr}.{}/selector-{selector}/4B",
+                    ["x", "y", "z", "w"][channel as usize]
+                )
+            },
+        ),
+        "v_bfrev_b32_e32" if matches!(len, 4 | 8) && first & 0xfe01_fe00 == 0x7e00_7000 => {
+            let selector = first & 511;
+            match selector {
+                256..=511 => format!("{name}/VGPR/{len}B"),
+                0..=105 => format!("{name}/SGPR/{len}B"),
+                _ => format!("{name}/selector-{selector}/{len}B"),
+            }
+        }
+        "s_mov_b32" if len == 4 && first & 0xffff_ff00 == 0xbefc_0300 => {
+            let selector = first & 255;
+            if selector <= 105 {
+                format!("{name}/SGPR-to-M0/4B")
+            } else {
+                format!("{name}/selector-{selector}-to-M0/4B")
+            }
+        }
+        "exp" if len == 8 && first & 0xffff_e000 == 0xf800_0000 && bucket != "exp/unclassified" => {
+            let en = first & 15;
+            let enabled_sources = if first & (1 << 10) != 0 {
+                u32::from(en & 3 != 0) | (u32::from(en & 12 != 0) << 1)
+            } else {
+                en
+            };
+            let nonzero_disabled =
+                (0..4).any(|i| enabled_sources & (1 << i) == 0 && (sources >> (i * 8)) & 255 != 0);
+            format!(
+                "{bucket}/8B/{}",
+                if nonzero_disabled {
+                    "nonzero-disabled"
+                } else {
+                    "zero-disabled"
+                }
+            )
+        }
+        _ => bucket.to_owned(),
+    }
+}
+
 #[derive(Default)]
 pub(super) struct DirectGaps {
     pub missing: BTreeMap<String, usize>,
+    pub operand_forms: BTreeMap<String, usize>,
     pub ordinary_vgpr_mul: usize,
     pub ordinary_vgpr_add: usize,
     pub contiguous: bool,
@@ -318,10 +388,12 @@ pub(super) fn direct_gaps(dis: &mut Disassembler, bytes: &[u8], slot: usize) -> 
             if name == "v_interp_mov_f32_e32" && len == 4 {
                 *gaps.interp_mov.entry(interp_mov_fields(first)).or_default() += 1;
             }
+            let bucket = nearest_form(name, first, len, text);
             *gaps
-                .missing
-                .entry(nearest_form(name, first, len, text))
+                .operand_forms
+                .entry(direct_operand_form(name, words, len, &bucket))
                 .or_default() += 1;
+            *gaps.missing.entry(bucket).or_default() += 1;
         }
     })
     .ok()?;
