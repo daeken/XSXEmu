@@ -261,6 +261,7 @@ fn exact_opcode(
                         "v_cvt_pkrtz_f16_f32_e32"
                     }
                 }
+                Op::CompareZeroLtF32 { .. } => name == "v_cmp_lt_f32_e32",
                 Op::CompareNonzero { .. } => name == "v_cmp_ne_u32_e32",
                 Op::SelectBits { .. } => name == "v_cndmask_b32_e32",
                 Op::End => name == "s_endpgm",
@@ -287,6 +288,7 @@ fn direct_operand_form(name: &str, words: [u32; 2], len: usize, bucket: &str) ->
     let [first, sources] = words;
     let attr = (first >> 10) & 63;
     match name {
+        "v_cmp_lt_f32_e32" => format!("{name}/sel{}/{}B", first & 511, len),
         "v_cvt_pkrtz_f16_f32_e64" if len == 8 && first & 0xffff_0000 == 0xd52f_0000 => {
             let kind = |src| match src {
                 256..=511 => "VGPR".to_string(),
@@ -441,6 +443,7 @@ pub(super) struct DirectGaps {
     pub partial_param0_noncanonical: usize,
     pub contiguous: bool,
     pub interp_mov: BTreeMap<Option<(u8, u8, u8)>, usize>,
+    pub cmp_zero_lt: usize,
     pub packed_ba: usize,
     pub packed_mrt1_rg_final: usize,
     pub packed_mrt0_noncanonical: [usize; 2], // RG / RGBA
@@ -504,6 +507,10 @@ pub(super) fn direct_gaps(dis: &mut Disassembler, bytes: &[u8], slot: usize) -> 
             gaps.inline_bfrev_sites += 1;
         }
         if exact_opcode(decoded, len, name) {
+            gaps.cmp_zero_lt += usize::from(matches!(
+                decoded,
+                Some((1, crate::graphics_decode::Op::CompareZeroLtF32 { .. }))
+            ));
             gaps.packed_ba += usize::from(matches!(
                 decoded,
                 Some((2, crate::graphics_decode::Op::PackedBa { .. }))

@@ -208,6 +208,18 @@ pub(crate) fn audit(words: &[u32], vertex: bool) -> Outcome {
                 }
                 f.write(dst, None);
             }
+            Op::CompareZeroLtF32 { rhs } => {
+                let bits = f.read(rhs);
+                // This result-only comparison is mode-independent for known
+                // normal/zero/Inf values. Retain a predicate for other inputs.
+                if !bits.is_some_and(|bits| {
+                    let mag = bits & 0x7fff_ffff;
+                    mag == 0 || (0x0080_0000..=0x7f80_0000).contains(&mag)
+                }) {
+                    f.outcome.needs.insert(F32ArithmeticMode);
+                }
+                local_vcc = true;
+            }
             Op::CompareNonzero { src } => {
                 f.read(src);
                 local_vcc = true;

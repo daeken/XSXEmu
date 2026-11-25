@@ -311,6 +311,8 @@ fn lift(stage: Stage, words: &[u32]) -> Result<Vec<Op>, Reject> {
                 require(src)?;
                 live[usize::from(dst.0)] = true;
             }
+            // The FP compare is owned by the isolated arithmetic probe only.
+            Op::CompareZeroLtF32 { .. } => return Err(Reject::Unsupported(pc)),
             Op::CompareNonzero { src } => {
                 if matches!(
                     stage,
@@ -483,7 +485,10 @@ fn body(out: &mut String, ops: &[Op]) {
 
 fn emit_body(out: &mut String, ops: &[Op], packed_color_lvalue: &str, multi: bool) {
     // Only the active lane's VCC bit is observable in this straight-line profile.
-    if ops.iter().any(|op| matches!(op, Op::CompareNonzero { .. })) {
+    if ops
+        .iter()
+        .any(|op| matches!(op, Op::CompareNonzero { .. } | Op::CompareZeroLtF32 { .. }))
+    {
         out.push_str("  bool lane_vcc;\n");
     }
     for op in ops {
@@ -493,6 +498,11 @@ fn emit_body(out: &mut String, ops: &[Op], packed_color_lvalue: &str, multi: boo
                 src: Vgpr(src),
             } => {
                 writeln!(out, "  r[{dst}] = r[{src}];").unwrap();
+            }
+            Op::CompareZeroLtF32 { rhs: Vgpr(r) } => {
+                // Fixed owned result policy, preserving positive subnormals.
+                // Compare bits to avoid depending on Metal FP mode or NaN optimizations.
+                writeln!(out, "  lane_vcc = r[{r}] != 0u && r[{r}] <= 0x7f800000u;").unwrap();
             }
             Op::CompareNonzero { src: Vgpr(r) } => {
                 writeln!(out, "  lane_vcc = r[{r}] != 0u;").unwrap();
@@ -738,6 +748,9 @@ const EDGE_MUL: &[u32] = &[0x101c_0300]; // v14 = v0 * v1
 const EDGE_SUB: &[u32] = &[0x0818_0080, 0x081a_0280]; // v12=+0-v0, v13=+0-v1
 const EDGE_SUB_ONE: &[u32] = &[0x0822_00f2]; // v17 = +1 - v0
 
+// The owned probe observes only this lane via an immediate CNDMASK.
+const EDGE_CMP_LT: &[u32] = &[0x7c02_0280, 0x022e_00ff, 0x8000_0000];
+
 const EDGE_SELECT: &[u32] = &[
     0x7d8a_0080,
     0x0214_02ff,
@@ -808,10 +821,29 @@ pub fn translate_legacy_edge_fixture() -> Result<String, DecodeError> {
     }
     let mut msl = MSL_HEADER.to_owned();
     msl.push_str(RTZ_HELPER);
-    msl.push_str("kernel void legacy_edges(const device uint4 *in [[buffer(0)]], device uint4 *out [[buffer(1)]], device uint *out_rtz_neg [[buffer(2)]], uint id [[thread_position_in_grid]]) {\n  uint r[256]; r[0] = in[id].x; r[1] = in[id].y; r[4] = in[id].z;\n");
+    msl.push_str("kernel void legacy_edges(const device uint4 *in [[buffer(0)]], device uint4 *out [[buffer(1)]], device uint2 *extra [[buffer(2)]], uint id [[thread_position_in_grid]]) {\n  uint r[256]; r[0] = in[id].x; r[1] = in[id].y; r[4] = in[id].z;\n");
     body(&mut msl, &[a, b, c, d]);
     body(&mut msl, &[decode(EDGE_RTZ_NEG, 0)?.1]);
-    msl.push_str("  out_rtz_neg[id] = r[22];\n");
+    let cmp = decode(EDGE_CMP_LT, 0)?;
+    let select = decode(EDGE_CMP_LT, 1)?;
+    if !matches!(cmp, (1, Op::CompareZeroLtF32 { rhs: Vgpr(1) }))
+        || !matches!(
+            select,
+            (
+                2,
+                Op::SelectBits {
+                    dst: Vgpr(23),
+                    when_false: 0x8000_0000,
+                    when_true: Vgpr(0)
+                }
+            )
+        )
+    {
+        return Err(DecodeError::Unsupported(0));
+    }
+    msl.push_str("  {\n");
+    body(&mut msl, &[cmp.1, select.1]);
+    msl.push_str("  }\n  extra[id] = uint2(r[22], r[23]);\n");
     let mut pc = 0;
     while pc < EDGE_MOV_HINTS.len() {
         let (width, op) = decode(EDGE_MOV_HINTS, pc)?;
@@ -1706,6 +1738,9 @@ mod tests {
         asm.push_str(
             "exp mrt0 v1, v1, v0, v0 compr\nexp mrt1 v0, off, off, off done vm\ns_endpgm\n",
         );
+        asm.push_str(
+            "v_cmp_lt_f32_e32 vcc_lo, 0, v1\nv_cndmask_b32_e32 v23, 0x80000000, v0, vcc_lo\n",
+        );
         asm.push_str("v_bfrev_b32_e32 v3, 60\nexp mrtz v2, off, off, off\nexp mrt0 v1, v1, v3, v3 done compr vm\ns_endpgm\n");
         asm.push_str("v_cvt_f32_i32_e32 v8, v4\nv_cvt_f32_i32_e32 v9, v5\nexp param0 v8, v9, v8, v9\nexp pos0 v0, v1, v2, v3 done\ns_endpgm\n");
         asm.push_str("exp param0 v4, v5, off, off\nexp pos0 v0, v1, v2, v3 done\ns_endpgm\n");
@@ -1764,6 +1799,7 @@ mod tests {
             .chain(&UNPACK_UINT_VS)
             .chain(MULTI_VS)
             .chain(&[DUAL_RED_PS[0], 1, DUAL_RED_PS[2], 0, DUAL_RED_PS[4]])
+            .chain(EDGE_CMP_LT)
             .chain(&[
                 BFREV_DEPTH_PS[0],
                 BFREV_DEPTH_PS[1],
@@ -2335,6 +2371,31 @@ mod tests {
         assert!(dual_red_exports(&words[..4]).is_err());
         words.push(0);
         assert!(dual_red_exports(&words).is_err());
+    }
+
+    #[test]
+    fn cmp_lt_decoder_keeps_inline_zero_and_rejects_cmpx() {
+        assert_eq!(
+            decode(EDGE_CMP_LT, 0),
+            Ok((1, Op::CompareZeroLtF32 { rhs: Vgpr(1) }))
+        );
+        assert_eq!(
+            decode(&[0x7c03_fe80], 0),
+            Ok((1, Op::CompareZeroLtF32 { rhs: Vgpr(255) }))
+        );
+        for word in [
+            0x7c02_0300,
+            0x7c02_0200,
+            0x7c02_02ff,
+            0x7c22_0280,
+            0x7c04_0280,
+        ] {
+            assert_eq!(decode(&[word, 0], 0), Err(DecodeError::Unsupported(0)));
+        }
+        assert_eq!(
+            lift(Stage::PackedPixel, &[EDGE_CMP_LT, PACKED_PS].concat()),
+            Err(Reject::Unsupported(0))
+        );
     }
 
     #[test]

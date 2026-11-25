@@ -131,6 +131,9 @@ pub(crate) enum Op {
         src: [Vgpr; 2],
         neg_first: bool,
     },
+    CompareZeroLtF32 {
+        rhs: Vgpr,
+    },
     CompareNonzero {
         src: Vgpr,
     },
@@ -204,6 +207,15 @@ pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeErro
         0xbf80_0000 => return Ok((1, Op::NopOneCycle)),
         0xbfa0_0003 => return Ok((1, Op::PrefetchThreeLines)),
         _ => {}
+    }
+    // VOPC LT_F32 with inline zero in SRC0 and VGPR in VSRC1.
+    if w & !0x1fe00 == 0x7c02_0080 {
+        return Ok((
+            1,
+            Op::CompareZeroLtF32 {
+                rhs: Vgpr((w >> 9) as u8),
+            },
+        ));
     }
     // VOPC NE_U32 with inline integer zero and one ordinary VGPR.
     if w & !0x1fe00 == 0x7d8a_0080 {

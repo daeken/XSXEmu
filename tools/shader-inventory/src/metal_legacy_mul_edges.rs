@@ -163,26 +163,42 @@ mod gpu {
         ];
         let cvt_start = inputs.len();
         inputs.extend(cvt_cases.iter().map(|(x, _, _)| [*x as u32, 0, 0, 0]));
+        // Distinct raw true marker, including no conversion after CNDMASK.
+        const TRUE_WORD: u32 = 0x7fc1_2345;
+        let cmp_cases = [
+            (P3, TRUE_WORD),
+            (N2, N0),
+            (P0, N0),
+            (N0, N0),
+            (NAN, N0),
+            (0xff81_2345, N0),
+            (INF, TRUE_WORD),
+            (NINF, N0),
+            (1, TRUE_WORD),
+            (0x8000_0001, N0),
+        ];
+        let cmp_start = inputs.len();
+        inputs.extend(cmp_cases.iter().map(|(x, _)| [TRUE_WORD, *x, 0, 0]));
         let bytes = std::mem::size_of_val(inputs.as_slice());
         let usage = MTLResourceOptions::StorageModeShared;
         let input = dev.new_buffer_with_data(inputs.as_ptr().cast(), bytes as u64, usage);
         let output = dev.new_buffer(5 * bytes as u64, usage);
         let out = output.contents().cast::<[u32; 4]>();
-        let neg_output = dev.new_buffer((inputs.len() * 4) as u64, usage);
-        let neg_out = neg_output.contents().cast::<u32>();
-        if out.is_null() || neg_out.is_null() {
+        let extra_output = dev.new_buffer((inputs.len() * 8) as u64, usage);
+        let extra_out = extra_output.contents().cast::<[u32; 2]>();
+        if out.is_null() || extra_out.is_null() {
             return Err("unmapped readback".into());
         }
         // Shared buffer is owned here; no CPU access during execution.
         unsafe { out.write_bytes(0xa5, 5 * inputs.len()) };
-        unsafe { neg_out.write_bytes(0xa5, inputs.len()) };
+        unsafe { extra_out.write_bytes(0xa5, inputs.len()) };
         let queue = dev.new_command_queue();
         let cmd = queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&pipeline);
         enc.set_buffer(0, Some(&input), 0);
         enc.set_buffer(1, Some(&output), 0);
-        enc.set_buffer(2, Some(&neg_output), 0);
+        enc.set_buffer(2, Some(&extra_output), 0);
         enc.dispatch_threads(
             MTLSize::new(inputs.len() as u64, 1, 1),
             MTLSize::new(inputs.len() as u64, 1, 1),
@@ -214,7 +230,7 @@ mod gpu {
         }
         for (i, (_, expected, expected_neg)) in rtz.into_iter().enumerate() {
             let got = unsafe { out.add(5 * (rtz_start + i)).read() }[3];
-            let got_neg = unsafe { neg_out.add(rtz_start + i).read() };
+            let got_neg = unsafe { extra_out.add(rtz_start + i).read() }[0];
             if got != expected || got_neg != expected_neg {
                 return Err(format!("RTZ row {i}: e32/e64 got {got:08x}/{got_neg:08x}, expected {expected:08x}/{expected_neg:08x}").into());
             }
@@ -326,8 +342,16 @@ mod gpu {
                 .into());
             }
         }
+        for (i, (_, want)) in cmp_cases.into_iter().enumerate() {
+            let got = unsafe { extra_out.add(cmp_start + i).read() }[1];
+            if got != want {
+                return Err(
+                    format!("ordered CMP LT row {i}: expected {want:08x}, got {got:08x}").into(),
+                );
+            }
+        }
         println!(
-            "{}: {profile}, 16/16 legacy words, 2/2 FMAC words, 5/5 e32 packed RTZ words, 5/5 e64 NEG0 packed RTZ words, {mov_words}/{mov_words} raw MOV words 8/8 select words, 8/8 subtract words 11/11 ordinary multiply checks 8/8 ordinary add words 7/7 inline -1 add words 7/7 inline +1 subtract words and 36/36 mode-dependent CVT words",
+            "{}: {profile}, 16/16 legacy words, 2/2 FMAC words, 5/5 e32 packed RTZ words, 5/5 e64 NEG0 packed RTZ words, {mov_words}/{mov_words} raw MOV words 8/8 select words, 10/10 ordered CMP LT words, 8/8 subtract words 11/11 ordinary multiply checks 8/8 ordinary add words 7/7 inline -1 add words 7/7 inline +1 subtract words and 36/36 mode-dependent CVT words",
             dev.name(),
             mov_words = 4 * inputs.len()
         );

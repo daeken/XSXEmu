@@ -219,7 +219,11 @@ struct PairCounts {
     details: BTreeMap<Vec<(String, usize)>, usize>,
 }
 
-const FINAL_PARTIAL_EXPORTS: [&str; 2] = ["MRT0 EN12", "MRT1 EN3"];
+const TRACKED_EXACT_FORMS: [&str; 3] = [
+    "final packed MRT0 EN12",
+    "final packed MRT1 EN3",
+    "CMP LT F32 inline +0, VGPR",
+];
 
 #[derive(Default)]
 struct GapCounts {
@@ -235,8 +239,8 @@ struct GapCounts {
     partial_param0: [usize; 3],
     bfrev_depth: BTreeMap<[usize; 7], usize>,
     packed_cleared: [usize; 2],
-    partial_final: [(usize, usize); 2], // sites, windows
-    partial_final_requirements: [BTreeMap<Option<crate::graphics_semantics::Outcome>, usize>; 2],
+    tracked_exact: [(usize, usize); 3], // sites, windows
+    tracked_exact_requirements: [BTreeMap<Option<crate::graphics_semantics::Outcome>, usize>; 3],
     interp_sole: BTreeMap<(usize, Option<(u8, u8, u8)>), usize>,
     packed_requirements: [BTreeMap<crate::graphics_semantics::Outcome, usize>; 2],
     linear_sole: BTreeMap<String, usize>,
@@ -376,12 +380,12 @@ impl GapCounts {
             self.inline_first_fma
         );
         if stage == "PS" {
-            for ((form, (sites, windows)), requirements) in FINAL_PARTIAL_EXPORTS
+            for ((form, (sites, windows)), requirements) in TRACKED_EXACT_FORMS
                 .into_iter()
-                .zip(self.partial_final)
-                .zip(self.partial_final_requirements)
+                .zip(self.tracked_exact)
+                .zip(self.tracked_exact_requirements)
             {
-                println!("    exact final packed {form}: {sites} sites in {windows} windows");
+                println!("    exact {form}: {sites} sites in {windows} windows");
                 for (outcome, n) in requirements {
                     println!(
                         "    {form}-covered contiguous exact PS: {n} windows, local requirements: {outcome:?}"
@@ -519,8 +523,8 @@ pub(super) fn run_gaps(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), B
     let mut setprio: [[BTreeMap<Option<SetprioProjection>, usize>; 2]; STARTS.len()] =
         Default::default();
     let mut packed_spans = [HashSet::new(), HashSet::new()];
-    let mut partial_final_spans = [HashSet::new(), HashSet::new()];
-    let mut partial_final_cleared = [HashSet::new(), HashSet::new()];
+    let mut tracked_exact_spans = std::array::from_fn::<_, 3, _>(|_| HashSet::new());
+    let mut tracked_exact_cleared = std::array::from_fn::<_, 3, _>(|_| HashSet::new());
     let mut vs_sets = BTreeMap::<Vec<String>, HashMap<_, (usize, u8)>>::new();
     let mut pair_spans = [PairSpans::new(), PairSpans::new()];
     let mut refined_spans = [PairSpans::new(), PairSpans::new()];
@@ -547,19 +551,20 @@ pub(super) fn run_gaps(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), B
                         let tally = &mut counts[slot][i][w];
                         tally.note(&gaps);
                         if slot == 0 {
-                            for (form, sites) in [gaps.packed_ba, gaps.packed_mrt1_rg_final]
-                                .into_iter()
-                                .enumerate()
+                            for (form, sites) in
+                                [gaps.packed_ba, gaps.packed_mrt1_rg_final, gaps.cmp_zero_lt]
+                                    .into_iter()
+                                    .enumerate()
                             {
                                 if sites == 0 {
                                     continue;
                                 }
-                                tally.partial_final[form].0 += sites;
-                                tally.partial_final[form].1 += 1;
-                                partial_final_spans[form].insert(reference.program);
+                                tally.tracked_exact[form].0 += sites;
+                                tally.tracked_exact[form].1 += 1;
+                                tracked_exact_spans[form].insert(reference.program);
                                 if gaps.missing.is_empty() && gaps.contiguous {
-                                    partial_final_cleared[form].insert(reference.program);
-                                    *tally.partial_final_requirements[form]
+                                    tracked_exact_cleared[form].insert(reference.program);
+                                    *tally.tracked_exact_requirements[form]
                                         .entry(exact_semantics(wave, window, false))
                                         .or_default() += 1;
                                 }
@@ -636,11 +641,11 @@ pub(super) fn run_gaps(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), B
         "  Distinct PS spans with sole interp MOV gap bucket across hypotheses: {}",
         interp_spans.len()
     );
-    for (index, form) in FINAL_PARTIAL_EXPORTS.into_iter().enumerate() {
+    for (index, form) in TRACKED_EXACT_FORMS.into_iter().enumerate() {
         println!(
-            "  Distinct PS spans with exact final packed {form} across hypotheses: {}; contiguous encoding-complete: {}",
-            partial_final_spans[index].len(),
-            partial_final_cleared[index].len()
+            "  Distinct PS spans with exact {form} across hypotheses: {}; contiguous encoding-complete: {}",
+            tracked_exact_spans[index].len(),
+            tracked_exact_cleared[index].len()
         );
     }
     println!(
