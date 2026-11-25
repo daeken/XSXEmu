@@ -45,12 +45,16 @@ pub fn validate_title(bytes: &[u8], pe: &crate::pe::Pe<'_>) -> crate::Result<()>
             .is_some_and(|end| end <= s.mapped_size())
     };
     if bytes.len() != IMAGE_LEN
-        || !pe
-            .sections
-            .iter()
-            .any(|s| s.readable() && s.executable() && !s.writable() && contains(s, RETURN_RVA, 1))
         || !pe.sections.iter().any(|s| {
-            s.readable()
+            s.name == *b".text\0\0\0"
+                && s.readable()
+                && s.executable()
+                && !s.writable()
+                && contains(s, RETURN_RVA, 1)
+        })
+        || !pe.sections.iter().any(|s| {
+            s.name == *b".data\0\0\0"
+                && s.readable()
                 && s.writable()
                 && !s.executable()
                 && contains(s, OUTPUT_RVA, TOKEN_BYTES as u32)

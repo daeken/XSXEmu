@@ -2545,6 +2545,38 @@ fn xmem_physical_bridge_rejects_unpinned_root_import() {
     }
 }
 
+#[test]
+fn xmem_physical_bridge_rejects_wrong_image_even_at_exact_slot() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let mut exe = image(Kind::Solo);
+    dir_import_one(&mut exe, b"XMEM.dll\0", b"XMemAllocatePhysicalPages\0");
+    // Add a sparse virtual section with one raw page of original zeroes.
+    // This matches the observed IAT RVA, not the title or its section layout.
+    const SLOT: usize = 0x0679_3a10;
+    let rva = SLOT / PAGE * PAGE;
+    let raw = exe.len();
+    exe.resize(raw + PAGE, 0);
+    w16(&mut exe, 0x86, 4);
+    w32(&mut exe, OP + 56, rva + PAGE);
+    let s = DATA_SECTION + 40;
+    put(&mut exe, s, b".iat");
+    w32(&mut exe, s + 8, PAGE);
+    w32(&mut exe, s + 12, rva);
+    w32(&mut exe, s + 16, PAGE);
+    w32(&mut exe, s + 20, raw);
+    w32(&mut exe, s + 36, 0xc000_0040);
+    w32(&mut exe, file(LINK + 0x780) + 16, SLOT);
+    let path = scratch.write("wrong-image-exact-xmem-slot.exe", &exe);
+    expect(
+        run(&path, &[OPT, TRUSTED, "--rust-providers"]),
+        1,
+        "unsupported XMem root image or logical section extents",
+    );
+}
+
 const THREAD_ID_CODE_CAPACITY: usize = 0x180;
 
 #[repr(C)]
