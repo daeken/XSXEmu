@@ -30,7 +30,16 @@ See [Title-addressed descriptor heaps](title-descriptor-heaps.md) for the slot-1
 
 ### Bootstrap #26 is distinct from allocation-info #25
 
-- All three #26 calls target the device via the same global at `08759d00` and pass the same `rsp+0xd0` storage. No fifth argument is set up at these sites, and there is no intervening read from the storage or `RAX`. After the third call a 16-byte write at `02478783` begins repurposing that storage for queue creation at `0247878a`. This does not prove that every byte or any device-side effect is irrelevant, or give a writable result extent. The argument values and desktop comparison favor a heap-properties query over an allocation-info query.
+All three #26 calls use the device copied into global `08759d00` at `02478621` and dispatch via its vtable, independently of the first argument. The reaching definitions are:
+
+| Call RVA | `RCX` scratch definition | `RDX` device load | `R8D = 1` | `R9D` raw value and definition |
+| --- | --- | --- | --- | --- |
+| `0247870d` | `rsp+0xd0` at `024786ef` | `02478703` | `024786f7` | `1` at `024786fd` |
+| `02478731` | `rsp+0xd0` at `0247871a` | `02478713` | `02478722` | `2` at `02478728` |
+| `02478758` | `rsp+0xd0` via `RSI` at `0247873e` / `02478752` | `02478737` | `02478746` | `3` at `0247874c` |
+
+There is no fifth argument setup or intervening caller read of the scratch storage or `RAX` in this sequence. The 16-byte store at `02478783` initializes the scratch prefix for the subsequent queue call at `0247878a`; it measures the queue-description initialization, **not** the slot-26 result extent. No caller-verified slot-26 result bytes or write size were found. A bounded search for explicit `+0xd0` dispatches near direct loads of the known device globals did not identify an additional same-receiver result consumer; it does not cover indirect aliases or all call encodings. Keep slot 26 unidentified: its hidden-output-like ordering and selector values `1/2/3` are consistent with the public heap-properties analogue (desktop `DEFAULT`/`UPLOAD`/`READBACK`), but neither the Xbox enum labels nor output schema are verified. This is not evidence that the method or its side effects can be skipped.
+
 - On the **same device global**, calls at `0034413f`, `00344182` and `01a0dce9` instead load vtable `+0xc8` (**slot 25**). The observed shape is `RCX=out`, `RDX=device`, `R8D=1`, `R9D=1`, `S20=resource-description pointer`. At `00344145` and `00344188`, the caller copies 16 bytes from the result storage (the first path compares the qword at result `+8` with `0x1000`); `01a0dcef`–`01a0dcf6` reads low dwords at `+0` and `+8`. These sites consume the buffer, not `RAX`.
 - The slot-25 shape and result accesses fit desktop `GetResourceAllocationInfo` (`SizeInBytes` and `Alignment`, each `UINT64`), except that desktop Win64 orders `this` before the output pointer. This comparison does not supply Xbox sizing/alignment rules or define the input record. Keep the two methods separate: do not dispatch bootstrap #26 to a slot-25 allocation-info implementation or write a desktop heap-properties layout on this evidence alone.
 
@@ -65,6 +74,8 @@ The owned `static_tls_lane` fixture exercises the IAT bridge with the observed r
 ## Owned ABI probe and implementation boundary
 
 `cargo test --offline --target x86_64-apple-darwin --test xbox_d3d12_abi` runs the original slot-26 probe on x86-64 (Rosetta on Apple Silicon); other x86-64 hosts can run the same test with their native target. The assembly caller supplies an owned vtable, shadow space, and the observed register order; a typed `extern "win64"` callee records distinct values into separate writable storage. The output is a synthetic ledger, not an Xbox heap-properties type. The test intentionally ignores `RAX` and registers no export or provider. A separate slot-25 fixture puts an original description token in the fifth Win64 argument and checks an owned two-qword result with surrounding canaries. It validates transport and the fixture's write boundary, not the Xbox resource-description layout, native write extent, or sizing policy.
+
+If a PE-boundary oracle is needed, build a tiny import-free owned AMD64 PE with a local synthetic object and vtable. Let a Win64 machine-code caller invoke the two tested register shapes; check the recorded arguments and test-defined canaries before returning a distinct process status. For #26 treat any fixture write as an invented marker only, or capture the scratch address without dereferencing it; no native output write bound is known. This would add PE-boundary validation, not require an SDK, title assets, or provider registration. To establish a native #26 result contract instead, obtain a legally available callee implementation or a same-receiver caller that consumes the result; the current evidence does not suffice.
 
 The [macOS CPU alias proof](xmem-cpu-alias.md) exercises shared backing and view lifetime with real host mappings. It does not verify `XMemMapPhysicalPages` or the GPU placement and visibility needs of slot 133.
 
