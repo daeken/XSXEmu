@@ -124,6 +124,17 @@ mod gpu {
         ];
         let inline_add_start = inputs.len();
         inputs.extend(inline_add_cases.iter().map(|(x, _)| [*x, 0, 0, 0]));
+        // Same inputs, independent raw goldens for +1-x. In particular,
+        // cancellation is +0, not the -0 from negating a rounded add.
+        let inline_sub_expected = [
+            0x3f80_0000,
+            0x3f7f_fffe,
+            0x3f80_0000,
+            0x3f80_0002,
+            P0,
+            0x3380_0000,
+            0xb400_0000,
+        ];
         let bytes = std::mem::size_of_val(inputs.as_slice());
         let usage = MTLResourceOptions::StorageModeShared;
         let input = dev.new_buffer_with_data(inputs.as_ptr().cast(), bytes as u64, usage);
@@ -261,8 +272,17 @@ mod gpu {
                 );
             }
         }
+        for (i, want) in inline_sub_expected.into_iter().enumerate() {
+            let got = unsafe { out.add(4 * (inline_add_start + i) + 3).read() }[3];
+            if got != want {
+                return Err(format!(
+                    "inline +1 subtract row {i}: expected {want:08x}, got {got:08x}"
+                )
+                .into());
+            }
+        }
         println!(
-            "{}: strict arithmetic archive, 16/16 legacy words, 2/2 FMAC words, 3/3 packed RTZ words, {mov_words}/{mov_words} raw MOV words 8/8 select words, 8/8 subtract words 11/11 ordinary multiply checks 8/8 ordinary add words and 7/7 inline -1 add words",
+            "{}: strict arithmetic archive, 16/16 legacy words, 2/2 FMAC words, 3/3 packed RTZ words, {mov_words}/{mov_words} raw MOV words 8/8 select words, 8/8 subtract words 11/11 ordinary multiply checks 8/8 ordinary add words 7/7 inline -1 add words and 7/7 inline +1 subtract words",
             dev.name(),
             mov_words = 4 * inputs.len()
         );

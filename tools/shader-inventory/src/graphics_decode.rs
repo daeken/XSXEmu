@@ -41,9 +41,10 @@ pub(crate) enum Op {
         coord: Vgpr,
         channel: u8,
     },
-    SubFromPositiveZero {
+    SubFromInline {
         dst: Vgpr,
         src: Vgpr,
+        one: bool,
     },
     ShiftLeftOne {
         dst: Vgpr,
@@ -338,7 +339,17 @@ pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeErro
     let dst = Vgpr((w >> 17) as u8);
     let vsrc1 = Vgpr((w >> 9) as u8);
     match w & 0xfe00_01ff {
-        0x0800_0080 => return Ok((1, Op::SubFromPositiveZero { dst, src: vsrc1 })),
+        // VOP2 SUB (not SUBREV), SRC0 +0 or +1, VSRC1 ordinary VGPR.
+        0x0800_0080 | 0x0800_00f2 => {
+            return Ok((
+                1,
+                Op::SubFromInline {
+                    dst,
+                    src: vsrc1,
+                    one: w & 511 == 242,
+                },
+            ));
+        }
         0x3400_0081 => return Ok((1, Op::ShiftLeftOne { dst, src: vsrc1 })),
         0x3600_0082 | 0x3600_00c2 => {
             return Ok((

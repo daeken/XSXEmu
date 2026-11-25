@@ -291,7 +291,7 @@ fn lift(stage: Stage, words: &[u32]) -> Result<Vec<Op>, Reject> {
             }
             Op::Move { dst, src }
             | Op::AddF32Literal { dst, src, .. }
-            | Op::SubFromPositiveZero { dst, src } => {
+            | Op::SubFromInline { dst, src, .. } => {
                 require(src)?;
                 live[usize::from(dst.0)] = true;
             }
@@ -490,13 +490,15 @@ fn emit_body(out: &mut String, ops: &[Op], packed_color_lvalue: &str, multi: boo
                 writeln!(out, "  r[{dst}] = 0x{bits:08x}u;").unwrap();
             }
             Op::NopOneCycle | Op::PrefetchThreeLines => {}
-            Op::SubFromPositiveZero {
+            Op::SubFromInline {
                 dst: Vgpr(dst),
                 src: Vgpr(src),
+                one,
             } => {
+                let lhs = if one { "1.0f" } else { "0.0f" };
                 writeln!(
                     out,
-                    "  r[{dst}] = as_type<uint>(0.0f - as_type<float>(r[{src}]));"
+                    "  r[{dst}] = as_type<uint>({lhs} - as_type<float>(r[{src}]));"
                 )
                 .unwrap();
             }
@@ -697,6 +699,7 @@ const EDGE_ADD_INLINE: &[u32] = &[0x0620_00f3]; // v16 = -1.0 + v0
 const EDGE_MUL: &[u32] = &[0x101c_0300]; // v14 = v0 * v1
 
 const EDGE_SUB: &[u32] = &[0x0818_0080, 0x081a_0280]; // v12=+0-v0, v13=+0-v1
+const EDGE_SUB_ONE: &[u32] = &[0x0822_00f2]; // v17 = +1 - v0
 
 const EDGE_SELECT: &[u32] = &[
     0x7d8a_0080,
@@ -761,7 +764,8 @@ pub fn translate_legacy_edge_fixture() -> Result<String, DecodeError> {
             decode(EDGE_ADD_INLINE, 0)?.1,
         ],
     );
-    msl.push_str("  out[4 * id] = uint4(r[2], r[3], r[4], r[5]);\n  out[4 * id + 1] = uint4(r[6], r[7], r[8], r[9]);\n  out[4 * id + 2] = uint4(r[10], r[11], r[12], r[13]);\n  out[4 * id + 3] = uint4(r[14], r[15], r[16], 0u);\n}\n");
+    body(&mut msl, &[decode(EDGE_SUB_ONE, 0)?.1]);
+    msl.push_str("  out[4 * id] = uint4(r[2], r[3], r[4], r[5]);\n  out[4 * id + 1] = uint4(r[6], r[7], r[8], r[9]);\n  out[4 * id + 2] = uint4(r[10], r[11], r[12], r[13]);\n  out[4 * id + 3] = uint4(r[14], r[15], r[16], r[17]);\n}\n");
     Ok(msl)
 }
 
@@ -1561,6 +1565,7 @@ mod tests {
         asm.push_str("v_mul_f32_e32 v14, v0, v1\nv_add_f32_e32 v15, v0, v1\n");
         asm.push_str("v_add_f32_e32 v16, -1.0, v0\n");
         asm.push_str("v_sub_f32_e32 v12, 0, v0\nv_sub_f32_e32 v13, 0, v1\n");
+        asm.push_str("v_sub_f32_e32 v17, 1.0, v0\n");
         asm.push_str("s_mov_b32 m0, s9\nv_interp_mov_f32_e32 v2, p0, attr0.x\nexp mrt0 v2, off, off, off done vm\ns_endpgm\n");
         for (sgpr, component) in [(9, "x"), (14, "z"), (9, "z")] {
             writeln!(asm, "s_mov_b32 m0, s{sgpr}\nv_interp_p1_f32_e32 v2, v0, attr0.{component}\nv_interp_p2_f32_e32 v2, v1, attr0.{component}\nexp mrt0 v2, v2, v2, v2 done\ns_endpgm").unwrap();
@@ -1620,6 +1625,7 @@ mod tests {
             .chain(EDGE_ADD)
             .chain(EDGE_ADD_INLINE)
             .chain(EDGE_SUB)
+            .chain(EDGE_SUB_ONE)
             .chain(PARAM_MOV_PS)
             .chain(INTERP_X_PS)
             .chain(INTERP_Z_PS)
@@ -1827,6 +1833,36 @@ mod tests {
                 Err(Reject::Uninitialized(0, _))
             ));
         }
+    }
+
+    #[test]
+    fn subtract_one_preserves_exact_opcode_order_width_and_liveness() {
+        let word = EDGE_SUB_ONE[0];
+        assert_eq!(
+            decode(&[word, 0xbf81_0000], 0),
+            Ok((
+                1,
+                Op::SubFromInline {
+                    dst: Vgpr(17),
+                    src: Vgpr(0),
+                    one: true
+                }
+            ))
+        );
+        assert!(lift(Stage::Vertex, &[EDGE_SUB_ONE, VS].concat()).is_ok());
+        for bad in [
+            word ^ 0x0200_0000,
+            (word & !511) | 129,
+            (word & !511) | 243,
+            (word & !511) | 255,
+            (word & !511) | 256,
+        ] {
+            assert!(decode(&[bad], 0).is_err());
+        }
+        assert!(matches!(
+            lift(Stage::Vertex, &[&[word | (0x80 << 9)], VS].concat()),
+            Err(Reject::Uninitialized(0, 128))
+        ));
     }
 
     #[test]

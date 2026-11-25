@@ -171,7 +171,7 @@ pub(crate) fn audit(words: &[u32], vertex: bool) -> Outcome {
                 f.write(dst, None);
             }
             Op::AddF32Literal { dst, src, .. }
-            | Op::SubFromPositiveZero { dst, src }
+            | Op::SubFromInline { dst, src, .. }
             | Op::FmaUnpack { dst, src, .. } => {
                 f.read(src);
                 f.write(dst, None);

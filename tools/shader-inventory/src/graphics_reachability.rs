@@ -229,7 +229,7 @@ fn exact_opcode(
                 Op::InitInterpM0 { .. } => name == "s_mov_b32",
                 Op::InterpPhase { second: false, .. } => name == "v_interp_p1_f32_e32",
                 Op::InterpPhase { second: true, .. } => name == "v_interp_p2_f32_e32",
-                Op::SubFromPositiveZero { .. } => name == "v_sub_f32_e32",
+                Op::SubFromInline { .. } => name == "v_sub_f32_e32",
                 Op::ShiftLeftOne { .. } => name == "v_lshlrev_b32_e32",
                 Op::AndMask { .. } => name == "v_and_b32_e32",
                 Op::ConvertInt { .. } => name == "v_cvt_f32_i32_e32",
@@ -408,6 +408,7 @@ pub(super) struct DirectGaps {
     pub ordinary_vgpr_mul: usize,
     pub ordinary_vgpr_add: usize,
     pub inline_minus_one_add: usize,
+    pub inline_one_sub: usize,
     pub signed_vgpr_convert: usize,
     pub inline_first_fma: [usize; 2],
     pub partial_param0: usize,
@@ -501,6 +502,13 @@ pub(super) fn direct_gaps(dis: &mut Disassembler, bytes: &[u8], slot: usize) -> 
             gaps.signed_vgpr_convert += usize::from(matches!(
                 decoded,
                 Some((1, crate::graphics_decode::Op::ConvertInt { .. }))
+            ));
+            gaps.inline_one_sub += usize::from(matches!(
+                decoded,
+                Some((
+                    1,
+                    crate::graphics_decode::Op::SubFromInline { one: true, .. }
+                ))
             ));
             gaps.inline_minus_one_add += usize::from(matches!(
                 decoded,
