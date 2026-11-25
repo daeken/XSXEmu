@@ -683,6 +683,9 @@ impl LiftGaps {
                 width * 4 == len
                     && match op {
                         Op::Move { .. } | Op::MoveBits { .. } => name == "v_mov_b32_e32",
+                        Op::InitInterpM0 { .. } => name == "s_mov_b32",
+                        Op::InterpPhase { second: false, .. } => name == "v_interp_p1_f32_e32",
+                        Op::InterpPhase { second: true, .. } => name == "v_interp_p2_f32_e32",
                         Op::NopOneCycle => name == "s_nop",
                         Op::PrefetchThreeLines => name == "s_inst_prefetch",
                         Op::AddF32Literal { .. } => name == "v_add_f32_e32",

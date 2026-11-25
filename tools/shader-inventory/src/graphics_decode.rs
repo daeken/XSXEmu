@@ -29,6 +29,15 @@ pub(crate) enum Op {
         dst: Vgpr,
         bits: u32,
     },
+    InitInterpM0 {
+        sgpr: u8,
+    },
+    InterpPhase {
+        second: bool,
+        dst: Vgpr,
+        coord: Vgpr,
+        channel: u8,
+    },
     NopOneCycle,
     PrefetchThreeLines,
     AddF32Literal {
@@ -91,6 +100,25 @@ pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeErro
     let ext = || words.get(pc + 1).copied().ok_or(DecodeError::Truncated(pc));
     if w == 0xbf81_0000 {
         return Ok((1, Op::End));
+    }
+    // Scalar M0 copies from two ordinary stage-input SGPR selectors, not a
+    // general scalar register file. VINTRP accepts only attr0 X/Z, P1/P2.
+    if matches!(w, 0xbefc_0309 | 0xbefc_030e) {
+        return Ok((1, Op::InitInterpM0 { sgpr: w as u8 }));
+    }
+    if w & 0xfc02_fc00 == 0xc800_0000 {
+        let channel = ((w >> 8) & 3) as u8;
+        if matches!(channel, 0 | 2) {
+            return Ok((
+                1,
+                Op::InterpPhase {
+                    second: w & 0x1_0000 != 0,
+                    dst: Vgpr((w >> 18) as u8),
+                    coord: Vgpr(w as u8),
+                    channel,
+                },
+            ));
+        }
     }
     match w {
         0xbf80_0000 => return Ok((1, Op::NopOneCycle)),

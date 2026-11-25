@@ -78,9 +78,31 @@ fn depth_oracle_distinguishes_raster_depth_and_disabled_writes() {
 #[cfg(target_os = "macos")]
 mod gpu {
     use super::*;
-    use graphics_lift::MrtFixture;
+    use graphics_lift::{InterpFixture, MrtFixture};
     use metal::*;
     use std::path::Path;
+
+    fn expected_interp(x: usize, y: usize, mode: InterpFixture) -> f32 {
+        // Screen positions are (0,8), (16,8), (0,-8) in Metal coordinates.
+        let b = (x as f64 + 0.5) / 16.;
+        let c = (7.5 - y as f64) / 16.;
+        let mut weights = [1. - b - c, b, c];
+        if matches!(mode, InterpFixture::WrongPerspective) {
+            weights[1] /= 2.;
+            weights[2] /= 4.;
+        }
+        let values = if matches!(mode, InterpFixture::AffineZ | InterpFixture::WrongChannel) {
+            [0.75, 0.25, 0.5]
+        } else {
+            [0.125, 0.625, 0.375]
+        };
+        (weights
+            .into_iter()
+            .zip(values)
+            .map(|(w, v)| w * v)
+            .sum::<f64>()
+            / weights.iter().sum::<f64>()) as f32
+    }
 
     enum Mode<'a> {
         Source,
@@ -89,6 +111,8 @@ mod gpu {
         MrtSource(MrtFixture),
         SwappedTripleSource,
         MrtLoad(&'a Path, MrtFixture),
+        InterpSource(InterpFixture),
+        InterpLoad(&'a Path, InterpFixture),
         MultiSource,
         MultiLoad(&'a Path),
         DepthSource(bool),
@@ -134,6 +158,17 @@ mod gpu {
                 print!("{}", graphics_lift::translate_mrt_fixture(fixture).map_err(|e| format!("MRT lift rejected: {e:?}"))?);
                 return Ok(());
             }
+            [mode] if mode == "--interp-x-source" => Mode::InterpSource(InterpFixture::AffineX),
+            [mode] if mode == "--interp-z-source" => Mode::InterpSource(InterpFixture::AffineZ),
+            [mode] if mode == "--expect-interp-wrong-mode" => Mode::InterpSource(InterpFixture::WrongPerspective),
+            [mode] if mode == "--expect-interp-wrong-channel" => Mode::InterpSource(InterpFixture::WrongChannel),
+            [mode, lib] if mode == "--load-interp-x-metallib" => Mode::InterpLoad(Path::new(lib), InterpFixture::AffineX),
+            [mode, lib] if mode == "--load-interp-z-metallib" => Mode::InterpLoad(Path::new(lib), InterpFixture::AffineZ),
+            [mode] if mode == "--emit-interp-x-msl" || mode == "--emit-interp-z-msl" => {
+                let fixture = if mode == "--emit-interp-z-msl" { InterpFixture::AffineZ } else { InterpFixture::AffineX };
+                print!("{}", graphics_lift::translate_interp_fixture(fixture).map_err(|e| format!("interpolation lift rejected: {e:?}"))?);
+                return Ok(());
+            }
             [mode] if mode == "--multi-source" => Mode::MultiSource,
             [mode, lib] if mode == "--load-multi-metallib" => Mode::MultiLoad(Path::new(lib)),
             [mode] if mode == "--emit-multi-msl" => {
@@ -166,7 +201,7 @@ mod gpu {
             [mode, lib] if mode == "--load-metallib" || mode == "--load-mutated-metallib" => Mode::Load(Path::new(lib), mode == "--load-mutated-metallib"),
             [mode, lib, archive] if mode == "--expect-owned-metal-miss" => Mode::ExpectStrictMiss(Path::new(lib), Path::new(archive)),
             [mode, lib, archive, compiler] if mode == "--bake-archive" || mode == "--replay-archive" || mode == "--replay-mutated-archive" => Mode::Archive(Path::new(lib), Path::new(archive), mode == "--bake-archive", mode == "--replay-mutated-archive", owned_graphics_artifact::compiler_profile(compiler)?),
-            _ => return Err("usage: shader-metal-graphics-lift [--expect-swapped-triple | --triple-rg-source | --emit-triple-rg-msl | --load-triple-rg-metallib LIB | --triple-source | --emit-triple-msl | --load-triple-metallib LIB | --dual-source | --emit-dual-msl | --load-dual-metallib LIB | --multi-source | --emit-multi-msl | --load-multi-metallib LIB | --packed-rg-source | --emit-packed-rg-msl | --load-packed-rg-metallib LIB | --wait-depth-source | --emit-wait-depth-msl | --load-wait-depth-metallib LIB | --expect-late-depth-read | --early-depth-source | --emit-early-depth-msl | --load-early-depth-metallib LIB | --depth-source | --emit-depth-msl | --load-depth-metallib LIB | --packed-source | --emit-packed-msl | --load-packed-metallib LIB | --emit-msl | --emit-mutated-msl | --load-metallib LIB | --load-mutated-metallib LIB | {--bake-archive|--replay-archive|--replay-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-owned-metal-miss MUTATED_LIB ARCHIVE]".into()),
+            _ => return Err("usage: shader-metal-graphics-lift [--expect-swapped-triple | --triple-rg-source | --emit-triple-rg-msl | --load-triple-rg-metallib LIB | --triple-source | --emit-triple-msl | --load-triple-metallib LIB | --dual-source | --emit-dual-msl | --load-dual-metallib LIB | --interp-x-source | --interp-z-source | --expect-interp-wrong-mode | --expect-interp-wrong-channel | --emit-interp-x-msl | --emit-interp-z-msl | --load-interp-x-metallib LIB | --load-interp-z-metallib LIB | --multi-source | --emit-multi-msl | --load-multi-metallib LIB | --packed-rg-source | --emit-packed-rg-msl | --load-packed-rg-metallib LIB | --wait-depth-source | --emit-wait-depth-msl | --load-wait-depth-metallib LIB | --expect-late-depth-read | --early-depth-source | --emit-early-depth-msl | --load-early-depth-metallib LIB | --depth-source | --emit-depth-msl | --load-depth-metallib LIB | --packed-source | --emit-packed-msl | --load-packed-metallib LIB | --emit-msl | --emit-mutated-msl | --load-metallib LIB | --load-mutated-metallib LIB | {--bake-archive|--replay-archive|--replay-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-owned-metal-miss MUTATED_LIB ARCHIVE]".into()),
         };
         if matches!(mode, Mode::Archive(..) | Mode::ExpectStrictMiss(..))
             && std::env::var_os("MTL_SHADER_VALIDATION").is_some()
@@ -194,6 +229,10 @@ mod gpu {
         let late_read = matches!(mode, Mode::WaitDepthSource(true));
         let depth = wait_depth || matches!(mode, Mode::DepthSource(_) | Mode::DepthLoad(..));
         let early_depth = matches!(mode, Mode::DepthSource(true) | Mode::DepthLoad(_, true));
+        let interp = match mode {
+            Mode::InterpSource(f) | Mode::InterpLoad(_, f) => Some(f),
+            _ => None,
+        };
         let multi = matches!(mode, Mode::MultiSource | Mode::MultiLoad(_));
         let fixture = match mode {
             Mode::MrtSource(f) | Mode::MrtLoad(_, f) => Some(f),
@@ -213,11 +252,14 @@ mod gpu {
             | Mode::PackedSource(_)
             | Mode::DepthSource(_)
             | Mode::WaitDepthSource(_)
+            | Mode::InterpSource(_)
             | Mode::MultiSource
             | Mode::MrtSource(_)
             | Mode::SwappedTripleSource => {
                 let msl = if let Some(fixture) = fixture {
                     graphics_lift::translate_mrt_fixture(fixture)
+                } else if let Some(interp) = interp {
+                    graphics_lift::translate_interp_fixture(interp)
                 } else if multi {
                     graphics_lift::translate_multi_vertex_fixture()
                 } else if wait_depth {
@@ -235,6 +277,7 @@ mod gpu {
                 dev.new_library_with_source(&msl, &options)?
             }
             Mode::PackedLoad(path, _)
+            | Mode::InterpLoad(path, _)
             | Mode::MultiLoad(path)
             | Mode::MrtLoad(path, _)
             | Mode::DepthLoad(path, _)
@@ -250,6 +293,8 @@ mod gpu {
         const DEPTH_FORMAT: MTLPixelFormat = MTLPixelFormat::Depth32Float;
         let (format, pixel_bytes, default_ps) = if let Some(fixture) = fixture {
             (MTLPixelFormat::RGBA32Float, 16, fixture.entry())
+        } else if interp.is_some() {
+            (MTLPixelFormat::RGBA32Float, 16, "interp_ps")
         } else if multi {
             (MTLPixelFormat::RGBA32Float, 16, "multi_ps")
         } else if depth {
@@ -438,6 +483,15 @@ mod gpu {
             std::mem::size_of_val(&vertices) as u64,
             vertices.as_ptr().cast(),
         );
+        if interp.is_some() {
+            // Equal NDC positions to the baseline, but W varies across vertices.
+            let data: [[f32; 8]; 3] = [
+                [-1., -1., 0., 1., 0.125, 0., 0.75, 0.],
+                [6., -2., 0., 2., 0.625, 0., 0.25, 0.],
+                [-4., 12., 0., 4., 0.375, 0., 0.5, 0.],
+            ];
+            enc.set_vertex_bytes(0, std::mem::size_of_val(&data) as u64, data.as_ptr().cast());
+        }
         if multi {
             let mut data = [[[0.0f32; 4]; 8]; 3];
             for (v, row) in data.iter_mut().enumerate() {
@@ -533,6 +587,51 @@ mod gpu {
         }
         // The GPU writes have completed and the owned buffer remains alive through the last read.
         let pixels = unsafe { std::slice::from_raw_parts(ptr, extent) };
+        if let Some(interp) = interp {
+            let negative = matches!(
+                interp,
+                InterpFixture::WrongPerspective | InterpFixture::WrongChannel
+            );
+            let label = match interp {
+                InterpFixture::AffineX => "affine X",
+                InterpFixture::AffineZ => "affine Z",
+                InterpFixture::WrongPerspective => "wrong perspective mode",
+                InterpFixture::WrongChannel => "wrong channel",
+            };
+            let mut differs = 0;
+            for y in 0..SIDE {
+                for x in 0..SIDE {
+                    let want = expected_interp(x, y, interp);
+                    let at = y * STRIDE + x * 16;
+                    for component in pixels[at..at + 16].chunks_exact(4) {
+                        let got = f32::from_le_bytes(component.try_into().unwrap());
+                        // Raster interpolation rounds even for affine dyadics.
+                        let ok = got.is_finite() && (got - want).abs() < 0.000001;
+                        if !ok {
+                            return Err(format!(
+                                "{label} at ({x},{y}): expected {want}, got {got}"
+                            ));
+                        }
+                    }
+                    differs += usize::from(
+                        (want - expected_interp(x, y, InterpFixture::AffineX)).abs() > 0.000001,
+                    );
+                }
+            }
+            if negative && differs != SIDE * SIDE {
+                return Err(format!("{label} only discriminates {differs} pixels"));
+            }
+            println!(
+                "{} owned native VS→PS {label}: 64/64 pixels matched{}",
+                dev.name(),
+                if negative {
+                    " predicted control, all differ from affine X"
+                } else {
+                    ""
+                }
+            );
+            return Ok(());
+        }
         let mutated = matches!(mode, Mode::Load(_, true) | Mode::Archive(_, _, _, true, _));
         let mut mapping_mismatches = 0;
         let mut late_read_differences = 0;

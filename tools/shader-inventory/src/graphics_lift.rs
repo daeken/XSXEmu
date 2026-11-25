@@ -280,7 +280,9 @@ fn lift(stage: Stage, words: &[u32]) -> Result<Vec<Op>, Reject> {
                 exported += 1;
             }
             // The separate owned raw-bit probe establishes the value domain.
-            Op::PackHalfRtz { .. } => return Err(Reject::Unsupported(pc)),
+            Op::PackHalfRtz { .. } | Op::InitInterpM0 { .. } | Op::InterpPhase { .. } => {
+                return Err(Reject::Unsupported(pc));
+            }
             Op::End => {
                 if pc + width != words.len() || exported != stage.export_count() {
                     return Err(Reject::BadEnd(pc));
@@ -416,6 +418,9 @@ fn emit_body(out: &mut String, ops: &[Op], packed_color_lvalue: &str, multi: boo
                     "  r[{dst}] = half_rtz_bits(r[{lo}]) | (half_rtz_bits(r[{hi}]) << 16);"
                 )
                 .unwrap();
+            }
+            Op::InitInterpM0 { .. } | Op::InterpPhase { .. } => {
+                unreachable!("interpolation phases require a verified pair")
             }
             Op::End => out.push_str("  return out;\n}\n"),
         }
@@ -749,6 +754,117 @@ pub fn translate_multi_vertex_fixture() -> Result<String, Reject> {
     Ok(msl)
 }
 
+const INTERP_X_PS: &[u32] = &[
+    0xbefc_0309,
+    0xc808_0000,
+    0xc809_0001,
+    0xf800_080f,
+    0x0202_0202,
+    0xbf81_0000,
+];
+const INTERP_Z_PS: &[u32] = &[
+    0xbefc_030e,
+    0xc808_0200,
+    0xc809_0201,
+    0xf800_080f,
+    0x0202_0202,
+    0xbf81_0000,
+];
+
+// Separate owned ABI: s9/s14 are explicitly supplied as zero M0 state,
+// full-precision PARAM0 plane coefficients, center I=v0 and J=v1. Metal
+// rasterization fulfills the interpolation contract rather than exposing LDS.
+fn lift_interp_pair(words: &[u32], bound_sgpr: u8) -> Result<(Vgpr, u8, Op), Reject> {
+    if words.len() != 6 {
+        return Err(Reject::Extent);
+    }
+    if decode(words, 0) != Ok((1, Op::InitInterpM0 { sgpr: bound_sgpr })) {
+        return Err(Reject::Unsupported(0));
+    }
+    let Ok((
+        1,
+        Op::InterpPhase {
+            second: false,
+            dst,
+            coord: Vgpr(0),
+            channel,
+        },
+    )) = decode(words, 1)
+    else {
+        return Err(Reject::Unsupported(1));
+    };
+    if dst.0 < 2
+        || decode(words, 2)
+            != Ok((
+                1,
+                Op::InterpPhase {
+                    second: true,
+                    dst,
+                    coord: Vgpr(1),
+                    channel,
+                },
+            ))
+    {
+        return Err(Reject::Unsupported(2));
+    }
+    let Ok((
+        2,
+        op @ Op::Export {
+            target: Target::Color,
+            src,
+            done: true,
+        },
+    )) = decode(words, 3)
+    else {
+        return Err(Reject::BadExports(3));
+    };
+    if src != [dst; 4] {
+        return Err(Reject::BadExports(3));
+    }
+    if decode(words, 5) != Ok((1, Op::End)) {
+        return Err(Reject::BadEnd(5));
+    }
+    Ok((dst, channel, op))
+}
+
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+pub(crate) enum InterpFixture {
+    AffineX,
+    AffineZ,
+    WrongPerspective,
+    WrongChannel,
+}
+
+#[allow(dead_code)]
+pub(crate) fn translate_interp_fixture(fixture: InterpFixture) -> Result<String, Reject> {
+    let vs = lift(Stage::Vertex, VS)?;
+    let (words, sgpr) = if matches!(fixture, InterpFixture::AffineZ) {
+        (INTERP_Z_PS, 14)
+    } else {
+        (INTERP_X_PS, 9)
+    };
+    let (Vgpr(dst), channel, color) = lift_interp_pair(words, sgpr)?;
+    let mut msl = vertex_module(&vs);
+    // Named owned PARAM0 link. Mutations are used only for discriminating readbacks.
+    msl = msl.replace(
+        "[[center_no_perspective]]",
+        if matches!(fixture, InterpFixture::WrongPerspective) {
+            "[[user(param0), center_perspective]]"
+        } else {
+            "[[user(param0), center_no_perspective]]"
+        },
+    );
+    let component = if matches!(fixture, InterpFixture::WrongChannel) || channel == 2 {
+        'z'
+    } else {
+        'x'
+    };
+    writeln!(msl, "fragment float4 interp_ps(Varyings input [[stage_in]]) {{\n  uint r[256]; float4 out;\n  r[{dst}] = as_type<uint>(input.parameter.{component});").unwrap();
+    body(&mut msl, &[color, Op::End]);
+    Ok(msl)
+}
+
 fn vertex_module(vs: &[Op]) -> String {
     // Only the entry/binding convention and one interpolation rule are authored
     // here. All moves, arithmetic, output operands and returns come from the lift.
@@ -782,6 +898,9 @@ mod tests {
         };
         let asm = "v_mov_b32_e32 v8, v4\nexp param0 v8, v5, v6, v7\nexp pos0 v0, v1, v2, v3 done\ns_endpgm\nv_add_f32_e32 v4, 0.25, v0\nv_fma_f32 v5, v1, v2, v3\nv_mul_legacy_f32_e32 v6, v5, v4\nv_mul_legacy_f32_e32 v6, 0.5, v6\nv_mul_legacy_f32_e32 v7, 0, v3\nexp mrt0 v4, v5, v6, v7 done\ns_endpgm\nv_mul_legacy_f32_e32 v2, v0, v1\nv_mul_legacy_f32_e32 v3, 0.25, v1\nv_fmac_f32_e32 v4, v0, v1\nv_cvt_pkrtz_f16_f32_e32 v5, v0, v1\ns_inst_prefetch 3\nv_mov_b32_e32 v6, 0\ns_nop 0\nv_mov_b32_e32 v7, 0.5\nv_mov_b32_e32 v8, 1.0\nv_mov_b32_e32 v9, 0x7fc12345\nv_cmp_ne_u32_e32 vcc_lo, 0, v0\nv_cndmask_b32_e32 v10, 0x7fc12345, v1, vcc_lo\nv_cmp_ne_u32_e32 vcc_lo, 0, v1\nv_cndmask_b32_e32 v11, 0x80000000, v0, vcc_lo\nexp mrt0 v1, v1, v0, v0 done compr vm\ns_endpgm\nexp mrt0 v1, v1, off, off done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrtz v2, off, off, off done vm\ns_endpgm\nexp mrtz v2, off, off, off\nexp mrt0 v1, v1, v0, v0 done compr vm\ns_endpgm\nexp mrtz v2, off, off, off\ns_waitcnt expcnt(0)\nv_cvt_pkrtz_f16_f32_e32 v2, v0, v1\nexp mrt0 v2, v2, v3, v3 done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrt1 v0, v0, v1, v1 done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrt1 v0, v0, v1, v1 compr\nexp mrt2 v1, v1, v1, v1 done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrt1 v0, v0, off, off compr\nexp mrt2 v1, v1, v1, v1 done compr vm\ns_endpgm\n";
         let mut asm = asm.to_owned();
+        for (sgpr, component) in [(9, "x"), (14, "z")] {
+            writeln!(asm, "s_mov_b32 m0, s{sgpr}\nv_interp_p1_f32_e32 v2, v0, attr0.{component}\nv_interp_p2_f32_e32 v2, v1, attr0.{component}\nexp mrt0 v2, v2, v2, v2 done\ns_endpgm").unwrap();
+        }
         for n in 0..7 {
             let r = 4 + 4 * n;
             writeln!(asm, "exp param{n} v{r}, v{}, v{}, v{}", r + 1, r + 2, r + 3).unwrap();
@@ -804,6 +923,8 @@ mod tests {
             .chain(DUAL_PS)
             .chain(TRIPLE_PS)
             .chain(TRIPLE_RG_PS)
+            .chain(INTERP_X_PS)
+            .chain(INTERP_Z_PS)
             .chain(MULTI_VS)
             .flat_map(|w| w.to_le_bytes())
             .collect();
@@ -830,6 +951,28 @@ mod tests {
                 .map(|hex| u8::from_str_radix(hex.trim().strip_prefix("0x").unwrap(), 16).unwrap())
                 .collect();
             assert_eq!(bytes, expected, "{cpu}");
+        }
+    }
+
+    #[test]
+    fn interpolation_requires_bound_m0_and_two_matching_phases() {
+        assert!(lift_interp_pair(INTERP_X_PS, 9).is_ok());
+        assert!(lift_interp_pair(INTERP_Z_PS, 14).is_ok());
+        assert!(lift_interp_pair(INTERP_X_PS, 14).is_err());
+        for (at, word) in [
+            (0, 0xbefc_0380),
+            (0, 0xbe00_0309),
+            (1, 0xc808_0400),
+            (2, 0xc809_0201),
+            (2, 0xc80d_0001),
+            (2, 0xc809_0003),
+            (2, 0xc808_0001),
+            (4, 0x0002_0202),
+            (5, 0xbf80_0000),
+        ] {
+            let mut words = INTERP_X_PS.to_vec();
+            words[at] = word;
+            assert!(lift_interp_pair(&words, 9).is_err());
         }
     }
 

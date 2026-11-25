@@ -98,6 +98,16 @@ compile wait-depth
 compile multi
 "$p" --load-multi-metallib "$d/multi.metallib"
 
+# Owned native VS→native PS PARAM0 and exact interpolation pairs.
+for channel in x z; do
+    "$p" "--interp-$channel-source"
+    "$p" "--emit-interp-$channel-msl" > "$d/interp-$channel.metal"
+    compile "interp-$channel"
+    "$p" "--load-interp-$channel-metallib" "$d/interp-$channel.metallib"
+done
+"$p" --expect-interp-wrong-mode
+"$p" --expect-interp-wrong-channel
+
 # Two explicitly mapped FP16_ABGR exports, each with independent readback.
 "$p" --dual-source
 "$p" --emit-dual-msl > "$d/dual.metal"
