@@ -10,6 +10,7 @@ unset MTL_SHADER_VALIDATION
 cargo build --locked --manifest-path "$root/Cargo.toml" --target-dir "$d/target" \
     --features metal-probe --bin shader-legacy-mul-edges
 p=$d/target/debug/shader-legacy-mul-edges
+"$p" --source
 "$p" --emit-msl > "$d/edges.metal"
 xcrun -sdk macosx metal -std=metal3.1 -fno-fast-math -c "$d/edges.metal" -o "$d/edges.air"
 xcrun -sdk macosx metallib "$d/edges.air" -o "$d/edges.metallib"

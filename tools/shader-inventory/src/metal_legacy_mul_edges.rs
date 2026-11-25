@@ -22,38 +22,49 @@ mod gpu {
             );
             return Ok(());
         }
-        let [mode, lib, path] = args.as_slice() else {
-            return Err(
-                "usage: shader-legacy-mul-edges --emit-msl | <--bake|--replay> LIB ARCHIVE".into(),
-            );
-        };
-        let bake = mode == "--bake";
-        if (!bake && mode != "--replay") || std::env::var_os("MTL_SHADER_VALIDATION").is_some() {
-            return Err("expected --bake or --replay with MTL_SHADER_VALIDATION unset".into());
+        if std::env::var_os("MTL_SHADER_VALIDATION").is_some() {
+            return Err("expected MTL_SHADER_VALIDATION unset".into());
         }
         let dev = Device::system_default().ok_or("no Metal device")?;
-        super::metal_artifact::file_url(Path::new(lib), false)?;
-        let lib = dev.new_library_with_file(Path::new(lib))?;
-        let function = lib.get_function("legacy_edges", None)?;
-        let url = super::metal_artifact::file_url(Path::new(path), bake)?;
-        let ad = BinaryArchiveDescriptor::new();
-        if !bake {
-            ad.set_url(&url);
-        }
-        let archive = dev.new_binary_archive_with_descriptor(&ad)?;
-        let pd = ComputePipelineDescriptor::new();
-        pd.set_compute_function(Some(&function));
-        if bake
-            && (!archive.add_compute_pipeline_functions_with_descriptor(&pd)?
-                || !archive.serialize_to_url(&url)?)
-        {
-            return Err("could not bake owned edge archive".into());
-        }
-        pd.set_binary_archives(&[&archive]);
-        let (pipeline, _) = dev.new_compute_pipeline_state_with_reflection(
-            &pd,
-            MTLPipelineOption::FailOnBinaryArchiveMiss,
-        )?;
+        let (pipeline, profile) = match args.as_slice() {
+            [mode] if mode == "--source" => {
+                let msl = super::graphics_lift::translate_legacy_edge_fixture()
+                    .map_err(|e| format!("decode: {e:?}"))?;
+                let options = CompileOptions::new();
+                options.set_language_version(MTLLanguageVersion::V3_1);
+                options.set_fast_math_enabled(false);
+                let lib = dev.new_library_with_source(&msl, &options)?;
+                let function = lib.get_function("legacy_edges", None)?;
+                (dev.new_compute_pipeline_state_with_function(&function)?, "source")
+            }
+            [mode, lib, path] if mode == "--bake" || mode == "--replay" => {
+                let bake = mode == "--bake";
+                super::metal_artifact::file_url(Path::new(lib), false)?;
+                let lib = dev.new_library_with_file(Path::new(lib))?;
+                let function = lib.get_function("legacy_edges", None)?;
+                let url = super::metal_artifact::file_url(Path::new(path), bake)?;
+                let ad = BinaryArchiveDescriptor::new();
+                if !bake {
+                    ad.set_url(&url);
+                }
+                let archive = dev.new_binary_archive_with_descriptor(&ad)?;
+                let pd = ComputePipelineDescriptor::new();
+                pd.set_compute_function(Some(&function));
+                if bake
+                    && (!archive.add_compute_pipeline_functions_with_descriptor(&pd)?
+                        || !archive.serialize_to_url(&url)?)
+                {
+                    return Err("could not bake owned edge archive".into());
+                }
+                pd.set_binary_archives(&[&archive]);
+                let (pipeline, _) = dev.new_compute_pipeline_state_with_reflection(
+                    &pd,
+                    MTLPipelineOption::FailOnBinaryArchiveMiss,
+                )?;
+                (pipeline, if bake { "strict offline bake" } else { "strict offline replay" })
+            }
+            _ => return Err("usage: shader-legacy-mul-edges --emit-msl | --source | <--bake|--replay> LIB ARCHIVE".into()),
+        };
         const P0: u32 = 0;
         const N0: u32 = 0x8000_0000;
         const INF: u32 = 0x7f80_0000;
@@ -316,7 +327,7 @@ mod gpu {
             }
         }
         println!(
-            "{}: strict arithmetic archive, 16/16 legacy words, 2/2 FMAC words, 5/5 e32 packed RTZ words, 5/5 e64 NEG0 packed RTZ words, {mov_words}/{mov_words} raw MOV words 8/8 select words, 8/8 subtract words 11/11 ordinary multiply checks 8/8 ordinary add words 7/7 inline -1 add words 7/7 inline +1 subtract words and 36/36 mode-dependent CVT words",
+            "{}: {profile}, 16/16 legacy words, 2/2 FMAC words, 5/5 e32 packed RTZ words, 5/5 e64 NEG0 packed RTZ words, {mov_words}/{mov_words} raw MOV words 8/8 select words, 8/8 subtract words 11/11 ordinary multiply checks 8/8 ordinary add words 7/7 inline -1 add words 7/7 inline +1 subtract words and 36/36 mode-dependent CVT words",
             dev.name(),
             mov_words = 4 * inputs.len()
         );
