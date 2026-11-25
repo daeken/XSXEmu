@@ -2284,7 +2284,20 @@ mod tests {
                 duplicate.insert(2, SETPRIO3);
                 let mut with_wait = exact.to_vec();
                 with_wait.insert(2, WAIT_EXPORT_ZERO);
-                for words in [other_imm.as_slice(), &duplicate, &with_wait, &exact[..6]] {
+                let mut with_status_read = exact.to_vec();
+                // s_getreg_b32 s0, hwreg(HW_REG_STATUS, 3, 2)
+                with_status_read.insert(2, 0xb900_08c2);
+                let mut with_timer = exact.to_vec();
+                // s_memrealtime s[2:3]
+                with_timer.splice(2..2, [0xf494_0080, 0]);
+                for words in [
+                    other_imm.as_slice(),
+                    &duplicate,
+                    &with_wait,
+                    &with_status_read,
+                    &with_timer,
+                    &exact[..6],
+                ] {
                     assert!(project_sole_setprio3(&mut dis, &bytes(words)).is_none());
                 }
             }
