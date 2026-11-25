@@ -113,6 +113,11 @@ pub(crate) fn lookup(dll: &[u8], name: &[u8]) -> Option<HostExport> {
             "CreateEventA",
             crate::providers::win_io::native::create_event_a
         ),
+        (b"kernelbase.dll" | b"kernel32.dll" | SYNCH, b"SetEvent") => export!(
+            "kernelbase.dll",
+            "SetEvent",
+            crate::providers::win_io::native::set_event
+        ),
         (b"kernelbase.dll" | b"kernel32.dll" | SYNCH, b"CreateMutexA") => export!(
             "kernelbase.dll",
             "CreateMutexA",
@@ -201,6 +206,7 @@ mod registry_tests {
             b"AcquireSRWLockExclusive".as_slice(),
             b"ReleaseSemaphore",
             b"WaitForSingleObject",
+            b"SetEvent",
             b"ReleaseSRWLockExclusive",
         ] {
             let entry = crate::providers::lookup(SYNCH, name).unwrap();
@@ -213,7 +219,6 @@ mod registry_tests {
         }
         for name in [
             b"ReleaseMutex".as_slice(),
-            b"SetEvent",
             b"ResetEvent",
             b"WaitForSingleObjectEx",
             b"AcquireSRWLockShared",
@@ -238,6 +243,7 @@ mod registry_tests {
         for name in [
             b"CreateSemaphoreExW".as_slice(),
             b"ReleaseSemaphore",
+            b"SetEvent",
             b"WaitForSingleObject",
         ] {
             assert!(lookup(SYNCH_121, name).is_none());

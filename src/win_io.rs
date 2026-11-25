@@ -329,6 +329,7 @@ pub(crate) mod native {
     const SEMAPHORE_RIGHTS: u32 = SYNCHRONIZE | SEMAPHORE_MODIFY_STATE;
     const SEMAPHORE_ALL_ACCESS: u32 = 0x001f_0003;
 
+    const EVENT_MODIFY_STATE: u32 = 2;
     const EVENT_ALL_ACCESS: u32 = 0x001f_0003;
     const MUTEX_ALL_ACCESS: u32 = 0x001f_0001;
 
@@ -514,13 +515,10 @@ pub(crate) mod native {
             maximum: i32,
             available: Condvar,
         },
-        #[allow(
-            dead_code,
-            reason = "event signaling and waits are not implemented yet"
-        )]
         Event {
             manual_reset: bool,
-            signaled: bool,
+            signaled: Mutex<bool>,
+            ready: Condvar,
         },
         #[allow(dead_code, reason = "mutex release and waits are not implemented yet")]
         Mutex {
@@ -1067,6 +1065,42 @@ pub(crate) mod native {
                     }
                     return Ok(thread.wait(milliseconds));
                 }
+                if let Object::Event {
+                    manual_reset,
+                    signaled,
+                    ready,
+                } = &*e.obj
+                {
+                    // Keep manual-reset operations out of scope until ResetEvent exists.
+                    if *manual_reset {
+                        return Err(UNSUPPORTED);
+                    }
+                    if e.access & SYNCHRONIZE == 0 {
+                        return Err(ACCESS);
+                    }
+                    let signal = lock(signaled);
+                    let mut signal = match milliseconds {
+                        0 => signal,
+                        u32::MAX => ready
+                            .wait_while(signal, |set| !*set)
+                            .unwrap_or_else(|e| e.into_inner()),
+                        ms => {
+                            ready
+                                .wait_timeout_while(
+                                    signal,
+                                    Duration::from_millis(u64::from(ms)),
+                                    |set| !*set,
+                                )
+                                .unwrap_or_else(|e| e.into_inner())
+                                .0
+                        }
+                    };
+                    if !*signal {
+                        return Ok(WAIT_TIMEOUT);
+                    }
+                    *signal = false;
+                    return Ok(WAIT_OBJECT_0);
+                }
                 let Object::Semaphore {
                     count, available, ..
                 } = &*e.obj
@@ -1159,7 +1193,8 @@ pub(crate) mod native {
                 lock(&STATE).insert(Entry {
                     obj: Arc::new(Object::Event {
                         manual_reset: manual_reset != 0,
-                        signaled: initial_state != 0,
+                        signaled: Mutex::new(initial_state != 0),
+                        ready: Condvar::new(),
                     }),
                     access: EVENT_ALL_ACCESS,
                     inheritable: false,
@@ -1167,6 +1202,33 @@ pub(crate) mod native {
             })(),
             0,
         )
+    }
+
+    pub(crate) extern "win64" fn set_event(h: usize) -> i32 {
+        boolean((|| {
+            let e = entry(h)?;
+            let Object::Event {
+                manual_reset,
+                signaled,
+                ready,
+            } = &*e.obj
+            else {
+                return Err(BAD_HANDLE);
+            };
+            if *manual_reset {
+                return Err(UNSUPPORTED);
+            }
+            if e.access & EVENT_MODIFY_STATE == 0 {
+                return Err(ACCESS);
+            }
+            let mut signal = lock(signaled);
+            // SetEvent leaves exactly one signal pending even if no one is waiting.
+            if !*signal {
+                *signal = true;
+                ready.notify_one();
+            }
+            Ok(())
+        })())
     }
 
     pub(crate) extern "win64" fn create_mutex_a(
@@ -1409,15 +1471,82 @@ pub(crate) mod native {
             let e = entry(h).unwrap();
             assert_eq!(e.access, EVENT_ALL_ACCESS);
             assert!(!e.inheritable);
-            assert!(
-                matches!(*e.obj, Object::Event { manual_reset: manual, signaled }
-                if manual == (manual_reset != 0) && signaled == (initial_state != 0))
-            );
+            let Object::Event {
+                manual_reset: manual,
+                signaled,
+                ..
+            } = &*e.obj
+            else {
+                panic!("expected an event object");
+            };
+            assert_eq!(*manual, manual_reset != 0);
+            assert_eq!(*lock(signaled), initial_state != 0);
             assert_eq!(GetFileType(h), 0);
             assert_eq!(get_last_error(), BAD_HANDLE);
             assert_eq!(CloseHandle(h), 1);
             assert!(entry(h).is_err());
         }
+    }
+
+    #[test]
+    fn auto_reset_event_wakes_one_waiter_and_shares_state_across_handles() {
+        use crate::providers::native::get_last_error;
+        use std::{sync::mpsc, thread};
+
+        let h = create_event_a(ptr::null(), 0, 0, ptr::null());
+        let (mut wait, mut post) = (0, 0);
+        unsafe {
+            assert_eq!(
+                DuplicateHandle(INVALID, h, INVALID, &mut wait, SYNCHRONIZE, 0, 0),
+                1
+            );
+            assert_eq!(
+                DuplicateHandle(INVALID, h, INVALID, &mut post, EVENT_MODIFY_STATE, 0, 0),
+                1
+            );
+        }
+        assert_eq!(set_event(wait), 0);
+        assert_eq!(get_last_error(), ACCESS);
+        assert_eq!(wait_for_single_object(post, 0), WAIT_FAILED);
+        assert_eq!(get_last_error(), ACCESS);
+        assert_eq!(CloseHandle(h), 1);
+        assert_eq!(set_event(h), 0);
+        assert_eq!(get_last_error(), BAD_HANDLE);
+        assert_eq!(wait_for_single_object(h, 0), WAIT_FAILED);
+        assert_eq!(get_last_error(), BAD_HANDLE);
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let started_tx = started_tx.clone();
+            let result_tx = result_tx.clone();
+            workers.push(thread::spawn(move || {
+                set_last_error(123);
+                started_tx.send(()).unwrap();
+                result_tx
+                    .send((wait_for_single_object(wait, u32::MAX), get_last_error()))
+                    .unwrap();
+            }));
+        }
+        let bound = Duration::from_secs(5);
+        for _ in 0..2 {
+            started_rx.recv_timeout(bound).unwrap();
+        }
+        assert_eq!(set_event(post), 1);
+        assert_eq!(result_rx.recv_timeout(bound).unwrap(), (WAIT_OBJECT_0, 123));
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_millis(20)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+        assert_eq!(set_event(post), 1);
+        assert_eq!(result_rx.recv_timeout(bound).unwrap(), (WAIT_OBJECT_0, 123));
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(wait_for_single_object(wait, 0), WAIT_TIMEOUT);
+        assert_eq!(CloseHandle(wait), 1);
+        assert_eq!(CloseHandle(post), 1);
     }
 
     #[test]

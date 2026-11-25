@@ -2717,7 +2717,7 @@ fn semaphore_wait_and_release_bridge_checks_counts_and_last_error() {
     );
 }
 
-const EVENT_CODE_CAPACITY: usize = 0x200;
+const EVENT_CODE_CAPACITY: usize = 0x500;
 
 #[repr(C)]
 struct EventFixture {
@@ -2736,7 +2736,7 @@ unsafe extern "C" {
 }
 
 #[test]
-fn event_bridge_creates_distinct_unnamed_events_and_rejects_pointer_inputs() {
+fn event_bridge_checks_creation_auto_reset_waits_signals_and_last_error() {
     if !rosetta() {
         return;
     }
@@ -2747,11 +2747,28 @@ fn event_bridge_creates_distinct_unnamed_events_and_rejects_pointer_inputs() {
     put(&mut exe, file(TEXT), &fixture.code);
     w32(&mut exe, OP + 16, TEXT + fixture.entry as usize);
     w64(&mut exe, file(ARRAY), PREFERRED + TEXT);
-    dir_import_one(
+    let imports = LINK + 0x780;
+    dir(&mut exe, 1, imports, 40);
+    w32(&mut exe, file(imports), imports + 0x30);
+    w32(&mut exe, file(imports) + 12, imports + 0x60);
+    w32(&mut exe, file(imports) + 16, IAT);
+    put(
         &mut exe,
+        file(imports) + 0x60,
         b"api-ms-win-core-synch-l1-1-0.dll\0",
-        b"CreateEventA\0",
     );
+    for (i, symbol) in [
+        b"CreateEventA\0".as_slice(),
+        b"WaitForSingleObject\0",
+        b"SetEvent\0",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let hint_name = imports + 0x90 + i * 0x20;
+        w64(&mut exe, file(imports) + 0x30 + i * 8, hint_name);
+        put(&mut exe, file(hint_name) + 2, symbol);
+    }
     let path = scratch.write("event.exe", &exe);
     expect(run(&path, &[OPT]), 1, "incomplete dependency graph");
     let flags = [OPT, "--rust-providers"];
@@ -2761,13 +2778,21 @@ fn event_bridge_creates_distinct_unnamed_events_and_rejects_pointer_inputs() {
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(
-        stderr
-            .matches("bridge dispatch kernelbase.dll!CreateEventA guest_return_pc=")
-            .count(),
-        4,
-        "{stderr}"
-    );
+    for (name, count) in [
+        ("CreateEventA", 4),
+        ("WaitForSingleObject", 6),
+        ("SetEvent", 4),
+    ] {
+        assert_eq!(
+            stderr
+                .matches(&format!(
+                    "bridge dispatch kernelbase.dll!{name} guest_return_pc="
+                ))
+                .count(),
+            count,
+            "{stderr}"
+        );
+    }
     expect(output, 51, "Guest entry returned 51");
 }
 
