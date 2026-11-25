@@ -212,6 +212,21 @@ The owned compute probe checks 36 raw words: nine signed inputs, including zero,
 
 Recognition finds 62 sites in 31 VS windows and 7 sites in 4 PS windows per +36/+40 and wave, with neither CPU disagreeing and no sites at +0/+24. In the same 26 next VS spans, 52 sites are recognized but not accepted; both conversions and SETPRIO imm3 remain blockers. These 26 checked paths are contiguous and have no modeled in-window MODE setup; the entry or inherited MODE values are not established. Strict site acceptance and whole-window closure remain unchanged (0 VS, 225 PS per +36/+40 profile). No SETPRIO handling, retail entry, binding, or admission changes.
 
+## Direct PS attachment evidence by exact shipped row
+
+Run `--direct-ps-attachments "$INFLATED_LIBRARY" "$TRUSTED_LLVM_21_DYLIB" gfx1013` (and repeat with `gfx1030`). The audit joins contiguous reference-checked encoding-complete PS paths with reached active exports back to exact slot occurrences, without wrappers or digests. The attachment-only subset has no semantic gaps and exactly `AttachmentFormatAndMask` outstanding. It tests stored-end +36 and +40 independently in wave64 and wave32. All passing rows passed all four hypotheses per CPU, without differences in the projected export shape or attachment-only class across passing windows. LLVM 21.1.6 aggregates agree across both CPUs. The summary counts each row once; none of the hypotheses authenticates entry.
+
+| Exact slot set | All rows / distinct PS spans | Encoding-complete PS rows / spans | Attachment-only PS rows / spans |
+|---|---:|---:|---:|
+| PS+VS | 13,383 / 2,921 | 22 / 13 | 18 / 10 |
+| PS+MS | 10,726 / 7,132 | 353 / 214 | 348 / 211 |
+| PS+VS+unknown slot 6 | 2 / 1 | 0 / 0 | 0 / 0 |
+| Total (PS spans deduplicated across slot sets) | 24,111 / 9,996 | 375 / 225 | 366 / 219 |
+
+Ranked by exact row occurrences in the attachment-only cohort: scalar MRT0 EN1 (349 rows, 346 with MS and 3 with VS); packed MRT0 EN15 (8 VS rows); packed MRT0 EN3 (7 VS rows); packed MRT0 EN15 with scalar depth (2 MS rows). For a VS+PS attachment contract, prioritize packed EN15, then packed EN3, then scalar red. The nine other encoding-complete PS rows still have additional predicates or gaps; four are PS+MS with packed MRT0 and scalar MRT1. No companion-stage eligibility is inferred.
+
+All 366 attachment-only rows have an empty residual under the previously tested +380/+464 state split despite a reached color export. Of the nine other rows, four mixed-MRT rows also have no residual, and the five single-color rows have one nonzero chunk. This rejects a required one-to-one residual/active-color relation under these splits; occupancy agreement does not establish a format or mask. Native export EN/COMPR constrain shader output, not render-state write masks or pixel formats. The next evidence is an exact same-build draw or PSO binding that ties the resident program and state to ordered color formats, color write masks, sample count, and, for MRTZ, depth format and state. No entry, attachment defaults, translation admission, bake, or runtime behavior changed.
+
 ## Independent evidence for distinguishing starts
 
 `--graphics-entry-evidence "$INFLATED_LIBRARY" "$TRUSTED_LLVM_21_DYLIB"` uses the exact 13,383 two-slot rows (2,921 distinct checked PS spans, 1,322 VS). It does not repeat the closure census or use wrapper joins. It checks the stage metadata footer fingerprint, then tests the third-group marker at `+26` as in [compute layout sites](compute-layout-sites.md). The marker supports interpreting the group at `+24` as part of the stored prefix, not a global execution rule. The comparisons beginning at `+24` are withheld for marked groups. Nonzero `0x42` sites are tested independently as aligned in-span scalar loads, without assuming they are reachable from any entry.
