@@ -114,6 +114,7 @@ mod gpu {
         InterpSource(InterpFixture),
         InterpLoad(&'a Path, InterpFixture),
         BoundAffineSource(bool),
+        BoundAffineControl(InterpFixture),
         BoundAffineLoad(&'a Path, bool),
         ConstantRtzSource(bool),
         ConstantRtzLoad(&'a Path, bool),
@@ -171,6 +172,8 @@ mod gpu {
                 print!("{}", graphics_lift::translate_mrt_fixture(fixture).map_err(|e| format!("MRT lift rejected: {e:?}"))?);
                 return Ok(());
             }
+            [mode] if mode == "--expect-bound-affine-wrong-mode" => Mode::BoundAffineControl(InterpFixture::WrongPerspective),
+            [mode] if mode == "--expect-bound-affine-wrong-channel" => Mode::BoundAffineControl(InterpFixture::WrongChannel),
             [mode] if mode == "--bound-affine-x-source" || mode == "--bound-affine-z-source" => Mode::BoundAffineSource(mode == "--bound-affine-z-source"),
             [mode, lib] if mode == "--load-bound-affine-x-metallib" || mode == "--load-bound-affine-z-metallib" => Mode::BoundAffineLoad(Path::new(lib), mode == "--load-bound-affine-z-metallib"),
             [mode] if mode == "--emit-bound-affine-x-msl" || mode == "--emit-bound-affine-z-msl" => {
@@ -251,7 +254,7 @@ mod gpu {
             [mode, lib] if mode == "--load-metallib" || mode == "--load-mutated-metallib" => Mode::Load(Path::new(lib), mode == "--load-mutated-metallib"),
             [mode, lib, archive] if mode == "--expect-owned-metal-miss" => Mode::ExpectStrictMiss(Path::new(lib), Path::new(archive)),
             [mode, lib, archive, compiler] if mode == "--bake-archive" || mode == "--replay-archive" || mode == "--replay-mutated-archive" => Mode::Archive(Path::new(lib), Path::new(archive), mode == "--bake-archive", mode == "--replay-mutated-archive", owned_graphics_artifact::compiler_profile(compiler)?),
-            _ => return Err("usage: shader-metal-graphics-lift [--expect-swapped-triple | --triple-rg-source | --emit-triple-rg-msl | --load-triple-rg-metallib LIB | --triple-source | --emit-triple-msl | --load-triple-metallib LIB | --dual-source | --emit-dual-msl | --load-dual-metallib LIB | --bound-affine-{x,z}-source | --emit-bound-affine-{x,z}-msl | --load-bound-affine-{x,z}-metallib LIB | --interp-x-source | --interp-z-source | --expect-interp-wrong-mode | --expect-interp-wrong-channel | --emit-interp-x-msl | --emit-interp-z-msl | --load-interp-x-metallib LIB | --load-interp-z-metallib LIB | --constant-rtz[-rg]-source | --emit-constant-rtz[-rg]-msl | --load-constant-rtz[-rg]-metallib LIB | --expect-bound-swapped-component | --bound[-rg]-source | --emit-bound[-rg]-msl | --load-bound[-rg]-metallib LIB | --pos-first-source | --emit-pos-first-msl | --load-pos-first-metallib LIB | --wait-pos-source | --emit-wait-pos-msl | --load-wait-pos-metallib LIB | --expect-late-pos-read | --unpack-{byte,uint}-source | --emit-unpack-{byte,uint}-msl | --load-unpack-{byte,uint}-metallib LIB | --multi-source | --emit-multi-msl | --load-multi-metallib LIB | --packed-rg-source | --emit-packed-rg-msl | --load-packed-rg-metallib LIB | --wait-depth-source | --emit-wait-depth-msl | --load-wait-depth-metallib LIB | --expect-late-depth-read | --early-depth-source | --emit-early-depth-msl | --load-early-depth-metallib LIB | --depth-source | --emit-depth-msl | --load-depth-metallib LIB | --packed-source | --emit-packed-msl | --load-packed-metallib LIB | --emit-msl | --emit-mutated-msl | --load-metallib LIB | --load-mutated-metallib LIB | {--bake-archive|--replay-archive|--replay-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-owned-metal-miss MUTATED_LIB ARCHIVE]".into()),
+            _ => return Err("usage: shader-metal-graphics-lift [--expect-swapped-triple | --triple-rg-source | --emit-triple-rg-msl | --load-triple-rg-metallib LIB | --triple-source | --emit-triple-msl | --load-triple-metallib LIB | --dual-source | --emit-dual-msl | --load-dual-metallib LIB | --expect-bound-affine-wrong-mode | --expect-bound-affine-wrong-channel | --bound-affine-{x,z}-source | --emit-bound-affine-{x,z}-msl | --load-bound-affine-{x,z}-metallib LIB | --interp-x-source | --interp-z-source | --expect-interp-wrong-mode | --expect-interp-wrong-channel | --emit-interp-x-msl | --emit-interp-z-msl | --load-interp-x-metallib LIB | --load-interp-z-metallib LIB | --constant-rtz[-rg]-source | --emit-constant-rtz[-rg]-msl | --load-constant-rtz[-rg]-metallib LIB | --expect-bound-swapped-component | --bound[-rg]-source | --emit-bound[-rg]-msl | --load-bound[-rg]-metallib LIB | --pos-first-source | --emit-pos-first-msl | --load-pos-first-metallib LIB | --wait-pos-source | --emit-wait-pos-msl | --load-wait-pos-metallib LIB | --expect-late-pos-read | --unpack-{byte,uint}-source | --emit-unpack-{byte,uint}-msl | --load-unpack-{byte,uint}-metallib LIB | --multi-source | --emit-multi-msl | --load-multi-metallib LIB | --packed-rg-source | --emit-packed-rg-msl | --load-packed-rg-metallib LIB | --wait-depth-source | --emit-wait-depth-msl | --load-wait-depth-metallib LIB | --expect-late-depth-read | --early-depth-source | --emit-early-depth-msl | --load-early-depth-metallib LIB | --depth-source | --emit-depth-msl | --load-depth-metallib LIB | --packed-source | --emit-packed-msl | --load-packed-metallib LIB | --emit-msl | --emit-mutated-msl | --load-metallib LIB | --load-mutated-metallib LIB | {--bake-archive|--replay-archive|--replay-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-owned-metal-miss MUTATED_LIB ARCHIVE]".into()),
         };
         if matches!(mode, Mode::Archive(..) | Mode::ExpectStrictMiss(..))
             && std::env::var_os("MTL_SHADER_VALIDATION").is_some()
@@ -281,10 +284,12 @@ mod gpu {
         let early_depth = matches!(mode, Mode::DepthSource(true) | Mode::DepthLoad(_, true));
         let bound_affine = match mode {
             Mode::BoundAffineSource(z) | Mode::BoundAffineLoad(_, z) => Some(z),
+            Mode::BoundAffineControl(_) => Some(false),
             _ => None,
         };
         let interp = match mode {
             Mode::InterpSource(f) | Mode::InterpLoad(_, f) => Some(f),
+            Mode::BoundAffineControl(f) => Some(f),
             Mode::BoundAffineSource(z) | Mode::BoundAffineLoad(_, z) => Some(if z {
                 InterpFixture::AffineZ
             } else {
@@ -340,6 +345,7 @@ mod gpu {
             | Mode::WaitDepthSource(_)
             | Mode::InterpSource(_)
             | Mode::BoundAffineSource(_)
+            | Mode::BoundAffineControl(_)
             | Mode::ConstantRtzSource(_)
             | Mode::BoundSource(_)
             | Mode::BoundSwappedSource
@@ -352,9 +358,20 @@ mod gpu {
                 let msl = if let Some(fixture) = fixture {
                     graphics_lift::translate_mrt_fixture(fixture)
                 } else if let Some(z) = bound_affine {
-                    Ok(graphics_lift::bound::owned_affine(z)
+                    let source = graphics_lift::bound::owned_affine(z)
                         .map_err(|e| format!("affine binding rejected: {e:?}"))?
-                        .source)
+                        .source;
+                    // Harness-only controls mutate the validated API output.
+                    // The translator itself refuses these mismatched contracts.
+                    Ok(match mode {
+                        Mode::BoundAffineControl(InterpFixture::WrongPerspective) => {
+                            source.replace("center_no_perspective", "center_perspective")
+                        }
+                        Mode::BoundAffineControl(InterpFixture::WrongChannel) => {
+                            source.replace("input.param0[0]", "input.param0[2]")
+                        }
+                        _ => source,
+                    })
                 } else if let Some(interp) = interp {
                     graphics_lift::translate_interp_fixture(interp)
                 } else if let Some(plan) = &bound_pair {
@@ -972,8 +989,13 @@ mod gpu {
                 return Err(format!("{label} only discriminates {differs} pixels"));
             }
             println!(
-                "{} owned native VS→PS {label}: 64/64 pixels matched{}",
+                "{} owned native VS→PS {}{label}: 64/64 pixels matched{}",
                 dev.name(),
+                if bound_affine.is_some() {
+                    "bound API "
+                } else {
+                    ""
+                },
                 if negative {
                     " predicted control, all differ from affine X"
                 } else {

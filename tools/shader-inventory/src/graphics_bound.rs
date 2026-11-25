@@ -50,6 +50,13 @@ pub(crate) struct NoPsLink<'a> {
     pub unconsumed_params: &'a [u8],
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InterpolationMode {
+    CenterNoPerspective,
+    #[cfg(test)]
+    CenterPerspective,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct AffineLink {
     pub param: u8,
@@ -59,7 +66,7 @@ pub(crate) struct AffineLink {
     pub channel: u8,
     pub m0_sgpr: u8,
     pub m0_value: u32,
-    pub center_no_perspective: bool,
+    pub mode: InterpolationMode,
     pub full_precision: bool,
 }
 
@@ -226,7 +233,7 @@ pub(crate) fn translate(vs: &[u32], ps: &[u32], b: Bindings<'_>) -> Result<Metal
             || l.channel > 3
             || params.contains(&l.param)
             || l.m0_value != 0
-            || !l.center_no_perspective
+            || l.mode != InterpolationMode::CenterNoPerspective
             || !l.full_precision
         {
             return Err(Error::InterpolationBinding);
@@ -627,7 +634,7 @@ fn affine_binding(z: bool) -> Bindings<'static> {
             channel: if z { 2 } else { 0 },
             m0_sgpr: if z { 14 } else { 9 },
             m0_value: 0,
-            center_no_perspective: true,
+            mode: InterpolationMode::CenterNoPerspective,
             full_precision: true,
         }),
         color: Some(ColorBinding {
@@ -677,7 +684,7 @@ mod tests {
             AffineLink { m0_sgpr: 14, ..l },
             AffineLink { m0_value: 1, ..l },
             AffineLink {
-                center_no_perspective: false,
+                mode: InterpolationMode::CenterPerspective,
                 ..l
             },
             AffineLink {
@@ -701,6 +708,28 @@ mod tests {
             )
             .unwrap_err(),
             Error::InterpolationBinding
+        );
+        let vs = super::super::VS;
+        let duplicate = [&vs[..3], &vs[1..]].concat();
+        let ps = super::super::INTERP_X_PS;
+        assert_eq!(
+            translate(&duplicate, ps, b).unwrap_err(),
+            Error::ParameterBinding
+        );
+        assert_eq!(
+            translate(&vs[3..], ps, b).unwrap_err(),
+            Error::InterpolationBinding
+        );
+        assert!(
+            translate(
+                vs,
+                ps,
+                Bindings {
+                    affine_link: None,
+                    ..b
+                }
+            )
+            .is_err()
         );
         let mut ps = super::super::INTERP_X_PS.to_vec();
         ps[2] = 0xc809_0201; // P2 for a different channel than P1.

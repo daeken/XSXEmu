@@ -157,6 +157,10 @@ for channel in x z; do
     "$p" "--load-$variant-metallib" "$d/$variant.metallib"
 done
 
+# Harness-only mutations of MSL produced by the bound API; neither contract is admitted.
+"$p" --expect-bound-affine-wrong-mode
+"$p" --expect-bound-affine-wrong-channel
+
 # Two explicitly mapped FP16_ABGR exports, each with independent readback.
 "$p" --dual-source
 "$p" --emit-dual-msl > "$d/dual.metal"
