@@ -247,7 +247,7 @@ pub(crate) fn audit(words: &[u32], vertex: bool) -> Outcome {
                 let (target, src): (_, &[_]) = match &op {
                     Op::Export { target, src, .. } => (Some(*target), src),
                     Op::PackedColor { src, .. } => (Some(Target::Color), src),
-                    Op::PackedRg { src, .. } | Op::ExportRed { src } => {
+                    Op::PackedRg { src, .. } | Op::ExportRed { src, .. } => {
                         (Some(Target::Color), std::slice::from_ref(src))
                     }
                     Op::PixelDepth { src, .. } => (None, std::slice::from_ref(src)),

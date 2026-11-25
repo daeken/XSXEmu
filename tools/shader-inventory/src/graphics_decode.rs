@@ -100,6 +100,7 @@ pub(crate) enum Op {
         vm: bool,
     },
     ExportRed {
+        slot: u8,
         src: Vgpr,
     },
     PackedRg {
@@ -394,7 +395,7 @@ pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeErro
         0xf800_040f | 0xf800_1c0f | 0xf800_041f | 0xf800_1c1f | 0xf800_1c2f
     ) {
         let [rg, ba, unused2, unused3] = ext()?.to_le_bytes();
-        if w != 0xf800_1c0f && (unused2 != 0 || unused3 != 0) {
+        if !matches!(w, 0xf800_040f | 0xf800_1c0f) && (unused2 != 0 || unused3 != 0) {
             return Err(DecodeError::Unsupported(pc));
         }
         return Ok((
@@ -408,10 +409,11 @@ pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeErro
         ));
     }
     // EN=1 reads only VSRC0. Disabled component selectors are not read.
-    if w == 0xf800_1801 {
+    if matches!(w, 0xf800_1801 | 0xf800_1811) {
         return Ok((
             2,
             Op::ExportRed {
+                slot: ((w >> 4) & 63) as u8,
                 src: Vgpr(ext()? as u8),
             },
         ));

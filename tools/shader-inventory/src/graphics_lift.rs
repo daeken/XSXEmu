@@ -334,8 +334,8 @@ fn lift(stage: Stage, words: &[u32]) -> Result<Vec<Op>, Reject> {
                 }
                 exported += 1;
             }
-            Op::ExportRed { src } => {
-                if stage != Stage::ConstantRedPixel || exported != 0 {
+            Op::ExportRed { slot, src } => {
+                if slot != 0 || stage != Stage::ConstantRedPixel || exported != 0 {
                     return Err(Reject::BadExports(pc));
                 }
                 require(src)?;
@@ -586,7 +586,7 @@ fn emit_body(out: &mut String, ops: &[Op], packed_color_lvalue: &str, multi: boo
                 };
                 writeln!(out, "  {packed_color_lvalue} = float4(float(as_type<half>(ushort(r[{rg}]))), float(as_type<half>(ushort(r[{rg}] >> 16))), float(as_type<half>(ushort(r[{ba}]))), float(as_type<half>(ushort(r[{ba}] >> 16))));").unwrap();
             }
-            Op::ExportRed { src: Vgpr(r) } => {
+            Op::ExportRed { src: Vgpr(r), .. } => {
                 // GBA placeholders are disabled by the owned R-only descriptor.
                 writeln!(
                     out,
@@ -905,19 +905,30 @@ const DUAL_RED_PS: &[u32] = &[
 ];
 
 fn dual_red_exports(words: &[u32]) -> Result<([Vgpr; 2], Vgpr), Reject> {
-    match *words {
-        [0xf800_040f, packed, 0xf800_1811, scalar, 0xbf81_0000] => {
-            let [rg, ba, _, _] = packed.to_le_bytes();
-            let red = scalar as u8;
-            for (pc, r) in [(0, rg), (0, ba), (2, red)] {
-                if r > 1 {
-                    return Err(Reject::Uninitialized(pc, r));
-                }
-            }
-            Ok(([Vgpr(rg), Vgpr(ba)], Vgpr(red)))
-        }
-        _ => Err(Reject::BadExports(0)),
+    if words.len() != 5 || words[4] != 0xbf81_0000 {
+        return Err(Reject::BadEnd(4));
     }
+    let (
+        Ok((
+            2,
+            Op::PackedColor {
+                slot: 0,
+                src,
+                done: false,
+                vm: false,
+            },
+        )),
+        Ok((2, Op::ExportRed { slot: 1, src: red })),
+    ) = (decode(words, 0), decode(words, 2))
+    else {
+        return Err(Reject::BadExports(0));
+    };
+    for (pc, r) in [(0, src[0]), (0, src[1]), (2, red)] {
+        if r.0 > 1 {
+            return Err(Reject::Uninitialized(pc, r.0));
+        }
+    }
+    Ok((src, red))
 }
 
 #[allow(dead_code)] // Separate MRT render probe.
@@ -1175,7 +1186,7 @@ fn param_mov_source(words: &[u32], m0: u32) -> Result<String, Reject> {
         return Err(Reject::Unsupported(1));
     }
     let dst = Vgpr((read >> 18) as u8);
-    if decode(tail, 0) != Ok((2, Op::ExportRed { src: dst }))
+    if decode(tail, 0) != Ok((2, Op::ExportRed { slot: 0, src: dst }))
         || tail.get(2..) != Some(&[0xbf81_0000])
     {
         return Err(Reject::BadExports(2));
@@ -1183,7 +1194,7 @@ fn param_mov_source(words: &[u32], m0: u32) -> Result<String, Reject> {
     let mut msl = vertex_module(&lift(Stage::Vertex, VS)?);
     msl.push_str("fragment float4 param_mov_ps(constant uint &bound_p0_attr0_x [[buffer(0)]]) { uint r[256]; float4 out;\n");
     writeln!(msl, "  r[{}] = bound_p0_attr0_x;", dst.0).unwrap();
-    body(&mut msl, &[Op::ExportRed { src: dst }, Op::End]);
+    body(&mut msl, &[Op::ExportRed { slot: 0, src: dst }, Op::End]);
     Ok(msl)
 }
 

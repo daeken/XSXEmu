@@ -1309,6 +1309,15 @@ mod gpu {
                     let slot = index + 1;
                     let at = slot * BYTES + at;
                     let got = &pixels[at..at + pixel_bytes];
+                    if dual_red_all {
+                        let normal = if inside {
+                            [f32::from_bits(0xb800_3e00), 0.5, 0.75, 1.]
+                        } else {
+                            [0., 0.5, 0.75, 1.]
+                        };
+                        let normal = normal.map(f32::to_le_bytes);
+                        mapping_mismatches += usize::from(got != normal.as_flattened());
+                    }
                     mapping_mismatches += usize::from(got != extra[index]);
                     let expected = &extra[if swapped { 1 - index } else { index }];
                     if got != expected {
@@ -1330,6 +1339,17 @@ mod gpu {
             }
             println!(
                 "late depth source read rejected by oracle: all 64 pixels cleared, including {late_read_differences} expected color writes"
+            );
+            return Ok(());
+        }
+        if dual_red_all {
+            if mapping_mismatches != 20 {
+                return Err(format!(
+                    "expected 20 mismatches against normal MRT1 oracle, got {mapping_mismatches}"
+                ));
+            }
+            println!(
+                "all-channel MRT1 rejected by normal oracle: {mapping_mismatches} covered pixels lose G/B/A clears; all 128 pixels match the control oracle"
             );
             return Ok(());
         }
