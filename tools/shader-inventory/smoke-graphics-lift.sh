@@ -240,3 +240,9 @@ compile triple
 "$p" --emit-triple-rg-msl > "$d/triple-rg.metal"
 compile triple-rg
 "$p" --load-triple-rg-metallib "$d/triple-rg.metallib"
+"$p" --triple-alias-source
+"$p" --emit-triple-alias-msl > "$d/triple-alias.metal"
+compile triple-alias
+"$p" --load-triple-alias-metallib "$d/triple-alias.metallib"
+"$p" --expect-triple-alias-all-mask "$d/triple-alias.metallib"
+"$p" --expect-triple-alias-swapped "$d/triple-alias.metallib"

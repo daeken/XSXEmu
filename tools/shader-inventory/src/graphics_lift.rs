@@ -113,6 +113,30 @@ const TRIPLE_RG_PS: &[u32] = &[
     0xbf81_0000,
 ];
 
+// Owned words only: one locally defined packed word, aliased across every
+// active source. Disabled bytes deliberately do not name that register.
+const TRIPLE_ALIAS_PS: [u32; 9] = [
+    0x7e0a_02ff,
+    0xb800_3e00,
+    0xf800_040f,
+    0xfefd_0505,
+    0xf800_0413,
+    0xfcfd_fe05,
+    0xf800_1c2f,
+    0xfcfd_0505,
+    0xbf81_0000,
+];
+
+fn owned_triple_alias_ops() -> Result<Vec<Op>, Reject> {
+    // Project only the fixed owned fixture, not arbitrary program input.
+    // Keep strict native decode unchanged until the probe is reviewed.
+    let mut canonical = TRIPLE_ALIAS_PS;
+    for (operand, active) in [(3, 0xffff), (5, 0xff), (7, 0xffff)] {
+        canonical[operand] &= active;
+    }
+    lift(Stage::TriplePackedRgPixel, &canonical)
+}
+
 const DEPTH_PS: &[u32] = &[
     0xf800_040f,
     1, // exp mrt0 v1, v1, v0, v0 compr
@@ -1119,6 +1143,7 @@ pub(crate) enum MrtFixture {
     DualRg,
     Triple,
     TripleRg,
+    TripleAlias,
 }
 
 impl MrtFixture {
@@ -1130,6 +1155,7 @@ impl MrtFixture {
             Self::DualRg => "dual_rg_ps",
             Self::Triple => "triple_ps",
             Self::TripleRg => "triple_rg_ps",
+            Self::TripleAlias => "triple_alias_ps",
         }
     }
 }
@@ -1148,6 +1174,7 @@ pub(crate) fn translate_mrt_fixture(fixture: MrtFixture) -> Result<String, Rejec
         }
         MrtFixture::Triple => lift(Stage::TriplePackedPixel, TRIPLE_PS)?,
         MrtFixture::TripleRg => lift(Stage::TriplePackedRgPixel, TRIPLE_RG_PS)?,
+        MrtFixture::TripleAlias => owned_triple_alias_ops()?,
     };
     let mut msl = vertex_module(&vs);
     msl.push_str("struct PackedColors { float4 color0 [[color(0)]]; float4 color1 [[color(1)]];");
@@ -1155,7 +1182,15 @@ pub(crate) fn translate_mrt_fixture(fixture: MrtFixture) -> Result<String, Rejec
         msl.push_str(" float4 color2 [[color(2)]];");
     }
     let entry = fixture.entry();
-    writeln!(msl, "}};\nfragment PackedColors {entry}(constant uint2 &input [[buffer(0)]]) {{\n  uint r[256]; PackedColors out; r[0] = input.x; r[1] = input.y;").unwrap();
+    if matches!(fixture, MrtFixture::TripleAlias) {
+        writeln!(
+            msl,
+            "}};\nfragment PackedColors {entry}() {{\n  uint r[256]; PackedColors out;"
+        )
+        .unwrap();
+    } else {
+        writeln!(msl, "}};\nfragment PackedColors {entry}(constant uint2 &input [[buffer(0)]]) {{\n  uint r[256]; PackedColors out; r[0] = input.x; r[1] = input.y;").unwrap();
+    }
     emit_body(&mut msl, &ps, "out.color0", false);
     Ok(msl)
 }
@@ -2281,6 +2316,45 @@ mod tests {
         assert_eq!(
             decode(&[0xf800_1c1f, 0x10001], 0),
             Err(DecodeError::Unsupported(0))
+        );
+    }
+
+    #[test]
+    fn all_alias_probe_preserves_exact_export_operands_without_widening_decode() {
+        assert_eq!(
+            decode(&TRIPLE_ALIAS_PS, 4),
+            Err(DecodeError::Unsupported(4))
+        );
+        assert_eq!(
+            decode(&TRIPLE_ALIAS_PS, 6),
+            Err(DecodeError::Unsupported(6))
+        );
+        assert_eq!(
+            owned_triple_alias_ops().unwrap(),
+            [
+                Op::MoveBits {
+                    dst: Vgpr(5),
+                    bits: 0xb800_3e00
+                },
+                Op::PackedColor {
+                    slot: 0,
+                    src: [Vgpr(5); 2],
+                    done: false,
+                    vm: false
+                },
+                Op::PackedRg {
+                    slot: 1,
+                    src: Vgpr(5),
+                    final_export: false
+                },
+                Op::PackedColor {
+                    slot: 2,
+                    src: [Vgpr(5); 2],
+                    done: true,
+                    vm: true
+                },
+                Op::End,
+            ]
         );
     }
 
