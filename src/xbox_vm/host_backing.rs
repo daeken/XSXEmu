@@ -145,9 +145,11 @@ impl Backing {
             )
         })?;
         let view = View {
-            task: self.task,
-            base,
-            len,
+            mapping: Mapping {
+                task: self.task,
+                base,
+                len,
+            },
             _thread_bound: PhantomData,
         };
         if base == 0
@@ -172,25 +174,45 @@ impl Drop for Backing {
 
 /// Owns one virtual mapping. It never lends Rust references to mapped bytes.
 pub struct View {
+    mapping: Mapping,
+    _thread_bound: PhantomData<Rc<()>>,
+}
+
+/// Owns an unmap operation, not access to the bytes. Unlike `View`, this
+/// lifetime token can be dropped on any thread in the same Mach task.
+pub(super) struct Mapping {
     task: Port,
     base: u64,
     len: u64,
-    _thread_bound: PhantomData<Rc<()>>,
+}
+
+impl Mapping {
+    #[allow(dead_code)] // Only the standalone Metal tool imports ranges.
+    pub(super) fn aligned_range(&self, offset: u64, len: u64) -> Result<(usize, usize), Error> {
+        map_range(offset, len, self.len)?;
+        // Construction already checked that base + mapping length fits usize.
+        Ok(((self.base + offset) as usize, len as usize))
+    }
 }
 
 impl View {
     /// Numeric virtual address for diagnostics, not a pointer for data access.
     pub fn base_address(&self) -> u64 {
-        self.base
+        self.mapping.base
+    }
+
+    #[allow(dead_code)] // Only the standalone Metal tool transfers ownership.
+    pub(super) fn into_mapping(self) -> Mapping {
+        self.mapping
     }
 
     fn checked_start(&self, offset: u64, len: usize) -> Result<usize, Error> {
         if offset
             .checked_add(len as u64)
-            .is_some_and(|end| end <= self.len)
+            .is_some_and(|end| end <= self.mapping.len)
         {
             // The entire mapping was checked to fit in usize at construction.
-            Ok((self.base + offset) as usize)
+            Ok((self.mapping.base + offset) as usize)
         } else {
             Err(Error::InvalidRange)
         }
@@ -219,7 +241,7 @@ impl View {
     }
 }
 
-impl Drop for View {
+impl Drop for Mapping {
     fn drop(&mut self) {
         // SAFETY: Exact range uniquely owned by this view. Other mappings may
         // alias the object, but occupy different host virtual addresses.

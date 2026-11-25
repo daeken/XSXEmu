@@ -1,6 +1,6 @@
 # macOS CPU alias proof for 64 KiB logical pages
 
-The [test-only XMem model](../src/xbox_vm/backing.rs) translates numeric guest addresses. The independent [macOS host backing module](../src/xbox_vm/host_backing.rs) uses **real mappings at disjoint CPU virtual addresses**. Darwin `mach_vm_map` can request 64 KiB alignment and let the kernel pick free addresses, without a fixed-address replacement or an address-hint retry loop. The standalone probe is the module's only caller; the runtime does not link it.
+The [test-only XMem model](../src/xbox_vm/backing.rs) translates numeric guest addresses. The independent [macOS host backing module](../src/xbox_vm/host_backing.rs) uses **real mappings at disjoint CPU virtual addresses**. Darwin `mach_vm_map` can request 64 KiB alignment and let the kernel pick free addresses, without a fixed-address replacement or an address-hint retry loop. Only the standalone CPU and [Metal](xmem-metal-buffer.md) probes use this module; the runtime does not link it.
 
 `Backing` owns an anonymous Mach memory-entry send right, and each `View` owns one virtual mapping. `Drop` releases each resource; the kernel retains the underlying object as long as any mapping survives, even after `Backing` is dropped. Creation and mapping require nonempty, 64 KiB-aligned extents and check for overflow and out-of-bounds ranges. Mappings are writable, shared (`copy = false`), non-executable, and without inheritance.
 
