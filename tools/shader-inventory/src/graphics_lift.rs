@@ -914,6 +914,79 @@ pub(crate) fn translate_interp_fixture(fixture: InterpFixture) -> Result<String,
     Ok(msl)
 }
 
+const WAIT_POS_VS: &[u32] = &[
+    0xf800_08cf,
+    0x0302_0100,
+    crate::graphics_decode::WAIT_EXPORT_ZERO,
+    0x7e00_0304,
+    0xf800_020f,
+    0x0706_0500,
+    0xbf81_0000,
+];
+
+fn lift_pos_snapshot(words: &[u32], late: bool) -> Result<Vec<Op>, Reject> {
+    if words.len() != 7 {
+        return Err(Reject::Extent);
+    }
+    let Ok((
+        2,
+        pos @ Op::Export {
+            target: Target::Position,
+            src: position,
+            done: true,
+        },
+    )) = decode(words, 0)
+    else {
+        return Err(Reject::BadExports(0));
+    };
+    if words[2] != crate::graphics_decode::WAIT_EXPORT_ZERO {
+        return Err(Reject::Unsupported(2));
+    }
+    let Ok((1, mov @ Op::Move { dst, src })) = decode(words, 3) else {
+        return Err(Reject::Unsupported(3));
+    };
+    let Ok((
+        2,
+        param @ Op::Export {
+            target: Target::Parameter(0),
+            src: parameter,
+            done: false,
+        },
+    )) = decode(words, 4)
+    else {
+        return Err(Reject::BadExports(4));
+    };
+    if !position.contains(&dst)
+        || !parameter.contains(&dst)
+        || src == dst
+        || position
+            .into_iter()
+            .chain(parameter)
+            .chain([src])
+            .any(|r| r.0 >= 8)
+    {
+        return Err(Reject::BadExports(4));
+    }
+    if decode(words, 6) != Ok((1, Op::End)) {
+        return Err(Reject::BadEnd(6));
+    }
+    // Assignment copies the complete pending POS0 operand before the MOV.
+    Ok(if late {
+        vec![mov, pos, param, Op::End]
+    } else {
+        vec![pos, mov, param, Op::End]
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) fn translate_wait_pos_fixture(late: bool) -> Result<String, Reject> {
+    let mut msl = vertex_module(&lift_pos_snapshot(WAIT_POS_VS, late)?);
+    msl.push_str(
+        "fragment float4 wait_pos_ps(Varyings input [[stage_in]]) { return input.parameter; }\n",
+    );
+    Ok(msl)
+}
+
 const UNPACK_BYTE_VS: [u32; 14] = [
     0x3410_0a81,
     0x3612_0882,
@@ -997,6 +1070,7 @@ mod tests {
         for (sgpr, component) in [(9, "x"), (14, "z")] {
             writeln!(asm, "s_mov_b32 m0, s{sgpr}\nv_interp_p1_f32_e32 v2, v0, attr0.{component}\nv_interp_p2_f32_e32 v2, v1, attr0.{component}\nexp mrt0 v2, v2, v2, v2 done\ns_endpgm").unwrap();
         }
+        asm.push_str("exp pos0 v0, v1, v2, v3 done\ns_waitcnt expcnt(0)\nv_mov_b32_e32 v0, v4\nexp param0 v0, v5, v6, v7\ns_endpgm\n");
         for uint in [false, true] {
             let (mask, cvt) = if uint {
                 ("-2", "v_cvt_f32_u32_e32")
@@ -1029,6 +1103,7 @@ mod tests {
             .chain(TRIPLE_RG_PS)
             .chain(INTERP_X_PS)
             .chain(INTERP_Z_PS)
+            .chain(WAIT_POS_VS)
             .chain(&UNPACK_BYTE_VS)
             .chain(&UNPACK_UINT_VS)
             .chain(MULTI_VS)
@@ -1058,6 +1133,27 @@ mod tests {
                 .collect();
             assert_eq!(bytes, expected, "{cpu}");
         }
+    }
+
+    #[test]
+    fn vertex_snapshot_rejects_wrong_wait_undefined_data_and_nonreuse() {
+        assert!(lift_pos_snapshot(WAIT_POS_VS, false).is_ok());
+        for (at, word) in [
+            (0, 0xf800_00cf),
+            (2, 0xbf8c_ff1f),
+            (2, 0xbf80_0000),
+            (3, 0x7e00_0308),
+            (3, 0x7e10_0304),
+            (5, 0x0706_0504),
+            (6, 0xbf80_0000),
+        ] {
+            let mut words = WAIT_POS_VS.to_vec();
+            words[at] = word;
+            assert!(lift_pos_snapshot(&words, false).is_err());
+        }
+        let mut words = WAIT_POS_VS.to_vec();
+        words.swap(2, 3);
+        assert!(lift_pos_snapshot(&words, false).is_err());
     }
 
     #[test]

@@ -113,6 +113,8 @@ mod gpu {
         MrtLoad(&'a Path, MrtFixture),
         InterpSource(InterpFixture),
         InterpLoad(&'a Path, InterpFixture),
+        WaitPosSource(bool),
+        WaitPosLoad(&'a Path),
         UnpackSource(bool),
         UnpackLoad(&'a Path, bool),
         MultiSource,
@@ -171,6 +173,12 @@ mod gpu {
                 print!("{}", graphics_lift::translate_interp_fixture(fixture).map_err(|e| format!("interpolation lift rejected: {e:?}"))?);
                 return Ok(());
             }
+            [mode] if mode == "--wait-pos-source" || mode == "--expect-late-pos-read" => Mode::WaitPosSource(mode == "--expect-late-pos-read"),
+            [mode, lib] if mode == "--load-wait-pos-metallib" => Mode::WaitPosLoad(Path::new(lib)),
+            [mode] if mode == "--emit-wait-pos-msl" => {
+                print!("{}", graphics_lift::translate_wait_pos_fixture(false).map_err(|e| format!("position wait lift rejected: {e:?}"))?);
+                return Ok(());
+            }
             [mode] if mode == "--unpack-byte-source" || mode == "--unpack-uint-source" => Mode::UnpackSource(mode == "--unpack-uint-source"),
             [mode, lib] if mode == "--load-unpack-byte-metallib" || mode == "--load-unpack-uint-metallib" => Mode::UnpackLoad(Path::new(lib), mode == "--load-unpack-uint-metallib"),
             [mode] if mode == "--emit-unpack-byte-msl" || mode == "--emit-unpack-uint-msl" => {
@@ -209,7 +217,7 @@ mod gpu {
             [mode, lib] if mode == "--load-metallib" || mode == "--load-mutated-metallib" => Mode::Load(Path::new(lib), mode == "--load-mutated-metallib"),
             [mode, lib, archive] if mode == "--expect-owned-metal-miss" => Mode::ExpectStrictMiss(Path::new(lib), Path::new(archive)),
             [mode, lib, archive, compiler] if mode == "--bake-archive" || mode == "--replay-archive" || mode == "--replay-mutated-archive" => Mode::Archive(Path::new(lib), Path::new(archive), mode == "--bake-archive", mode == "--replay-mutated-archive", owned_graphics_artifact::compiler_profile(compiler)?),
-            _ => return Err("usage: shader-metal-graphics-lift [--expect-swapped-triple | --triple-rg-source | --emit-triple-rg-msl | --load-triple-rg-metallib LIB | --triple-source | --emit-triple-msl | --load-triple-metallib LIB | --dual-source | --emit-dual-msl | --load-dual-metallib LIB | --interp-x-source | --interp-z-source | --expect-interp-wrong-mode | --expect-interp-wrong-channel | --emit-interp-x-msl | --emit-interp-z-msl | --load-interp-x-metallib LIB | --load-interp-z-metallib LIB | --unpack-{byte,uint}-source | --emit-unpack-{byte,uint}-msl | --load-unpack-{byte,uint}-metallib LIB | --multi-source | --emit-multi-msl | --load-multi-metallib LIB | --packed-rg-source | --emit-packed-rg-msl | --load-packed-rg-metallib LIB | --wait-depth-source | --emit-wait-depth-msl | --load-wait-depth-metallib LIB | --expect-late-depth-read | --early-depth-source | --emit-early-depth-msl | --load-early-depth-metallib LIB | --depth-source | --emit-depth-msl | --load-depth-metallib LIB | --packed-source | --emit-packed-msl | --load-packed-metallib LIB | --emit-msl | --emit-mutated-msl | --load-metallib LIB | --load-mutated-metallib LIB | {--bake-archive|--replay-archive|--replay-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-owned-metal-miss MUTATED_LIB ARCHIVE]".into()),
+            _ => return Err("usage: shader-metal-graphics-lift [--expect-swapped-triple | --triple-rg-source | --emit-triple-rg-msl | --load-triple-rg-metallib LIB | --triple-source | --emit-triple-msl | --load-triple-metallib LIB | --dual-source | --emit-dual-msl | --load-dual-metallib LIB | --interp-x-source | --interp-z-source | --expect-interp-wrong-mode | --expect-interp-wrong-channel | --emit-interp-x-msl | --emit-interp-z-msl | --load-interp-x-metallib LIB | --load-interp-z-metallib LIB | --wait-pos-source | --emit-wait-pos-msl | --load-wait-pos-metallib LIB | --expect-late-pos-read | --unpack-{byte,uint}-source | --emit-unpack-{byte,uint}-msl | --load-unpack-{byte,uint}-metallib LIB | --multi-source | --emit-multi-msl | --load-multi-metallib LIB | --packed-rg-source | --emit-packed-rg-msl | --load-packed-rg-metallib LIB | --wait-depth-source | --emit-wait-depth-msl | --load-wait-depth-metallib LIB | --expect-late-depth-read | --early-depth-source | --emit-early-depth-msl | --load-early-depth-metallib LIB | --depth-source | --emit-depth-msl | --load-depth-metallib LIB | --packed-source | --emit-packed-msl | --load-packed-metallib LIB | --emit-msl | --emit-mutated-msl | --load-metallib LIB | --load-mutated-metallib LIB | {--bake-archive|--replay-archive|--replay-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-owned-metal-miss MUTATED_LIB ARCHIVE]".into()),
         };
         if matches!(mode, Mode::Archive(..) | Mode::ExpectStrictMiss(..))
             && std::env::var_os("MTL_SHADER_VALIDATION").is_some()
@@ -241,6 +249,8 @@ mod gpu {
             Mode::InterpSource(f) | Mode::InterpLoad(_, f) => Some(f),
             _ => None,
         };
+        let wait_pos = matches!(mode, Mode::WaitPosSource(_) | Mode::WaitPosLoad(_));
+        let late_pos = matches!(mode, Mode::WaitPosSource(true));
         let unpack = match mode {
             Mode::UnpackSource(uint) | Mode::UnpackLoad(_, uint) => Some(uint),
             _ => None,
@@ -265,6 +275,7 @@ mod gpu {
             | Mode::DepthSource(_)
             | Mode::WaitDepthSource(_)
             | Mode::InterpSource(_)
+            | Mode::WaitPosSource(_)
             | Mode::UnpackSource(_)
             | Mode::MultiSource
             | Mode::MrtSource(_)
@@ -273,6 +284,8 @@ mod gpu {
                     graphics_lift::translate_mrt_fixture(fixture)
                 } else if let Some(interp) = interp {
                     graphics_lift::translate_interp_fixture(interp)
+                } else if wait_pos {
+                    graphics_lift::translate_wait_pos_fixture(late_pos)
                 } else if let Some(uint) = unpack {
                     graphics_lift::translate_unpack_fixture(uint)
                 } else if multi {
@@ -293,6 +306,7 @@ mod gpu {
             }
             Mode::PackedLoad(path, _)
             | Mode::InterpLoad(path, _)
+            | Mode::WaitPosLoad(path)
             | Mode::UnpackLoad(path, _)
             | Mode::MultiLoad(path)
             | Mode::MrtLoad(path, _)
@@ -309,6 +323,8 @@ mod gpu {
         const DEPTH_FORMAT: MTLPixelFormat = MTLPixelFormat::Depth32Float;
         let (format, pixel_bytes, default_ps) = if let Some(fixture) = fixture {
             (MTLPixelFormat::RGBA32Float, 16, fixture.entry())
+        } else if wait_pos {
+            (MTLPixelFormat::RGBA32Float, 16, "wait_pos_ps")
         } else if unpack.is_some() {
             (MTLPixelFormat::RGBA32Float, 16, "unpack_ps")
         } else if interp.is_some() {
@@ -521,6 +537,17 @@ mod gpu {
             }
             enc.set_vertex_bytes(0, std::mem::size_of_val(&data) as u64, data.as_ptr().cast());
         }
+        if wait_pos {
+            // Constant replacement x makes the late-read triangle degenerate.
+            let data = vertices.map(|v| [v[0], v[1], v[2], v[3], 0.25, 0.5, 0.75, 1.]);
+            enc.set_scissor_rect(MTLScissorRect {
+                x: 2,
+                y: 1,
+                width: 4,
+                height: 5,
+            });
+            enc.set_vertex_bytes(0, std::mem::size_of_val(&data) as u64, data.as_ptr().cast());
+        }
         if unpack.is_some() {
             // Each pair drives a two-column stripe with the same words at
             // all three vertices. The MSB of the shift source is discarded.
@@ -639,6 +666,39 @@ mod gpu {
         }
         // The GPU writes have completed and the owned buffer remains alive through the last read.
         let pixels = unsafe { std::slice::from_raw_parts(ptr, extent) };
+        if wait_pos {
+            let mut writes = 0;
+            for y in 0..SIDE {
+                for x in 0..SIDE {
+                    let covered = (2..6).contains(&x) && (1..6).contains(&y);
+                    writes += usize::from(covered);
+                    let want: [f32; 4] = if covered && !late_pos {
+                        [0.25, 0.5, 0.75, 1.]
+                    } else {
+                        [1., 0., 1., 0.]
+                    };
+                    let at = y * STRIDE + x * 16;
+                    for (part, value) in pixels[at..at + 16].chunks_exact(4).zip(want) {
+                        let got = f32::from_le_bytes(part.try_into().unwrap());
+                        if !got.is_finite() || (got - value).abs() > 0.000001 {
+                            return Err(format!(
+                                "POS0 snapshot (late={late_pos}) ({x},{y}): expected {value}, got {got}"
+                            ));
+                        }
+                    }
+                }
+            }
+            println!(
+                "{} owned POS0 export snapshot (late={late_pos}): 64/64 pixels matched; {}",
+                dev.name(),
+                if late_pos {
+                    format!("{writes} expected writes lost")
+                } else {
+                    format!("{writes} correct color writes")
+                }
+            );
+            return Ok(());
+        }
         if let Some(uint) = unpack {
             // Independent expected [2*x-1, 1-2*y, x, y]. The U32 table
             // explicitly fixes both ties at 2^25 and the carry to 2^32.

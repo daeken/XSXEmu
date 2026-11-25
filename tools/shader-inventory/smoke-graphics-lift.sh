@@ -92,6 +92,13 @@ compile wait-depth
 "$p" --load-wait-depth-metallib "$d/wait-depth.metallib"
 "$p" --expect-late-depth-read
 
+# POS0 must retain clip position while the replaced X feeds PARAM0.
+"$p" --wait-pos-source
+"$p" --emit-wait-pos-msl > "$d/wait-pos.metal"
+compile wait-pos
+"$p" --load-wait-pos-metallib "$d/wait-pos.metallib"
+"$p" --expect-late-pos-read
+
 # Seven explicit native PARAM outputs linked by name with a synthetic consumer.
 "$p" --multi-source
 "$p" --emit-multi-msl > "$d/multi.metal"
