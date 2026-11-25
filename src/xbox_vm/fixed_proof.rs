@@ -297,17 +297,32 @@ fn exact_shared_replacement_restore_and_live_token_reuse() {
     arena.write(b + PAGE - 1, 0x42);
     assert_eq!(arena.byte(a + 2 * PAGE - 1), 0x42);
     assert_eq!(arena.byte(a + PAGE - 1), 0);
+    let views = arena.views.clone();
+    let next_token = arena.next_token;
+    // Rejected by the owner before the kernel path.
     assert_eq!(arena.map(guard, &[p, q]), Err(Refusal::Occupied));
     assert_eq!(arena.unmap(a, 1), Err(Refusal::NotExactView));
     assert_eq!(arena.unmap(a, 3), Err(Refusal::NotExactView));
     assert_eq!(arena.free(batch.clone()), Err(Refusal::Busy));
+    assert_eq!(arena.views, views);
+    assert_eq!(arena.next_token, next_token);
+    assert_eq!(arena.batch.as_ref().unwrap().tokens, batch);
+    for slot in [0, 3, 5] {
+        arena.assert_parked(slot);
+    }
 
     // Intentionally bypass token preflight for one negative kernel call. A
     // real in-task entry whose offset equals its extent cannot back this page.
     let entry = arena.batch.as_ref().unwrap().backing.entry;
     let (status, _) = arena.kernel_replace(&(3..4), entry, 2 * PAGE, READ_WRITE);
     assert_ne!(status, 0);
-    arena.assert_parked(3);
+    assert_eq!(arena.views, views);
+    assert_eq!(arena.next_token, next_token);
+    assert_eq!(arena.batch.as_ref().unwrap().tokens, batch);
+    for slot in [0, 3, 5] {
+        arena.assert_parked(slot);
+    }
+    assert_eq!(arena.byte(a + PAGE), 0x31);
     assert_eq!(arena.byte(b + PAGE - 1), 0x42);
 
     arena.unmap(a, 2).unwrap();
