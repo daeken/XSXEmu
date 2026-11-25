@@ -44,12 +44,17 @@ pub(crate) struct RasterState {
     pub alpha_to_coverage: bool,
 }
 
+/// Caller assertion for this closed profile, not inferred title liveness.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NoPsLink<'a> {
+    pub unconsumed_params: &'a [u8],
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Bindings<'a> {
     pub vertex_inputs: &'a [VertexInput],
     pub position: Option<Position>,
-    /// Exact native PARAM ordinals the caller explicitly declares unconsumed.
-    pub discard_params: &'a [u8],
+    pub no_ps_link: NoPsLink<'a>,
     pub color: Option<ColorBinding>,
     pub state: RasterState,
 }
@@ -184,11 +189,12 @@ pub(crate) fn translate(vs: &[u32], ps: &[u32], b: Bindings<'_>) -> Result<Metal
     if color.native_mrt > 2 || color.metal_color != 0 || !color.fp16_abgr || !color.rgba32_float {
         return Err(Error::ColorBinding);
     }
-    if b.vertex_inputs.len() > 32 || b.discard_params.len() > 7 {
+    let unconsumed = b.no_ps_link.unconsumed_params;
+    if b.vertex_inputs.len() > 32 || unconsumed.len() > 7 {
         return Err(Error::Extent);
     }
-    let params: BTreeSet<_> = b.discard_params.iter().copied().collect();
-    if params.len() != b.discard_params.len() || params.iter().any(|&n| n > 6) {
+    let params: BTreeSet<_> = unconsumed.iter().copied().collect();
+    if params.len() != unconsumed.len() || params.iter().any(|&n| n > 6) {
         return Err(Error::ParameterBinding);
     }
     let mut f = Flow::new();
@@ -377,11 +383,44 @@ pub(super) const VS_WORDS: &[u32] = &[
     0,
     0xbf81_0000,
 ];
+const RG_INPUTS: &[VertexInput] = &[
+    VertexInput {
+        vgpr: 24,
+        buffer: 6,
+        component: 1,
+    },
+    VertexInput {
+        vgpr: 25,
+        buffer: 6,
+        component: 3,
+    },
+    VertexInput {
+        vgpr: 26,
+        buffer: 6,
+        component: 0,
+    },
+    VertexInput {
+        vgpr: 27,
+        buffer: 6,
+        component: 2,
+    },
+];
+pub(super) const RG_VS_WORDS: &[u32] = &[
+    0x7e04_0280,
+    0xf800_020f,
+    0x0202_0202,
+    0xf800_08cf,
+    0x1b1a_1918,
+    0xbf81_0000,
+];
+
 fn binding(rg: bool) -> Bindings<'static> {
     Bindings {
-        vertex_inputs: INPUTS,
+        vertex_inputs: if rg { RG_INPUTS } else { INPUTS },
         position: Some(Position::Pos0MetalClip),
-        discard_params: &[2],
+        no_ps_link: NoPsLink {
+            unconsumed_params: if rg { &[0] } else { &[2] },
+        },
         color: Some(ColorBinding {
             native_mrt: if rg { 0 } else { 1 },
             metal_color: 0,
@@ -408,9 +447,24 @@ pub(super) fn owned_full_ps() -> Vec<u32> {
 pub(crate) fn owned_pair(rg: bool) -> Result<MetalPair, Error> {
     let full = owned_full_ps();
     translate(
-        VS_WORDS,
+        if rg { RG_VS_WORDS } else { VS_WORDS },
         if rg { super::CONSTANT_RTZ_RG_PS } else { &full },
         binding(rg),
+    )
+}
+
+pub(crate) fn owned_swapped_pair() -> Result<MetalPair, Error> {
+    let mut inputs = INPUTS.to_vec();
+    // Swap X/Z with two still-unique and correctly typed bindings.
+    inputs[0].component = 3;
+    inputs[2].component = 2;
+    translate(
+        VS_WORDS,
+        &owned_full_ps(),
+        Bindings {
+            vertex_inputs: &inputs,
+            ..binding(false)
+        },
     )
 }
 
@@ -425,12 +479,22 @@ mod tests {
         assert!(pass.source.contains("r[10] = buffer_5[vid][2]"));
         assert!(pass.source.contains("[[color(0)]]"));
         assert!(!pass.source.contains("out.param2"));
+        let rg = owned_pair(true).unwrap();
+        assert!(rg.source.contains("[[buffer(6)]]"));
+        assert!(!rg.source.contains("out.param0"));
+        let swapped = owned_swapped_pair().unwrap();
+        assert!(swapped.source.contains("r[10] = buffer_5[vid][3]"));
+        assert_ne!(swapped.source, pass.source);
         let check = |b| translate(VS_WORDS, super::super::CONSTANT_RTZ_RG_PS, b).unwrap_err();
-        let b = binding(true);
+        let c = binding(true).color;
+        let b = Bindings {
+            color: c,
+            ..binding(false)
+        };
         let duplicate = [INPUTS[0], INPUTS[0]];
         assert_eq!(
             check(Bindings {
-                vertex_inputs: &[],
+                vertex_inputs: &INPUTS[1..], // Only the X component is missing.
                 ..b
             }),
             Error::ReadBeforeWrite(0, 10)
@@ -453,7 +517,9 @@ mod tests {
         for params in [&[][..], &[0], &[2, 2], &[1, 2]] {
             assert_eq!(
                 check(Bindings {
-                    discard_params: params,
+                    no_ps_link: NoPsLink {
+                        unconsumed_params: params
+                    },
                     ..b
                 }),
                 Error::ParameterBinding

@@ -89,6 +89,9 @@ for variant in bound bound-rg; do
     "$p" "--load-$variant-metallib" "$d/$variant.metallib"
 done
 
+# Swap X/Z in the same slot-5 input contract: all expected writes disappear.
+"$p" --expect-bound-swapped-component
+
 # Scalar depth with explicit Depth32Float and overlapping draws.
 "$p" --depth-source
 "$p" --emit-depth-msl > "$d/depth.metal"
