@@ -50,6 +50,11 @@ path = "src/metal_vm_bfe_probe.rs"
 required-features = ["metal-probe"]
 
 [[bin]]
+name = "shader-metal-scalar-descriptor-probe"
+path = "src/metal_scalar_descriptor_probe.rs"
+required-features = ["metal-probe"]
+
+[[bin]]
 name = "shader-bake-plan"
 path = "src/bake_plan.rs"
 required-features = ["bake-planner"]
