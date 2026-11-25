@@ -238,6 +238,8 @@ The isolated owned probe binds a raw unsigned word explicitly and converts under
 
 Both CPUs agree at +36/+40: **18 sites in the same 18 VS spans** per wave; PS has **721 sites in 675 spans** for wave64 and **722 in 676** for wave32 (676 distinct PS spans across hypotheses). No matching sites occur at +0/+24. The same three VS spans move from four remaining sites to three, joining the 26 that still require SETPRIO imm3 and two MODE-dependent OMOD1 conversions. Strict coverage stays **0 VS / 233 PS**, with **223** attachment-only PS spans and no semantic-closure gain. SETPRIO, native MODE and entry state, and title admission remain unchanged.
 
+The [native vertex launch audit](native-vertex-launch-audit.md) traces all 29 spans: the signed CVTs consume only `0` or `2`, so their numerical gate is the shared OMOD scale/suppress predicate, while rounding and the `s10` launch binding matter separately for Z in three spans.
+
 ## Direct PS attachment evidence by exact shipped row
 
 Run `--direct-ps-attachments "$INFLATED_LIBRARY" "$TRUSTED_LLVM_21_DYLIB" gfx1013` (and repeat with `gfx1030`). The audit joins contiguous reference-checked encoding-complete PS paths with reached active exports back to exact slot occurrences, without wrappers or digests. The attachment-only subset has no semantic gaps and exactly `AttachmentFormatAndMask` outstanding. It tests stored-end +36 and +40 independently in wave64 and wave32. All passing rows passed all four hypotheses per CPU, without differences in the projected export shape or attachment-only class across passing windows. LLVM 21.1.6 aggregates agree across both CPUs. The summary counts each row once; none of the hypotheses authenticates entry.
