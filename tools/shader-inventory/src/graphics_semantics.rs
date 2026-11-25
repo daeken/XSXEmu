@@ -164,6 +164,12 @@ pub(crate) fn audit(words: &[u32], vertex: bool) -> Outcome {
                 f.write(dst, None);
                 f.outcome.needs.insert(F32ArithmeticMode);
             }
+            Op::MulF32 { dst, lhs, rhs } => {
+                f.read(lhs);
+                f.read(rhs);
+                f.write(dst, None);
+                f.outcome.needs.insert(F32ArithmeticMode);
+            }
             Op::MulLegacyF32 { dst, lhs, rhs } => {
                 if let FloatSource::Vgpr(r) = lhs {
                     f.read(r);

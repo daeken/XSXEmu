@@ -215,6 +215,86 @@ pub(super) fn direct_result(dis: &mut Disassembler, bytes: &[u8], slot: usize) -
     D::ClosedStageExport
 }
 
+fn exact_opcode(
+    decoded: Option<(usize, crate::graphics_decode::Op)>,
+    len: usize,
+    name: &str,
+) -> bool {
+    use crate::graphics_decode::Op;
+    decoded.is_some_and(|(width, op)| {
+        width * 4 == len
+            && match op {
+                Op::Move { .. } | Op::MoveBits { .. } => name == "v_mov_b32_e32",
+                Op::InitInterpM0 { .. } => name == "s_mov_b32",
+                Op::InterpPhase { second: false, .. } => name == "v_interp_p1_f32_e32",
+                Op::InterpPhase { second: true, .. } => name == "v_interp_p2_f32_e32",
+                Op::SubFromPositiveZero { .. } => name == "v_sub_f32_e32",
+                Op::ShiftLeftOne { .. } => name == "v_lshlrev_b32_e32",
+                Op::AndMask { .. } => name == "v_and_b32_e32",
+                Op::ConvertUint { byte0: true, .. } => name == "v_cvt_f32_ubyte0_e32",
+                Op::ConvertUint { byte0: false, .. } => name == "v_cvt_f32_u32_e32",
+                Op::FmaUnpack { .. } => name == "v_fma_f32",
+                Op::NopOneCycle => name == "s_nop",
+                Op::PrefetchThreeLines => name == "s_inst_prefetch",
+                Op::AddF32Literal { .. } => name == "v_add_f32_e32",
+                Op::MulF32 { .. } => name == "v_mul_f32_e32",
+                Op::MulLegacyF32 { .. } => name == "v_mul_legacy_f32_e32",
+                Op::FmaF32 {
+                    accumulate: true, ..
+                } => name == "v_fmac_f32_e32",
+                Op::FmaF32 {
+                    accumulate: false, ..
+                } => name == "v_fma_f32",
+                Op::Export { .. }
+                | Op::PackedColor { .. }
+                | Op::PackedRg { .. }
+                | Op::PixelDepth { .. } => name == "exp",
+                Op::PackHalfRtz { .. } => name == "v_cvt_pkrtz_f16_f32_e32",
+                Op::CompareNonzero { .. } => name == "v_cmp_ne_u32_e32",
+                Op::SelectBits { .. } => name == "v_cndmask_b32_e32",
+                Op::End => name == "s_endpgm",
+            }
+    })
+}
+
+#[derive(Default)]
+pub(super) struct DirectGaps {
+    pub missing: BTreeMap<String, usize>,
+    pub ordinary_vgpr_mul: usize,
+}
+
+/// Count only checked instructions in a closed stage-export-qualified window.
+pub(super) fn direct_gaps(dis: &mut Disassembler, bytes: &[u8], slot: usize) -> Option<DirectGaps> {
+    use crate::graphics_decode::decode;
+    let mut gaps = DirectGaps::default();
+    let mut ended = false;
+    let exp = project_exports_observe(dis, bytes, false, |tail, len, text| {
+        let name = text.split_ascii_whitespace().next().unwrap_or_default();
+        let first = word(tail, 0).unwrap_or_default() as u32;
+        ended |= len == 4 && first == 0xbf810000 && name == "s_endpgm";
+        let words = [first, word(tail, 4).unwrap_or_default() as u32];
+        let decoded = words.get(..len / 4).and_then(|w| decode(w, 0).ok());
+        if exact_opcode(decoded, len, name) {
+            gaps.ordinary_vgpr_mul += usize::from(matches!(
+                decoded,
+                Some((1, crate::graphics_decode::Op::MulF32 { .. }))
+            ));
+        } else {
+            *gaps
+                .missing
+                .entry(nearest_form(name, first, len, text))
+                .or_default() += 1;
+        }
+    })
+    .ok()?;
+    let qualifies = match slot {
+        0 => exp.color != 0 || exp.mrtz_masks & !1 != 0,
+        1 => exp.positions[0] & !1 != 0,
+        _ => false,
+    };
+    (ended && qualifies).then_some(gaps)
+}
+
 fn checked_exports(dis: &mut Disassembler, bytes: &[u8]) -> Result<Exports, ResultClass> {
     project_exports(dis, bytes, false)
 }
@@ -471,7 +551,11 @@ fn export_shape(first: u32, len: usize, text: &str) -> Option<ExportShape> {
 fn nearest_form(name: &str, w: u32, len: usize, text: &str) -> String {
     let source = w & 0x1ff;
     match name {
-        "v_mov_b32_e32" | "v_cvt_pkrtz_f16_f32_e32" | "v_cmp_ne_u32_e32" | "v_cndmask_b32_e32" => {
+        "v_mul_f32_e32"
+        | "v_mov_b32_e32"
+        | "v_cvt_pkrtz_f16_f32_e32"
+        | "v_cmp_ne_u32_e32"
+        | "v_cndmask_b32_e32" => {
             if (256..=511).contains(&source) {
                 format!("{name}/VGPR/{len}B")
             } else if source <= 105 {
@@ -837,39 +921,7 @@ impl LiftGaps {
             {
                 depth_reused |= wait_depth == Some(dst);
             }
-            let matches = decoded.is_some_and(|(width, op)| {
-                width * 4 == len
-                    && match op {
-                        Op::Move { .. } | Op::MoveBits { .. } => name == "v_mov_b32_e32",
-                        Op::InitInterpM0 { .. } => name == "s_mov_b32",
-                        Op::InterpPhase { second: false, .. } => name == "v_interp_p1_f32_e32",
-                        Op::InterpPhase { second: true, .. } => name == "v_interp_p2_f32_e32",
-                        Op::SubFromPositiveZero { .. } => name == "v_sub_f32_e32",
-                        Op::ShiftLeftOne { .. } => name == "v_lshlrev_b32_e32",
-                        Op::AndMask { .. } => name == "v_and_b32_e32",
-                        Op::ConvertUint { byte0: true, .. } => name == "v_cvt_f32_ubyte0_e32",
-                        Op::ConvertUint { byte0: false, .. } => name == "v_cvt_f32_u32_e32",
-                        Op::FmaUnpack { .. } => name == "v_fma_f32",
-                        Op::NopOneCycle => name == "s_nop",
-                        Op::PrefetchThreeLines => name == "s_inst_prefetch",
-                        Op::AddF32Literal { .. } => name == "v_add_f32_e32",
-                        Op::MulLegacyF32 { .. } => name == "v_mul_legacy_f32_e32",
-                        Op::FmaF32 {
-                            accumulate: true, ..
-                        } => name == "v_fmac_f32_e32",
-                        Op::FmaF32 {
-                            accumulate: false, ..
-                        } => name == "v_fma_f32",
-                        Op::Export { .. }
-                        | Op::PackedColor { .. }
-                        | Op::PackedRg { .. }
-                        | Op::PixelDepth { .. } => name == "exp",
-                        Op::PackHalfRtz { .. } => name == "v_cvt_pkrtz_f16_f32_e32",
-                        Op::CompareNonzero { .. } => name == "v_cmp_ne_u32_e32",
-                        Op::SelectBits { .. } => name == "v_cndmask_b32_e32",
-                        Op::End => name == "s_endpgm",
-                    }
-            });
+            let matches = exact_opcode(decoded, len, name);
             if name == "exp" && !matches {
                 *export_shapes
                     .entry(export_shape(words[0], len, text))

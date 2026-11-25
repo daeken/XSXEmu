@@ -74,6 +74,22 @@ The complete aggregate histograms were identical between gfx1013 and gfx1030 wit
 
 Every program with stage-export closure had multiple passing starts; none established a unique entry. Of 13,383 exact VS+PS occurrences, both stages had stage-export closure on 12,794 (wave64), 12,798 (wave32), and 12,794 (same window in both waves for each stage). For the same-window projection, 550 had only VS closure, 39 only PS, and none had neither. No stage-export-qualified VS or PS window was encoding-complete under the owned decoder, so none of the pairs reached the output-binding-only tier. This is conditional static evidence about the tested library spans, not a runtime entry, binding, native variant selection, bake admission, or translation.
 
+## Direct stored-window translator gap ranking
+
+Run `--direct-library-graphics-gaps "$INFLATED_LIBRARY" "$TRUSTED_LLVM_21_DYLIB" gfx1013` (and repeat with `gfx1030`). The report ranks checked unsupported sites and counts affected windows per form. It deduplicates stage/program references, keeps starts and waves separate, and uses the stored end only. It counts reached instruction starts in reference graphs that close at a decoded END and contain a qualifying stage export. It excludes MS and rejected graphs. Counts are static, not execution frequencies; operand-unclassified buckets may contain several forms.
+
+Before the change, `v_mul_f32_e32` at four bytes ranked first by site count at +36 and +40 for both stages and waves. Both CPU references gave the same aggregates. The exact two-VGPR form now matches the following subset (the +36 and +40 counts agree; do not add them):
+
+| Stage / wave | Qualified windows | Prior 4-byte multiply gaps | Newly matched two-VGPR sites | Windows with those sites |
+|---|---:|---:|---:|---:|
+| PS / 64 | 6,161 | 594,614 | 460,619 | 5,510 |
+| PS / 32 | 6,191 | 619,337 | 481,658 | 5,540 |
+| VS / both, each | 1,304 | 105,923 | 82,623 | 908 |
+
+At +36 the largest remaining PS buckets are 4-byte `s_waitcnt` (270,008 / 275,768) and 8-byte `v_fma_f32` (249,700 / 260,190), in wave64 / wave32 order. The leading VS bucket is 4-byte `v_add_f32_e32` (52,623 in either wave). No window becomes encoding-complete. At +36 the closest PS group still has 218 windows with one gap; the closest VS group has 25 windows with five each. No runtime entry or binding is selected.
+
+The owned lowering emits ordinary F32 multiplication, not the legacy zero shortcut. LLVM MC confirms the exact two-VGPR VOP2 word on both references; SGPR, inline, literal and other forms remain outside this addition. Apple M4 strict arithmetic archive bake and replay each passed 11/11 ordinary multiply checks: finite and rounding-sensitive values, signed zeros, and NaN classification for zero with infinity or NaN inputs. The static semantic check still requires both operands to be defined and the applicable F32 mode to be proven. No claim about title FP mode, NaN payloads, denormals, or pipeline admission follows.
+
 ## Independent evidence for distinguishing starts
 
 `--graphics-entry-evidence "$INFLATED_LIBRARY" "$TRUSTED_LLVM_21_DYLIB"` uses the exact 13,383 two-slot rows (2,921 distinct checked PS spans, 1,322 VS). It does not repeat the closure census or use wrapper joins. It checks the stage metadata footer fingerprint, then tests the third-group marker at `+26` as in [compute layout sites](compute-layout-sites.md). The marker supports interpreting the group at `+24` as part of the stored prefix, not a global execution rule. The comparisons beginning at `+24` are withheld for marked groups. Nonzero `0x42` sites are tested independently as aligned in-span scalar loads, without assuming they are reachable from any entry.

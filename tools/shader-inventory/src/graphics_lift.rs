@@ -303,6 +303,11 @@ fn lift(stage: Stage, words: &[u32]) -> Result<Vec<Op>, Reject> {
             // All admitted profiles have no native memory, clocks, or timing-
             // observable operations. Not valid for arbitrary guest instruction streams.
             Op::NopOneCycle | Op::PrefetchThreeLines => {}
+            Op::MulF32 { dst, lhs, rhs } => {
+                require(lhs)?;
+                require(rhs)?;
+                live[usize::from(dst.0)] = true;
+            }
             Op::MulLegacyF32 { dst, lhs, rhs } => {
                 if let FloatSource::Vgpr(r) = lhs {
                     require(r)?;
@@ -471,6 +476,13 @@ fn emit_body(out: &mut String, ops: &[Op], packed_color_lvalue: &str, multi: boo
             } => {
                 writeln!(out, "  r[{dst}] = as_type<uint>(as_type<float>(0x{literal_bits:08x}u) + as_type<float>(r[{src}]));").unwrap();
             }
+            Op::MulF32 {
+                dst: Vgpr(dst),
+                lhs: Vgpr(lhs),
+                rhs: Vgpr(rhs),
+            } => {
+                writeln!(out, "  r[{dst}] = as_type<uint>(as_type<float>(r[{lhs}]) * as_type<float>(r[{rhs}]));").unwrap();
+            }
             Op::MulLegacyF32 {
                 dst: Vgpr(dst),
                 lhs,
@@ -613,6 +625,8 @@ const EDGE_LITERAL: &[u32] = &[0x0e06_02ff, 0x3e80_0000]; // v_mul_legacy_f32_e3
 const EDGE_FMAC: &[u32] = &[0x5608_0300]; // v_fmac_f32_e32 v4, v0, v1
 const EDGE_RTZ: &[u32] = &[0x5e0a_0300]; // v_cvt_pkrtz_f16_f32_e32 v5, v0, v1
 
+const EDGE_MUL: &[u32] = &[0x101c_0300]; // v14 = v0 * v1
+
 const EDGE_SUB: &[u32] = &[0x0818_0080, 0x081a_0280]; // v12=+0-v0, v13=+0-v1
 
 const EDGE_SELECT: &[u32] = &[
@@ -670,7 +684,8 @@ pub fn translate_legacy_edge_fixture() -> Result<String, DecodeError> {
     for pc in 0..EDGE_SUB.len() {
         body(&mut msl, &[decode(EDGE_SUB, pc)?.1]);
     }
-    msl.push_str("  out[3 * id] = uint4(r[2], r[3], r[4], r[5]);\n  out[3 * id + 1] = uint4(r[6], r[7], r[8], r[9]);\n  out[3 * id + 2] = uint4(r[10], r[11], r[12], r[13]);\n}\n");
+    body(&mut msl, &[decode(EDGE_MUL, 0)?.1]);
+    msl.push_str("  out[4 * id] = uint4(r[2], r[3], r[4], r[5]);\n  out[4 * id + 1] = uint4(r[6], r[7], r[8], r[9]);\n  out[4 * id + 2] = uint4(r[10], r[11], r[12], r[13]);\n  out[4 * id + 3] = uint4(r[14], 0u, 0u, 0u);\n}\n");
     Ok(msl)
 }
 
@@ -1309,6 +1324,7 @@ mod tests {
         };
         let asm = "v_mov_b32_e32 v8, v4\nexp param0 v8, v5, v6, v7\nexp pos0 v0, v1, v2, v3 done\ns_endpgm\nv_add_f32_e32 v4, 0.25, v0\nv_fma_f32 v5, v1, v2, v3\nv_mul_legacy_f32_e32 v6, v5, v4\nv_mul_legacy_f32_e32 v6, 0.5, v6\nv_mul_legacy_f32_e32 v7, 0, v3\nexp mrt0 v4, v5, v6, v7 done\ns_endpgm\nv_mul_legacy_f32_e32 v2, v0, v1\nv_mul_legacy_f32_e32 v3, 0.25, v1\nv_fmac_f32_e32 v4, v0, v1\nv_cvt_pkrtz_f16_f32_e32 v5, v0, v1\ns_inst_prefetch 3\nv_mov_b32_e32 v6, 0\ns_nop 0\nv_mov_b32_e32 v7, 0.5\nv_mov_b32_e32 v8, 1.0\nv_mov_b32_e32 v9, 0x7fc12345\nv_cmp_ne_u32_e32 vcc_lo, 0, v0\nv_cndmask_b32_e32 v10, 0x7fc12345, v1, vcc_lo\nv_cmp_ne_u32_e32 vcc_lo, 0, v1\nv_cndmask_b32_e32 v11, 0x80000000, v0, vcc_lo\nexp mrt0 v1, v1, v0, v0 done compr vm\ns_endpgm\nexp mrt0 v1, v1, off, off done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrtz v2, off, off, off done vm\ns_endpgm\nexp mrtz v2, off, off, off\nexp mrt0 v1, v1, v0, v0 done compr vm\ns_endpgm\nexp mrtz v2, off, off, off\ns_waitcnt expcnt(0)\nv_cvt_pkrtz_f16_f32_e32 v2, v0, v1\nexp mrt0 v2, v2, v3, v3 done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrt1 v0, v0, v1, v1 done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrt1 v0, v0, v1, v1 compr\nexp mrt2 v1, v1, v1, v1 done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrt1 v0, v0, off, off compr\nexp mrt2 v1, v1, v1, v1 done compr vm\ns_endpgm\n";
         let mut asm = asm.to_owned();
+        asm.push_str("v_mul_f32_e32 v14, v0, v1\n");
         asm.push_str("v_sub_f32_e32 v12, 0, v0\nv_sub_f32_e32 v13, 0, v1\n");
         for (sgpr, component) in [(9, "x"), (14, "z"), (9, "z")] {
             writeln!(asm, "s_mov_b32 m0, s{sgpr}\nv_interp_p1_f32_e32 v2, v0, attr0.{component}\nv_interp_p2_f32_e32 v2, v1, attr0.{component}\nexp mrt0 v2, v2, v2, v2 done\ns_endpgm").unwrap();
@@ -1352,6 +1368,7 @@ mod tests {
             .chain(DUAL_PS)
             .chain(TRIPLE_PS)
             .chain(TRIPLE_RG_PS)
+            .chain(EDGE_MUL)
             .chain(EDGE_SUB)
             .chain(INTERP_X_PS)
             .chain(INTERP_Z_PS)
@@ -1450,6 +1467,21 @@ mod tests {
             lift(Stage::ConstantRtzPixel, &words),
             Err(Reject::Uninitialized(2, 4))
         );
+    }
+
+    #[test]
+    fn ordinary_multiply_checks_exact_form_and_both_inputs() {
+        let [word] = EDGE_MUL else { unreachable!() };
+        for selector in [0, 128, 255] {
+            assert!(decode(&[(word & !0x1ff) | selector, 0x3f80_0000], 0).is_err());
+        }
+        assert!(lift(Stage::PackedPixel, &[EDGE_MUL, PACKED_PS].concat()).is_ok());
+        for bad_input in [word | 0x80, word | 0x10000] {
+            assert!(matches!(
+                lift(Stage::PackedPixel, &[&[bad_input], PACKED_PS].concat()),
+                Err(Reject::Uninitialized(0, _))
+            ));
+        }
     }
 
     #[test]

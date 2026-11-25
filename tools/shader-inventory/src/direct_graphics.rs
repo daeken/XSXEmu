@@ -1,7 +1,7 @@
 //! Direct checked library-span hypotheses; no source families, native files, or entry selection.
 use crate::{
     ARCHIVE_LIMIT, BLOB_LIMIT,
-    graphics_reachability::{DirectResult as ResultClass, direct_result},
+    graphics_reachability::{DirectGaps, DirectResult as ResultClass, direct_gaps, direct_result},
     llvm::{Cpu, Llvm},
     wrapped_library::library_to_final_marker,
 };
@@ -79,7 +79,7 @@ impl StageCounts {
     }
 }
 
-pub(super) fn run(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), Box<dyn Error>> {
+fn read_library(path: &Path) -> Result<Vec<u8>, Box<dyn Error>> {
     let mut bytes = Vec::new();
     File::open(path)?
         .take(ARCHIVE_LIMIT as u64 + 1)
@@ -87,6 +87,11 @@ pub(super) fn run(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), Box<dy
     if bytes.len() > ARCHIVE_LIMIT {
         return Err("pipeline library exceeds bound".into());
     }
+    Ok(bytes)
+}
+
+pub(super) fn run(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), Box<dyn Error>> {
+    let bytes = read_library(path)?;
     let lib = PipelineLibrary::parse(&bytes)?;
     let llvm = Llvm::load(reference)?;
     let (major, minor, patch) = llvm.version;
@@ -191,6 +196,98 @@ pub(super) fn run(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), Box<dy
     Ok(())
 }
 
+#[derive(Default)]
+struct GapCounts {
+    eligible: usize,
+    exact: usize,
+    ordinary_mul: (usize, usize),
+    distances: BTreeMap<usize, usize>,
+    forms: BTreeMap<String, (usize, usize)>,
+}
+
+impl GapCounts {
+    fn note(&mut self, gaps: &DirectGaps) {
+        self.ordinary_mul.0 += gaps.ordinary_vgpr_mul;
+        self.ordinary_mul.1 += usize::from(gaps.ordinary_vgpr_mul > 0);
+        let gaps = &gaps.missing;
+        self.eligible += 1;
+        self.exact += usize::from(gaps.is_empty());
+        if !gaps.is_empty() {
+            *self.distances.entry(gaps.values().sum()).or_default() += 1;
+        }
+        for (name, &sites) in gaps {
+            let form = self.forms.entry(name.clone()).or_default();
+            form.0 += sites;
+            form.1 += 1;
+        }
+    }
+
+    fn report(self, stage: &str, start: usize, wave: usize) {
+        println!(
+            "  {stage} +{start} stored wave{wave}: qualified={}, no encoding gaps={}",
+            self.eligible, self.exact
+        );
+        println!(
+            "    exact two-VGPR v_mul_f32_e32: {} sites in {} windows",
+            self.ordinary_mul.0, self.ordinary_mul.1
+        );
+        let distances: Vec<_> = self.distances.into_iter().take(3).collect();
+        println!("    nearest (unsupported sites, windows): {distances:?}");
+        let mut rows: Vec<_> = self.forms.into_iter().collect();
+        rows.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        for (form, (sites, windows)) in rows.into_iter().take(16) {
+            println!("    {form}: {sites} sites in {windows} windows");
+        }
+    }
+}
+
+pub(super) fn run_gaps(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), Box<dyn Error>> {
+    let bytes = read_library(path)?;
+    let lib = PipelineLibrary::parse(&bytes)?;
+    let llvm = Llvm::load(reference)?;
+    let (major, minor, patch) = llvm.version;
+    println!(
+        "Direct graphics encoding gaps: LLVM {major}.{minor}.{patch} {}",
+        cpu.name()
+    );
+    let mut waves = [llvm.context(cpu, false)?, llvm.context(cpu, true)?];
+    let mut distinct = HashSet::new();
+    let mut counts: [[[GapCounts; 2]; STARTS.len()]; 2] = Default::default();
+    for row in lib.graphics() {
+        for (slot, reference) in row.slots.into_iter().take(2).enumerate() {
+            let Some(reference) = reference else { continue };
+            if !distinct.insert((slot, reference.program)) {
+                continue;
+            }
+            let span = lib
+                .program(reference.program)
+                .ok_or("missing checked program span")?;
+            for (i, window) in STARTS.iter().enumerate() {
+                let Some(window) = span.get(*window..) else {
+                    continue;
+                };
+                if window.is_empty() || !window.len().is_multiple_of(4) || window.len() > BLOB_LIMIT
+                {
+                    continue;
+                }
+                for (w, wave) in waves.iter_mut().enumerate() {
+                    if let Some(gaps) = direct_gaps(wave, window, slot) {
+                        counts[slot][i][w].note(&gaps);
+                    }
+                }
+            }
+        }
+    }
+    for (s, stage) in counts.into_iter().enumerate() {
+        for (i, start) in stage.into_iter().enumerate() {
+            for (w, wave) in start.into_iter().enumerate() {
+                wave.report(STAGES[s], STARTS[i], [64, 32][w]);
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,6 +324,36 @@ mod tests {
             direct_result(&mut wave, &pixel, 1),
             ResultClass::ClosedNoStageExport
         );
+    }
+
+    #[test]
+    fn gap_rank_requires_closed_stage_export_and_checks_exact_width() {
+        let Some(path) = std::env::var_os("LLVM_DISASM_LIB") else {
+            return;
+        };
+        let llvm = Llvm::load(&path).unwrap();
+        let mut wave = llvm.context(Cpu::Gfx1030, false).unwrap();
+        let bytes = |words: &[u32]| {
+            words
+                .iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect::<Vec<_>>()
+        };
+        let ps = [
+            0x1004_0300,
+            0x1006_0200,
+            0xf800_080f,
+            0x0202_0202,
+            0xbf81_0000,
+        ];
+        let gaps = direct_gaps(&mut wave, &bytes(&ps), 0).unwrap();
+        assert_eq!(gaps.ordinary_vgpr_mul, 1);
+        assert_eq!(
+            gaps.missing,
+            BTreeMap::from([("v_mul_f32_e32/SGPR/4B".into(), 1)])
+        );
+        assert!(direct_gaps(&mut wave, &bytes(&ps), 1).is_none());
+        assert!(direct_gaps(&mut wave, &bytes(&ps[..4]), 0).is_none());
     }
 
     #[test]

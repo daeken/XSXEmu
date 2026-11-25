@@ -309,13 +309,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let llvm = args.next().filter(|_| args.next().is_none()).ok_or(usage)?;
         return entry_evidence::run(library.as_ref(), &llvm);
     }
-    if first == "--direct-library-graphics" {
-        let usage = "usage: xsx-shader-inventory --direct-library-graphics <expanded PS/0/9 library> <trusted LLVM 21 library> <gfx1013|gfx1030>";
+    if first == "--direct-library-graphics" || first == "--direct-library-graphics-gaps" {
+        let usage = "usage: xsx-shader-inventory <--direct-library-graphics|--direct-library-graphics-gaps> <expanded PS/0/9 library> <trusted LLVM 21 library> <gfx1013|gfx1030>";
         let library = args.next().ok_or(usage)?;
         let llvm = args.next().ok_or(usage)?;
         let cpu = llvm::Cpu::parse(&args.next().filter(|_| args.next().is_none()).ok_or(usage)?)
             .ok_or(usage)?;
-        return direct_graphics::run(library.as_ref(), &llvm, cpu);
+        return if first == "--direct-library-graphics-gaps" {
+            direct_graphics::run_gaps(library.as_ref(), &llvm, cpu)
+        } else {
+            direct_graphics::run(library.as_ref(), &llvm, cpu)
+        };
     }
     if first == "--native-vs-ps" {
         let usage = "usage: xsx-shader-inventory --native-vs-ps <native FSSM directory> <expanded PS/0/9 library> <trusted LLVM 21 library> <gfx1013|gfx1030>";

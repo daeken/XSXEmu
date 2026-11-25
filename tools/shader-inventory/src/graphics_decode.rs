@@ -68,6 +68,11 @@ pub(crate) enum Op {
         src: Vgpr,
         literal_bits: u32,
     },
+    MulF32 {
+        dst: Vgpr,
+        lhs: Vgpr,
+        rhs: Vgpr,
+    },
     MulLegacyF32 {
         dst: Vgpr,
         lhs: FloatSource,
@@ -241,6 +246,17 @@ pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeErro
             Op::MulLegacyF32 {
                 dst: Vgpr((w >> 17) as u8),
                 lhs,
+                rhs: Vgpr((w >> 9) as u8),
+            },
+        ));
+    }
+    // Ordinary VOP2 F32 multiply (opcode 8), exactly two VGPR operands.
+    if w & 0xfe00_0100 == 0x1000_0100 {
+        return Ok((
+            1,
+            Op::MulF32 {
+                dst: Vgpr((w >> 17) as u8),
+                lhs: Vgpr(w as u8),
                 rhs: Vgpr((w >> 9) as u8),
             },
         ));
