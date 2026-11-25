@@ -14,6 +14,9 @@ use std::{
 const NONE: i32 = 0;
 const RW: i32 = 3;
 const SLOTS: usize = 128;
+// Serialize these tests so a sibling fixture cannot reuse an address between
+// a drop and its kernel-region check.
+static VM_TEST: Mutex<()> = Mutex::new(());
 static NEXT: AtomicU64 = AtomicU64::new(1);
 // Reject recycling a previously staged CPU start even after the kernel unmaps it.
 static USED_BASES: Mutex<BTreeSet<u64>> = Mutex::new(BTreeSet::new());
@@ -135,15 +138,15 @@ impl Mapping {
     }
 
     fn verify(&self) {
-        assert_eq!(
-            region(self.start),
-            Some((self.start, self.page, NONE, NONE))
-        );
+        // Darwin can coalesce adjacent no-access guards from independent
+        // allocations. Check full protection coverage, not the kernel's
+        // choice of region boundaries. The interior RW extent stays exact.
+        for guard in [self.start, self.data() + self.page] {
+            let (start, len, current, max) = region(guard).unwrap();
+            assert!(start <= guard && start.checked_add(len).unwrap() >= guard + self.page);
+            assert_eq!((current, max), (NONE, NONE));
+        }
         assert_eq!(region(self.data()), Some((self.data(), self.page, RW, RW)));
-        assert_eq!(
-            region(self.data() + self.page),
-            Some((self.data() + self.page, self.page, NONE, NONE))
-        );
     }
 
     fn write(&self, offset: usize, val: u8) {
@@ -305,6 +308,7 @@ fn unmapped(extent: Range<u64>) {
 
 #[test]
 fn paired_type1_heaps_are_guarded_independent_and_transactional_for_both_strides() {
+    let _guard = VM_TEST.lock().unwrap();
     for (stride, expected_span) in [(16, 0x800), (32, 0x1000)] {
         let mut owner = Owner::default();
         let mut other = Owner::default();
@@ -479,4 +483,197 @@ fn paired_type1_heaps_are_guarded_independent_and_transactional_for_both_strides
         drop(other);
         unmapped(c_extent);
     }
+}
+
+// This fixture checks the whole list before mutating state. The private bitmap
+// is model bookkeeping, not a guest heap layout or a synchronization protocol.
+const FREE_STRIDE: usize = 16;
+const FREE_BYTES: usize = SLOTS * FREE_STRIDE;
+const FREE_END: u32 = u32::MAX;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FreeError {
+    Outside,
+    Cycle,
+    Inconsistent,
+    DoubleRecycle,
+}
+
+struct FreeList {
+    map: Mapping,
+    head: u32,
+    checked_out: [bool; SLOTS],
+}
+
+impl FreeList {
+    fn new(map: Mapping) -> Self {
+        assert!(FREE_BYTES <= map.page as usize);
+        let list = Self {
+            map,
+            head: 0,
+            checked_out: [false; SLOTS],
+        };
+        for slot in 0..SLOTS {
+            list.set_link(
+                slot,
+                if slot + 1 == SLOTS {
+                    FREE_END
+                } else {
+                    slot as u32 + 1
+                },
+            );
+        }
+        list
+    }
+
+    fn link(&self, slot: usize) -> u32 {
+        assert!(slot < SLOTS);
+        u32::from_le_bytes(std::array::from_fn(|i| {
+            self.map.read(slot * FREE_STRIDE + i)
+        }))
+    }
+
+    fn set_link(&self, slot: usize, next: u32) {
+        assert!(slot < SLOTS);
+        for (i, byte) in next.to_le_bytes().into_iter().enumerate() {
+            self.map.write(slot * FREE_STRIDE + i, byte);
+        }
+    }
+
+    fn validate(&self) -> Result<(), FreeError> {
+        let mut seen = [false; SLOTS];
+        let mut at = self.head;
+        while at != FREE_END {
+            let slot = at as usize;
+            let entry = seen.get_mut(slot).ok_or(FreeError::Outside)?;
+            if *entry {
+                return Err(FreeError::Cycle);
+            }
+            if self.checked_out[slot] {
+                return Err(FreeError::Inconsistent);
+            }
+            *entry = true;
+            at = self.link(slot);
+        }
+        if seen
+            .iter()
+            .zip(&self.checked_out)
+            .any(|(&seen, &out)| seen == out)
+        {
+            return Err(FreeError::Inconsistent);
+        }
+        Ok(())
+    }
+
+    fn pop(&mut self) -> Result<Option<u32>, FreeError> {
+        self.validate()?;
+        let old = self.head;
+        if old == FREE_END {
+            return Ok(None);
+        }
+        self.head = self.link(old as usize);
+        self.checked_out[old as usize] = true;
+        Ok(Some(old))
+    }
+
+    fn recycle(&mut self, slot: u32) -> Result<(), FreeError> {
+        let index = slot as usize;
+        if !self
+            .checked_out
+            .get(index)
+            .copied()
+            .ok_or(FreeError::Outside)?
+        {
+            return Err(FreeError::DoubleRecycle);
+        }
+        self.validate()?;
+        self.set_link(index, self.head);
+        self.checked_out[index] = false;
+        self.head = slot;
+        Ok(())
+    }
+}
+
+#[test]
+fn guarded_cpu_freelist_preserves_nonlink_bytes_and_refuses_corruption() {
+    let _guard = VM_TEST.lock().unwrap();
+    assert_eq!(FREE_BYTES, 0x800);
+    let map = Mapping::new();
+    let foreign = Mapping::new();
+    let (owned, unrelated) = (map.extent(), foreign.extent());
+    assert!(disjoint(owned.clone(), unrelated.clone()));
+    let snapshot = |m: &Mapping| {
+        (0..m.page as usize)
+            .map(|offset| m.read(offset))
+            .collect::<Vec<_>>()
+    };
+    for i in 0..map.page as usize {
+        map.write(i, i.wrapping_mul(19).wrapping_add(i >> 4) as u8);
+        foreign.write(i, i.wrapping_mul(37).wrapping_add(0x65) as u8);
+    }
+    let untouched = snapshot(&map);
+    let foreign_bytes = snapshot(&foreign);
+    let check_guards = |m: &Mapping| {
+        for (offset, byte) in snapshot(m).into_iter().enumerate() {
+            if offset >= FREE_BYTES || offset % FREE_STRIDE >= 4 {
+                assert_eq!(byte, untouched[offset], "untouched byte {offset:#x}");
+            }
+        }
+        assert_eq!(snapshot(&foreign), foreign_bytes);
+    };
+    let mut list = FreeList::new(map);
+    check_guards(&list.map);
+    let state = |list: &FreeList| (list.head, list.checked_out, snapshot(&list.map));
+    for slot in 0..SLOTS {
+        let next = if slot + 1 == SLOTS {
+            FREE_END
+        } else {
+            slot as u32 + 1
+        };
+        assert_eq!(list.link(slot), next);
+    }
+    let initial = state(&list);
+    for slot in 0..SLOTS {
+        assert_eq!(list.pop(), Ok(Some(slot as u32)));
+    }
+    check_guards(&list.map);
+    let empty = state(&list);
+    assert_eq!(list.pop(), Ok(None));
+    assert_eq!(state(&list), empty);
+    assert_eq!(list.recycle(SLOTS as u32), Err(FreeError::Outside));
+    assert_eq!(state(&list), empty);
+    for slot in (0..SLOTS).rev() {
+        list.recycle(slot as u32).unwrap();
+    }
+    assert_eq!(state(&list), initial);
+    assert_eq!(list.pop(), Ok(Some(0)));
+    for (slot, bad, expected) in [
+        (127, SLOTS as u32, FreeError::Outside),
+        (127, 0xfffffffe, FreeError::Outside),
+        (127, 1, FreeError::Cycle),
+        (64, 64, FreeError::Cycle),
+        (64, FREE_END, FreeError::Inconsistent),
+        (64, 0, FreeError::Inconsistent),
+    ] {
+        let old = list.link(slot);
+        list.set_link(slot, bad);
+        let corrupted = state(&list);
+        assert_eq!(list.pop(), Err(expected));
+        assert_eq!(state(&list), corrupted);
+        assert_eq!(list.recycle(0), Err(expected));
+        assert_eq!(state(&list), corrupted);
+        list.set_link(slot, old);
+    }
+    list.recycle(0).unwrap();
+    assert_eq!(list.recycle(0), Err(FreeError::DoubleRecycle));
+    assert_eq!(state(&list), initial);
+    check_guards(&list.map);
+    list.map.verify();
+    foreign.verify();
+    drop(list);
+    unmapped(owned);
+    assert_eq!(snapshot(&foreign), foreign_bytes);
+    foreign.verify();
+    drop(foreign);
+    unmapped(unrelated);
 }
