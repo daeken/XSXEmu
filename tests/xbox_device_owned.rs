@@ -12,18 +12,20 @@ use std::{
 use xsxemu::d3d12_command_state::{
     AllocatorId, CommandKind, CommandState, ListId, QueueId, StateError,
 };
-use xsxemu::xbox_device::{DeviceId, Error, IUNKNOWN, OBSERVED_DEVICE_IID, OwnedDevices};
+use xsxemu::xbox_device::{
+    DeviceId, Error, IUNKNOWN, OBSERVED_DEVICE_IID, OWNED_FIXTURE_PREFIX as PREFIX, OwnedDevices,
+};
 
 const E_POINTER: i32 = 0x8000_4003u32 as i32;
 const E_NOINTERFACE: i32 = 0x8000_4002u32 as i32;
 const E_NOTIMPL: i32 = 0x8000_4001u32 as i32;
 const E_FAIL: i32 = 0x8000_4005u32 as i32;
-const PREFIX: [u8; 80] = [0x5a; 80];
 
 struct State {
     ledger: OwnedDevices<MetalBackend>,
     fixture_enabled: bool,
     backend_enabled: bool,
+    publish_enabled: bool,
     live: BTreeMap<usize, LiveDevice>,
     next_queue: usize,
 }
@@ -174,26 +176,27 @@ extern "win64" fn create(adapter: usize, params: usize, iid: usize, out: usize) 
         return E_NOTIMPL;
     }
     let enabled = state.backend_enabled;
-    let id = match state
-        .ledger
-        .create_with_backend(adapter != 0, iid, params, &PREFIX, || {
-            enabled.then(MetalBackend::open).flatten()
-        }) {
-        Ok(id) => id,
-        Err(Error::UnsupportedAdapter | Error::UnsupportedParameters) => return E_NOTIMPL,
+    let pending = match state.ledger.stage_owned(adapter != 0, iid, params, || {
+        enabled.then(MetalBackend::open).flatten()
+    }) {
+        Ok(pending) => pending,
+        Err(
+            Error::UnsupportedAdapter
+            | Error::UnsupportedParameters
+            | Error::RecognizedUnsupportedCreationEffects,
+        ) => return E_NOTIMPL,
         Err(Error::UnsupportedInterface) => return E_NOINTERFACE,
         Err(_) => return E_FAIL,
     };
     let (Ok(copy), Some(next_queue)) = (CopyState::new(), state.next_queue.checked_add(1)) else {
-        state.ledger.release(id).unwrap();
         return E_FAIL;
     };
     let prefix = Box::new(vtable().as_ptr().addr());
     let address = std::ptr::from_ref(prefix.as_ref()).addr();
-    if !write_word(out, address) {
-        state.ledger.release(id).unwrap();
+    if !state.publish_enabled || !write_word(out, address) {
         return E_POINTER;
     }
+    let id = pending.commit();
     state.live.insert(
         address,
         LiveDevice {
@@ -324,6 +327,7 @@ fn owned_create_and_iunknown_prefix_obey_win64_and_reference_lifetime() {
         ledger: OwnedDevices::new(1),
         fixture_enabled: false,
         backend_enabled: false,
+        publish_enabled: true,
         live: BTreeMap::new(),
         next_queue: 1,
     });
@@ -388,6 +392,22 @@ fn owned_create_and_iunknown_prefix_obey_win64_and_reference_lifetime() {
             E_NOTIMPL
         );
         assert_eq!(device, 0);
+        // Only the final publication is denied; initial null write, real
+        // device/queue open, and staging all ran. Capacity must be reusable.
+        STATE.lock().unwrap().as_mut().unwrap().publish_enabled = false;
+        assert_eq!(
+            create_call(0, in_ptr, iid_ptr, (&raw mut device).addr()),
+            E_POINTER
+        );
+        assert_eq!(device, 0);
+        assert_eq!(host::DROPS.load(Ordering::Relaxed), drops + 1);
+        {
+            let guard = STATE.lock().unwrap();
+            let state = guard.as_ref().unwrap();
+            assert!(state.live.is_empty());
+            assert_eq!(state.next_queue, 1);
+        }
+        STATE.lock().unwrap().as_mut().unwrap().publish_enabled = true;
         assert_eq!(create_call(0, in_ptr, iid_ptr, (&raw mut device).addr()), 0);
         assert_ne!(device, 0);
         if std::env::var_os("XSXEMU_OWNED_DEVICE_UNSUPPORTED_CHILD").is_some() {
@@ -412,12 +432,12 @@ fn owned_create_and_iunknown_prefix_obey_win64_and_reference_lifetime() {
         assert_eq!(method::<1>(out, 0, 0), 3);
         assert_eq!(method::<2>(device, 0, 0), 2);
         assert_eq!(method::<2>(device, 0, 0), 1);
-        assert_eq!(host::DROPS.load(Ordering::Relaxed), drops);
+        assert_eq!(host::DROPS.load(Ordering::Relaxed), drops + 1);
         assert_eq!(method::<2>(device, 0, 0), 0);
     }
     let mut guard = STATE.lock().unwrap();
     assert!(guard.take().unwrap().live.is_empty());
-    assert_eq!(host::DROPS.load(Ordering::Relaxed), drops + 1);
+    assert_eq!(host::DROPS.load(Ordering::Relaxed), drops + 2);
     drop(guard);
     let child = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
@@ -442,6 +462,7 @@ fn owned_win64_copy_uses_only_the_creating_devices_queue() {
         ledger: OwnedDevices::new(2),
         fixture_enabled: true,
         backend_enabled: true,
+        publish_enabled: true,
         live: BTreeMap::new(),
         next_queue: 1,
     });

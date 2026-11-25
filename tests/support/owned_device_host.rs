@@ -1,10 +1,8 @@
 //! macOS-only host side of the owned fixture. No Windows or GPU address aliases.
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-#[link(name = "Metal", kind = "framework")]
-unsafe extern "C" {
-    fn MTLCreateSystemDefaultDevice() -> usize;
-}
+use xsxemu::owned_metal::MetalDevice;
+
 #[link(name = "objc")]
 unsafe extern "C" {
     fn sel_registerName(name: *const std::ffi::c_char) -> usize;
@@ -58,29 +56,11 @@ pub(super) fn write(address: usize, bytes: &[u8]) -> bool {
 
 pub(super) static DROPS: AtomicUsize = AtomicUsize::new(0);
 
-pub(super) struct MetalBackend {
-    device: usize,
-    queue: usize,
-}
+pub(super) struct MetalBackend(MetalDevice);
 
 impl MetalBackend {
     pub(super) fn open() -> Option<Self> {
-        // SAFETY: standard macOS Metal/ObjC calls. The device factory and the
-        // `new` selector return owned references on macOS.
-        unsafe {
-            let device = MTLCreateSystemDefaultDevice();
-            if device == 0 {
-                return None;
-            }
-            let send: unsafe extern "C" fn(usize, usize) -> usize =
-                std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
-            let queue = send(device, sel_registerName(c"newCommandQueue".as_ptr()));
-            if queue == 0 {
-                release(device);
-                return None;
-            }
-            Some(Self { device, queue })
-        }
+        MetalDevice::open().ok().map(Self)
     }
 }
 
@@ -106,7 +86,7 @@ impl MetalBackend {
                 std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
             let make = |bytes: &[u8; LEN]| {
                 let object = make_buffer(
-                    self.device,
+                    self.0.device().get(),
                     sel_registerName(c"newBufferWithBytes:length:options:".as_ptr()),
                     bytes.as_ptr(),
                     LEN,
@@ -116,7 +96,10 @@ impl MetalBackend {
             };
             let src = make(&input).ok_or("source buffer unavailable")?;
             let dst = make(&[0; LEN]).ok_or("destination buffer unavailable")?;
-            let cmd = get(self.queue, sel_registerName(c"commandBuffer".as_ptr()));
+            let cmd = get(
+                self.0.queue().get(),
+                sel_registerName(c"commandBuffer".as_ptr()),
+            );
             if cmd == 0 {
                 return Err("command buffer unavailable");
             }
@@ -196,11 +179,7 @@ unsafe fn release(obj: usize) {
 
 impl Drop for MetalBackend {
     fn drop(&mut self) {
-        // SAFETY: both owned references were acquired by open and are dropped once.
-        unsafe {
-            release(self.queue);
-            release(self.device);
-        }
+        // The MetalDevice field releases its two references after this count.
         DROPS.fetch_add(1, Ordering::Relaxed);
     }
 }

@@ -3,6 +3,8 @@
 pub mod compute_capture;
 pub mod compute_metadata;
 pub mod d3d12_command_state;
+#[cfg(target_os = "macos")]
+pub mod owned_metal;
 pub mod pe;
 pub mod pipeline_library;
 pub mod root_signature;
