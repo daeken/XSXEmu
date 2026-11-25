@@ -6,8 +6,11 @@ use std::cell::Cell;
 use std::ffi::c_void;
 use std::ptr;
 
-const DESC: [u8; 16] = *b"owned-queue-desc";
-const IID: [u8; 16] = *b"owned-test-iid!!";
+// Exact observed prefix and public queue IID in Win64 GUID byte order.
+const DESC: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0];
+const IID: [u8; 16] = [
+    0xa6, 0x70, 0xc8, 0x0e, 0x7e, 0x5d, 0x22, 0x4c, 0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed,
+];
 const REFUSED: i32 = -37;
 const MISMATCH: i32 = -5;
 const BEFORE: u64 = 0x0123_4567_89ab_cdef;
@@ -161,9 +164,25 @@ impl Drop for EndOfPage {
     }
 }
 
-fn run(refuse: bool) {
+#[derive(Clone, Copy)]
+enum Path {
+    Success,
+    Refused,
+    BadOut,
+    BadDesc,
+    BadIid,
+}
+
+fn run(path: Path) {
     let pages = EndOfPage::new();
-    let iid = IID;
+    let mut iid = IID;
+    if matches!(path, Path::BadDesc) {
+        // SAFETY: the exact 16-byte private span is writable.
+        unsafe { pages.token().write([0; 16]) };
+    }
+    if matches!(path, Path::BadIid) {
+        iid[15] ^= 1;
+    }
     let counts = Counts::default();
     let mut output = Output {
         before: BEFORE,
@@ -181,28 +200,31 @@ fn run(refuse: bool) {
         expected_out: &raw mut output.queue,
         queue_vtable: queue_table.as_ptr(),
         counts: &counts,
-        refuse,
+        refuse: matches!(path, Path::Refused),
+    };
+    let passed_out = if matches!(path, Path::BadOut) {
+        ptr::null_mut()
+    } else {
+        device.expected_out
     };
 
-    // SAFETY: the test owns every passed object and both vtables.
-    let status = unsafe {
-        call_create(
-            &device,
-            pages.token(),
-            &raw const iid,
-            &raw mut output.queue,
-        )
-    };
+    // SAFETY: the test owns every passed object and both vtables; the fixture
+    // callee rejects null output before accessing it.
+    let status = unsafe { call_create(&device, pages.token(), &raw const iid, passed_out) };
     assert_eq!((output.before, output.after), (BEFORE, AFTER));
     if status < 0 {
         unsafe { call_release((&raw const device).cast()) };
-        assert!(refuse);
-        assert_eq!(status, REFUSED);
+        let expected = match path {
+            Path::Success => panic!("valid synthetic queue request failed"),
+            Path::Refused => REFUSED,
+            _ => MISMATCH,
+        };
+        assert_eq!(status, expected);
         assert!(output.queue.is_null());
         assert_eq!(counts.device_release.get(), 1);
         assert_eq!(counts.queue_release.get(), 0);
     } else {
-        assert!(!refuse);
+        assert!(matches!(path, Path::Success));
         assert_eq!(status, 1);
         assert!(!output.queue.is_null());
         // A wrapper borrows the published reference; it does not own a second one.
@@ -216,15 +238,23 @@ fn run(refuse: bool) {
         assert_eq!(counts.device_release.get(), 0);
         assert_eq!(counts.queue_release.get(), 1);
     }
-    assert_eq!(counts.queue_dropped.get(), 1);
+    let expected_drops = u32::from(matches!(path, Path::Success | Path::Refused));
+    assert_eq!(counts.queue_dropped.get(), expected_drops);
 }
 
 #[test]
 fn direct_queue_slot_8_publishes_one_owned_reference_on_positive_success() {
-    run(false);
+    run(Path::Success);
 }
 
 #[test]
 fn direct_queue_slot_8_refusal_never_publishes_and_releases_only_device() {
-    run(true);
+    run(Path::Refused);
+}
+
+#[test]
+fn direct_queue_slot_8_checks_inputs_before_staging_an_owner() {
+    for path in [Path::BadOut, Path::BadDesc, Path::BadIid] {
+        run(path);
+    }
 }
