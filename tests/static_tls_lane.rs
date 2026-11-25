@@ -4545,6 +4545,88 @@ fn offline_thread_controls_report_virtual_group_and_reject_setters() {
     expect(output, 58, "Guest entry returned 58");
 }
 
+const CS_HANDOFF_CODE: usize = 0x400;
+
+#[repr(C)]
+struct CsHandoffFixture {
+    entry: u32,
+    bytes: [u8; CS_HANDOFF_CODE],
+}
+
+global_asm!(include_str!("fixtures/static_tls_cs_handoff.S"),
+    capacity = const CS_HANDOFF_CODE, iat = const IAT - TEXT,
+    data = const DATA + 0x380 - TEXT, options(att_syntax),
+);
+unsafe extern "C" {
+    static cs_handoff_fixture: CsHandoffFixture;
+}
+
+#[test]
+fn critical_section_handoff_between_two_guest_workers() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let fixture = unsafe { &cs_handoff_fixture };
+    let mut pe = image(Kind::Solo);
+    put(&mut pe, file(TEXT), &fixture.bytes);
+    w32(&mut pe, OP + 16, TEXT + fixture.entry as usize);
+    w64(&mut pe, file(ARRAY), PREFERRED + TEXT);
+
+    let imports = LINK + 0x780;
+    dir(&mut pe, 1, imports, 40);
+    w32(&mut pe, file(imports), imports + 0x30);
+    w32(&mut pe, file(imports) + 12, imports + 0x90);
+    w32(&mut pe, file(imports) + 16, IAT);
+    put(&mut pe, file(imports) + 0x90, b"kernel32.dll\0");
+    for (i, symbol) in [
+        b"InitializeCriticalSectionAndSpinCount\0".as_slice(),
+        b"EnterCriticalSection\0",
+        b"LeaveCriticalSection\0",
+        b"DeleteCriticalSection\0",
+        b"CreateSemaphoreW\0",
+        b"WaitForSingleObject\0",
+        b"ReleaseSemaphore\0",
+        b"CreateThread\0",
+        b"CloseHandle\0",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = imports + 0xb0 + 0x30 * i;
+        w64(&mut pe, file(imports) + 0x30 + i * 8, name);
+        put(&mut pe, file(name) + 2, symbol);
+    }
+    let path = scratch.write("critical-section-handoff.exe", &pe);
+    let output = launcher(&path, &[OPT, "--rust-providers"])
+        .env("XSXEMU_TRACE_STARTUP", "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let dispatches = |api: &str| {
+        stderr
+            .match_indices(&format!(
+                "bridge dispatch kernelbase.dll!{api} guest_return_pc="
+            ))
+            .map(|(i, _)| i)
+            .collect::<Vec<_>>()
+    };
+    let enters = dispatches("EnterCriticalSection");
+    let leaves = dispatches("LeaveCriticalSection");
+    assert_eq!(enters.len(), 3, "{stderr}");
+    assert_eq!(leaves.len(), 3, "{stderr}");
+    // Reject a run in which the peer didn't make it to the bridge before the
+    // final release. The guest separately checks that the peer never entered
+    // the protected region early and that each LastError survived the handoff.
+    assert!(enters[2] < leaves[1], "{stderr}");
+    assert_eq!(
+        stderr.matches("begin phase=thread-entry").count(),
+        2,
+        "{stderr}"
+    );
+    expect(output, 59, "Guest entry returned 59");
+}
+
 const THREAD_CODE: usize = 0x1000;
 #[repr(C)]
 struct ThreadFixture {
