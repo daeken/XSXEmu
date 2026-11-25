@@ -72,7 +72,7 @@ The complete aggregate histograms were identical between gfx1013 and gfx1030 wit
 | VS | 13,409 | 1,343 | 1,304 / 1,304 | 1,304 / 1,304 / 1,304 |
 | MS | 12,062 | 7,498 | 0 / 0 | 0 / 0 / 0 |
 
-Every program with stage-export closure had multiple passing starts; none established a unique entry. Of 13,383 exact VS+PS occurrences, both stages had stage-export closure on 12,794 (wave64), 12,798 (wave32), and 12,794 (same window in both waves for each stage). For the same-window projection, 550 had only VS closure, 39 only PS, and none had neither. No stage-export-qualified VS or PS window was encoding-complete under the owned decoder, so none of the pairs reached the output-binding-only tier. This is conditional static evidence about the tested library spans, not a runtime entry, binding, native variant selection, bake admission, or translation.
+Every program with stage-export closure had multiple passing starts; none established a unique entry. Of 13,383 exact VS+PS occurrences, both stages had stage-export closure on 12,794 (wave64), 12,798 (wave32), and 12,794 (same window in both waves for each stage). For the same-window projection, 550 had only VS closure, 39 only PS, and none had neither. In the original census no stage-export-qualified VS or PS window was encoding-complete; see the follow-up below for the newly cleared PS cohort. This is conditional static evidence about the tested library spans, not a runtime entry, binding, native variant selection, bake admission, or translation.
 
 ## Direct stored-window translator gap ranking
 
@@ -86,9 +86,22 @@ Before the change, `v_mul_f32_e32` at four bytes ranked first by site count at +
 | PS / 32 | 6,191 | 619,337 | 481,658 | 5,540 |
 | VS / both, each | 1,304 | 105,923 | 82,623 | 908 |
 
-At +36 the largest remaining PS buckets are 4-byte `s_waitcnt` (270,008 / 275,768) and 8-byte `v_fma_f32` (249,700 / 260,190), in wave64 / wave32 order. The leading VS bucket is 4-byte `v_add_f32_e32` (52,623 in either wave). No window becomes encoding-complete. At +36 the closest PS group still has 218 windows with one gap; the closest VS group has 25 windows with five each. No runtime entry or binding is selected.
+At +36 the largest remaining PS buckets are 4-byte `s_waitcnt` (270,008 / 275,768) and 8-byte `v_fma_f32` (249,700 / 260,190), in wave64 / wave32 order. The leading VS bucket is 4-byte `v_add_f32_e32` (52,623 in either wave). The multiply alone did not make any window encoding-complete. At that point, +36 had 218 PS windows with one gap and 25 VS windows with five each. No runtime entry or binding is selected.
 
 The owned lowering emits ordinary F32 multiplication, not the legacy zero shortcut. LLVM MC confirms the exact two-VGPR VOP2 word on both references; SGPR, inline, literal and other forms remain outside this addition. Apple M4 strict arithmetic archive bake and replay each passed 11/11 ordinary multiply checks: finite and rounding-sensitive values, signed zeros, and NaN classification for zero with infinity or NaN inputs. The static semantic check still requires both operands to be defined and the applicable F32 mode to be proven. No claim about title FP mode, NaN payloads, denormals, or pipeline admission follows.
+
+### Prioritize by whole-window leverage
+
+The census also ranks sole gap buckets by number of windows, reporting the contiguous subset separately. Under both LLVM 21.1.6 reference CPUs (`gfx1013` and `gfx1030`), at each start the prior top PS cohort was uncompressed MRT0 EN=1, DONE+VM: the one remaining site in each of 212 contiguous windows. The next cohorts were compressed MRT0 EN=3 (5 windows), compressed MRT0 EN=15 (1), and an unclassified `v_interp_mov_f32_e32` bucket (1 window, with 3 sites at +36 and 2 at +40). No VS window had just one gap bucket (1,304 closed stage-export windows per start and wave).
+
+| Stored start | PS wave64 closed stage-export windows | PS wave32 closed stage-export windows | Newly encoding-complete per wave and CPU |
+|---|---:|---:|---:|
+| +36 | 6,161 | 6,191 | 212 |
+| +40 | 6,161 | 6,191 | 212 |
+
+The bounded owned red-only lowering reads only VSRC0 and requires the exact MRT0/DONE/VM/EN header. LLVM MC assembles the canonical word on both CPUs; disassembly still reports GBA `off` when those disabled selector bytes are nonzero. With a single-sample no-blend RGBA32Float target and red-only write mask, Apple M4 readback matched 64/64 pixels bit-for-bit from source and from an offline metallib: 20 pixels wrote red only, and all retained nonzero GBA clears. Existing keyed graphics replay is unchanged.
+
+Across starts, 212 distinct PS become encoding-complete (do not add the two rows). Of those, 210 have only the attachment format/mask predicate outstanding in the static audit. No VS becomes encoding-complete, and no complete VS+PS pair passes both stages. Neither the closure nor this owned test selects a runtime entry, establishes a title attachment contract, or demonstrates bake readiness.
 
 ## Independent evidence for distinguishing starts
 

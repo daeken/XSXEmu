@@ -201,19 +201,31 @@ struct GapCounts {
     eligible: usize,
     exact: usize,
     ordinary_mul: (usize, usize),
+    linear_sole: BTreeMap<String, usize>,
     distances: BTreeMap<usize, usize>,
     forms: BTreeMap<String, (usize, usize)>,
+    sole_forms: BTreeMap<String, (usize, usize)>,
 }
 
 impl GapCounts {
     fn note(&mut self, gaps: &DirectGaps) {
         self.ordinary_mul.0 += gaps.ordinary_vgpr_mul;
         self.ordinary_mul.1 += usize::from(gaps.ordinary_vgpr_mul > 0);
+        let contiguous = gaps.contiguous;
         let gaps = &gaps.missing;
         self.eligible += 1;
         self.exact += usize::from(gaps.is_empty());
         if !gaps.is_empty() {
             *self.distances.entry(gaps.values().sum()).or_default() += 1;
+        }
+        if gaps.len() == 1 {
+            let (name, &sites) = gaps.first_key_value().unwrap();
+            let rank = self.sole_forms.entry(name.clone()).or_default();
+            rank.0 += 1;
+            rank.1 += sites;
+            if contiguous {
+                *self.linear_sole.entry(name.clone()).or_default() += 1;
+            }
         }
         for (name, &sites) in gaps {
             let form = self.forms.entry(name.clone()).or_default();
@@ -233,6 +245,14 @@ impl GapCounts {
         );
         let distances: Vec<_> = self.distances.into_iter().take(3).collect();
         println!("    nearest (unsupported sites, windows): {distances:?}");
+        let mut leverage: Vec<_> = self.sole_forms.into_iter().collect();
+        leverage.sort_unstable_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| a.0.cmp(&b.0)));
+        for (form, (windows, sites)) in leverage {
+            println!(
+                "    sole gap bucket {form}: {windows} windows, {sites} sites, {} contiguous",
+                self.linear_sole.get(&form).copied().unwrap_or(0)
+            );
+        }
         let mut rows: Vec<_> = self.forms.into_iter().collect();
         rows.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         for (form, (sites, windows)) in rows.into_iter().take(16) {

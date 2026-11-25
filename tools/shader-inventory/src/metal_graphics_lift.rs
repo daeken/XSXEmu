@@ -133,6 +133,8 @@ mod gpu {
         BoundAffineControl(InterpFixture),
         BoundAffineLoad(&'a Path, bool),
         BoundAffineMutatedLoad(&'a Path),
+        RedSource,
+        RedLoad(&'a Path),
         ConstantRtzSource(bool),
         ConstantRtzLoad(&'a Path, bool),
         BoundSource(bool),
@@ -212,6 +214,12 @@ mod gpu {
             [mode] if mode == "--emit-interp-x-msl" || mode == "--emit-interp-z-msl" => {
                 let fixture = if mode == "--emit-interp-z-msl" { InterpFixture::AffineZ } else { InterpFixture::AffineX };
                 print!("{}", graphics_lift::translate_interp_fixture(fixture).map_err(|e| format!("interpolation lift rejected: {e:?}"))?);
+                return Ok(());
+            }
+            [mode] if mode == "--red-source" => Mode::RedSource,
+            [mode, lib] if mode == "--load-red-metallib" => Mode::RedLoad(Path::new(lib)),
+            [mode] if mode == "--emit-red-msl" => {
+                print!("{}", graphics_lift::translate_red_fixture().map_err(|e| format!("red export rejected: {e:?}"))?);
                 return Ok(());
             }
             [mode] if mode == "--constant-rtz-source" || mode == "--constant-rtz-rg-source" => Mode::ConstantRtzSource(mode == "--constant-rtz-rg-source"),
@@ -344,6 +352,7 @@ mod gpu {
             }),
             _ => None,
         };
+        let red = matches!(mode, Mode::RedSource | Mode::RedLoad(_));
         let constant_rtz = match mode {
             Mode::ConstantRtzSource(rg) | Mode::ConstantRtzLoad(_, rg) => Some(rg),
             _ => None,
@@ -394,6 +403,7 @@ mod gpu {
             | Mode::BoundTwoAffineSource(_)
             | Mode::BoundAffineSource(_)
             | Mode::BoundAffineControl(_)
+            | Mode::RedSource
             | Mode::ConstantRtzSource(_)
             | Mode::BoundSource(_)
             | Mode::BoundSwappedSource
@@ -436,6 +446,8 @@ mod gpu {
                     graphics_lift::translate_interp_fixture(interp)
                 } else if let Some(plan) = &bound_pair {
                     Ok(plan.source.clone())
+                } else if red {
+                    graphics_lift::translate_red_fixture()
                 } else if let Some(rg) = constant_rtz {
                     graphics_lift::translate_constant_rtz_fixture(rg)
                 } else if pos_first {
@@ -465,6 +477,7 @@ mod gpu {
             | Mode::BoundTwoAffineLoad(path)
             | Mode::BoundAffineLoad(path, _)
             | Mode::BoundAffineMutatedLoad(path)
+            | Mode::RedLoad(path)
             | Mode::ConstantRtzLoad(path, _)
             | Mode::BoundLoad(path, _)
             | Mode::PosFirstLoad(path)
@@ -487,6 +500,8 @@ mod gpu {
             (MTLPixelFormat::RGBA32Float, 16, fixture.entry())
         } else if bound_pair.is_some() {
             (MTLPixelFormat::RGBA32Float, 16, "bound_ps")
+        } else if red {
+            (MTLPixelFormat::RGBA32Float, 16, "red_ps")
         } else if constant_rtz.is_some() {
             (MTLPixelFormat::RGBA32Float, 16, "constant_rtz_ps")
         } else if pos_first {
@@ -542,7 +557,9 @@ mod gpu {
             .object_at(0)
             .ok_or("no color slot")?;
         color_attachment.set_pixel_format(format);
-        color_attachment.set_write_mask(if partial {
+        color_attachment.set_write_mask(if red {
+            MTLColorWriteMask::Red
+        } else if partial {
             MTLColorWriteMask::Red | MTLColorWriteMask::Green
         } else {
             MTLColorWriteMask::All
@@ -631,9 +648,9 @@ mod gpu {
         attachment.set_texture(Some(&color));
         attachment.set_clear_color(MTLClearColor::new(
             1.,
-            0.,
+            if red { 0.5 } else { 0. },
             1.,
-            if partial { 0.75 } else { 0. },
+            if red || partial { 0.75 } else { 0. },
         ));
         attachment.set_load_action(MTLLoadAction::Clear);
         attachment.set_store_action(MTLStoreAction::Store);
@@ -831,6 +848,13 @@ mod gpu {
                 );
                 enc.draw_primitives(MTLPrimitiveType::Triangle, 0, 3);
             }
+        } else if red {
+            enc.set_scissor_rect(MTLScissorRect {
+                x: 2,
+                y: 1,
+                width: 4,
+                height: 5,
+            });
         } else if packed || mrt {
             enc.set_scissor_rect(MTLScissorRect {
                 x: 2,
@@ -926,6 +950,29 @@ mod gpu {
                     dev.name()
                 );
             }
+            return Ok(());
+        }
+        if red {
+            for y in 0..SIDE {
+                for x in 0..SIDE {
+                    let at = y * STRIDE + x * 16;
+                    let covered = (2..6).contains(&x) && (1..6).contains(&y);
+                    let expected =
+                        [if covered { 0.25f32 } else { 1. }, 0.5, 1., 0.75].map(f32::to_bits);
+                    let actual: [u32; 4] = std::array::from_fn(|i| {
+                        u32::from_le_bytes(pixels[at + 4 * i..at + 4 * i + 4].try_into().unwrap())
+                    });
+                    if actual != expected {
+                        return Err(format!(
+                            "red export ({x},{y}): expected {expected:08x?}, got {actual:08x?}"
+                        ));
+                    }
+                }
+            }
+            println!(
+                "{} owned final MRT0 R-only export: 64/64 pixels bit-exact (20 red writes, GBA preserved)",
+                dev.name()
+            );
             return Ok(());
         }
         if let Some(rg) = constant_rtz {

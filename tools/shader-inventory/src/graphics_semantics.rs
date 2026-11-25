@@ -240,13 +240,16 @@ pub(crate) fn audit(words: &[u32], vertex: bool) -> Outcome {
             op @ (Op::Export { .. }
             | Op::PackedColor { .. }
             | Op::PackedRg { .. }
+            | Op::ExportRed { .. }
             | Op::PixelDepth { .. }) => {
                 // Only exact decoder EXP forms reach this arm. Use the checked
                 // raw VM/DONE bits, rather than defaults from the owned emitter.
                 let (target, src): (_, &[_]) = match &op {
                     Op::Export { target, src, .. } => (Some(*target), src),
                     Op::PackedColor { src, .. } => (Some(Target::Color), src),
-                    Op::PackedRg { src, .. } => (Some(Target::Color), std::slice::from_ref(src)),
+                    Op::PackedRg { src, .. } | Op::ExportRed { src } => {
+                        (Some(Target::Color), std::slice::from_ref(src))
+                    }
                     Op::PixelDepth { src, .. } => (None, std::slice::from_ref(src)),
                     _ => unreachable!(),
                 };

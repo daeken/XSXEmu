@@ -94,6 +94,9 @@ pub(crate) enum Op {
         done: bool,
         vm: bool,
     },
+    ExportRed {
+        src: Vgpr,
+    },
     PackedRg {
         slot: u8,
         src: Vgpr,
@@ -384,6 +387,15 @@ pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeErro
                 src: [Vgpr(rg), Vgpr(ba)],
                 done: w & 0x800 != 0,
                 vm: w & 0x1000 != 0,
+            },
+        ));
+    }
+    // EN=1 reads only VSRC0. Disabled component selectors are not read.
+    if w == 0xf800_1801 {
+        return Ok((
+            2,
+            Op::ExportRed {
+                src: Vgpr(ext()? as u8),
             },
         ));
     }

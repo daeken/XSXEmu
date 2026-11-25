@@ -248,6 +248,7 @@ fn exact_opcode(
                 Op::Export { .. }
                 | Op::PackedColor { .. }
                 | Op::PackedRg { .. }
+                | Op::ExportRed { .. }
                 | Op::PixelDepth { .. } => name == "exp",
                 Op::PackHalfRtz { .. } => name == "v_cvt_pkrtz_f16_f32_e32",
                 Op::CompareNonzero { .. } => name == "v_cmp_ne_u32_e32",
@@ -261,6 +262,7 @@ fn exact_opcode(
 pub(super) struct DirectGaps {
     pub missing: BTreeMap<String, usize>,
     pub ordinary_vgpr_mul: usize,
+    pub contiguous: bool,
 }
 
 /// Count only checked instructions in a closed stage-export-qualified window.
@@ -268,7 +270,11 @@ pub(super) fn direct_gaps(dis: &mut Disassembler, bytes: &[u8], slot: usize) -> 
     use crate::graphics_decode::decode;
     let mut gaps = DirectGaps::default();
     let mut ended = false;
+    let mut next_len = bytes.len();
+    gaps.contiguous = true;
     let exp = project_exports_observe(dis, bytes, false, |tail, len, text| {
+        gaps.contiguous &= next_len == tail.len();
+        next_len = tail.len() - len;
         let name = text.split_ascii_whitespace().next().unwrap_or_default();
         let first = word(tail, 0).unwrap_or_default() as u32;
         ended |= len == 4 && first == 0xbf810000 && name == "s_endpgm";
