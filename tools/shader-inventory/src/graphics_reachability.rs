@@ -442,6 +442,7 @@ pub(super) struct DirectGaps {
     pub contiguous: bool,
     pub interp_mov: BTreeMap<Option<(u8, u8, u8)>, usize>,
     pub packed_ba: usize,
+    pub packed_mrt1_rg_final: usize,
     pub packed_mrt0_noncanonical: [usize; 2], // RG / RGBA
     pub inline_bfrev_sites: usize,
     pub scalar_depth_noncanonical: usize,
@@ -506,6 +507,17 @@ pub(super) fn direct_gaps(dis: &mut Disassembler, bytes: &[u8], slot: usize) -> 
             gaps.packed_ba += usize::from(matches!(
                 decoded,
                 Some((2, crate::graphics_decode::Op::PackedBa { .. }))
+            ));
+            gaps.packed_mrt1_rg_final += usize::from(matches!(
+                decoded,
+                Some((
+                    2,
+                    crate::graphics_decode::Op::PackedRg {
+                        slot: 1,
+                        final_export: true,
+                        ..
+                    }
+                ))
             ));
             // Count exactly the final MRT0 forms that used to fail the
             // disabled-selector canonical-zero constraint.

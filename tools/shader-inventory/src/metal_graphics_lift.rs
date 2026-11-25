@@ -223,6 +223,8 @@ mod gpu {
         let mode = match args.as_slice() {
             [] => Mode::Source,
             [mode] if mode == "--dual-source" => Mode::MrtSource(MrtFixture::Dual),
+            [mode] if mode == "--dual-rg-source" => Mode::MrtSource(MrtFixture::DualRg),
+            [mode, lib] if mode == "--load-dual-rg-metallib" || mode == "--expect-dual-rg-all-mask" => Mode::MrtLoad(Path::new(lib), MrtFixture::DualRg),
             [mode] if mode == "--dual-red-source" => Mode::MrtSource(MrtFixture::DualRed),
             [mode, lib] if mode == "--load-dual-red-metallib" || mode == "--expect-dual-red-all-mask" => Mode::MrtLoad(Path::new(lib), MrtFixture::DualRed),
             [mode] if mode == "--triple-source" => Mode::MrtSource(MrtFixture::Triple),
@@ -231,8 +233,8 @@ mod gpu {
             [mode, lib] if mode == "--load-dual-metallib" => Mode::MrtLoad(Path::new(lib), MrtFixture::Dual),
             [mode, lib] if mode == "--load-triple-metallib" => Mode::MrtLoad(Path::new(lib), MrtFixture::Triple),
             [mode, lib] if mode == "--load-triple-rg-metallib" => Mode::MrtLoad(Path::new(lib), MrtFixture::TripleRg),
-            [mode] if mode == "--emit-dual-msl" || mode == "--emit-dual-red-msl" || mode == "--emit-triple-msl" || mode == "--emit-triple-rg-msl" => {
-                let fixture = if mode == "--emit-triple-rg-msl" { MrtFixture::TripleRg } else if mode == "--emit-triple-msl" { MrtFixture::Triple } else if mode == "--emit-dual-red-msl" { MrtFixture::DualRed } else { MrtFixture::Dual };
+            [mode] if mode == "--emit-dual-msl" || mode == "--emit-dual-red-msl" || mode == "--emit-dual-rg-msl" || mode == "--emit-triple-msl" || mode == "--emit-triple-rg-msl" => {
+                let fixture = if mode == "--emit-triple-rg-msl" { MrtFixture::TripleRg } else if mode == "--emit-triple-msl" { MrtFixture::Triple } else if mode == "--emit-dual-red-msl" { MrtFixture::DualRed } else if mode == "--emit-dual-rg-msl" { MrtFixture::DualRg } else { MrtFixture::Dual };
                 print!("{}", graphics_lift::translate_mrt_fixture(fixture).map_err(|e| format!("MRT lift rejected: {e:?}"))?);
                 return Ok(());
             }
@@ -358,7 +360,7 @@ mod gpu {
             [mode, lib, archive, compiler] if mode == "--bake-bound-affine-archive" || mode == "--replay-bound-affine-archive" || mode == "--replay-bound-affine-mutated-archive" => Mode::Archive(Path::new(lib), Path::new(archive), mode == "--bake-bound-affine-archive", mode == "--replay-bound-affine-mutated-archive", owned_graphics_artifact::compiler_profile(compiler)?, true),
             [mode, lib, archive] if mode == "--expect-owned-metal-miss" => Mode::ExpectStrictMiss(Path::new(lib), Path::new(archive), false),
             [mode, lib, archive, compiler] if mode == "--bake-archive" || mode == "--replay-archive" || mode == "--replay-mutated-archive" => Mode::Archive(Path::new(lib), Path::new(archive), mode == "--bake-archive", mode == "--replay-mutated-archive", owned_graphics_artifact::compiler_profile(compiler)?, false),
-            _ => return Err("usage: shader-metal-graphics-lift [--param-mov-source | --emit-param-mov-msl | --load-param-mov-metallib LIB | --expect-param-mov-other-coefficient LIB | --expect-swapped-triple | --triple-rg-source | --emit-triple-rg-msl | --load-triple-rg-metallib LIB | --triple-source | --emit-triple-msl | --load-triple-metallib LIB | --dual-red-source | --emit-dual-red-msl | --load-dual-red-metallib LIB | --expect-dual-red-all-mask LIB | --dual-source | --emit-dual-msl | --load-dual-metallib LIB | --bound-two-affine-source | --expect-bound-two-affine-swapped | --emit-bound-two-affine-msl | --load-bound-two-affine-metallib LIB | --expect-bound-affine-wrong-mode | --expect-bound-affine-wrong-channel | --bound-affine-{x,z}-source | --emit-bound-affine-{x,z}-msl | --load-bound-affine-{x,z}-metallib LIB | --interp-x-source | --interp-z-source | --expect-interp-wrong-mode | --expect-interp-wrong-channel | --emit-interp-x-msl | --emit-interp-z-msl | --load-interp-x-metallib LIB | --load-interp-z-metallib LIB | --constant-rtz[-rg]-source | --emit-constant-rtz[-rg]-msl | --load-constant-rtz[-rg]-metallib LIB | --expect-bound-swapped-component | --bound[-rg]-source | --emit-bound[-rg]-msl | --load-bound[-rg]-metallib LIB | --pos-first-source | --emit-pos-first-msl | --load-pos-first-metallib LIB | --wait-pos-source | --emit-wait-pos-msl | --load-wait-pos-metallib LIB | --expect-late-pos-read | --unpack-{byte,uint}-source | --emit-unpack-{byte,uint}-msl | --load-unpack-{byte,uint}-metallib LIB | --multi-source | --emit-multi-msl | --load-multi-metallib LIB | --packed-ba-source | --emit-packed-ba-msl | --load-packed-ba-metallib LIB | --expect-packed-ba-all-mask LIB | --expect-packed-rg-all-mask LIB | --packed-rg-source | --emit-packed-rg-msl | --load-packed-rg-metallib LIB | --wait-depth-source | --emit-wait-depth-msl | --load-wait-depth-metallib LIB | --expect-late-depth-read | --early-depth-source | --emit-early-depth-msl | --load-early-depth-metallib LIB | --depth-source | --emit-depth-msl | --load-depth-metallib LIB | --packed-source | --emit-packed-msl | --load-packed-metallib LIB | --emit-msl | --emit-mutated-msl | --load-metallib LIB | --load-mutated-metallib LIB | {--bake-archive|--replay-archive|--replay-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-owned-metal-miss MUTATED_LIB ARCHIVE | --emit-bound-affine-mutated-msl | --load-bound-affine-mutated-metallib LIB | {--bake-bound-affine-archive|--replay-bound-affine-archive|--replay-bound-affine-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-bound-affine-metal-miss MUTATED_LIB ARCHIVE]".into()),
+            _ => return Err("usage: shader-metal-graphics-lift [--param-mov-source | --emit-param-mov-msl | --load-param-mov-metallib LIB | --expect-param-mov-other-coefficient LIB | --expect-swapped-triple | --triple-rg-source | --emit-triple-rg-msl | --load-triple-rg-metallib LIB | --triple-source | --emit-triple-msl | --load-triple-metallib LIB | --dual-rg-source | --emit-dual-rg-msl | --load-dual-rg-metallib LIB | --expect-dual-rg-all-mask LIB | --dual-red-source | --emit-dual-red-msl | --load-dual-red-metallib LIB | --expect-dual-red-all-mask LIB | --dual-source | --emit-dual-msl | --load-dual-metallib LIB | --bound-two-affine-source | --expect-bound-two-affine-swapped | --emit-bound-two-affine-msl | --load-bound-two-affine-metallib LIB | --expect-bound-affine-wrong-mode | --expect-bound-affine-wrong-channel | --bound-affine-{x,z}-source | --emit-bound-affine-{x,z}-msl | --load-bound-affine-{x,z}-metallib LIB | --interp-x-source | --interp-z-source | --expect-interp-wrong-mode | --expect-interp-wrong-channel | --emit-interp-x-msl | --emit-interp-z-msl | --load-interp-x-metallib LIB | --load-interp-z-metallib LIB | --constant-rtz[-rg]-source | --emit-constant-rtz[-rg]-msl | --load-constant-rtz[-rg]-metallib LIB | --expect-bound-swapped-component | --bound[-rg]-source | --emit-bound[-rg]-msl | --load-bound[-rg]-metallib LIB | --pos-first-source | --emit-pos-first-msl | --load-pos-first-metallib LIB | --wait-pos-source | --emit-wait-pos-msl | --load-wait-pos-metallib LIB | --expect-late-pos-read | --unpack-{byte,uint}-source | --emit-unpack-{byte,uint}-msl | --load-unpack-{byte,uint}-metallib LIB | --multi-source | --emit-multi-msl | --load-multi-metallib LIB | --packed-ba-source | --emit-packed-ba-msl | --load-packed-ba-metallib LIB | --expect-packed-ba-all-mask LIB | --expect-packed-rg-all-mask LIB | --packed-rg-source | --emit-packed-rg-msl | --load-packed-rg-metallib LIB | --wait-depth-source | --emit-wait-depth-msl | --load-wait-depth-metallib LIB | --expect-late-depth-read | --early-depth-source | --emit-early-depth-msl | --load-early-depth-metallib LIB | --depth-source | --emit-depth-msl | --load-depth-metallib LIB | --packed-source | --emit-packed-msl | --load-packed-metallib LIB | --emit-msl | --emit-mutated-msl | --load-metallib LIB | --load-mutated-metallib LIB | {--bake-archive|--replay-archive|--replay-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-owned-metal-miss MUTATED_LIB ARCHIVE | --emit-bound-affine-mutated-msl | --load-bound-affine-mutated-metallib LIB | {--bake-bound-affine-archive|--replay-bound-affine-archive|--replay-bound-affine-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-bound-affine-metal-miss MUTATED_LIB ARCHIVE]".into()),
         };
         if matches!(mode, Mode::Archive(..) | Mode::ExpectStrictMiss(..))
             && std::env::var_os("MTL_SHADER_VALIDATION").is_some()
@@ -475,13 +477,15 @@ mod gpu {
             _ => None,
         };
         let mrt = fixture.is_some();
-        let partial_mrt = matches!(fixture, Some(MrtFixture::TripleRg));
+        let dual_rg = matches!(fixture, Some(MrtFixture::DualRg));
+        let dual_rg_all = dual_rg && args[0] == "--expect-dual-rg-all-mask";
+        let partial_mrt = dual_rg || matches!(fixture, Some(MrtFixture::TripleRg));
         let dual_red = matches!(fixture, Some(MrtFixture::DualRed));
         let dual_red_all = dual_red && args[0] == "--expect-dual-red-all-mask";
         let swapped = matches!(mode, Mode::SwappedTripleSource);
         let attachment_count = match fixture {
             None => 1,
-            Some(MrtFixture::Dual | MrtFixture::DualRed) => 2,
+            Some(MrtFixture::Dual | MrtFixture::DualRed | MrtFixture::DualRg) => 2,
             _ => 3,
         };
         let lib = match mode {
@@ -690,7 +694,7 @@ mod gpu {
             attachment.set_pixel_format(format);
             attachment.set_write_mask(if dual_red && !dual_red_all && slot == 1 {
                 MTLColorWriteMask::Red
-            } else if partial_mrt && slot == 1 {
+            } else if partial_mrt && !dual_rg_all && slot == 1 {
                 MTLColorWriteMask::Red | MTLColorWriteMask::Green
             } else {
                 MTLColorWriteMask::All
@@ -1452,6 +1456,8 @@ mod gpu {
                             } else {
                                 [red, 0.5, 0.75, 1.]
                             }
+                        } else if dual_rg_all {
+                            [1.5, -0.5, 0., 0.]
                         } else if partial_mrt {
                             [1.5, -0.5, 0.75, 1.]
                         } else {
@@ -1470,6 +1476,15 @@ mod gpu {
                     let slot = index + 1;
                     let at = slot * BYTES + at;
                     let got = &pixels[at..at + pixel_bytes];
+                    if dual_rg_all {
+                        let normal: [f32; 4] = if inside {
+                            [1.5, -0.5, 0.75, 1.]
+                        } else {
+                            [0., 0.5, 0.75, 1.]
+                        };
+                        mapping_mismatches +=
+                            usize::from(got != normal.map(f32::to_le_bytes).as_flattened());
+                    }
                     if dual_red_all {
                         let normal = if inside {
                             [f32::from_bits(0xb800_3e00), 0.5, 0.75, 1.]
@@ -1524,6 +1539,17 @@ mod gpu {
                     dev.name()
                 );
             }
+            return Ok(());
+        }
+        if dual_rg {
+            let differences = if dual_rg_all { 20 } else { 0 };
+            if mapping_mismatches != differences {
+                return Err(format!("final MRT1 RG: expected {differences} normal-oracle differences, got {mapping_mismatches}").into());
+            }
+            println!(
+                "{} owned final MRT1 RG (all-mask={dual_rg_all}): 128/128 bit-exact attachment pixels; {differences} differ from the correct-mask oracle",
+                dev.name()
+            );
             return Ok(());
         }
         if dual_red_all {

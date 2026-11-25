@@ -220,6 +220,11 @@ compile dual
 compile dual-red
 "$p" --load-dual-red-metallib "$d/dual-red.metallib"
 "$p" --expect-dual-red-all-mask "$d/dual-red.metallib"
+"$p" --dual-rg-source
+"$p" --emit-dual-rg-msl > "$d/dual-rg.metal"
+compile dual-rg
+"$p" --load-dual-rg-metallib "$d/dual-rg.metallib"
+"$p" --expect-dual-rg-all-mask "$d/dual-rg.metallib"
 
 # Three distinct full-mask FP16_ABGR outputs, including nonfinal MRT1.
 "$p" --triple-source

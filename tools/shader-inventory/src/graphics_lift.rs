@@ -19,6 +19,7 @@ enum Stage {
     PackedRgPixel,
     PackedBaPixel,
     DualPackedPixel,
+    DualPackedRgPixel,
     TriplePackedPixel,
     TriplePackedRgPixel,
     DepthPixel,
@@ -90,6 +91,8 @@ const PACKED_RG_PS: &[u32] = &[0xf800_1c03, 0xfcfd_fe01, 0xbf81_0000];
 
 const DUAL_PS: &[u32] = &[0xf800_040f, 1, 0xf800_1c1f, 0x100, 0xbf81_0000];
 
+const DUAL_RG_PS: &[u32] = &[0xf800_040f, 1, 0xf800_1c13, 0xfcfd_fe00, 0xbf81_0000];
+
 const TRIPLE_PS: &[u32] = &[
     0xf800_040f,
     1,
@@ -138,7 +141,10 @@ impl Stage {
             Stage::PackedPixel => 2,
             Stage::PackedRgPixel => 2,
             Stage::PackedBaPixel => 1,
-            Stage::DualPackedPixel | Stage::TriplePackedPixel | Stage::TriplePackedRgPixel => 2,
+            Stage::DualPackedPixel
+            | Stage::DualPackedRgPixel
+            | Stage::TriplePackedPixel
+            | Stage::TriplePackedRgPixel => 2,
             Stage::DepthPixel | Stage::EarlyDepthPixel => 3,
         }
     }
@@ -168,6 +174,7 @@ impl Stage {
             | Stage::DepthPixel
             | Stage::EarlyDepthPixel
             | Stage::DualPackedPixel
+            | Stage::DualPackedRgPixel
             | Stage::TriplePackedPixel
             | Stage::TriplePackedRgPixel => &[],
         }
@@ -182,7 +189,10 @@ impl Stage {
             | Stage::ConstantRtzPixel
             | Stage::ConstantRtzRgPixel => 1,
             Stage::TriplePackedPixel | Stage::TriplePackedRgPixel => 3,
-            Stage::DepthPixel | Stage::EarlyDepthPixel | Stage::DualPackedPixel => 2,
+            Stage::DepthPixel
+            | Stage::EarlyDepthPixel
+            | Stage::DualPackedPixel
+            | Stage::DualPackedRgPixel => 2,
             _ => self.exports().len(),
         }
     }
@@ -381,6 +391,7 @@ fn lift(stage: Stage, words: &[u32]) -> Result<Vec<Op>, Reject> {
                         (exported, slot, done, vm),
                         (0, 0, false, false) | (1, 1, true, true)
                     ),
+                    Stage::DualPackedRgPixel => (exported, slot, done, vm) == (0, 0, false, false),
                     Stage::TriplePackedPixel => matches!(
                         (exported, slot, done, vm),
                         (0, 0, false, false) | (1, 1, false, false) | (2, 2, true, true)
@@ -406,11 +417,16 @@ fn lift(stage: Stage, words: &[u32]) -> Result<Vec<Op>, Reject> {
                 require(src)?;
                 exported += 1;
             }
-            Op::PackedRg { slot, src } => {
+            Op::PackedRg {
+                slot,
+                src,
+                final_export,
+            } => {
                 if !matches!(
-                    (stage, exported, slot),
-                    (Stage::PackedRgPixel | Stage::ConstantRtzRgPixel, 0, 0)
-                        | (Stage::TriplePackedRgPixel, 1, 1)
+                    (stage, exported, slot, final_export),
+                    (Stage::PackedRgPixel | Stage::ConstantRtzRgPixel, 0, 0, true)
+                        | (Stage::TriplePackedRgPixel, 1, 1, false)
+                        | (Stage::DualPackedRgPixel, 1, 1, true)
                 ) {
                     return Err(Reject::BadExports(pc));
                 }
@@ -656,6 +672,7 @@ fn emit_body(out: &mut String, ops: &[Op], packed_color_lvalue: &str, multi: boo
             Op::PackedRg {
                 slot,
                 src: Vgpr(rg),
+                ..
             } => {
                 let packed_color_lvalue = if slot == 1 {
                     "out.color1"
@@ -1067,6 +1084,7 @@ fn dual_red_exports(words: &[u32]) -> Result<([Vgpr; 2], Vgpr), Reject> {
 pub(crate) enum MrtFixture {
     Dual,
     DualRed,
+    DualRg,
     Triple,
     TripleRg,
 }
@@ -1077,6 +1095,7 @@ impl MrtFixture {
         match self {
             Self::Dual => "dual_ps",
             Self::DualRed => "dual_red_ps",
+            Self::DualRg => "dual_rg_ps",
             Self::Triple => "triple_ps",
             Self::TripleRg => "triple_rg_ps",
         }
@@ -1088,6 +1107,7 @@ pub(crate) fn translate_mrt_fixture(fixture: MrtFixture) -> Result<String, Rejec
     let vs = lift(Stage::Vertex, VS)?;
     let ps = match fixture {
         MrtFixture::Dual => lift(Stage::DualPackedPixel, DUAL_PS)?,
+        MrtFixture::DualRg => lift(Stage::DualPackedRgPixel, DUAL_RG_PS)?,
         MrtFixture::DualRed => {
             let ([Vgpr(rg), Vgpr(ba)], Vgpr(red)) = dual_red_exports(DUAL_RED_PS)?;
             let mut msl = vertex_module(&vs);
@@ -1099,7 +1119,7 @@ pub(crate) fn translate_mrt_fixture(fixture: MrtFixture) -> Result<String, Rejec
     };
     let mut msl = vertex_module(&vs);
     msl.push_str("struct PackedColors { float4 color0 [[color(0)]]; float4 color1 [[color(1)]];");
-    if !matches!(fixture, MrtFixture::Dual) {
+    if !matches!(fixture, MrtFixture::Dual | MrtFixture::DualRg) {
         msl.push_str(" float4 color2 [[color(2)]];");
     }
     let entry = fixture.entry();
@@ -1646,6 +1666,7 @@ mod tests {
         asm.push_str(
             "v_mov_b32_e32 v2, 0x3e800000\nexp mrt0 v2, off, off, off done vm\ns_endpgm\n",
         );
+        asm = asm.replacen("exp mrt0 v1, v1, v0, v0 compr\nexp mrt1 v0, v0, v1, v1 done compr vm\ns_endpgm\n", "exp mrt0 v1, v1, v0, v0 compr\nexp mrt1 v0, v0, v1, v1 done compr vm\ns_endpgm\nexp mrt0 v1, v1, v0, v0 compr\nexp mrt1 v0, v0, off, off done compr vm\ns_endpgm\n", 1);
         asm.push_str("v_mul_f32_e32 v14, v0, v1\nv_add_f32_e32 v15, v0, v1\n");
         asm.push_str("v_add_f32_e32 v16, -1.0, v0\n");
         asm.push_str("v_sub_f32_e32 v12, 0, v0\nv_sub_f32_e32 v13, 0, v1\n");
@@ -1706,6 +1727,16 @@ mod tests {
             .chain(EARLY_DEPTH_PS)
             .chain(WAIT_DEPTH_PS)
             .chain(DUAL_PS)
+            .chain(
+                [
+                    DUAL_RG_PS[0],
+                    DUAL_RG_PS[1],
+                    DUAL_RG_PS[2],
+                    DUAL_RG_PS[3] & 0xff,
+                    DUAL_RG_PS[4],
+                ]
+                .iter(),
+            )
             .chain(TRIPLE_PS)
             .chain(TRIPLE_RG_PS)
             .chain(RED_PS)
@@ -2307,6 +2338,55 @@ mod tests {
     }
 
     #[test]
+    fn final_mrt1_rg_checks_only_active_selector_and_exact_order() {
+        let expected = Ok((
+            2,
+            Op::PackedRg {
+                slot: 1,
+                src: Vgpr(0),
+                final_export: true,
+            },
+        ));
+        assert_eq!(decode(&DUAL_RG_PS[2..], 0), expected);
+        assert_eq!(decode(&[DUAL_RG_PS[2], 0], 0), expected);
+        assert_eq!(decode(&DUAL_RG_PS[2..3], 0), Err(DecodeError::Truncated(0)));
+        assert_eq!(lift(Stage::DualPackedRgPixel, DUAL_RG_PS).unwrap().len(), 3);
+        assert_eq!(
+            lift(Stage::DualPackedRgPixel, &DUAL_RG_PS[2..]),
+            Err(Reject::BadExports(0))
+        );
+        assert_eq!(
+            lift(Stage::DualPackedRgPixel, &DUAL_RG_PS[..4]),
+            Err(Reject::BadEnd(4))
+        );
+        assert_eq!(
+            lift(Stage::DualPackedPixel, DUAL_RG_PS),
+            Err(Reject::BadExports(2))
+        );
+        let mut words = DUAL_RG_PS.to_vec();
+        words[3] |= 2;
+        assert_eq!(
+            lift(Stage::DualPackedRgPixel, &words),
+            Err(Reject::Uninitialized(2, 2))
+        );
+        words[2] = 0xf800_0413;
+        words[3] = 0;
+        assert_eq!(
+            lift(Stage::DualPackedRgPixel, &words),
+            Err(Reject::BadExports(2))
+        );
+        for header in [
+            0xf800_0c13,
+            0xf800_1413,
+            0xf800_3c13,
+            0xf800_1c23,
+            0xf800_1c1c,
+        ] {
+            assert_eq!(decode(&[header, 0], 0), Err(DecodeError::Unsupported(0)));
+        }
+    }
+
+    #[test]
     fn dual_packed_requires_exact_slots_and_final_valid_mask() {
         assert_eq!(lift(Stage::DualPackedPixel, DUAL_PS).unwrap().len(), 3);
         assert_eq!(
@@ -2323,7 +2403,7 @@ mod tests {
             lift(Stage::DualPackedPixel, &ps),
             Err(Reject::BadExports(2))
         );
-        for hdr in [0xf800_1c13, 0xf800_1c3f, 0xf800_0c1f, 0xf800_141f] {
+        for hdr in [0xf800_1c23, 0xf800_1c3f, 0xf800_0c1f, 0xf800_141f] {
             assert_eq!(decode(&[hdr, 0], 0), Err(DecodeError::Unsupported(0)));
         }
         assert_eq!(
@@ -2384,7 +2464,7 @@ mod tests {
             lift(Stage::PackedRgPixel, &[0xf800_1c03, 7, 0xbf81_0000]),
             Err(Reject::Uninitialized(0, 7))
         );
-        for header in [0xf800_1c0d, 0xf800_1c13, 0xf800_3c03] {
+        for header in [0xf800_1c0d, 0xf800_1c23, 0xf800_3c03] {
             assert_eq!(decode(&[header, 1], 0), Err(DecodeError::Unsupported(0)));
         }
         assert_eq!(

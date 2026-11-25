@@ -119,6 +119,7 @@ pub(crate) enum Op {
     },
     PackedRg {
         slot: u8,
+        final_export: bool,
         src: Vgpr,
     },
     PixelDepth {
@@ -463,17 +464,18 @@ pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeErro
             },
         ));
     }
-    // EN3 enables only the packed RG word. Final MRT0 ignores disabled
-    // selectors; retain the canonical-zero gate for other targets.
-    if matches!(w, 0xf800_1c03 | 0xf800_0413) {
+    // EN3 reads only VSRC0. The exact final MRT0/MRT1 forms ignore disabled
+    // selectors; retain the zero gate for nonfinal MRT1.
+    if matches!(w, 0xf800_1c03 | 0xf800_1c13 | 0xf800_0413) {
         let fields = ext()?;
-        if w != 0xf800_1c03 && fields >> 8 != 0 {
+        if w == 0xf800_0413 && fields >> 8 != 0 {
             return Err(DecodeError::Unsupported(pc));
         }
         return Ok((
             2,
             Op::PackedRg {
                 slot: ((w >> 4) & 0x3f) as u8,
+                final_export: w & 0x800 != 0,
                 src: Vgpr(fields as u8),
             },
         ));

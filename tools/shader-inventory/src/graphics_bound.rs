@@ -471,16 +471,21 @@ pub(crate) fn translate(vs: &[u32], ps: &[u32], b: Bindings<'_>) -> Result<Metal
                 );
                 return Ok(());
             }
-            // The shared decoder also recognizes a nonfinal MRT1 RG form.
-            // Only the exact MRT0 form has DONE+VM in this encoding subset.
-            Op::PackedRg { slot: 0, src }
-                if !affine && color.native_mrt == 0 && color.mask == Mask::Rg =>
-            {
+            // This bound profile still accepts only the final MRT0 RG form.
+            Op::PackedRg {
+                slot: 0,
+                src,
+                final_export: true,
+            } if !affine && color.native_mrt == 0 && color.mask == Mask::Rg => {
                 require_packed(f.read(src, pc)?, pc)?;
                 emitted = true;
                 emit_body(
                     &mut msl,
-                    &[Op::PackedRg { slot: 0, src }],
+                    &[Op::PackedRg {
+                        slot: 0,
+                        src,
+                        final_export: true,
+                    }],
                     "out.value",
                     false,
                 );
