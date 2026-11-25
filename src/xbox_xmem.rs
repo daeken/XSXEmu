@@ -267,6 +267,138 @@ mod tests {
     }
 
     #[test]
+    fn owned_64k_bump_arena_decommit_preserves_va_and_discards_bytes() {
+        use std::{
+            ptr::without_provenance_mut,
+            sync::atomic::{AtomicU64, Ordering},
+        };
+
+        // Independent from runtime admission and its persistent mapping ledger.
+        let arena = Reservation::new(ALIGN, Mode::CpuCommit64KiB).unwrap();
+        let other = Reservation::new(ALIGN, Mode::CpuCommit64KiB).unwrap();
+        let end = arena.base.checked_add(arena.len).unwrap();
+        assert!(arena.base.is_multiple_of(ALIGN as u64));
+        assert_eq!(arena.len, 0x10000);
+        assert!(end <= other.base || other.base + other.len <= arena.base);
+        let cursor = AtomicU64::new(arena.base);
+        let bump = |size: u64, align: u64| {
+            if size == 0 || !align.is_power_of_two() {
+                return None;
+            }
+            loop {
+                let old = cursor.load(Ordering::Relaxed);
+                let start = old.checked_add(align - 1)? & !(align - 1);
+                let next = start.checked_add(size).filter(|&next| next <= end)?;
+                if cursor
+                    .compare_exchange_weak(old, next, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    return Some(start);
+                }
+            }
+        };
+        let check_region = |prot| {
+            for address in [arena.base, end - 1] {
+                assert_eq!(
+                    region(arena.task, address),
+                    Some((arena.base, arena.len, prot, prot))
+                );
+            }
+        };
+        let data = without_provenance_mut::<u8>(arena.base as usize);
+        let unrelated = without_provenance_mut::<u8>(other.base as usize);
+        check_region(PROT_RW);
+        // SAFETY: the first and last bytes are in owned CPU RW mappings; no
+        // references or concurrent accesses exist. One full zero fill mirrors
+        // the title's immediate post-allocation CPU use.
+        unsafe {
+            assert_eq!(data.read_volatile(), 0);
+            assert_eq!(data.wrapping_add(ALIGN - 1).read_volatile(), 0);
+            for i in 0..ALIGN {
+                data.wrapping_add(i).write_volatile(0);
+            }
+            unrelated.write_volatile(0x7c);
+            unrelated.wrapping_add(ALIGN - 1).write_volatile(0xd1);
+        }
+        let first = bump(8, 8).unwrap();
+        let next = bump(0xd8, 4).unwrap();
+        assert_eq!((first, next), (arena.base, arena.base + 8));
+        let old = cursor.load(Ordering::Relaxed);
+        assert_eq!(bump(1, 3), None);
+        assert_eq!(bump(u64::MAX, 16), None);
+        assert_eq!(cursor.load(Ordering::Relaxed), old);
+        assert_eq!(bump(end - old, 8), Some(old));
+        assert_eq!(bump(1, 1), None);
+        assert_eq!(cursor.load(Ordering::Relaxed), end);
+        // SAFETY: no aliases; both addressed bytes are within the active arena.
+        unsafe {
+            data.write_volatile(0x42);
+            data.wrapping_add(ALIGN - 1).write_volatile(0x81);
+        }
+
+        const VM_FLAGS_FIXED_OVERWRITE: i32 = 0x4000;
+        let replace_exact = |protection| {
+            let mut base = arena.base;
+            // SAFETY: replace exactly the still-owned, unmapped-to-guest arena.
+            // No concurrent observers, external aliases or references exist.
+            let status = unsafe {
+                mach_vm_map(
+                    arena.task,
+                    &mut base,
+                    arena.len,
+                    0,
+                    VM_FLAGS_FIXED_OVERWRITE,
+                    0,
+                    0,
+                    0,
+                    protection,
+                    protection,
+                    INHERIT_NONE,
+                )
+            };
+            assert_eq!(status, 0);
+            assert_eq!(base, arena.base);
+            check_region(protection);
+        };
+        replace_exact(PROT_NONE);
+        // Removing access is not releasing the address space. Try a fixed map
+        // without OVERWRITE on a host-page-aligned position in the old span.
+        let mut occupied = arena.base;
+        // SAFETY: no OVERWRITE, so the call cannot replace our owned span.
+        let conflict = unsafe {
+            mach_vm_map(
+                arena.task,
+                &mut occupied,
+                arena.len,
+                0,
+                0,
+                0,
+                0,
+                0,
+                PROT_RW,
+                PROT_RW,
+                INHERIT_NONE,
+            )
+        };
+        assert_eq!(conflict, 3); // KERN_NO_SPACE
+        replace_exact(PROT_RW);
+        // SAFETY: recommit restored CPU RW throughout the exact span;
+        // the independent mapping never lost access.
+        unsafe {
+            for i in 0..ALIGN {
+                assert_eq!(data.wrapping_add(i).read_volatile(), 0);
+            }
+            assert_eq!(unrelated.read_volatile(), 0x7c);
+            assert_eq!(unrelated.wrapping_add(ALIGN - 1).read_volatile(), 0xd1);
+        }
+        let (task, base) = (arena.task, arena.base);
+        drop(arena);
+        for address in [base, end - 1] {
+            assert!(region(task, address).is_none_or(|(next, _, _, _)| next >= end));
+        }
+    }
+
+    #[test]
     fn production_reservations_are_no_access_and_owned() {
         for size in [S16, S24] {
             let len = size as u64;
