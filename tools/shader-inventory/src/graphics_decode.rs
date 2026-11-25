@@ -476,13 +476,9 @@ pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeErro
             },
         ));
     }
-    // EN3 reads only VSRC0. The exact final MRT0/MRT1 forms ignore disabled
-    // selectors; retain the zero gate for nonfinal MRT1.
+    // These exact packed EN3 forms consume VSRC0 only, including nonfinal MRT1.
     if matches!(w, 0xf800_1c03 | 0xf800_1c13 | 0xf800_0413) {
         let fields = ext()?;
-        if w == 0xf800_0413 && fields >> 8 != 0 {
-            return Err(DecodeError::Unsupported(pc));
-        }
         return Ok((
             2,
             Op::PackedRg {
@@ -507,7 +503,8 @@ pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeErro
         0xf800_040f | 0xf800_1c0f | 0xf800_041f | 0xf800_1c1f | 0xf800_1c2f
     ) {
         let [rg, ba, unused2, unused3] = ext()?.to_le_bytes();
-        if !matches!(w, 0xf800_040f | 0xf800_1c0f) && (unused2 != 0 || unused3 != 0) {
+        // Only these verified full-color forms ignore inactive VSRC2/VSRC3.
+        if !matches!(w, 0xf800_040f | 0xf800_1c0f | 0xf800_1c2f) && (unused2 != 0 || unused3 != 0) {
             return Err(DecodeError::Unsupported(pc));
         }
         return Ok((

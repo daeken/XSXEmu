@@ -127,16 +127,6 @@ const TRIPLE_ALIAS_PS: [u32; 9] = [
     0xbf81_0000,
 ];
 
-fn owned_triple_alias_ops() -> Result<Vec<Op>, Reject> {
-    // Project only the fixed owned fixture, not arbitrary program input.
-    // Keep strict native decode unchanged until the probe is reviewed.
-    let mut canonical = TRIPLE_ALIAS_PS;
-    for (operand, active) in [(3, 0xffff), (5, 0xff), (7, 0xffff)] {
-        canonical[operand] &= active;
-    }
-    lift(Stage::TriplePackedRgPixel, &canonical)
-}
-
 const DEPTH_PS: &[u32] = &[
     0xf800_040f,
     1, // exp mrt0 v1, v1, v0, v0 compr
@@ -1174,7 +1164,7 @@ pub(crate) fn translate_mrt_fixture(fixture: MrtFixture) -> Result<String, Rejec
         }
         MrtFixture::Triple => lift(Stage::TriplePackedPixel, TRIPLE_PS)?,
         MrtFixture::TripleRg => lift(Stage::TriplePackedRgPixel, TRIPLE_RG_PS)?,
-        MrtFixture::TripleAlias => owned_triple_alias_ops()?,
+        MrtFixture::TripleAlias => lift(Stage::TriplePackedRgPixel, &TRIPLE_ALIAS_PS)?,
     };
     let mut msl = vertex_module(&vs);
     msl.push_str("struct PackedColors { float4 color0 [[color(0)]]; float4 color1 [[color(1)]];");
@@ -2320,17 +2310,9 @@ mod tests {
     }
 
     #[test]
-    fn all_alias_probe_preserves_exact_export_operands_without_widening_decode() {
+    fn raw_all_alias_preserves_exact_export_operands() {
         assert_eq!(
-            decode(&TRIPLE_ALIAS_PS, 4),
-            Err(DecodeError::Unsupported(4))
-        );
-        assert_eq!(
-            decode(&TRIPLE_ALIAS_PS, 6),
-            Err(DecodeError::Unsupported(6))
-        );
-        assert_eq!(
-            owned_triple_alias_ops().unwrap(),
+            lift(Stage::TriplePackedRgPixel, &TRIPLE_ALIAS_PS).unwrap(),
             [
                 Op::MoveBits {
                     dst: Vgpr(5),
@@ -2359,6 +2341,43 @@ mod tests {
     }
 
     #[test]
+    fn raw_triple_keeps_active_sources_and_exact_headers_strict() {
+        for (pc, shift) in [(4, 0), (6, 0), (6, 8)] {
+            let mut words = TRIPLE_ALIAS_PS;
+            words[pc + 1] ^= 1 << shift; // active v5 becomes undefined v4
+            assert_eq!(
+                lift(Stage::TriplePackedRgPixel, &words),
+                Err(Reject::Uninitialized(pc, 4))
+            );
+        }
+        for (pc, header) in [
+            (4, 0xf800_0403), // wrong target
+            (4, 0xf800_0417), // wrong EN
+            (4, 0xf800_0c13), // premature DONE
+            (4, 0xf800_1413), // premature VM
+            (4, 0xf800_2413), // reserved bit
+            (6, 0xf800_042f), // nonfinal MRT2
+            (6, 0xf800_0c2f), // missing VM
+            (6, 0xf800_182f), // missing COMPR
+            (6, 0xf800_1c23), // wrong EN
+            (6, 0xf800_3c2f), // reserved bit
+            (6, 0xf800_1c3f), // wrong target
+            (4, 0xf800_041f), // full MRT1 still requires zero inactive bytes
+            (6, 0xf800_1c1f), // full final MRT1 still requires zero inactive bytes
+        ] {
+            let mut words = TRIPLE_ALIAS_PS;
+            words[pc] = header;
+            assert_eq!(decode(&words, pc), Err(DecodeError::Unsupported(pc)));
+        }
+        let mut words = TRIPLE_ALIAS_PS;
+        words[4..8].rotate_left(2);
+        assert_eq!(
+            lift(Stage::TriplePackedRgPixel, &words),
+            Err(Reject::BadExports(4))
+        );
+    }
+
+    #[test]
     fn triple_packed_rg_requires_rg_only_mrt1_before_final_full_mrt2() {
         assert_eq!(
             lift(Stage::TriplePackedRgPixel, TRIPLE_RG_PS)
@@ -2380,10 +2399,11 @@ mod tests {
             lift(Stage::TriplePackedRgPixel, &ps),
             Err(Reject::Uninitialized(2, 2))
         );
-        ps[3] = 0x100;
+        ps[3] = 0xffff_ff00;
+        ps[5] |= 0xffff_0000;
         assert_eq!(
             lift(Stage::TriplePackedRgPixel, &ps),
-            Err(Reject::Unsupported(2))
+            lift(Stage::TriplePackedRgPixel, TRIPLE_RG_PS)
         );
         ps[2..6].rotate_left(2);
         assert_eq!(
@@ -2415,7 +2435,7 @@ mod tests {
         );
         assert_eq!(
             decode(&[TRIPLE_PS[4], 0x0100_0101], 0),
-            Err(DecodeError::Unsupported(0))
+            decode(TRIPLE_PS, 4)
         );
     }
 
@@ -2604,7 +2624,14 @@ mod tests {
         }
         assert_eq!(
             decode(&[0xf800_0413, 0x0101], 0),
-            Err(DecodeError::Unsupported(0))
+            Ok((
+                2,
+                Op::PackedRg {
+                    slot: 1,
+                    src: Vgpr(1),
+                    final_export: false
+                }
+            ))
         );
     }
 
