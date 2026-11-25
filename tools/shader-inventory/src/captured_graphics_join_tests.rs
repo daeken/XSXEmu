@@ -8,6 +8,7 @@ struct Scope {
     producer: [u8; 32], // identifies the verified schema/consumer implementation
     session: u64,
     creation: u64, // occurrence, not a reusable address or handle
+    object_generation: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,18 +45,24 @@ struct Attachment {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct BoundViews {
-    draw: u64,               // within the same session and creation above
     color: [Option<u32>; 8], // owned view generations, not native pointer identity
     depth: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Draw<'a> {
+    parent: Scope,
+    occurrence: u64,
+    views: Option<BoundViews>,
+    stages: [Option<Stage<'a>>; 7],
 }
 
 #[derive(Clone, Copy)]
 struct Observation<'a> {
     scope: Scope,
     row: Row,
-    stages: [Option<Stage<'a>>; 7],
     attachment: Option<Attachment>,
-    views: Option<BoundViews>,
+    draw: Option<Draw<'a>>,
 }
 
 // This is the result of an external trusted verification path, mocked only
@@ -75,7 +82,7 @@ enum Failure {
 #[derive(Debug, PartialEq, Eq)]
 enum Joined {
     CreationOnly,
-    CreationAndBoundViews,
+    CreationAndDraw,
 }
 
 fn join(
@@ -98,10 +105,38 @@ fn join(
         .iter()
         .enumerate()
         .fold(0, |m, (i, s)| m | (u8::from(s.is_some()) << i));
-    if !matches!(slot_mask, 3 | 5) || candidate.stages != trusted.stages {
+    if !matches!(slot_mask, 3 | 5) {
         return Err(Failure::Stage);
     }
-    for (stage, reference) in candidate.stages.into_iter().zip(row.refs.slots) {
+    let desc = candidate.attachment.ok_or(Failure::Attachment)?;
+    if trusted.attachment != Some(desc)
+        || desc.samples.0 == 0
+        || desc
+            .color
+            .into_iter()
+            .flatten()
+            .any(|c| c.format == 0 || c.mask & !15 != 0)
+        || desc.depth.is_some_and(|(format, _, _)| format == 0)
+    {
+        return Err(Failure::Attachment);
+    }
+    let draw = match (candidate.draw, trusted.draw) {
+        (None, None) => return Ok(Joined::CreationOnly),
+        (Some(draw), Some(expected))
+            if draw.parent == candidate.scope
+                && draw.parent == expected.parent
+                && draw.occurrence == expected.occurrence
+                && draw.views.is_some()
+                && draw.views == expected.views =>
+        {
+            if draw.stages != expected.stages {
+                return Err(Failure::Stage);
+            }
+            draw
+        }
+        _ => return Err(Failure::Draw),
+    };
+    for (stage, reference) in draw.stages.into_iter().zip(row.refs.slots) {
         match (stage, reference) {
             (None, None) => (),
             (Some(s), Some(r))
@@ -119,37 +154,12 @@ fn join(
             _ => return Err(Failure::Stage),
         }
     }
-    let desc = candidate.attachment.ok_or(Failure::Attachment)?;
-    if trusted.attachment != Some(desc)
-        || desc.samples.0 == 0
-        || desc
-            .color
-            .into_iter()
-            .flatten()
-            .any(|c| c.format == 0 || c.mask & !15 != 0)
-        || desc.depth.is_some_and(|(format, _, _)| format == 0)
-    {
-        return Err(Failure::Attachment);
-    }
-    if candidate.views != trusted.views {
-        // Never downgrade a contradictory draw claim to a successful creation join.
-        return Err(Failure::Draw);
-    }
-    Ok(if candidate.views.is_some() {
-        Joined::CreationAndBoundViews
-    } else {
-        Joined::CreationOnly
-    })
+    Ok(Joined::CreationAndDraw)
 }
 
 fn owned(bytes: &[u8]) -> Observation<'_> {
     let lib = PipelineLibrary::parse(bytes).unwrap();
     let refs = lib.graphics().next().unwrap();
-    let stage = Stage {
-        start: 0,
-        body: lib.program(refs.slots[1].unwrap().program).unwrap(),
-        wave: Wave::W32,
-    };
     Observation {
         scope: Scope {
             executable: [1; 32],
@@ -157,9 +167,9 @@ fn owned(bytes: &[u8]) -> Observation<'_> {
             producer: [2; 32],
             session: 3,
             creation: 4,
+            object_generation: 1,
         },
         row: Row { ordinal: 0, refs },
-        stages: [Some(stage), Some(stage), None, None, None, None, None],
         attachment: Some(Attachment {
             color: [
                 Some(Color {
@@ -180,8 +190,29 @@ fn owned(bytes: &[u8]) -> Observation<'_> {
             samples: (4, 0),
             depth: Some((3, true, 1)),
         }),
-        views: None,
+        draw: None,
     }
+}
+
+fn owned_draw<'a>(bytes: &'a [u8], creation: Observation<'a>) -> Observation<'a> {
+    let lib = PipelineLibrary::parse(bytes).unwrap();
+    let mut captured = creation;
+    captured.draw = Some(Draw {
+        parent: creation.scope,
+        occurrence: 5,
+        views: Some(BoundViews {
+            color: [Some(7), None, Some(8), None, None, None, None, None],
+            depth: Some(9),
+        }),
+        stages: creation.row.refs.slots.map(|reference| {
+            reference.map(|r| Stage {
+                start: 0,
+                body: lib.program(r.program).unwrap(),
+                wave: Wave::W32,
+            })
+        }),
+    });
+    captured
 }
 
 fn owned_bytes() -> Vec<u8> {
@@ -220,6 +251,7 @@ fn creation_is_an_exact_row_occurrence_and_never_a_draw() {
         |s: &mut Scope| s.producer[0] ^= 1,
         |s: &mut Scope| s.session += 1,
         |s: &mut Scope| s.creation += 1,
+        |s: &mut Scope| s.object_generation += 1,
     ] {
         x = good;
         change(&mut x.scope);
@@ -230,7 +262,7 @@ fn creation_is_an_exact_row_occurrence_and_never_a_draw() {
 #[test]
 fn stage_entry_wave_and_bytes_cannot_be_substituted() {
     let b = owned_bytes();
-    let good = owned(&b);
+    let good = owned_draw(&b, owned(&b));
     let verified = Verified(good);
     for change in [
         |s: &mut Stage<'_>| s.start += 4,
@@ -238,14 +270,14 @@ fn stage_entry_wave_and_bytes_cannot_be_substituted() {
         |s: &mut Stage<'_>| s.body = &[1, 0, 0, 0],
     ] {
         let mut x = good;
-        change(x.stages[0].as_mut().unwrap());
+        change(x.draw.as_mut().unwrap().stages[0].as_mut().unwrap());
         assert_eq!(join(&b, Some(&verified), &x), Err(Failure::Stage));
     }
     let mut x = good;
-    x.stages[1] = None;
+    x.draw.as_mut().unwrap().stages[1] = None;
     assert_eq!(join(&b, Some(&verified), &x), Err(Failure::Stage));
     x = good;
-    x.stages[0].as_mut().unwrap().start = usize::MAX & !3;
+    x.draw.as_mut().unwrap().stages[0].as_mut().unwrap().start = usize::MAX & !3;
     assert_eq!(join(&b, Some(&Verified(x)), &x), Err(Failure::Stage));
 }
 
@@ -278,25 +310,33 @@ fn draw_evidence_is_not_borrowed_from_another_observation() {
     let b = owned_bytes();
     let p = plan(&b);
     let creation = owned(&b);
-    let mut draw = creation;
-    draw.views = Some(BoundViews {
-        draw: 5,
-        color: [Some(7), None, Some(8), None, None, None, None, None],
-        depth: Some(9),
-    });
+    let draw = owned_draw(&b, creation);
     assert_eq!(
         join(&b, Some(&Verified(creation)), &draw),
         Err(Failure::Draw)
     );
     assert_eq!(
         join(&b, Some(&Verified(draw)), &draw),
-        Ok(Joined::CreationAndBoundViews)
+        Ok(Joined::CreationAndDraw)
     );
     let mut x = draw;
-    x.views.as_mut().unwrap().draw += 1;
+    x.draw.as_mut().unwrap().occurrence += 1;
     assert_eq!(join(&b, Some(&Verified(draw)), &x), Err(Failure::Draw));
     x = draw;
-    x.views.as_mut().unwrap().color.swap(0, 2);
+    x.draw
+        .as_mut()
+        .unwrap()
+        .views
+        .as_mut()
+        .unwrap()
+        .color
+        .swap(0, 2);
     assert_eq!(join(&b, Some(&Verified(draw)), &x), Err(Failure::Draw));
+    x = draw;
+    x.draw.as_mut().unwrap().parent.object_generation += 1;
+    assert_eq!(join(&b, Some(&Verified(draw)), &x), Err(Failure::Draw));
+    x = draw;
+    x.draw.as_mut().unwrap().views = None;
+    assert_eq!(join(&b, Some(&Verified(x)), &x), Err(Failure::Draw));
     assert!(p.summarize().contains("ready=0"));
 }
