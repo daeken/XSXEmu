@@ -1727,6 +1727,7 @@ pub(super) fn direct_mesh_gate(
 ) -> (MeshGate, BTreeMap<String, usize>) {
     let mut forms = BTreeMap::new();
     let strict = result_class(checked_exports(dis, bytes));
+    let mut wait_nodes = BTreeMap::new();
     let mut projected_allocs = 0;
     let projected = matches!(strict, ResultClass::SendMsg(SendMsgClass::GsAllocReq)).then(|| {
         project_exports_observe(dis, bytes, true, |tail, len, text| {
@@ -1738,6 +1739,16 @@ pub(super) fn direct_mesh_gate(
             let name = text.split_ascii_whitespace().next().unwrap_or_default();
             let first = word(tail, 0).unwrap_or_default() as u32;
             let pair = [first, word(tail, 4).unwrap_or_default() as u32];
+            // The observer runs only at accepted starts; checked messages use projected Next.
+            wait_nodes.insert(
+                (bytes.len() - tail.len()) / 4,
+                crate::mesh_waits::Node::new(
+                    name,
+                    pair,
+                    len,
+                    control(name, first, len).unwrap_or(Flow::Next),
+                ),
+            );
             if !exact_opcode(
                 pair.get(..len / 4)
                     .and_then(|w| crate::graphics_decode::decode(w, 0).ok()),
@@ -1773,6 +1784,10 @@ pub(super) fn direct_mesh_gate(
     });
     if projected_prim_shape.is_none() {
         forms.clear();
+    } else {
+        for (shape, n) in crate::mesh_waits::audit(&wait_nodes) {
+            forms.insert(format!("wait-use/{shape}"), n);
+        }
     }
     (
         MeshGate {

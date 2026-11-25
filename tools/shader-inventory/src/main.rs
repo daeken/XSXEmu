@@ -14,6 +14,7 @@ mod graphics_semantics;
 mod library_index;
 mod llvm;
 mod mesh_cohorts;
+mod mesh_waits;
 mod native_pairs;
 mod reachable;
 mod signatures;

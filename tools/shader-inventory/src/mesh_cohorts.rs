@@ -130,6 +130,12 @@ pub(super) fn run(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), Box<dy
                     c.pairs.len()
                 );
             }
+            println!("    local wait-use witnesses in closed message projections (adjacent only):");
+            ranked_forms.retain(|form, (spans, sites, rows, attachment)| {
+                let Some(shape) = form.strip_prefix("wait-use/") else { return true };
+                println!("      {shape}: {rows} rows ({attachment} PS attachment-only), {} MS, {sites} distinct-span sites", spans.len());
+                false
+            });
             let mut forms: Vec<_> = ranked_forms.into_iter().collect();
             forms.sort_by(|(a, x), (b, y)| {
                 y.2.cmp(&x.2)
