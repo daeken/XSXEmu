@@ -222,6 +222,14 @@ A read-only rerun at `cf049e0` reproduces the direct-gap reports on both referen
 
 No production recognition, title execution, or admission changed.
 
+### Exact ordinary e32 literal multiply
+
+The shared decoder now recognizes only VOP2 ordinary multiply with SRC0 selector 255, extension `0x37800080`, and ordinary VGPR VSRC1, in addition to the existing two-VGPR form. The dataflow audit reads only VSRC1 and retains `F32ArithmeticMode`; lowering of the new form is restricted to the owned finite-RNE arithmetic probe. Negatives cover alternate literal bits, adjacent selector/opcode, truncation and rejection by the generic vertex profile.
+
+Apple M4 matched **7/7 raw result words** independently in generated Metal source, strict offline bake, and fresh strict archive replay. Literal goldens cross-checked by exact binary64 multiplication followed by binary32 RNE cover signed zero, signed unit values, and values of both signs near the `65535` discriminator. The ordinary product preserves negative zero and the `65535` case distinguishes the exact literal from `2^-16`.
+
+Each +36/+40 profile (both CPUs/waves) gains **203 recognized sites in 125 VS windows** and **155 in 79 PS windows**; none at +0/+24. Each of the three nearest five-site VS windows loses one blocker, leaving SETPRIO imm3, two MODE-dependent OMOD1 conversions and the unsigned SGPR CVT. Strict-complete counts stay **0 VS / 233 PS** and distinct attachment-only coverage stays **223**. No SETPRIO projection enters strict coverage; native entry/MODE state, binding and admission are unchanged.
+
 ## Direct PS attachment evidence by exact shipped row
 
 Run `--direct-ps-attachments "$INFLATED_LIBRARY" "$TRUSTED_LLVM_21_DYLIB" gfx1013` (and repeat with `gfx1030`). The audit joins contiguous reference-checked encoding-complete PS paths with reached active exports back to exact slot occurrences, without wrappers or digests. The attachment-only subset has no semantic gaps and exactly `AttachmentFormatAndMask` outstanding. It tests stored-end +36 and +40 independently in wave64 and wave32. All passing rows passed all four hypotheses per CPU, without differences in the projected export shape or attachment-only class across passing windows. LLVM 21.1.6 aggregates agree across both CPUs. The summary counts each row once; none of the hypotheses authenticates entry.

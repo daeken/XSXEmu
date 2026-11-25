@@ -239,7 +239,7 @@ fn exact_opcode(
                 Op::NopOneCycle => name == "s_nop",
                 Op::PrefetchThreeLines => name == "s_inst_prefetch",
                 Op::AddF32Literal { .. } | Op::AddF32 { .. } => name == "v_add_f32_e32",
-                Op::MulF32 { .. } => name == "v_mul_f32_e32",
+                Op::MulF32 { .. } | Op::MulF32ExactLiteral { .. } => name == "v_mul_f32_e32",
                 Op::MulLegacyF32 { .. } => name == "v_mul_legacy_f32_e32",
                 Op::FmaF32 {
                     accumulate: true, ..

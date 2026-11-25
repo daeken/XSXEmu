@@ -183,6 +183,11 @@ pub(crate) fn audit(words: &[u32], vertex: bool) -> Outcome {
                 f.write(dst, None);
                 f.outcome.needs.insert(F32ArithmeticMode);
             }
+            Op::MulF32ExactLiteral { dst, rhs } => {
+                f.read(rhs);
+                f.write(dst, None);
+                f.outcome.needs.insert(F32ArithmeticMode);
+            }
             Op::MulLegacyF32 { dst, lhs, rhs } => {
                 if let FloatSource::Vgpr(r) = lhs {
                     f.read(r);

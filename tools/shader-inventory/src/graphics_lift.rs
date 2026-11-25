@@ -356,6 +356,8 @@ fn lift(stage: Stage, words: &[u32]) -> Result<Vec<Op>, Reject> {
             // All admitted profiles have no native memory, clocks, or timing-
             // observable operations. Not valid for arbitrary guest instruction streams.
             Op::NopOneCycle | Op::PrefetchThreeLines => {}
+            // The exact literal form is only lowered by the finite RNE arithmetic probe.
+            Op::MulF32ExactLiteral { .. } => return Err(Reject::Unsupported(pc)),
             Op::MulF32 { dst, lhs, rhs } | Op::AddF32 { dst, lhs, rhs } => {
                 require(lhs)?;
                 require(rhs)?;
@@ -584,6 +586,12 @@ fn emit_body(out: &mut String, ops: &[Op], packed_color_lvalue: &str, multi: boo
             } => {
                 writeln!(out, "  r[{dst}] = as_type<uint>(as_type<float>(r[{lhs}]) * as_type<float>(r[{rhs}]));").unwrap();
             }
+            Op::MulF32ExactLiteral {
+                dst: Vgpr(dst),
+                rhs: Vgpr(rhs),
+            } => {
+                writeln!(out, "  r[{dst}] = as_type<uint>(as_type<float>(0x37800080u) * as_type<float>(r[{rhs}]));").unwrap();
+            }
             Op::MulLegacyF32 {
                 dst: Vgpr(dst),
                 lhs,
@@ -773,6 +781,7 @@ const EDGE_ADD: &[u32] = &[0x061e_0300]; // v15 = v0 + v1
 const EDGE_ADD_INLINE: &[u32] = &[0x0620_00f3]; // v16 = -1.0 + v0
 
 const EDGE_MUL: &[u32] = &[0x101c_0300]; // v14 = v0 * v1
+const EDGE_MUL_EXACT_LITERAL: [u32; 2] = [0x1034_30ff, 0x3780_0080]; // v26 = literal * v24
 
 const EDGE_SUB: &[u32] = &[0x0818_0080, 0x081a_0280]; // v12=+0-v0, v13=+0-v1
 const EDGE_SUB_ONE: &[u32] = &[0x0822_00f2]; // v17 = +1 - v0
@@ -850,7 +859,7 @@ pub fn translate_legacy_edge_fixture() -> Result<String, DecodeError> {
     }
     let mut msl = MSL_HEADER.to_owned();
     msl.push_str(RTZ_HELPER);
-    msl.push_str("kernel void legacy_edges(const device uint4 *in [[buffer(0)]], device uint4 *out [[buffer(1)]], device uint4 *extra [[buffer(2)]], uint id [[thread_position_in_grid]]) {\n  uint r[256]; r[0] = in[id].x; r[1] = in[id].y; r[4] = in[id].z;\n");
+    msl.push_str("kernel void legacy_edges(const device uint4 *in [[buffer(0)]], device uint4 *out [[buffer(1)]], device uint4 *extra [[buffer(2)]], device uint *literal_product [[buffer(3)]], uint id [[thread_position_in_grid]]) {\n  uint r[256]; r[0] = in[id].x; r[1] = in[id].y; r[4] = in[id].z;\n");
     body(&mut msl, &[a, b, c, d]);
     body(&mut msl, &[decode(EDGE_RTZ_NEG, 0)?.1]);
     let cmp = decode(EDGE_CMP_LT, 0)?;
@@ -873,6 +882,8 @@ pub fn translate_legacy_edge_fixture() -> Result<String, DecodeError> {
     msl.push_str("  {\n");
     body(&mut msl, &[cmp.1, select.1]);
     msl.push_str("  }\n  r[24] = in[id].w; r[25] = 0xdeadbeefu;\n");
+    body(&mut msl, &[decode(&EDGE_MUL_EXACT_LITERAL, 0)?.1]);
+    msl.push_str("  literal_product[id] = r[26];\n");
     for pc in 0..EDGE_RTZ_ZERO.len() {
         body(&mut msl, &[decode(&EDGE_RTZ_ZERO, pc)?.1]);
     }
@@ -2984,6 +2995,34 @@ mod tests {
         let mut ps = vec![0xbfa0_0003, 0xbf80_0000, 0x7e00_0280];
         ps.extend_from_slice(PACKED_PS);
         assert_eq!(lift(Stage::PackedPixel, &ps).unwrap().len(), 5);
+    }
+
+    #[test]
+    fn exact_literal_multiply_rejects_neighbors_and_generic_lift() {
+        let words = EDGE_MUL_EXACT_LITERAL;
+        assert_eq!(
+            decode(&words, 0),
+            Ok((
+                2,
+                Op::MulF32ExactLiteral {
+                    dst: Vgpr(26),
+                    rhs: Vgpr(24)
+                }
+            ))
+        );
+        assert_eq!(decode(&words[..1], 0), Err(DecodeError::Truncated(0)));
+        for (head, literal) in [
+            (words[0], 0x3780_0000),
+            (words[0], words[1] ^ 1),
+            (words[0] ^ 1, words[1]),
+            (words[0] ^ (1 << 25), words[1]),
+        ] {
+            assert!(!matches!(
+                decode(&[head, literal], 0),
+                Ok((_, Op::MulF32ExactLiteral { .. }))
+            ));
+        }
+        assert_eq!(lift(Stage::Vertex, &words), Err(Reject::Unsupported(0)));
     }
 
     #[test]

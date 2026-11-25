@@ -86,6 +86,10 @@ pub(crate) enum Op {
         lhs: Vgpr,
         rhs: Vgpr,
     },
+    MulF32ExactLiteral {
+        dst: Vgpr,
+        rhs: Vgpr,
+    },
     MulLegacyF32 {
         dst: Vgpr,
         lhs: FloatSource,
@@ -339,6 +343,18 @@ pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeErro
             Op::MulF32 {
                 dst: Vgpr((w >> 17) as u8),
                 lhs: Vgpr(w as u8),
+                rhs: Vgpr((w >> 9) as u8),
+            },
+        ));
+    }
+    if w & 0xfe00_01ff == 0x1000_00ff {
+        if ext()? != 0x3780_0080 {
+            return Err(DecodeError::Unsupported(pc));
+        }
+        return Ok((
+            2,
+            Op::MulF32ExactLiteral {
+                dst: Vgpr((w >> 17) as u8),
                 rhs: Vgpr((w >> 9) as u8),
             },
         ));
