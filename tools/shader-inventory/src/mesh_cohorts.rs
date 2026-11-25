@@ -48,16 +48,15 @@ pub(super) fn run(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), Box<dy
                 let [Some(ps), None, Some(ms), None, None, None, None] = row.slots else {
                     continue;
                 };
-                if !*ps_cache.entry(ps.program).or_insert_with(|| {
+                let ps_result = *ps_cache.entry(ps.program).or_insert_with(|| {
                     lib.program(ps.program)
                         .and_then(|p| p.get(start..))
-                        .is_some_and(|p| {
-                            matches!(
-                                direct_result(&mut dis, p, 0),
-                                DirectResult::EncodingComplete | DirectResult::OutputBindingOnly
-                            )
-                        })
-                }) {
+                        .map_or(DirectResult::NoWindow, |p| direct_result(&mut dis, p, 0))
+                });
+                if !matches!(
+                    ps_result,
+                    DirectResult::EncodingComplete | DirectResult::OutputBindingOnly
+                ) {
                     continue;
                 }
                 ms_cache.entry(ms.program).or_insert_with(|| {
@@ -65,18 +64,44 @@ pub(super) fn run(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), Box<dy
                         .and_then(|p| p.get(start..))
                         .map(|p| direct_mesh_gate(&mut dis, p))
                 });
-                joined.push((ps.program, ms.program));
+                joined.push((
+                    ps.program,
+                    ms.program,
+                    ps_result == DirectResult::OutputBindingOnly,
+                ));
             }
             let mut totals = Count::default();
-            for (ps, ms) in joined {
+            let mut attachment = Count::default();
+            let mut ranked_forms =
+                BTreeMap::<&str, (HashSet<ProgramId>, usize, usize, usize)>::new();
+            for (ps, ms, attachment_only) in joined {
+                if let Some((_, forms)) = &ms_cache[&ms] {
+                    for (form, n) in forms {
+                        let (spans, sites, rows, attachment_rows) =
+                            ranked_forms.entry(form).or_default();
+                        if spans.insert(ms) {
+                            *sites += n;
+                        }
+                        *rows += 1;
+                        *attachment_rows += usize::from(attachment_only);
+                    }
+                }
                 for c in [
                     &mut totals,
-                    counts.entry(ms_cache[&ms].as_ref()).or_default(),
+                    counts
+                        .entry(ms_cache[&ms].as_ref().map(|(gate, _)| gate))
+                        .or_default(),
                 ] {
                     c.rows += 1;
                     c.ps.insert(ps);
                     c.ms.insert(ms);
                     c.pairs.insert((ps, ms));
+                }
+                if attachment_only {
+                    attachment.rows += 1;
+                    attachment.ps.insert(ps);
+                    attachment.ms.insert(ms);
+                    attachment.pairs.insert((ps, ms));
                 }
             }
             println!(
@@ -87,6 +112,13 @@ pub(super) fn run(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), Box<dy
                 totals.ms.len(),
                 totals.pairs.len()
             );
+            println!(
+                "    PS attachment-only subset: {} rows / {} PS / {} MS / {} pairs",
+                attachment.rows,
+                attachment.ps.len(),
+                attachment.ms.len(),
+                attachment.pairs.len()
+            );
             let mut ranked: Vec<_> = counts.into_iter().collect();
             ranked.sort_by(|(a, x), (b, y)| y.rows.cmp(&x.rows).then_with(|| a.cmp(b)));
             for (gate, c) in ranked {
@@ -96,6 +128,26 @@ pub(super) fn run(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), Box<dy
                     c.ps.len(),
                     c.ms.len(),
                     c.pairs.len()
+                );
+            }
+            let mut forms: Vec<_> = ranked_forms.into_iter().collect();
+            forms.sort_by(|(a, x), (b, y)| {
+                y.2.cmp(&x.2)
+                    .then_with(|| y.1.cmp(&x.1))
+                    .then_with(|| a.cmp(b))
+            });
+            println!(
+                "    leading unsupported operand buckets in closed message projections (not MS lowering):"
+            );
+            for (rank, (form, (spans, sites, rows, attachment_rows))) in
+                forms.into_iter().enumerate()
+            {
+                if rank >= 12 && !form.starts_with("exp/PRIM/") && !form.starts_with("s_sendmsg/") {
+                    continue;
+                }
+                println!(
+                    "      {form}: {rows} rows ({attachment_rows} PS attachment-only), {} MS, {sites} distinct-span sites",
+                    spans.len()
                 );
             }
         }

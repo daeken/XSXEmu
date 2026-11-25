@@ -1721,7 +1721,11 @@ pub(super) struct MeshGate {
     projected_allocs: usize,
 }
 
-pub(super) fn direct_mesh_gate(dis: &mut Disassembler, bytes: &[u8]) -> MeshGate {
+pub(super) fn direct_mesh_gate(
+    dis: &mut Disassembler,
+    bytes: &[u8],
+) -> (MeshGate, BTreeMap<String, usize>) {
+    let mut forms = BTreeMap::new();
     let strict = result_class(checked_exports(dis, bytes));
     let mut projected_allocs = 0;
     let projected = matches!(strict, ResultClass::SendMsg(SendMsgClass::GsAllocReq)).then(|| {
@@ -1730,6 +1734,33 @@ pub(super) fn direct_mesh_gate(dis: &mut Disassembler, bytes: &[u8]) -> MeshGate
                 == SendMsgClass::GsAllocReq
             {
                 projected_allocs += 1;
+            }
+            let name = text.split_ascii_whitespace().next().unwrap_or_default();
+            let first = word(tail, 0).unwrap_or_default() as u32;
+            let pair = [first, word(tail, 4).unwrap_or_default() as u32];
+            if !exact_opcode(
+                pair.get(..len / 4)
+                    .and_then(|w| crate::graphics_decode::decode(w, 0).ok()),
+                len,
+                name,
+            ) {
+                let form = match (name, len) {
+                    ("s_sendmsg", 4) => {
+                        format!("s_sendmsg/{:?}/4B", sendmsg_class(first, len, text))
+                    }
+                    ("exp", 8)
+                        if matches!(export(first, len, text), Some(Export::Primitive { .. })) =>
+                    {
+                        format!("exp/PRIM/EN{}/flags{:x}/8B", first & 15, (first >> 10) & 7)
+                    }
+                    ("s_waitcnt", 4) if first >> 16 == 0xbf8c => {
+                        format!("s_waitcnt/imm-{:#06x}/4B", first as u16)
+                    }
+                    _ => {
+                        direct_operand_form(name, pair, len, &nearest_form(name, first, len, text))
+                    }
+                };
+                *forms.entry(form).or_default() += 1;
             }
         })
     });
@@ -1740,12 +1771,18 @@ pub(super) fn direct_mesh_gate(dis: &mut Disassembler, bytes: &[u8]) -> MeshGate
             e.primitive_sites.raw_bits_10_to_12,
         )
     });
-    MeshGate {
-        strict,
-        projection: projected.map(result_class),
-        projected_prim_shape,
-        projected_allocs,
+    if projected_prim_shape.is_none() {
+        forms.clear();
     }
+    (
+        MeshGate {
+            strict,
+            projection: projected.map(result_class),
+            projected_prim_shape,
+            projected_allocs,
+        },
+        forms,
+    )
 }
 
 fn wrapped_mesh_exports(
@@ -2137,7 +2174,8 @@ mod tests {
                 let mut dis = llvm.context(cpu, wave32).unwrap();
                 let (strict, projected) = wrapped_mesh_exports(&mut dis, &bytes);
                 assert_eq!(strict, ResultClass::SendMsg(SendMsgClass::GsAllocReq));
-                let gate = direct_mesh_gate(&mut dis, &bytes);
+                let (gate, forms) = direct_mesh_gate(&mut dis, &bytes);
+                assert_eq!(forms["s_sendmsg/GsAllocReq/4B"], 1);
                 assert_eq!(gate.strict, strict);
                 assert_eq!(gate.projection, Some(ResultClass::CompleteWithExp));
                 assert_eq!(gate.projected_allocs, 1);
@@ -2145,7 +2183,8 @@ mod tests {
                     gate.projected_prim_shape,
                     Some((1, 1 << 1, [0, 0, 1, 0, 0, 0, 0, 0]))
                 );
-                let truncated = direct_mesh_gate(&mut dis, &bytes[..12]);
+                let (truncated, forms) = direct_mesh_gate(&mut dis, &bytes[..12]);
+                assert!(forms.is_empty());
                 assert_eq!(truncated.strict, strict);
                 assert_eq!(truncated.projection, Some(ResultClass::BadSuccessor));
                 assert_eq!(truncated.projected_prim_shape, None);
