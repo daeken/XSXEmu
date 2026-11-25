@@ -151,6 +151,70 @@ struct Exports {
     other: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum DirectResult {
+    NoWindow,
+    Decode,
+    IndirectPc,
+    OtherControl,
+    SendMsg,
+    BadSuccessor,
+    BadWidth,
+    Overlap,
+    NoExit,
+    ClosedNoStageExport,
+    ClosedStageExport,
+    EncodingComplete,
+    OutputBindingOnly,
+}
+
+pub(super) fn direct_result(dis: &mut Disassembler, bytes: &[u8], slot: usize) -> DirectResult {
+    use DirectResult as D;
+    let mut reached_end = false;
+    let result = project_exports_observe(dis, bytes, false, |tail, len, name| {
+        // Only instructions already accepted by the control checker reach here.
+        reached_end |= len == 4 && word(tail, 0) == Some(0xbf810000) && name == "s_endpgm";
+    });
+    let exp = match result {
+        Ok(exp) if reached_end => exp,
+        Ok(_) | Err(ResultClass::NoExit) => return D::NoExit,
+        Err(ResultClass::Decode) => return D::Decode,
+        Err(ResultClass::OtherControl(_)) => return D::OtherControl,
+        Err(ResultClass::SendMsg(_)) => return D::SendMsg,
+        Err(ResultClass::UnmodeledPc(_) | ResultClass::SetPc(_) | ResultClass::SwapPc(_)) => {
+            return D::IndirectPc;
+        }
+        Err(ResultClass::BadSuccessor) => return D::BadSuccessor,
+        Err(ResultClass::BadWidth) => return D::BadWidth,
+        Err(ResultClass::Overlap) => return D::Overlap,
+        Err(ResultClass::CompleteWithExp | ResultClass::CompleteWithoutExp) => unreachable!(),
+    };
+    let relevant = match slot {
+        0 => exp.color != 0 || exp.mrtz_masks & !1 != 0,
+        1 => exp.positions[0] & !1 != 0,
+        2 => exp.primitive_en_values != 0,
+        _ => false,
+    };
+    if !relevant {
+        return D::ClosedNoStageExport;
+    }
+    if slot < 2
+        && let Some(outcome) = exact_semantics(dis, bytes, slot == 1)
+    {
+        let expected = if slot == 1 {
+            crate::graphics_semantics::Need::VertexOutputLink
+        } else {
+            crate::graphics_semantics::Need::AttachmentFormatAndMask
+        };
+        if outcome.gaps.is_empty() && outcome.needs.len() == 1 && outcome.needs.contains(&expected)
+        {
+            return D::OutputBindingOnly;
+        }
+        return D::EncodingComplete;
+    }
+    D::ClosedStageExport
+}
+
 fn checked_exports(dis: &mut Disassembler, bytes: &[u8]) -> Result<Exports, ResultClass> {
     project_exports(dis, bytes, false)
 }

@@ -1,0 +1,245 @@
+//! Direct checked library-span hypotheses; no source families, native files, or entry selection.
+use crate::{
+    ARCHIVE_LIMIT, BLOB_LIMIT,
+    graphics_reachability::{DirectResult as ResultClass, direct_result},
+    llvm::{Cpu, Llvm},
+    wrapped_library::library_to_final_marker,
+};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    error::Error,
+    ffi::OsStr,
+    fs::File,
+    io::Read,
+    path::Path,
+};
+use xsxemu::pipeline_library::PipelineLibrary;
+
+const STARTS: [usize; 4] = [0, 24, 36, 40];
+const WINDOWS: usize = 2 * STARTS.len();
+const THRESHOLDS: [ResultClass; 4] = [
+    ResultClass::ClosedNoStageExport,
+    ResultClass::ClosedStageExport,
+    ResultClass::EncodingComplete,
+    ResultClass::OutputBindingOnly,
+];
+const STAGES: [&str; 3] = ["PS", "VS", "MS"];
+type Results = [[ResultClass; 2]; WINDOWS];
+
+fn windows(span: &[u8]) -> [Option<&[u8]>; WINDOWS] {
+    let ends = [Some(span), library_to_final_marker(span)];
+    std::array::from_fn(|i| {
+        let end = ends[i / STARTS.len()]?;
+        let window = end.get(STARTS[i % STARTS.len()]..)?;
+        (!window.is_empty() && window.len().is_multiple_of(4) && window.len() <= BLOB_LIMIT)
+            .then_some(window)
+    })
+}
+
+fn projections(r: &Results) -> [[usize; 3]; THRESHOLDS.len()] {
+    THRESHOLDS.map(|threshold| {
+        let mut starts = [0u8; 3];
+        for (i, [w64, w32]) in r.iter().enumerate() {
+            for (mask, yes) in starts.iter_mut().zip([
+                *w64 >= threshold,
+                *w32 >= threshold,
+                (*w64).min(*w32) >= threshold,
+            ]) {
+                if yes {
+                    *mask |= 1 << (i % STARTS.len());
+                }
+            }
+        }
+        starts.map(|mask| mask.count_ones() as usize)
+    })
+}
+
+#[derive(Default)]
+struct StageCounts {
+    total: usize,
+    windows: BTreeMap<(usize, usize, ResultClass), usize>,
+    per_tier: [[usize; 3]; THRESHOLDS.len()],
+    multiple_starts: [[usize; 3]; THRESHOLDS.len()],
+}
+
+impl StageCounts {
+    fn note(&mut self, r: &Results) {
+        self.total += 1;
+        for (i, window) in r.iter().enumerate() {
+            for (wave, &result) in window.iter().enumerate() {
+                *self.windows.entry((i, wave, result)).or_default() += 1;
+            }
+        }
+        for (t, counts) in projections(r).iter().enumerate() {
+            for (w, &n) in counts.iter().enumerate() {
+                self.per_tier[t][w] += usize::from(n > 0);
+                self.multiple_starts[t][w] += usize::from(n > 1);
+            }
+        }
+    }
+}
+
+pub(super) fn run(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), Box<dyn Error>> {
+    let mut bytes = Vec::new();
+    File::open(path)?
+        .take(ARCHIVE_LIMIT as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > ARCHIVE_LIMIT {
+        return Err("pipeline library exceeds bound".into());
+    }
+    let lib = PipelineLibrary::parse(&bytes)?;
+    let llvm = Llvm::load(reference)?;
+    let (major, minor, patch) = llvm.version;
+    println!(
+        "Direct stored graphics spans: LLVM {major}.{minor}.{patch} {}",
+        cpu.name()
+    );
+    let mut waves = [llvm.context(cpu, false)?, llvm.context(cpu, true)?];
+    let mut cache = HashMap::new();
+    let mut unknown = 0;
+    let mut stage: [StageCounts; 3] = Default::default();
+    let mut occurrences = [0; 3];
+    let mut pairs = 0;
+    let mut pair_keys = HashSet::new();
+    // [tier][wave/hypothesis intersection][neither, VS only, PS only, both]
+    let mut pair_counts = [[[0; 4]; 3]; THRESHOLDS.len()];
+    for row in lib.graphics() {
+        let mut row_results = [None; 3];
+        for (slot, reference) in row.slots.into_iter().enumerate() {
+            let Some(reference) = reference else { continue };
+            if slot >= STAGES.len() {
+                unknown += 1;
+                continue;
+            }
+            occurrences[slot] += 1;
+            let key = (slot, reference.program);
+            let projected = if let Some(&cached) = cache.get(&key) {
+                cached
+            } else {
+                let span = lib
+                    .program(reference.program)
+                    .ok_or("missing checked program span")?;
+                let w = windows(span);
+                let mut r = [[ResultClass::NoWindow; 2]; WINDOWS];
+                for (i, window) in w.into_iter().enumerate() {
+                    if let Some(window) = window {
+                        r[i] = if i >= STARTS.len() && Some(window) == w[i - STARTS.len()] {
+                            r[i - STARTS.len()]
+                        } else {
+                            waves
+                                .each_mut()
+                                .map(|wave| direct_result(wave, window, slot))
+                        };
+                    }
+                }
+                stage[slot].note(&r);
+                let p = projections(&r);
+                cache.insert(key, p);
+                p
+            };
+            row_results[slot] = Some(projected);
+        }
+        let [Some(ps), Some(vs), None, None, None, None, None] = row.slots else {
+            continue;
+        };
+        pair_keys.insert(((vs.program, vs.metadata), (ps.program, ps.metadata)));
+        pairs += 1;
+        let [Some(p), Some(v), _] = row_results else {
+            unreachable!()
+        };
+        for t in 0..THRESHOLDS.len() {
+            for w in 0..3 {
+                let pattern = usize::from(v[t][w] > 0) | (usize::from(p[t][w] > 0) << 1);
+                pair_counts[t][w][pattern] += 1;
+            }
+        }
+    }
+    println!("  unclassified slot occurrences excluded={unknown}");
+    for (i, s) in stage.into_iter().enumerate() {
+        println!(
+            "  {}: distinct stage/programs={}, slot occurrences={}",
+            STAGES[i], s.total, occurrences[i]
+        );
+        for t in 0..THRESHOLDS.len() {
+            println!(
+                "    {:?}: eligible={:?}, multiple starts={:?} (wave64 / wave32 / same window)",
+                THRESHOLDS[t], s.per_tier[t], s.multiple_starts[t]
+            );
+        }
+        for ((window, wave, outcome), count) in s.windows {
+            let end = if window < STARTS.len() {
+                "stored"
+            } else {
+                "last marker"
+            };
+            let wave = [64, 32][wave];
+            println!(
+                "    +{}, {end}, wave{wave}, {outcome:?}: {count}",
+                STARTS[window % STARTS.len()]
+            );
+        }
+    }
+    println!(
+        "  exact VS+PS occurrences={pairs}, distinct program/metadata pairs={}",
+        pair_keys.len()
+    );
+    for (tier, counts) in THRESHOLDS.into_iter().zip(pair_counts) {
+        println!(
+            "    {tier:?}: {counts:?} (rows: wave64 / wave32 / same window per stage; columns: neither / VS only / PS only / both)"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn marker_operand_is_not_a_reached_end_and_slot_controls_export_evidence() {
+        let Some(path) = std::env::var_os("LLVM_DISASM_LIB") else {
+            return;
+        };
+        let llvm = Llvm::load(&path).unwrap();
+        let mut wave = llvm.context(Cpu::Gfx1030, true).unwrap();
+        let owned = |words: &[u32]| {
+            words
+                .iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect::<Vec<_>>()
+        };
+        let literal = owned(&[0x7e0002ff, 0xbf810000]);
+        assert_ne!(
+            direct_result(&mut wave, &literal, 0),
+            ResultClass::ClosedNoStageExport
+        );
+        let end_only = owned(&[0xbf810000]);
+        assert_eq!(
+            direct_result(&mut wave, &end_only, 0),
+            ResultClass::ClosedNoStageExport
+        );
+        let pixel = owned(&[0x7e000280, 0xf8001c0f, 0, 0xbf810000]);
+        assert_eq!(
+            direct_result(&mut wave, &pixel, 0),
+            ResultClass::OutputBindingOnly
+        );
+        assert_eq!(
+            direct_result(&mut wave, &pixel, 1),
+            ResultClass::ClosedNoStageExport
+        );
+    }
+
+    #[test]
+    fn same_window_requires_both_waves_not_merely_matching_start() {
+        let mut r = [[ResultClass::NoWindow; 2]; WINDOWS];
+        r[0][0] = ResultClass::EncodingComplete;
+        r[4][1] = ResultClass::EncodingComplete;
+        assert_eq!(projections(&r)[2], [1, 1, 0]);
+        r[0][1] = ResultClass::EncodingComplete;
+        assert_eq!(projections(&r)[2], [1, 1, 1]);
+        r[4][0] = ResultClass::EncodingComplete;
+        assert_eq!(projections(&r)[2], [1, 1, 1]);
+        r[1] = [ResultClass::EncodingComplete; 2];
+        assert_eq!(projections(&r)[2], [2, 2, 2]);
+    }
+}

@@ -53,3 +53,23 @@ Both CPU profiles with LLVM 21.1.6 admitted 10 VS and 321 PS native file occurre
 | No witness for either stage | 13,383 | 13,383 | 13,383 |
 
 No native file in any tested cohort had a witness. This rules out the compared windows as a way to establish even one stage of these pairs; it does not rule out different program framing or a different native variant. No lift, bake admission, readiness, artifacts, or title execution changed.
+
+## Direct stored graphics program census
+
+```sh
+cargo run --locked --release --manifest-path tools/shader-inventory/Cargo.toml -- \
+  --direct-library-graphics "$INFLATED_LIBRARY" "$TRUSTED_LLVM_21_DYLIB" gfx1013
+# Repeat with gfx1030.
+```
+
+This probe uses the checked library arena spans without requiring wrappers, native files, or source digests. It uses known PS/VS/MS slot roles and excludes the two unknown slot occurrences. Each of `+0`, `+24`, `+36`, and `+40` is tested independently to both the stored end and the hypothesized last aligned `0xbf810000` in the last 512 bytes. A closed reference graph must reach a decoded exact `s_endpgm` and must not hit an unmodeled transfer, overlap, or out-of-span edge. Closure neither requires the last raw marker to be that instruction nor proves termination on all inputs. The stricter stage-export tier additionally needs active PS color/depth/stencil export, active VS POS0, or MS PRIM. For VS and PS, encoding completeness additionally needs a contiguous reached path with exact agreement between LLVM and the owned opcode/width decoder. Output-binding-only adds the same no-default static semantic check as above. The MS survey stops at the stage-export tier; `s_sendmsg` does not get a synthetic fallthrough. Counts labeled same-window require that both wave references pass on the same start/end hypothesis, not that their decoded operands are identical.
+
+The complete aggregate histograms were identical between gfx1013 and gfx1030 with LLVM 21.1.6. At `+0` all 18,837 distinct stage/program references stopped at decode. For the stored end, `+24` gave stage-export closure on 5 PS and 2 VS programs in either wave; `+36` and `+40` each reached the counts below. Cutting at the last marker removed one of the PS closures at each of `+36` and `+40` in both waves. At those two starts the strict MS walk stopped at `s_sendmsg` for 6,775 programs, and at decode for the other 723.
+
+| Stage | Slot occurrences | Distinct stage/programs | Any closed window, wave64 / wave32 | Stage-export closures, wave64 / wave32 / same window |
+|---|---:|---:|---:|---:|
+| PS | 24,111 | 9,996 | 6,755 / 6,785 | 6,161 / 6,191 / 6,161 |
+| VS | 13,409 | 1,343 | 1,304 / 1,304 | 1,304 / 1,304 / 1,304 |
+| MS | 12,062 | 7,498 | 0 / 0 | 0 / 0 / 0 |
+
+Every program with stage-export closure had multiple passing starts; none established a unique entry. Of 13,383 exact VS+PS occurrences, both stages had stage-export closure on 12,794 (wave64), 12,798 (wave32), and 12,794 (same window in both waves for each stage). For the same-window projection, 550 had only VS closure, 39 only PS, and none had neither. No stage-export-qualified VS or PS window was encoding-complete under the owned decoder, so none of the pairs reached the output-binding-only tier. This is conditional static evidence about the tested library spans, not a runtime entry, binding, native variant selection, bake admission, or translation.
