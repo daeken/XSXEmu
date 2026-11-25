@@ -72,6 +72,7 @@ compile packed
 "$p" --emit-packed-rg-msl > "$d/packed-rg.metal"
 compile packed-rg
 "$p" --load-packed-rg-metallib "$d/packed-rg.metallib"
+"$p" --expect-packed-rg-all-mask "$d/packed-rg.metallib"
 
 # Locally proven packed RTZ constants, including above-midpoint and signed zero.
 for variant in constant-rtz constant-rtz-rg red; do

@@ -109,6 +109,14 @@ At each stored start (+36 and +40), both LLVM CPUs and both wave settings see 42
 
 LLVM MC verifies the exact two-VGPR VOP2 word on both CPUs. On Apple M4, the owned offline strict arithmetic bake and separate-process replay each match 8/8 raw sum words, covering ties in both rounding directions, an above-tie input, signed zero and cancellation. The static audit still requires both operands and the applicable native FP mode; these tests establish neither a title FP profile nor denormal or NaN-payload behavior.
 
+### Final compressed MRT0 selector blockers
+
+The next five RG windows each have one compressed MRT0 EN=3 DONE+VM export; the next full-mask window has one compressed MRT0 EN=15 DONE+VM export. Their headers and enabled source positions already fit the owned packed export profiles. The former decoder rejected nonzero disabled selector bytes. LLVM disassembly on both reference CPUs confirms EN=3 uses only VSRC0 (RG), and EN=15 uses VSRC0 (RG) and VSRC1 (BA); higher unused bytes do not change those operands. The relaxation is restricted to those two final MRT0 headers, not other targets or export forms.
+
+The audit finds five distinct RG and one distinct RGBA PS spans across hypotheses. Each of +36 and +40 contains those same six candidate windows per CPU and wave, raising encoding completeness from 212 to 218 out of 6,161 (wave64) or 6,191 (wave32). Four RG spans add only the attachment format/mask predicate; the other RG span and the full-mask span additionally need entry VGPRs and SGPRs, interpolation linkage, F32 mode and the packed RTZ domain. The static output-binding-only total is now 214 PS; no VS or full pair clears both stages. No wait, runtime entry or PSO admission change follows.
+
+On Apple M4, the owned packed RG and RGBA paths with nonzero disabled selectors each match 64/64 RGBA32Float pixels from generated source and from an offline metallib. The RG write mask preserves nonzero B/A clears. As a control, the same RG metallib with all-channel writes overrides both clears on exactly the 20 covered pixels, matching a separate CPU prediction. The fixture uses raster/scissor coverage without lane kills or EXEC updates and does not model general VM behavior.
+
 ## Independent evidence for distinguishing starts
 
 `--graphics-entry-evidence "$INFLATED_LIBRARY" "$TRUSTED_LLVM_21_DYLIB"` uses the exact 13,383 two-slot rows (2,921 distinct checked PS spans, 1,322 VS). It does not repeat the closure census or use wrapper joins. It checks the stage metadata footer fingerprint, then tests the third-group marker at `+26` as in [compute layout sites](compute-layout-sites.md). The marker supports interpreting the group at `+24` as part of the stored prefix, not a global execution rule. The comparisons beginning at `+24` are withheld for marked groups. Nonzero `0x42` sites are tested independently as aligned in-span scalar loads, without assuming they are reachable from any entry.

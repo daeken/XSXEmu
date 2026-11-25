@@ -373,10 +373,11 @@ pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeErro
             },
         ));
     }
-    // EN3 enables the packed RG word only; all unused selectors are canonical zero.
+    // EN3 enables only the packed RG word. Final MRT0 ignores disabled
+    // selectors; retain the canonical-zero gate for other targets.
     if matches!(w, 0xf800_1c03 | 0xf800_0413) {
         let fields = ext()?;
-        if fields >> 8 != 0 {
+        if w != 0xf800_1c03 && fields >> 8 != 0 {
             return Err(DecodeError::Unsupported(pc));
         }
         return Ok((
@@ -393,7 +394,7 @@ pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeErro
         0xf800_040f | 0xf800_1c0f | 0xf800_041f | 0xf800_1c1f | 0xf800_1c2f
     ) {
         let [rg, ba, unused2, unused3] = ext()?.to_le_bytes();
-        if unused2 != 0 || unused3 != 0 {
+        if w != 0xf800_1c0f && (unused2 != 0 || unused3 != 0) {
             return Err(DecodeError::Unsupported(pc));
         }
         return Ok((

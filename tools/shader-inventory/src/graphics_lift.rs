@@ -79,11 +79,11 @@ const PS: &[u32] = &[
 
 const PACKED_PS: &[u32] = &[
     0xf800_1c0f,
-    0x0000_0001, // exp mrt0 v1, v1, v0, v0 done compr vm
+    0xfcfd_0001, // Same full packed export, with both unused fields nonzero.
     0xbf81_0000,
 ];
 
-const PACKED_RG_PS: &[u32] = &[0xf800_1c03, 1, 0xbf81_0000];
+const PACKED_RG_PS: &[u32] = &[0xf800_1c03, 0xfcfd_fe01, 0xbf81_0000];
 
 const DUAL_PS: &[u32] = &[0xf800_040f, 1, 0xf800_1c1f, 0x100, 0xbf81_0000];
 
@@ -1401,8 +1401,8 @@ mod tests {
             .chain(EDGE_RTZ)
             .chain(EDGE_MOV_HINTS)
             .chain(EDGE_SELECT)
-            .chain(PACKED_PS)
-            .chain(PACKED_RG_PS)
+            .chain([PACKED_PS[0], 1, PACKED_PS[2]].iter())
+            .chain([PACKED_RG_PS[0], 1, PACKED_RG_PS[2]].iter())
             .chain(DEPTH_PS)
             .chain(EARLY_DEPTH_PS)
             .chain(WAIT_DEPTH_PS)
@@ -1655,7 +1655,7 @@ mod tests {
             lift(Stage::PackedPixel, &ps),
             Err(Reject::Uninitialized(0, 8))
         );
-        ps[1] = PACKED_PS[1];
+        ps[1] = PACKED_PS[1] & 0xffff;
         ps[0] &= !0x1800;
         assert_eq!(lift(Stage::PackedPixel, &ps), Err(Reject::BadExports(0)));
         for header in [
@@ -1668,7 +1668,7 @@ mod tests {
             assert_eq!(decode(&[header, 1], 0), Err(DecodeError::Unsupported(0)));
         }
         assert_eq!(
-            decode(&[PACKED_PS[0], 0x10001], 0),
+            decode(&[0xf800_1c1f, 0x10001], 0),
             Err(DecodeError::Unsupported(0))
         );
     }
@@ -1816,9 +1816,39 @@ mod tests {
             assert_eq!(decode(&[header, 1], 0), Err(DecodeError::Unsupported(0)));
         }
         assert_eq!(
-            decode(&[0xf800_1c03, 0x0101], 0),
+            decode(&[0xf800_0413, 0x0101], 0),
             Err(DecodeError::Unsupported(0))
         );
+    }
+
+    #[test]
+    fn final_packed_mrt0_ignores_only_disabled_selectors() {
+        for (stage, words) in [
+            (Stage::PackedRgPixel, PACKED_RG_PS),
+            (Stage::PackedPixel, PACKED_PS),
+        ] {
+            let mut canonical = words.to_vec();
+            canonical[1] &= if stage == Stage::PackedRgPixel {
+                0xff
+            } else {
+                0xffff
+            };
+            assert_eq!(
+                lift(stage, words).unwrap(),
+                lift(stage, &canonical).unwrap()
+            );
+            let mut bad = words.to_vec();
+            bad[1] ^= 0x80; // the enabled R/G selector must be checked
+            assert!(matches!(
+                lift(stage, &bad),
+                Err(Reject::Uninitialized(0, 129))
+            ));
+        }
+        // Full EN=15 additionally needs its second packed word live.
+        assert!(matches!(
+            lift(Stage::PackedPixel, &[0xf800_1c0f, 0xfcfd_8001, 0xbf81_0000]),
+            Err(Reject::Uninitialized(0, 128))
+        ));
     }
 
     #[test]

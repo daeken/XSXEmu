@@ -1,7 +1,9 @@
 //! Direct checked library-span hypotheses; no source families, native files, or entry selection.
 use crate::{
     ARCHIVE_LIMIT, BLOB_LIMIT,
-    graphics_reachability::{DirectGaps, DirectResult as ResultClass, direct_gaps, direct_result},
+    graphics_reachability::{
+        DirectGaps, DirectResult as ResultClass, direct_gaps, direct_result, exact_semantics,
+    },
     llvm::{Cpu, Llvm},
     wrapped_library::library_to_final_marker,
 };
@@ -202,6 +204,8 @@ struct GapCounts {
     exact: usize,
     ordinary_mul: (usize, usize),
     ordinary_add: (usize, usize),
+    packed_cleared: [usize; 2],
+    packed_requirements: [BTreeMap<crate::graphics_semantics::Outcome, usize>; 2],
     linear_sole: BTreeMap<String, usize>,
     distances: BTreeMap<usize, usize>,
     forms: BTreeMap<String, (usize, usize)>,
@@ -250,6 +254,20 @@ impl GapCounts {
             "    exact two-VGPR v_add_f32_e32: {} sites in {} windows",
             self.ordinary_add.0, self.ordinary_add.1
         );
+        if stage == "PS" {
+            println!(
+                "    sole prior packed-selector blocker (RG / RGBA): {:?} windows",
+                self.packed_cleared
+            );
+        }
+        for (kind, requirements) in ["RG", "RGBA"].into_iter().zip(self.packed_requirements) {
+            for (outcome, count) in requirements {
+                println!(
+                    "      {kind}: {count} windows, local gaps={:?}, unresolved predicates={:?}",
+                    outcome.gaps, outcome.needs
+                );
+            }
+        }
         let distances: Vec<_> = self.distances.into_iter().take(3).collect();
         println!("    nearest (unsupported sites, windows): {distances:?}");
         let mut leverage: Vec<_> = self.sole_forms.into_iter().collect();
@@ -279,6 +297,7 @@ pub(super) fn run_gaps(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), B
     );
     let mut waves = [llvm.context(cpu, false)?, llvm.context(cpu, true)?];
     let mut distinct = HashSet::new();
+    let mut packed_spans = [HashSet::new(), HashSet::new()];
     let mut counts: [[[GapCounts; 2]; STARTS.len()]; 2] = Default::default();
     for row in lib.graphics() {
         for (slot, reference) in row.slots.into_iter().take(2).enumerate() {
@@ -300,11 +319,28 @@ pub(super) fn run_gaps(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), B
                 for (w, wave) in waves.iter_mut().enumerate() {
                     if let Some(gaps) = direct_gaps(wave, window, slot) {
                         counts[slot][i][w].note(&gaps);
+                        if slot == 0 && gaps.contiguous && gaps.missing.is_empty() {
+                            for (form, only_one) in [[1, 0], [0, 1]].into_iter().enumerate() {
+                                if gaps.packed_mrt0_noncanonical == only_one {
+                                    counts[slot][i][w].packed_cleared[form] += 1;
+                                    packed_spans[form].insert(reference.program);
+                                    if let Some(outcome) = exact_semantics(wave, window, false) {
+                                        *counts[slot][i][w].packed_requirements[form]
+                                            .entry(outcome)
+                                            .or_default() += 1;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
     }
+    println!(
+        "  Distinct PS spans with sole prior packed-selector blocker across hypotheses (RG / RGBA): {:?}",
+        packed_spans.map(|spans| spans.len())
+    );
     for (s, stage) in counts.into_iter().enumerate() {
         for (i, start) in stage.into_iter().enumerate() {
             for (w, wave) in start.into_iter().enumerate() {

@@ -264,6 +264,7 @@ pub(super) struct DirectGaps {
     pub ordinary_vgpr_mul: usize,
     pub ordinary_vgpr_add: usize,
     pub contiguous: bool,
+    pub packed_mrt0_noncanonical: [usize; 2], // RG / RGBA
 }
 
 /// Count only checked instructions in a closed stage-export-qualified window.
@@ -282,6 +283,15 @@ pub(super) fn direct_gaps(dis: &mut Disassembler, bytes: &[u8], slot: usize) -> 
         let words = [first, word(tail, 4).unwrap_or_default() as u32];
         let decoded = words.get(..len / 4).and_then(|w| decode(w, 0).ok());
         if exact_opcode(decoded, len, name) {
+            // Count exactly the final MRT0 forms that used to fail the
+            // disabled-selector canonical-zero constraint.
+            if name == "exp" && len == 8 {
+                match first {
+                    0xf800_1c03 if words[1] >> 8 != 0 => gaps.packed_mrt0_noncanonical[0] += 1,
+                    0xf800_1c0f if words[1] >> 16 != 0 => gaps.packed_mrt0_noncanonical[1] += 1,
+                    _ => (),
+                }
+            }
             gaps.ordinary_vgpr_add += usize::from(matches!(
                 decoded,
                 Some((1, crate::graphics_decode::Op::AddF32 { .. }))
