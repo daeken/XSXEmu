@@ -1,0 +1,9 @@
+# Owned Xbox D3D12 device lifetime foundation
+
+The [static startup trace](xbox-d3d12-abi.md) observes `RCX=0`, `RDX=&caller_block`, `R8=&IID`, and `R9=&out` at `D3D12XboxCreateDevice`. It establishes an 80-byte initialized prefix and the requested UUID, not a complete Xbox parameter type, adapter policy, or device-creation semantics. The matching desktop UUID does not justify a desktop device vtable.
+
+`xbox_device::OwnedDevices` is a bounded identity/refcount ledger, not a provider. Creation snapshots an **owned** opaque prefix, requires the observed request UUID and no adapter, and gives the object one reference. The model's `QueryInterface` recognizes `IUnknown` and that same UUID with one canonical identity. Unsupported queries do not acquire references. Overflow is an error; final release removes the record and IDs are not reused. ID checks do not make a released native pointer safe to dereference.
+
+`cargo test --offline --target x86_64-apple-darwin --test xbox_device_owned` uses original Win64 assembly and a private three-slot IUnknown vtable. The fixture calls with the observed register order, checks output clearing on failure, verifies successful identity/refcount transitions and releases the prefix. Fixture return codes describe this owned model only. All non-null pointers are to direct, live fixture storage; this does not validate arbitrary guest ranges. The ledger tests separately cover reference overflow, capacity, stale IDs, and cross-ledger rejection.
+
+No retail import registration, title execution, GPU/VM device, queue, command list, descriptor, or success for an unimplemented operation is added. A production guest facade would require audited checked input/output, guest-safe vtable entries (including a terminal unsupported path), actual object behavior and live evidence for the enabled scope.

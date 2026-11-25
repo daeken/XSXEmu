@@ -10,3 +10,4 @@ pub mod rpf9;
 mod rpf9_crypto;
 #[cfg(feature = "rpf9-retail")]
 pub mod rpf9_retail;
+pub mod xbox_device;
