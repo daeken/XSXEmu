@@ -143,6 +143,19 @@ impl Arena {
             .unwrap()
     }
 
+    #[allow(dead_code)] // Standalone Metal fixture deliberately checks one kernel failure.
+    pub(crate) fn assert_backing_end_refused_at_parked(&self, slot: u64) {
+        let slots = slot..slot.checked_add(1).unwrap();
+        self.vacant(&slots).unwrap();
+        let batch = self.batch.as_ref().unwrap();
+        let end = (batch.tokens.end - batch.tokens.start) * PAGE;
+        let views = self.views.clone();
+        let (status, _) = self.kernel_replace(&slots, batch.backing.object.entry, end, READ_WRITE);
+        assert_ne!(status, 0);
+        self.assert_parked(slot);
+        assert_eq!(self.views, views);
+    }
+
     pub(crate) fn address(&self, slot: u64) -> u64 {
         self.mapping.base + slot * PAGE
     }

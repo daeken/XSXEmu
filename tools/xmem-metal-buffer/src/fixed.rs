@@ -227,6 +227,13 @@ fn fixed_full_descriptor_suffix() {
             (A, B, D + E + A),
             (A + B, C, D + E + A + B),
         ] {
+            if va == A + B {
+                assert!(matches!(
+                    owner.pin(suffix, SUFFIX / PAGE),
+                    Err(Refusal::Unmapped)
+                ));
+                owner.assert_backing_end_refused_at_parked(va / PAGE);
+            }
             let first = tokens.start + offset / PAGE;
             let ids: Vec<_> = (first..first + len / PAGE).collect();
             owner.map(base + va, &ids).unwrap();
@@ -260,6 +267,9 @@ fn fixed_full_descriptor_suffix() {
         let lease = owner.pin(suffix, SUFFIX / PAGE).unwrap();
         let (address, len) = lease.extent();
         assert_eq!((address, len), (suffix as usize, SUFFIX as usize));
+        assert!(address.is_multiple_of(PAGE as usize) && len.is_multiple_of(PAGE as usize));
+        let max = device.max_buffer_length();
+        assert!(SUFFIX <= max);
         // SAFETY: The lease owns the exact mapped suffix. CPU aliases are not
         // accessed until ordered commands have completed.
         let creator = unsafe { metal_backing::import_pinned(&device, address, len, lease) }
@@ -268,7 +278,7 @@ fn fixed_full_descriptor_suffix() {
         drop(creator);
         assert!(live());
         println!(
-            "full-suffix: {} {} contents={address:#x} len={len:#x}",
+            "full-suffix: {} {} contents={address:#x} len={len:#x} storage=Shared maxBufferLength={max:#x} alignment={PAGE:#x}",
             std::env::consts::ARCH,
             device.name()
         );
