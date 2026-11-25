@@ -317,6 +317,11 @@ fn direct_operand_form(name: &str, words: [u32; 2], len: usize, bucket: &str) ->
                 _ => format!("{name}/selector-{selector}/no-modifiers/8B"),
             }
         }
+        "v_cvt_f32_i32_e64"
+            if len == 8 && crate::graphics_decode::cvt_i32_omod1(first, sources).is_some() =>
+        {
+            CVT_OMOD1_FORM.to_owned()
+        }
         "v_cvt_f32_i32_e64" if len == 8 && first & 0xffff_0000 == 0xd585_0000 => {
             let src = match sources & 511 {
                 0..=105 => "SGPR".to_owned(),
@@ -549,6 +554,7 @@ pub(super) fn direct_gaps(dis: &mut Disassembler, bytes: &[u8], slot: usize) -> 
     (ended && qualifies).then_some(gaps)
 }
 
+pub(super) const CVT_OMOD1_FORM: &str = "v_cvt_f32_i32_e64/VGPR/OMOD1/requires-MODE/8B";
 pub(super) const SETPRIO3_FORM: &str = "s_setprio/imm-3/4B";
 const SETPRIO3: u32 = 0xbf8f_0003;
 

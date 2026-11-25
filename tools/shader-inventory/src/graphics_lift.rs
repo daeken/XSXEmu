@@ -720,6 +720,35 @@ const EDGE_MOV_HINTS: &[u32] = &[
     0x7fc1_2345,
 ];
 
+// Owned result-only contract: no trap/status/timing observation. The caller
+// supplies MODE explicitly; there is no default or title-mode inference.
+fn emit_owned_cvt_omod1(
+    msl: &mut String,
+    words: &[u32; 2],
+    mode: Option<u32>,
+) -> Result<(), DecodeError> {
+    let Some((Vgpr(dst), Vgpr(src))) = crate::graphics_decode::cvt_i32_omod1(words[0], words[1])
+    else {
+        return Err(DecodeError::Unsupported(0));
+    };
+    let mode = mode
+        .filter(|m| m & 3 == 0)
+        .ok_or(DecodeError::Unsupported(0))?;
+    let scale = if mode & ((1 << 9) | (1 << 5)) == 0 {
+        " * 2.0f"
+    } else {
+        ""
+    };
+    writeln!(
+        msl,
+        "  r[{dst}] = as_type<uint>(float(as_type<int>(r[{src}])){scale});"
+    )
+    .unwrap();
+    Ok(())
+}
+
+const EDGE_CVT_OMOD1: [u32; 2] = [0xd585_0012, 0x0800_0100];
+
 #[allow(dead_code)] // Used by the separate owned bit-exact edge probe.
 pub fn translate_legacy_edge_fixture() -> Result<String, DecodeError> {
     let (a_width, a) = decode(EDGE_VGPR, 0)?;
@@ -765,7 +794,12 @@ pub fn translate_legacy_edge_fixture() -> Result<String, DecodeError> {
         ],
     );
     body(&mut msl, &[decode(EDGE_SUB_ONE, 0)?.1]);
-    msl.push_str("  out[4 * id] = uint4(r[2], r[3], r[4], r[5]);\n  out[4 * id + 1] = uint4(r[6], r[7], r[8], r[9]);\n  out[4 * id + 2] = uint4(r[10], r[11], r[12], r[13]);\n  out[4 * id + 3] = uint4(r[14], r[15], r[16], r[17]);\n}\n");
+    for (slot, mode) in [0, 1 << 4, 1 << 9, 1 << 5].into_iter().enumerate() {
+        let mut words = EDGE_CVT_OMOD1;
+        words[0] += slot as u32;
+        emit_owned_cvt_omod1(&mut msl, &words, Some(mode))?;
+    }
+    msl.push_str("  out[5 * id] = uint4(r[2], r[3], r[4], r[5]);\n  out[5 * id + 1] = uint4(r[6], r[7], r[8], r[9]);\n  out[5 * id + 2] = uint4(r[10], r[11], r[12], r[13]);\n  out[5 * id + 3] = uint4(r[14], r[15], r[16], r[17]);\n  out[5 * id + 4] = uint4(r[18], r[19], r[20], r[21]);\n}\n");
     Ok(msl)
 }
 
@@ -1566,6 +1600,7 @@ mod tests {
         asm.push_str("v_add_f32_e32 v16, -1.0, v0\n");
         asm.push_str("v_sub_f32_e32 v12, 0, v0\nv_sub_f32_e32 v13, 0, v1\n");
         asm.push_str("v_sub_f32_e32 v17, 1.0, v0\n");
+        asm.push_str("v_cvt_f32_i32_e64 v18, v0 mul:2\n");
         asm.push_str("s_mov_b32 m0, s9\nv_interp_mov_f32_e32 v2, p0, attr0.x\nexp mrt0 v2, off, off, off done vm\ns_endpgm\n");
         for (sgpr, component) in [(9, "x"), (14, "z"), (9, "z")] {
             writeln!(asm, "s_mov_b32 m0, s{sgpr}\nv_interp_p1_f32_e32 v2, v0, attr0.{component}\nv_interp_p2_f32_e32 v2, v1, attr0.{component}\nexp mrt0 v2, v2, v2, v2 done\ns_endpgm").unwrap();
@@ -1626,6 +1661,7 @@ mod tests {
             .chain(EDGE_ADD_INLINE)
             .chain(EDGE_SUB)
             .chain(EDGE_SUB_ONE)
+            .chain(&EDGE_CVT_OMOD1)
             .chain(PARAM_MOV_PS)
             .chain(INTERP_X_PS)
             .chain(INTERP_Z_PS)
@@ -1832,6 +1868,34 @@ mod tests {
                 lift(Stage::PackedPixel, &[&[bad_input], PACKED_PS].concat()),
                 Err(Reject::Uninitialized(0, _))
             ));
+        }
+    }
+
+    #[test]
+    fn omod1_conversion_requires_explicit_rne_and_exact_fields() {
+        let [first, ext] = EDGE_CVT_OMOD1;
+        assert!(decode(&EDGE_CVT_OMOD1, 0).is_err());
+        for (a, b) in [
+            (first ^ (1 << 8), ext),
+            (first ^ (1 << 15), ext),
+            (first ^ (1 << 11), ext),
+            (first, ext ^ (1 << 8)),
+            (first, ext ^ (1 << 9)),
+            (first, ext ^ (1 << 29)),
+            (first, ext ^ (1 << 27)),
+        ] {
+            assert!(crate::graphics_decode::cvt_i32_omod1(a, b).is_none());
+        }
+        for mode in [None, Some(1), Some(2), Some(3)] {
+            assert!(emit_owned_cvt_omod1(&mut String::new(), &EDGE_CVT_OMOD1, mode).is_err());
+        }
+        for ieee in [0, 1 << 9] {
+            for denorm in 0..4 {
+                let mut text = String::new();
+                emit_owned_cvt_omod1(&mut text, &EDGE_CVT_OMOD1, Some(ieee | (denorm << 4)))
+                    .unwrap();
+                assert_eq!(text.contains(" * 2.0f"), ieee == 0 && denorm < 2);
+            }
         }
     }
 

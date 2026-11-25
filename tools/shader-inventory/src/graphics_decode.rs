@@ -172,6 +172,12 @@ pub(crate) fn inline_first_unpack_fma(fields: u32) -> Option<bool> {
     }
 }
 
+// Recognition only: the context-free decoder deliberately rejects this form.
+pub(crate) fn cvt_i32_omod1(first: u32, ext: u32) -> Option<(Vgpr, Vgpr)> {
+    (first & 0xffff_ff00 == 0xd585_0000 && ext & 0xffff_ff00 == 0x0800_0100)
+        .then_some((Vgpr(first as u8), Vgpr(ext as u8)))
+}
+
 pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeError> {
     let w = words[pc];
     let ext = || words.get(pc + 1).copied().ok_or(DecodeError::Truncated(pc));

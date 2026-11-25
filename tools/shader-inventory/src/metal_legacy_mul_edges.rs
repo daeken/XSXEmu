@@ -135,16 +135,31 @@ mod gpu {
             0x3380_0000,
             0xb400_0000,
         ];
+        // Independent literal (unscaled, scaled) goldens; odd integers
+        // on either side of a rounding tie, both signs, and signed extrema.
+        let cvt_cases: [(i32, u32, u32); 9] = [
+            (0, 0, 0),
+            (1, 0x3f80_0000, 0x4000_0000),
+            (-1, 0xbf80_0000, 0xc000_0000),
+            (16_777_217, 0x4b80_0000, 0x4c00_0000),
+            (16_777_219, 0x4b80_0002, 0x4c00_0002),
+            (-16_777_217, 0xcb80_0000, 0xcc00_0000),
+            (-16_777_219, 0xcb80_0002, 0xcc00_0002),
+            (i32::MAX, 0x4f00_0000, 0x4f80_0000),
+            (i32::MIN, 0xcf00_0000, 0xcf80_0000),
+        ];
+        let cvt_start = inputs.len();
+        inputs.extend(cvt_cases.iter().map(|(x, _, _)| [*x as u32, 0, 0, 0]));
         let bytes = std::mem::size_of_val(inputs.as_slice());
         let usage = MTLResourceOptions::StorageModeShared;
         let input = dev.new_buffer_with_data(inputs.as_ptr().cast(), bytes as u64, usage);
-        let output = dev.new_buffer(4 * bytes as u64, usage);
+        let output = dev.new_buffer(5 * bytes as u64, usage);
         let out = output.contents().cast::<[u32; 4]>();
         if out.is_null() {
             return Err("unmapped readback".into());
         }
         // Shared buffer is owned here; no CPU access during execution.
-        unsafe { out.write_bytes(0xa5, 4 * inputs.len()) };
+        unsafe { out.write_bytes(0xa5, 5 * inputs.len()) };
         let queue = dev.new_command_queue();
         let cmd = queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
@@ -163,7 +178,7 @@ mod gpu {
         }
         for (i, (_, expected)) in cases.into_iter().enumerate() {
             // Exact dispatched extent, completed writes, owned allocation still live.
-            let actual = unsafe { out.add(4 * i).read() };
+            let actual = unsafe { out.add(5 * i).read() };
             if actual[..2] != expected {
                 return Err(
                     format!("edge row {i}: got {actual:08x?}, expected {expected:08x?}").into(),
@@ -175,20 +190,20 @@ mod gpu {
         assert_eq!(4097_i64 * 4097 - 16785408, 1);
         assert_eq!(4097_f32 * 4097. - 16785408., 0.);
         for i in cases.len()..rtz_start {
-            let got = unsafe { out.add(4 * i).read() }[2];
+            let got = unsafe { out.add(5 * i).read() }[2];
             if got != 1_f32.to_bits() {
                 return Err(format!("FMAC row {i} returned {got:08x}").into());
             }
         }
         for (i, (_, expected)) in rtz.into_iter().enumerate() {
-            let got = unsafe { out.add(4 * (rtz_start + i)).read() }[3];
+            let got = unsafe { out.add(5 * (rtz_start + i)).read() }[3];
             if got != expected {
                 return Err(format!("RTZ row {i}: got {got:08x}, expected {expected:08x}").into());
             }
         }
         let mov_oracle = [0, 0.5_f32.to_bits(), 1_f32.to_bits(), 0x7fc1_2345];
         for i in 0..inputs.len() {
-            let got = unsafe { out.add(4 * i + 1).read() };
+            let got = unsafe { out.add(5 * i + 1).read() };
             if got != mov_oracle {
                 return Err(
                     format!("MOV row {i}: got {got:08x?}, expected {mov_oracle:08x?}").into(),
@@ -204,7 +219,7 @@ mod gpu {
             (0, [INF, N0]),
             (6, [N2, P3]),
         ] {
-            let got = unsafe { out.add(4 * i + 2).read() };
+            let got = unsafe { out.add(5 * i + 2).read() };
             if got[..2] != expected {
                 return Err(format!(
                     "conditional row {i}: got {got:08x?}, expected {expected:08x?}"
@@ -220,7 +235,7 @@ mod gpu {
             (6, [0xc040_0000, 0x4000_0000]),
             (0, [P0, NINF]),
         ] {
-            let got = unsafe { out.add(4 * i + 2).read() };
+            let got = unsafe { out.add(5 * i + 2).read() };
             if got[2..] != expected {
                 return Err(format!(
                     "subtract row {i}: got {:08x?}, expected {expected:08x?}",
@@ -233,7 +248,7 @@ mod gpu {
         // compare classification only, not sign or payload. Finite, signed
         // zero and a product requiring one rounding use independent goldens.
         for i in [0, 1, 2, 3, nan_zero_row] {
-            let got = unsafe { out.add(4 * i + 3).read() }[0];
+            let got = unsafe { out.add(5 * i + 3).read() }[0];
             if !f32::from_bits(got).is_nan() {
                 return Err(
                     format!("ordinary multiply row {i}: expected NaN, got {got:08x}").into(),
@@ -241,7 +256,7 @@ mod gpu {
             }
         }
         for (i, expected) in [(4, P0), (5, P0), (6, N6), (7, N6), (8, 0x4b80_1000)] {
-            let got = unsafe { out.add(4 * i + 3).read() }[0];
+            let got = unsafe { out.add(5 * i + 3).read() }[0];
             if got != expected {
                 return Err(format!(
                     "ordinary multiply row {i}: expected {expected:08x}, got {got:08x}"
@@ -250,14 +265,14 @@ mod gpu {
             }
         }
         // Reuse the (-0, +1/4) input to check a negative result zero.
-        let got = unsafe { out.add(4 * (rtz_start + 1) + 3).read() }[0];
+        let got = unsafe { out.add(5 * (rtz_start + 1) + 3).read() }[0];
         if got != N0 {
             return Err(
                 format!("ordinary multiply signed zero: expected -0, got {got:08x}").into(),
             );
         }
         for (i, (_, want)) in add_cases.into_iter().enumerate() {
-            let got = unsafe { out.add(4 * (add_start + i) + 3).read() }[1];
+            let got = unsafe { out.add(5 * (add_start + i) + 3).read() }[1];
             if got != want {
                 return Err(
                     format!("ordinary add row {i}: expected {want:08x}, got {got:08x}").into(),
@@ -265,7 +280,7 @@ mod gpu {
             }
         }
         for (i, (_, want)) in inline_add_cases.into_iter().enumerate() {
-            let got = unsafe { out.add(4 * (inline_add_start + i) + 3).read() }[2];
+            let got = unsafe { out.add(5 * (inline_add_start + i) + 3).read() }[2];
             if got != want {
                 return Err(
                     format!("inline -1 add row {i}: expected {want:08x}, got {got:08x}").into(),
@@ -273,7 +288,7 @@ mod gpu {
             }
         }
         for (i, want) in inline_sub_expected.into_iter().enumerate() {
-            let got = unsafe { out.add(4 * (inline_add_start + i) + 3).read() }[3];
+            let got = unsafe { out.add(5 * (inline_add_start + i) + 3).read() }[3];
             if got != want {
                 return Err(format!(
                     "inline +1 subtract row {i}: expected {want:08x}, got {got:08x}"
@@ -281,8 +296,20 @@ mod gpu {
                 .into());
             }
         }
+        for (i, (x, plain, scaled)) in cvt_cases.into_iter().enumerate() {
+            assert_eq!((f64::from(x) as f32).to_bits(), plain);
+            assert_eq!(((f64::from(x) * 2.0) as f32).to_bits(), scaled);
+            let want = [scaled, scaled, plain, plain];
+            let got = unsafe { out.add(5 * (cvt_start + i) + 4).read() };
+            if got != want {
+                return Err(format!(
+                    "OMOD1 conversion row {i}: got {got:08x?}, expected {want:08x?}"
+                )
+                .into());
+            }
+        }
         println!(
-            "{}: strict arithmetic archive, 16/16 legacy words, 2/2 FMAC words, 3/3 packed RTZ words, {mov_words}/{mov_words} raw MOV words 8/8 select words, 8/8 subtract words 11/11 ordinary multiply checks 8/8 ordinary add words 7/7 inline -1 add words and 7/7 inline +1 subtract words",
+            "{}: strict arithmetic archive, 16/16 legacy words, 2/2 FMAC words, 3/3 packed RTZ words, {mov_words}/{mov_words} raw MOV words 8/8 select words, 8/8 subtract words 11/11 ordinary multiply checks 8/8 ordinary add words 7/7 inline -1 add words 7/7 inline +1 subtract words and 36/36 mode-dependent CVT words",
             dev.name(),
             mov_words = 4 * inputs.len()
         );

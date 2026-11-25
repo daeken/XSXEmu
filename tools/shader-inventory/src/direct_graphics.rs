@@ -228,6 +228,7 @@ struct GapCounts {
     inline_minus_one_add: (usize, usize),
     inline_one_sub: (usize, usize),
     signed_convert: (usize, usize),
+    mode_dependent_convert: (usize, usize),
     inline_first_fma: [(usize, usize); 2], // (sites, windows), positive/negative pair
     partial_param0: [usize; 3],
     bfrev_depth: BTreeMap<[usize; 7], usize>,
@@ -255,6 +256,13 @@ impl GapCounts {
         self.partial_param0[2] += gaps.partial_param0_noncanonical;
         self.signed_convert.0 += gaps.signed_vgpr_convert;
         self.signed_convert.1 += usize::from(gaps.signed_vgpr_convert > 0);
+        if let Some(&n) = gaps
+            .operand_forms
+            .get(crate::graphics_reachability::CVT_OMOD1_FORM)
+        {
+            self.mode_dependent_convert.0 += n;
+            self.mode_dependent_convert.1 += 1;
+        }
         for (total, n) in self.inline_first_fma.iter_mut().zip(gaps.inline_first_fma) {
             total.0 += n;
             total.1 += usize::from(n > 0);
@@ -344,6 +352,10 @@ impl GapCounts {
         println!(
             "    exact signed VGPR e32 conversion: {} sites in {} windows",
             self.signed_convert.0, self.signed_convert.1
+        );
+        let (sites, windows) = self.mode_dependent_convert;
+        println!(
+            "    exact e64 OMOD1 VGPR CVT recognized, MODE unresolved: {sites} sites in {windows} windows"
         );
         println!(
             "    exact inline-first VOP3 FMA (sites, windows) for (+2,v,-1) / (-2,v,+1): {:?}",
