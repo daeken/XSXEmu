@@ -175,3 +175,189 @@ fn fixed_consecutive_control() {
 fn fixed_nonconsecutive_composition() {
     run("fixed-nonconsecutive", &[2, 0], true);
 }
+
+#[test]
+fn fixed_full_descriptor_suffix() {
+    use crate::host_backing::Backing;
+    use std::time::{Duration, Instant};
+
+    // Captured geometry only; all bytes and tokens belong to this fixture.
+    const A: u64 = 0xa00000;
+    const B: u64 = 0x100000;
+    const C: u64 = 0x1b00000;
+    const D: u64 = 0x2f00000;
+    const E: u64 = 0x6400000;
+    const TOTAL: u64 = A + B + C + D + E;
+    const SUFFIX: u64 = C + D + E;
+    const OFFSETS: [u64; 6] = [0, C - 4, C, C + D - 4, C + D, SUFFIX - 4];
+    const SOURCE: [u64; 6] = [D + E + A + B, TOTAL - 4, 0, D - 4, D, D + E - 4];
+    const INIT: u32 = 0x20c41600;
+    const MASKS: [u32; 2] = [0x10204081, 0x01030509];
+    const KERNEL: &str = r#"
+    #include <metal_stdlib>
+    using namespace metal;
+    kernel void suffix(device uint *words [[buffer(0)]], constant uint &mask [[buffer(1)]],
+                       uint i [[thread_position_in_grid]]) {
+        const uint at[] = {0, 0x6bffff, 0x6c0000, 0x127ffff, 0x1280000, 0x2b7ffff};
+        words[at[i]] ^= mask + 17u * i;
+    }
+    "#;
+    assert_eq!((TOTAL, SUFFIX), (0xb900000, 0xae00000));
+    autoreleasepool(|| {
+        let device = Device::system_default().expect("Metal device");
+        let queue = device.new_command_queue();
+        let library = device
+            .new_library_with_source(KERNEL, &CompileOptions::new())
+            .unwrap();
+        let kernel = library.get_function("suffix", None).unwrap();
+        let pipeline = device
+            .new_compute_pipeline_state_with_function(&kernel)
+            .unwrap();
+        let gate = device.new_shared_event();
+        let mut arena = Some(Arena::with_slots(TOTAL / PAGE));
+        let owner = arena.as_mut().unwrap();
+        let base = owner.address(0);
+        let suffix = base + A + B;
+        let live = owner.observes_live_mapping();
+        let tokens = owner.allocate(TOTAL / PAGE);
+        for (va, len, offset) in [
+            (A + B + C, D, 0),
+            (A + B + C + D, E, D),
+            (0, A, D + E),
+            (A, B, D + E + A),
+            (A + B, C, D + E + A + B),
+        ] {
+            let first = tokens.start + offset / PAGE;
+            let ids: Vec<_> = (first..first + len / PAGE).collect();
+            owner.map(base + va, &ids).unwrap();
+        }
+        let alias = owner.batch_alias();
+        assert!(alias.base_address() + TOTAL <= base || alias.base_address() >= base + TOTAL);
+        let alias_word = |offset| {
+            let mut bytes = [0; 4];
+            alias.read(offset, &mut bytes).unwrap();
+            u32::from_le_bytes(bytes)
+        };
+        for (i, (&va, &offset)) in OFFSETS.iter().zip(&SOURCE).enumerate() {
+            alias
+                .write(offset, &(INIT + i as u32).to_le_bytes())
+                .unwrap();
+            assert_eq!(word(owner, suffix + va), INIT + i as u32);
+        }
+        let guards = [
+            (D + E, 0x37),
+            (D + E + A - 4, 0x91),
+            (D + E + A, 0xa3),
+            (D + E + A + B - 4, 0xe8),
+        ];
+        for (off, value) in guards {
+            alias.write(off, &[value]).unwrap();
+        }
+        let foreign = Backing::new(PAGE).unwrap().map(0, PAGE).unwrap();
+        foreign.write(0, &[0x47]).unwrap();
+        foreign.write(PAGE - 1, &[0x94]).unwrap();
+
+        let lease = owner.pin(suffix, SUFFIX / PAGE).unwrap();
+        let (address, len) = lease.extent();
+        assert_eq!((address, len), (suffix as usize, SUFFIX as usize));
+        // SAFETY: The lease owns the exact mapped suffix. CPU aliases are not
+        // accessed until ordered commands have completed.
+        let creator = unsafe { metal_backing::import_pinned(&device, address, len, lease) }
+            .expect("exact reordered no-copy import (no fallback)");
+        let retained: metal::Buffer = creator.clone();
+        drop(creator);
+        assert!(live());
+        println!(
+            "full-suffix: {} {} contents={address:#x} len={len:#x}",
+            std::env::consts::ARCH,
+            device.name()
+        );
+        autoreleasepool(|| {
+            let mut submitted = Vec::with_capacity(MASKS.len());
+            for (i, mask) in MASKS.into_iter().enumerate() {
+                let command = queue.new_command_buffer();
+                command.encode_wait_for_event(&gate, 1);
+                let encoder = command.new_compute_command_encoder();
+                encoder.set_compute_pipeline_state(&pipeline);
+                encoder.set_buffer(0, Some(&retained), 0);
+                // SAFETY: Metal takes an immediate copy of this fixed-size scalar.
+                encoder.set_bytes(1, 4, (&raw const mask).cast());
+                let threads = MTLSize::new(6, 1, 1);
+                encoder.dispatch_threads(threads, threads);
+                encoder.end_encoding();
+                command.commit();
+                submitted.push(command);
+                if i == 0 {
+                    let owner = arena.as_mut().unwrap();
+                    assert_eq!(owner.unmap(suffix, C / PAGE), Err(Refusal::Busy));
+                    assert_eq!(owner.unmap(suffix + C, D / PAGE), Err(Refusal::Busy));
+                    assert_eq!(owner.unmap(suffix + C + D, E / PAGE), Err(Refusal::Busy));
+                    assert_eq!(owner.map(suffix, &[tokens.start]), Err(Refusal::Busy));
+                    assert_eq!(owner.free(tokens.clone()), Err(Refusal::Busy));
+                }
+            }
+            let tail = queue.new_command_buffer();
+            tail.commit(); // completion witnesses the two earlier commands on this queue
+            assert!(!matches!(
+                tail.status(),
+                MTLCommandBufferStatus::Completed | MTLCommandBufferStatus::Error
+            ));
+            drop(retained);
+            drop(arena.take()); // releases creator's backing right as well as its arena handle
+            assert!(live(), "pending commands did not retain the arena");
+            gate.set_signaled_value(1);
+            let deadline = Instant::now() + Duration::from_secs(8);
+            while !matches!(
+                tail.status(),
+                MTLCommandBufferStatus::Completed | MTLCommandBufferStatus::Error
+            ) {
+                assert!(
+                    Instant::now() < deadline,
+                    "ordered Metal completion timed out"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert_eq!(tail.status(), MTLCommandBufferStatus::Completed);
+            for command in submitted {
+                assert_eq!(command.status(), MTLCommandBufferStatus::Completed);
+            }
+        });
+        for (i, offset) in SOURCE.into_iter().enumerate() {
+            let i = i as u32;
+            assert_eq!(
+                alias_word(offset),
+                (INIT + i) ^ (MASKS[0] + 17 * i) ^ (MASKS[1] + 17 * i)
+            );
+        }
+        let mut byte = [0];
+        for (off, value) in guards {
+            alias.read(off, &mut byte).unwrap();
+            assert_eq!(byte, [value]);
+        }
+        for (off, value) in [(0, 0x47), (PAGE - 1, 0x94)] {
+            foreign.read(off, &mut byte).unwrap();
+            assert_eq!(byte, [value]);
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while live() {
+            assert!(
+                Instant::now() < deadline,
+                "Metal retained the arena after ordered completion and pool drain"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        for (start, len) in [
+            (0, A),
+            (A, B),
+            (A + B, C),
+            (A + B + C, D),
+            (A + B + C + D, E),
+        ] {
+            crate::probe::check_unmapped(base + start, len);
+        }
+        drop(alias);
+        println!(
+            "PASS full-suffix: six endpoint/seam words, guards, ordered retirement and full arena cleanup"
+        );
+    });
+}

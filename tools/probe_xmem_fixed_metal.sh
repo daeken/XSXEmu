@@ -24,7 +24,8 @@ probes = [a['executable'] for a in artifacts if a['reason'] == 'compiler-artifac
           and a['executable']]
 if len(probes) != 1:
     sys.exit('expected exactly one fixed Metal probe executable')
-for case in ('fixed_one_page', 'fixed_consecutive_control', 'fixed_nonconsecutive_composition'):
+for case in ('fixed_one_page', 'fixed_consecutive_control', 'fixed_nonconsecutive_composition',
+             'fixed_full_descriptor_suffix'):
     try:
         status = subprocess.run(['/usr/bin/arch', '-' + arch, probes[0], '--exact',
                                  'fixed::' + case, '--nocapture'], timeout=30).returncode

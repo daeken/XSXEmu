@@ -51,7 +51,7 @@ fn sample_mapping(address: u64) -> Result<u8, i32> {
     Ok(byte)
 }
 
-fn check_unmapped(base: u64, len: u64) {
+pub(crate) fn check_unmapped(base: u64, len: u64) {
     for address in [base, base + len - 1] {
         assert_eq!(
             sample_mapping(address),

@@ -68,9 +68,9 @@ impl Arena {
         Self::with_slots(SLOTS)
     }
 
-    fn with_slots(slots: u64) -> Self {
-        assert!((1..=SLOTS).contains(&slots));
-        let len = slots * PAGE;
+    pub(crate) fn with_slots(slots: u64) -> Self {
+        assert!((1..=0xb90).contains(&slots));
+        let len = slots.checked_mul(PAGE).unwrap();
         let mut base = 0;
         // SAFETY: The kernel chooses unoccupied VA. The whole range is ours
         // until the arena and any pins are dropped. Only this owner mutates it.
@@ -126,6 +126,21 @@ impl Arena {
             return Err(Refusal::Partition);
         }
         Ok(())
+    }
+
+    #[allow(dead_code)] // Full-size standalone Metal fixture only.
+    pub(crate) fn observes_live_mapping(&self) -> impl Fn() -> bool + use<> {
+        let weak = Arc::downgrade(&self.mapping);
+        move || weak.strong_count() != 0
+    }
+
+    #[allow(dead_code)] // Full-size standalone Metal fixture only.
+    pub(crate) fn batch_alias(&self) -> View {
+        let batch = self.batch.as_ref().unwrap();
+        batch
+            .backing
+            .map(0, (batch.tokens.end - batch.tokens.start) * PAGE)
+            .unwrap()
     }
 
     pub(crate) fn address(&self, slot: u64) -> u64 {
