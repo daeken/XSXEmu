@@ -224,6 +224,7 @@ struct GapCounts {
     exact: usize,
     ordinary_mul: (usize, usize),
     ordinary_add: (usize, usize),
+    signed_convert: (usize, usize),
     bfrev_depth: BTreeMap<[usize; 7], usize>,
     packed_cleared: [usize; 2],
     interp_sole: BTreeMap<(usize, Option<(u8, u8, u8)>), usize>,
@@ -240,6 +241,8 @@ impl GapCounts {
     fn note(&mut self, gaps: &DirectGaps) {
         self.ordinary_add.0 += gaps.ordinary_vgpr_add;
         self.ordinary_add.1 += usize::from(gaps.ordinary_vgpr_add > 0);
+        self.signed_convert.0 += gaps.signed_vgpr_convert;
+        self.signed_convert.1 += usize::from(gaps.signed_vgpr_convert > 0);
         self.ordinary_mul.0 += gaps.ordinary_vgpr_mul;
         self.ordinary_mul.1 += usize::from(gaps.ordinary_vgpr_mul > 0);
         let contiguous = gaps.contiguous;
@@ -313,6 +316,10 @@ impl GapCounts {
         println!(
             "    exact two-VGPR v_add_f32_e32: {} sites in {} windows",
             self.ordinary_add.0, self.ordinary_add.1
+        );
+        println!(
+            "    exact signed VGPR e32 conversion: {} sites in {} windows",
+            self.signed_convert.0, self.signed_convert.1
         );
         if stage == "PS" {
             println!(
@@ -428,6 +435,7 @@ pub(super) fn run_gaps(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), B
     let mut distinct = HashSet::new();
     let mut interp_spans = HashSet::new();
     let mut packed_spans = [HashSet::new(), HashSet::new()];
+    let mut vs_sets = BTreeMap::<Vec<String>, HashMap<_, (usize, u8)>>::new();
     let mut pair_spans = [PairSpans::new(), PairSpans::new()];
     let mut refined_spans = [PairSpans::new(), PairSpans::new()];
     let mut counts: [[[GapCounts; 2]; STARTS.len()]; 2] = Default::default();
@@ -451,6 +459,17 @@ pub(super) fn run_gaps(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), B
                 for (w, wave) in waves.iter_mut().enumerate() {
                     if let Some(gaps) = direct_gaps(wave, window, slot) {
                         counts[slot][i][w].note(&gaps);
+                        if slot == 1 && !gaps.operand_forms.is_empty() {
+                            let key = gaps.operand_forms.keys().cloned().collect();
+                            let sites = gaps.operand_forms.values().sum();
+                            let row = vs_sets
+                                .entry(key)
+                                .or_default()
+                                .entry(reference.program)
+                                .or_insert((sites, 0));
+                            row.0 = row.0.min(sites);
+                            row.1 |= 1 << (i * 2 + w);
+                        }
                         pair_spans[slot].note(reference.program, &gaps.missing);
                         refined_spans[slot].note(reference.program, &gaps.operand_forms);
                         if slot == 0
@@ -500,6 +519,27 @@ pub(super) fn run_gaps(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), B
     {
         buckets.report(stage, "gap buckets");
         operands.report(stage, "operand forms");
+    }
+    let mut vs_sets: Vec<_> = vs_sets.into_iter().collect();
+    vs_sets.sort_unstable_by(|(a, x), (b, y)| {
+        a.len()
+            .cmp(&b.len())
+            .then_with(|| y.len().cmp(&x.len()))
+            .then_with(|| a.cmp(b))
+    });
+    for (forms, spans) in vs_sets.into_iter().take(12) {
+        let profiles: [usize; 8] = std::array::from_fn(|i| {
+            spans
+                .values()
+                .filter(|(_, mask)| mask & (1 << i) != 0)
+                .count()
+        });
+        let min_sites = spans.values().map(|(n, _)| *n).min().unwrap();
+        println!(
+            "  VS blocker set: {} forms, min {min_sites} sites, {} distinct spans, profiles +0/+24/+36/+40 (wave64 then wave32) {profiles:?}: {forms:?}",
+            forms.len(),
+            spans.len()
+        );
     }
     for (s, stage) in counts.into_iter().enumerate() {
         for (i, start) in stage.into_iter().enumerate() {

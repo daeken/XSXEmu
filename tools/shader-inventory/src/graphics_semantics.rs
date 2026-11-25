@@ -149,6 +149,16 @@ pub(crate) fn audit(words: &[u32], vertex: bool) -> Outcome {
                 let bits = f.read(src).map(|n| n & mask);
                 f.write(dst, bits);
             }
+            Op::ConvertInt { dst, src } => {
+                let bits = f.read(src);
+                if !bits.is_some_and(|n| {
+                    let mag = (n as i32).unsigned_abs();
+                    mag == 0 || mag.leading_zeros() + mag.trailing_zeros() >= 8
+                }) {
+                    f.outcome.needs.insert(F32ArithmeticMode);
+                }
+                f.write(dst, None);
+            }
             Op::ConvertUint { dst, src, byte0 } => {
                 // Byte0 conversion is always exactly representable. So is a
                 // known U32 with at most 24 significant bits after trailing zeros.

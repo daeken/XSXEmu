@@ -54,6 +54,10 @@ pub(crate) enum Op {
         src: Vgpr,
         mask: u32,
     },
+    ConvertInt {
+        dst: Vgpr,
+        src: Vgpr,
+    },
     ConvertUint {
         dst: Vgpr,
         src: Vgpr,
@@ -330,6 +334,15 @@ pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeErro
             ));
         }
         _ => {}
+    }
+    if w & 0xfe01_ff00 == 0x7e00_0b00 {
+        return Ok((
+            1,
+            Op::ConvertInt {
+                dst,
+                src: Vgpr(w as u8),
+            },
+        ));
     }
     if matches!(w & 0xfe01_ff00, 0x7e00_2300 | 0x7e00_0d00) {
         return Ok((

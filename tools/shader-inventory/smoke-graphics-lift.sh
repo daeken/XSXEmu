@@ -140,8 +140,8 @@ compile pos-first
 compile multi
 "$p" --load-multi-metallib "$d/multi.metallib"
 
-# Native vertex byte extraction and full unsigned conversion, with fused FMA.
-for kind in byte uint; do
+# Native byte/unsigned unpack + FMA, and independently rounded signed conversion.
+for kind in byte uint signed; do
     "$p" "--unpack-$kind-source"
     "$p" "--emit-unpack-$kind-msl" > "$d/unpack-$kind.metal"
     compile "unpack-$kind"

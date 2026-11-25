@@ -280,6 +280,7 @@ fn lift(stage: Stage, words: &[u32]) -> Result<Vec<Op>, Reject> {
         match op {
             Op::ShiftLeftOne { dst, src }
             | Op::AndMask { dst, src, .. }
+            | Op::ConvertInt { dst, src }
             | Op::ConvertUint { dst, src, .. }
             | Op::FmaUnpack { dst, src, .. } => {
                 if stage != Stage::UnpackVertex {
@@ -548,6 +549,16 @@ fn emit_body(out: &mut String, ops: &[Op], packed_color_lvalue: &str, multi: boo
                 src: Vgpr(s),
                 mask,
             } => writeln!(out, "  r[{d}] = r[{s}] & {mask}u;").unwrap(),
+            Op::ConvertInt {
+                dst: Vgpr(d),
+                src: Vgpr(s),
+            } => {
+                writeln!(
+                    out,
+                    "  r[{d}] = as_type<uint>(float(as_type<int>(r[{s}])));"
+                )
+                .unwrap();
+            }
             Op::ConvertUint {
                 dst: Vgpr(d),
                 src: Vgpr(s),
@@ -1401,11 +1412,24 @@ const UNPACK_UINT_VS: [u32; 14] = {
     words
 };
 
+// Owned RNE contract: uint vertex words interpreted as signed, flat readback.
+const SIGNED_VS: &[u32] = &[
+    0x7e10_0b04,
+    0x7e12_0b05,
+    0xf800_020f,
+    0x0908_0908,
+    0xf800_08cf,
+    0x0302_0100,
+    0xbf81_0000,
+];
+
 #[allow(dead_code)]
-pub(crate) fn translate_unpack_fixture(uint: bool) -> Result<String, Reject> {
+pub(crate) fn translate_unpack_fixture(uint: bool, signed: bool) -> Result<String, Reject> {
     let vs = lift(
         Stage::UnpackVertex,
-        if uint {
+        if signed {
+            SIGNED_VS
+        } else if uint {
             &UNPACK_UINT_VS
         } else {
             &UNPACK_BYTE_VS
@@ -1493,6 +1517,7 @@ mod tests {
             "exp mrt0 v1, v1, v0, v0 compr\nexp mrt1 v0, off, off, off done vm\ns_endpgm\n",
         );
         asm.push_str("v_bfrev_b32_e32 v3, 60\nexp mrtz v2, off, off, off\nexp mrt0 v1, v1, v3, v3 done compr vm\ns_endpgm\n");
+        asm.push_str("v_cvt_f32_i32_e32 v8, v4\nv_cvt_f32_i32_e32 v9, v5\nexp param0 v8, v9, v8, v9\nexp pos0 v0, v1, v2, v3 done\ns_endpgm\n");
         let expected: Vec<u8> = VS
             .iter()
             .chain(PS)
@@ -1540,6 +1565,7 @@ mod tests {
                 BFREV_DEPTH_PS[4],
                 BFREV_DEPTH_PS[5],
             ])
+            .chain(SIGNED_VS)
             .flat_map(|w| w.to_le_bytes())
             .collect();
         for cpu in ["gfx1013", "gfx1030"] {
@@ -1722,6 +1748,24 @@ mod tests {
         let mut words = WAIT_POS_VS.to_vec();
         words.swap(2, 3);
         assert!(lift_pos_snapshot(&words, false).is_err());
+    }
+
+    #[test]
+    fn signed_conversion_checks_width_selector_and_read_before_write() {
+        assert!(lift(Stage::UnpackVertex, SIGNED_VS).is_ok());
+        assert_eq!(lift(Stage::Vertex, SIGNED_VS), Err(Reject::Unsupported(0)));
+        let mut words = SIGNED_VS.to_vec();
+        words[0] = 0x7e10_0a04; // s4, not v4
+        assert_eq!(
+            lift(Stage::UnpackVertex, &words),
+            Err(Reject::Unsupported(0))
+        );
+        words[0] = 0x7e10_0b08; // v8 before definition
+        assert_eq!(
+            lift(Stage::UnpackVertex, &words),
+            Err(Reject::Uninitialized(0, 8))
+        );
+        assert!(decode(&[0xd585_0008, 0x104], 0).is_err());
     }
 
     #[test]

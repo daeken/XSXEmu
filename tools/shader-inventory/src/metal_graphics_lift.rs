@@ -25,6 +25,29 @@ fn expected(x: usize, mutated: bool) -> [u8; 4] {
     [gradient, 255, ((red_numerator * 255 + 32) / 64) as u8, 0]
 }
 
+#[cfg(any(test, target_os = "macos"))]
+const SIGNED_INPUTS: [[u32; 2]; 4] = [
+    [0, u32::MAX],
+    [0x0100_0001, 0xfeff_ffff],
+    [0x0100_0003, 0xfeff_fffd],
+    [0x7fff_ffff, 0x8000_0000],
+];
+#[cfg(any(test, target_os = "macos"))]
+const SIGNED_EXPECTED: [[f32; 2]; 4] = [
+    [0., -1.],
+    [16_777_216., -16_777_216.],
+    [16_777_220., -16_777_220.],
+    [2_147_483_648., -2_147_483_648.],
+];
+
+#[test]
+fn signed_conversion_cpu_matches_literal_ties_and_extrema() {
+    assert_eq!(
+        SIGNED_INPUTS.map(|pair| pair.map(|x| ((x as i32) as f32).to_bits())),
+        SIGNED_EXPECTED.map(|pair| pair.map(f32::to_bits))
+    );
+}
+
 // Independent integer depth oracle (depth in eighths), with literal expected
 // colors rather than extracting values from the native ABI input words.
 #[cfg(any(test, target_os = "macos"))]
@@ -273,10 +296,10 @@ mod gpu {
                 print!("{}", graphics_lift::translate_wait_pos_fixture(false).map_err(|e| format!("position wait lift rejected: {e:?}"))?);
                 return Ok(());
             }
-            [mode] if mode == "--unpack-byte-source" || mode == "--unpack-uint-source" => Mode::UnpackSource(mode == "--unpack-uint-source"),
-            [mode, lib] if mode == "--load-unpack-byte-metallib" || mode == "--load-unpack-uint-metallib" => Mode::UnpackLoad(Path::new(lib), mode == "--load-unpack-uint-metallib"),
-            [mode] if mode == "--emit-unpack-byte-msl" || mode == "--emit-unpack-uint-msl" => {
-                print!("{}", graphics_lift::translate_unpack_fixture(mode == "--emit-unpack-uint-msl").map_err(|e| format!("unpack lift rejected: {e:?}"))?);
+            [mode] if mode == "--unpack-byte-source" || mode == "--unpack-uint-source" || mode == "--unpack-signed-source" => Mode::UnpackSource(mode == "--unpack-uint-source"),
+            [mode, lib] if mode == "--load-unpack-byte-metallib" || mode == "--load-unpack-uint-metallib" || mode == "--load-unpack-signed-metallib" => Mode::UnpackLoad(Path::new(lib), mode == "--load-unpack-uint-metallib"),
+            [mode] if mode == "--emit-unpack-byte-msl" || mode == "--emit-unpack-uint-msl" || mode == "--emit-unpack-signed-msl" => {
+                print!("{}", graphics_lift::translate_unpack_fixture(mode == "--emit-unpack-uint-msl", mode == "--emit-unpack-signed-msl").map_err(|e| format!("unpack lift rejected: {e:?}"))?);
                 return Ok(());
             }
             [mode] if mode == "--multi-source" => Mode::MultiSource,
@@ -415,6 +438,9 @@ mod gpu {
         let wait_pos = matches!(mode, Mode::WaitPosSource(_) | Mode::WaitPosLoad(_));
         let pos_first = matches!(mode, Mode::PosFirstSource | Mode::PosFirstLoad(_));
         let late_pos = matches!(mode, Mode::WaitPosSource(true));
+        let signed_unpack = args
+            .first()
+            .is_some_and(|a| a == "--unpack-signed-source" || a == "--load-unpack-signed-metallib");
         let unpack = match mode {
             Mode::UnpackSource(uint) | Mode::UnpackLoad(_, uint) => Some(uint),
             _ => None,
@@ -499,7 +525,7 @@ mod gpu {
                 } else if wait_pos {
                     graphics_lift::translate_wait_pos_fixture(late_pos)
                 } else if let Some(uint) = unpack {
-                    graphics_lift::translate_unpack_fixture(uint)
+                    graphics_lift::translate_unpack_fixture(uint, signed_unpack)
                 } else if multi {
                     graphics_lift::translate_multi_vertex_fixture()
                 } else if wait_depth {
@@ -836,12 +862,16 @@ mod gpu {
         if unpack.is_some() {
             // Each pair drives a two-column stripe with the same words at
             // all three vertices. The MSB of the shift source is discarded.
-            for (stripe, [a, b]) in [
-                [1, 0x8000_0000],
-                [0x0200_0003, 0x8000_0001],
-                [0x0200_0007, 0xffff_fffe],
-                [0xffff_ffff, 0xffff_ffff],
-            ]
+            for (stripe, [a, b]) in (if signed_unpack {
+                SIGNED_INPUTS
+            } else {
+                [
+                    [1, 0x8000_0000],
+                    [0x0200_0003, 0x8000_0001],
+                    [0x0200_0007, 0xffff_fffe],
+                    [0xffff_ffff, 0xffff_ffff],
+                ]
+            })
             .into_iter()
             .enumerate()
             {
@@ -1130,7 +1160,9 @@ mod gpu {
         if let Some(uint) = unpack {
             // Independent expected [2*x-1, 1-2*y, x, y]. The U32 table
             // explicitly fixes both ties at 2^25 and the carry to 2^32.
-            let expected: [[f32; 4]; 4] = if uint {
+            let expected: [[f32; 4]; 4] = if signed_unpack {
+                SIGNED_EXPECTED.map(|[a, b]| [a, b, a, b])
+            } else if uint {
                 [
                     [-1., 1., 0., 0.],
                     [67_108_864., -3., 33_554_432., 2.],
@@ -1160,7 +1192,7 @@ mod gpu {
                 }
             }
             println!(
-                "{} owned native VS unpack/FMA (uint={uint}): 64/64 pixels bit-exact",
+                "{} owned native VS unpack (uint={uint}, signed={signed_unpack}): 64/64 pixels bit-exact",
                 dev.name()
             );
             return Ok(());

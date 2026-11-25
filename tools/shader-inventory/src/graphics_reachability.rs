@@ -232,6 +232,7 @@ fn exact_opcode(
                 Op::SubFromPositiveZero { .. } => name == "v_sub_f32_e32",
                 Op::ShiftLeftOne { .. } => name == "v_lshlrev_b32_e32",
                 Op::AndMask { .. } => name == "v_and_b32_e32",
+                Op::ConvertInt { .. } => name == "v_cvt_f32_i32_e32",
                 Op::ConvertUint { byte0: true, .. } => name == "v_cvt_f32_ubyte0_e32",
                 Op::ConvertUint { byte0: false, .. } => name == "v_cvt_f32_u32_e32",
                 Op::FmaUnpack { .. } => name == "v_fma_f32",
@@ -278,6 +279,27 @@ fn direct_operand_form(name: &str, words: [u32; 2], len: usize, bucket: &str) ->
     let [first, sources] = words;
     let attr = (first >> 10) & 63;
     match name {
+        "s_setprio" if len == 4 && first & 0xffff_fffc == 0xbf8f_0000 => {
+            format!("{name}/imm-{}/4B", first & 3)
+        }
+        "v_cvt_f32_i32_e32" if len == 4 && first & 0xfe01_fe00 == 0x7e00_0a00 => {
+            let selector = first & 511;
+            match selector {
+                256..=511 => format!("{name}/VGPR/4B"),
+                0..=105 => format!("{name}/SGPR/4B"),
+                _ => format!("{name}/selector-{selector}/4B"),
+            }
+        }
+        "v_cvt_f32_i32_e64"
+            if len == 8 && first & 0xffff_ff00 == 0xd585_0000 && sources & !511 == 0 =>
+        {
+            let selector = sources & 511;
+            match selector {
+                256..=511 => format!("{name}/VGPR/no-modifiers/8B"),
+                0..=105 => format!("{name}/SGPR/no-modifiers/8B"),
+                _ => format!("{name}/selector-{selector}/no-modifiers/8B"),
+            }
+        }
         "v_interp_p1_f32_e32" | "v_interp_p2_f32_e32"
             if len == 4
                 && attr <= 32
@@ -347,6 +369,7 @@ pub(super) struct DirectGaps {
     pub operand_forms: BTreeMap<String, usize>,
     pub ordinary_vgpr_mul: usize,
     pub ordinary_vgpr_add: usize,
+    pub signed_vgpr_convert: usize,
     pub contiguous: bool,
     pub interp_mov: BTreeMap<Option<(u8, u8, u8)>, usize>,
     pub packed_mrt0_noncanonical: [usize; 2], // RG / RGBA
@@ -419,6 +442,10 @@ pub(super) fn direct_gaps(dis: &mut Disassembler, bytes: &[u8], slot: usize) -> 
                     _ => (),
                 }
             }
+            gaps.signed_vgpr_convert += usize::from(matches!(
+                decoded,
+                Some((1, crate::graphics_decode::Op::ConvertInt { .. }))
+            ));
             gaps.ordinary_vgpr_add += usize::from(matches!(
                 decoded,
                 Some((1, crate::graphics_decode::Op::AddF32 { .. }))
