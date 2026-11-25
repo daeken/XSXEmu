@@ -115,6 +115,8 @@ pub(crate) enum Op {
         src: Vgpr,
     },
     PackedBa {
+        slot: u8,
+        final_export: bool,
         src: Vgpr,
     },
     PackedRg {
@@ -488,11 +490,13 @@ pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeErro
             },
         ));
     }
-    // Exact final packed MRT0 EN12: only VSRC1 is active (B low, A high).
-    if w == 0xf800_1c0c {
+    // Exact packed EN12 forms: only VSRC1 is active (B low, A high).
+    if matches!(w, 0xf800_040c | 0xf800_1c0c | 0xf800_1c1c) {
         return Ok((
             2,
             Op::PackedBa {
+                slot: ((w >> 4) & 63) as u8,
+                final_export: w & 0x800 != 0,
                 src: Vgpr((ext()? >> 8) as u8),
             },
         ));

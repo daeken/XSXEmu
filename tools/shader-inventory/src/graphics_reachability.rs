@@ -513,7 +513,14 @@ pub(super) fn direct_gaps(dis: &mut Disassembler, bytes: &[u8], slot: usize) -> 
             ));
             gaps.packed_ba += usize::from(matches!(
                 decoded,
-                Some((2, crate::graphics_decode::Op::PackedBa { .. }))
+                Some((
+                    2,
+                    crate::graphics_decode::Op::PackedBa {
+                        slot: 0,
+                        final_export: true,
+                        ..
+                    }
+                ))
             ));
             gaps.packed_mrt1_rg_final += usize::from(matches!(
                 decoded,

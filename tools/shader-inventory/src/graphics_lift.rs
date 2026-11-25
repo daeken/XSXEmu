@@ -426,8 +426,12 @@ fn lift(stage: Stage, words: &[u32]) -> Result<Vec<Op>, Reject> {
                 }
                 exported += 1;
             }
-            Op::PackedBa { src } => {
-                if stage != Stage::PackedBaPixel || exported != 0 {
+            Op::PackedBa {
+                slot,
+                final_export,
+                src,
+            } => {
+                if stage != Stage::PackedBaPixel || (exported, slot, final_export) != (0, 0, true) {
                     return Err(Reject::BadExports(pc));
                 }
                 require(src)?;
@@ -689,7 +693,7 @@ fn emit_body(out: &mut String, ops: &[Op], packed_color_lvalue: &str, multi: boo
                 )
                 .unwrap();
             }
-            Op::PackedBa { src: Vgpr(ba) } => {
+            Op::PackedBa { src: Vgpr(ba), .. } => {
                 // Metal return-value placeholders; R/G stores are disabled by the owned PSO.
                 writeln!(out, "  {packed_color_lvalue} = float4(0.0f, 0.0f, float(as_type<half>(ushort(r[{ba}]))), float(as_type<half>(ushort(r[{ba}] >> 16))));").unwrap();
             }
@@ -1137,7 +1141,7 @@ const DUAL_BA_PS: [u32; 8] = [
     0xbf81_0000,
 ];
 
-// Separate owned profile, not a shared decode or bound-translation admission.
+// Separate owned profile using the shared exact decoder; no bound-translation admission.
 fn dual_ba_words(words: &[u32]) -> Result<[u32; 2], Reject> {
     if words.len() != DUAL_BA_PS.len() {
         return Err(Reject::Extent);
@@ -1151,8 +1155,17 @@ fn dual_ba_words(words: &[u32]) -> Result<[u32; 2], Reject> {
     if first == second {
         return Err(Reject::BadExports(3));
     }
-    for (pc, header, Vgpr(src)) in [(3, 0xf800_040c, first), (5, 0xf800_1c1c, second)] {
-        if words[pc] != header || (words[pc + 1] >> 8) as u8 != src {
+    for (pc, slot, final_export, src) in [(3, 0, false, first), (5, 1, true, second)] {
+        if decode(words, pc)
+            != Ok((
+                2,
+                Op::PackedBa {
+                    slot,
+                    final_export,
+                    src,
+                },
+            ))
+        {
             return Err(Reject::BadExports(pc));
         }
     }
@@ -2381,9 +2394,42 @@ mod tests {
         let mut swapped = DUAL_BA_PS;
         swapped[3..7].rotate_left(2);
         assert!(dual_ba_words(&swapped).is_err());
-        for pc in [3, 5] {
-            assert_eq!(decode(&DUAL_BA_PS, pc), Err(DecodeError::Unsupported(pc)));
+        for (pc, slot, final_export, src) in [(3, 0, false, Vgpr(8)), (5, 1, true, Vgpr(9))] {
+            let expected = Ok((
+                2,
+                Op::PackedBa {
+                    slot,
+                    final_export,
+                    src,
+                },
+            ));
+            assert_eq!(decode(&DUAL_BA_PS, pc), expected);
+            assert_eq!(decode(&canonical, pc), expected);
+            assert_eq!(
+                decode(&DUAL_BA_PS[..pc + 1], pc),
+                Err(DecodeError::Truncated(pc))
+            );
+            for bit in [0, 5, 10, 12, 13] {
+                let header = DUAL_BA_PS[pc] ^ (1 << bit);
+                assert_eq!(
+                    decode(&[header, DUAL_BA_PS[pc + 1]], 0),
+                    Err(DecodeError::Unsupported(0))
+                );
+            }
         }
+        let mut wrong_source_order = DUAL_BA_PS;
+        wrong_source_order[4] ^= 0x100;
+        wrong_source_order[6] ^= 0x100;
+        assert_eq!(
+            dual_ba_words(&wrong_source_order),
+            Err(Reject::BadExports(3))
+        );
+        let mut premature_final_mrt0 = DUAL_BA_PS;
+        premature_final_mrt0[3] = PACKED_BA_PS[0];
+        assert_eq!(
+            dual_ba_words(&premature_final_mrt0),
+            Err(Reject::BadExports(3))
+        );
     }
 
     #[test]
@@ -2607,13 +2653,12 @@ mod tests {
             lift(Stage::DualPackedRgPixel, &words),
             Err(Reject::BadExports(2))
         );
-        for header in [
-            0xf800_0c13,
-            0xf800_1413,
-            0xf800_3c13,
-            0xf800_1c23,
-            0xf800_1c1c,
-        ] {
+        words[2] = 0xf800_1c1c;
+        assert_eq!(
+            lift(Stage::DualPackedRgPixel, &words),
+            Err(Reject::BadExports(2))
+        );
+        for header in [0xf800_0c13, 0xf800_1413, 0xf800_3c13, 0xf800_1c23] {
             assert_eq!(decode(&[header, 0], 0), Err(DecodeError::Unsupported(0)));
         }
     }
@@ -2714,7 +2759,14 @@ mod tests {
 
     #[test]
     fn packed_ba_checks_only_live_vsrc1_and_exact_export_header() {
-        let expected = Ok((2, Op::PackedBa { src: Vgpr(0) }));
+        let expected = Ok((
+            2,
+            Op::PackedBa {
+                slot: 0,
+                final_export: true,
+                src: Vgpr(0),
+            },
+        ));
         assert_eq!(decode(PACKED_BA_PS, 0), expected);
         assert_eq!(decode(&[PACKED_BA_PS[0], 0], 0), expected);
         assert_eq!(
@@ -2734,7 +2786,13 @@ mod tests {
             Err(Reject::Uninitialized(0, 1))
         );
         assert!(lift(Stage::PackedBaPixel, &PACKED_BA_PS[..2]).is_err());
-        for changed in [1, 1 << 4, 1 << 10, 1 << 11, 1 << 12, 1 << 13] {
+        for header in [0xf800_040c, 0xf800_1c1c] {
+            assert_eq!(
+                lift(Stage::PackedBaPixel, &[header, 0, PACKED_BA_PS[2]]),
+                Err(Reject::BadExports(0))
+            );
+        }
+        for changed in [1, 1 << 10, 1 << 12, 1 << 13] {
             assert_eq!(
                 decode(&[PACKED_BA_PS[0] ^ changed, 0], 0),
                 Err(DecodeError::Unsupported(0))
