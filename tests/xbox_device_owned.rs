@@ -3,10 +3,14 @@
 
 #[path = "support/owned_device_host.rs"]
 mod host;
-use host::{MetalBackend, read, write_word};
+use host::{MetalBackend, read, write, write_word};
+use std::collections::BTreeMap;
 use std::{
     arch::asm,
     sync::{Mutex, OnceLock, atomic::Ordering},
+};
+use xsxemu::d3d12_command_state::{
+    AllocatorId, CommandKind, CommandState, ListId, QueueId, StateError,
 };
 use xsxemu::xbox_device::{DeviceId, Error, IUNKNOWN, OBSERVED_DEVICE_IID, OwnedDevices};
 
@@ -20,9 +24,119 @@ struct State {
     ledger: OwnedDevices<MetalBackend>,
     fixture_enabled: bool,
     backend_enabled: bool,
-    live: Option<(DeviceId, Box<usize>)>,
+    live: BTreeMap<usize, LiveDevice>,
+    next_queue: usize,
 }
 static STATE: Mutex<Option<State>> = Mutex::new(None);
+static RUN: Mutex<()> = Mutex::new(());
+
+struct LiveDevice {
+    id: DeviceId,
+    _prefix: Box<usize>,
+    queue_key: usize,
+    copy: CopyState,
+}
+
+struct CopyState {
+    model: CommandState,
+    queue: QueueId,
+    allocator: AllocatorId,
+    list: ListId,
+    accepted: bool,
+}
+
+impl CopyState {
+    fn new() -> Result<Self, StateError> {
+        let mut model = CommandState::new()?;
+        let queue = model.create_queue(CommandKind::Copy);
+        let allocator = model.create_allocator(CommandKind::Copy);
+        let list = model.create_list(CommandKind::Copy, allocator)?;
+        model.close_list(list)?;
+        Ok(Self {
+            model,
+            queue,
+            allocator,
+            list,
+            accepted: false,
+        })
+    }
+
+    fn submit(
+        &mut self,
+        backend: &MetalBackend,
+        input: [u8; 64],
+    ) -> Result<[u8; 64], &'static str> {
+        if self.accepted {
+            return Err("owned queue already accepted its one copy");
+        }
+        let batch = self
+            .model
+            .prepare_submission(self.queue, &[self.list])
+            .map_err(|_| "copy preparation failed")?;
+        let mut token = None;
+        let result = backend.copy(input, || {
+            token = Some(batch.commit());
+            self.accepted = true;
+        });
+        let bytes = result?;
+        let token = token.ok_or("Metal copy not accepted")?;
+        if self.model.reset_allocator(self.allocator) != Err(StateError::AllocatorInFlight) {
+            return Err("allocator not pinned before completion ingestion");
+        }
+        self.model
+            .complete_through(self.queue, token)
+            .map_err(|_| "retirement failed")?;
+        self.model
+            .reset_allocator(self.allocator)
+            .map_err(|_| "allocator still pinned after retirement")?;
+        Ok(bytes)
+    }
+}
+
+// Private fixture ABI: no retail queue getter, descriptor, or vtable slot.
+extern "win64" fn owned_queue(this: usize, out: usize, _unused: usize, _unused2: usize) -> i32 {
+    if !write_word(out, 0) {
+        return E_POINTER;
+    }
+    let guard = STATE.lock().unwrap();
+    let Some(device) = guard.as_ref().unwrap().live.get(&this) else {
+        return E_FAIL;
+    };
+    if write_word(out, device.queue_key) {
+        0
+    } else {
+        E_POINTER
+    }
+}
+
+extern "win64" fn owned_submit(this: usize, queue_key: usize, input: usize, out: usize) -> i32 {
+    let mut guard = STATE.lock().unwrap();
+    let state = guard.as_mut().unwrap();
+    let Some(owner) = state
+        .live
+        .get_mut(&this)
+        .filter(|device| device.queue_key == queue_key)
+    else {
+        return E_FAIL;
+    };
+    let Some(input) = read::<64>(input) else {
+        return E_POINTER;
+    };
+    if !write(out, &[0; 64]) {
+        return E_POINTER;
+    }
+    let Ok(backend) = state.ledger.backend(owner.id) else {
+        return E_FAIL;
+    };
+    match owner.copy.submit(backend, input) {
+        Ok(bytes) if write(out, &bytes) => 0,
+        Ok(_) => E_POINTER,
+        Err(reason) => {
+            eprintln!("owned Xbox queue: {reason}");
+            E_FAIL
+        }
+    }
+}
 
 extern "win64" fn unsupported() -> ! {
     eprintln!("owned Xbox device: unsupported method");
@@ -42,8 +156,7 @@ fn vtable() -> &'static [usize; 134] {
 }
 
 fn live_id(state: &State, this: usize) -> Option<DeviceId> {
-    let (id, prefix) = state.live.as_ref()?;
-    (std::ptr::from_ref(prefix.as_ref()).addr() == this).then_some(*id)
+    Some(state.live.get(&this)?.id)
 }
 
 extern "win64" fn create(adapter: usize, params: usize, iid: usize, out: usize) -> i32 {
@@ -71,13 +184,26 @@ extern "win64" fn create(adapter: usize, params: usize, iid: usize, out: usize) 
         Err(Error::UnsupportedInterface) => return E_NOINTERFACE,
         Err(_) => return E_FAIL,
     };
+    let (Ok(copy), Some(next_queue)) = (CopyState::new(), state.next_queue.checked_add(1)) else {
+        state.ledger.release(id).unwrap();
+        return E_FAIL;
+    };
     let prefix = Box::new(vtable().as_ptr().addr());
     let address = std::ptr::from_ref(prefix.as_ref()).addr();
     if !write_word(out, address) {
         state.ledger.release(id).unwrap();
         return E_POINTER;
     }
-    state.live = Some((id, prefix));
+    state.live.insert(
+        address,
+        LiveDevice {
+            id,
+            _prefix: prefix,
+            queue_key: state.next_queue,
+            copy,
+        },
+    );
+    state.next_queue = next_queue;
     0
 }
 
@@ -121,17 +247,28 @@ extern "win64" fn release(this: usize) -> u32 {
     };
     let remaining = state.ledger.release(id).unwrap();
     if remaining == 0 {
-        state.live = None;
+        state.live.remove(&this);
     }
     remaining
 }
 
 unsafe fn create_call(adapter: usize, params: usize, iid: usize, out: usize) -> i32 {
+    // SAFETY: same owned Win64 signature and checked fixture inputs.
+    unsafe { direct(create, adapter, params, iid, out) }
+}
+
+unsafe fn direct(
+    entry: extern "win64" fn(usize, usize, usize, usize) -> i32,
+    adapter: usize,
+    params: usize,
+    iid: usize,
+    out: usize,
+) -> i32 {
     let result;
     // SAFETY: test inputs satisfy the fixture's explicitly owned contract; no unwind.
     unsafe {
         asm!("sub rsp, 32", "call {entry}", "add rsp, 32",
-            entry = in(reg) create as *const (),
+            entry = in(reg) entry as *const (),
             inlateout("rcx") adapter => _, inlateout("rdx") params => _,
             inlateout("r8") iid => _, inlateout("r9") out => _,
             lateout("eax") result, clobber_abi("win64"));
@@ -181,11 +318,14 @@ impl Drop for Guarded {
 
 #[test]
 fn owned_create_and_iunknown_prefix_obey_win64_and_reference_lifetime() {
+    let _run = RUN.lock().unwrap();
+    let drops = host::DROPS.load(Ordering::Relaxed);
     *STATE.lock().unwrap() = Some(State {
         ledger: OwnedDevices::new(1),
         fixture_enabled: false,
         backend_enabled: false,
-        live: None,
+        live: BTreeMap::new(),
+        next_queue: 1,
     });
     STATE.lock().unwrap().as_mut().unwrap().fixture_enabled = true;
     let params = PREFIX;
@@ -239,7 +379,7 @@ fn owned_create_and_iunknown_prefix_obey_win64_and_reference_lifetime() {
             E_FAIL
         );
         assert_eq!(device, 0);
-        assert_eq!(host::DROPS.load(Ordering::Relaxed), 0);
+        assert_eq!(host::DROPS.load(Ordering::Relaxed), drops);
         STATE.lock().unwrap().as_mut().unwrap().backend_enabled = true;
         let mut bad = params;
         bad[79] ^= 1;
@@ -272,12 +412,12 @@ fn owned_create_and_iunknown_prefix_obey_win64_and_reference_lifetime() {
         assert_eq!(method::<1>(out, 0, 0), 3);
         assert_eq!(method::<2>(device, 0, 0), 2);
         assert_eq!(method::<2>(device, 0, 0), 1);
-        assert_eq!(host::DROPS.load(Ordering::Relaxed), 0);
+        assert_eq!(host::DROPS.load(Ordering::Relaxed), drops);
         assert_eq!(method::<2>(device, 0, 0), 0);
     }
     let mut guard = STATE.lock().unwrap();
-    assert!(guard.take().unwrap().live.is_none());
-    assert_eq!(host::DROPS.load(Ordering::Relaxed), 1);
+    assert!(guard.take().unwrap().live.is_empty());
+    assert_eq!(host::DROPS.load(Ordering::Relaxed), drops + 1);
     drop(guard);
     let child = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
@@ -292,4 +432,66 @@ fn owned_create_and_iunknown_prefix_obey_win64_and_reference_lifetime() {
     assert!(
         String::from_utf8_lossy(&child.stderr).contains("owned Xbox device: unsupported method")
     );
+}
+
+#[test]
+fn owned_win64_copy_uses_only_the_creating_devices_queue() {
+    let _run = RUN.lock().unwrap();
+    let drops = host::DROPS.load(Ordering::Relaxed);
+    *STATE.lock().unwrap() = Some(State {
+        ledger: OwnedDevices::new(2),
+        fixture_enabled: true,
+        backend_enabled: true,
+        live: BTreeMap::new(),
+        next_queue: 1,
+    });
+    let mut device = 0;
+    let mut foreign = 0;
+    let mut queue = 0;
+    let mut foreign_queue = 0;
+    let input: [u8; 64] = std::array::from_fn(|i| (i as u8).wrapping_mul(71) ^ 93);
+    let mut output = [0x9du8; 64];
+    let params = PREFIX;
+    let iid = OBSERVED_DEVICE_IID;
+    // SAFETY: all pointers refer to disjoint, live fixture-owned storage.
+    unsafe {
+        for out in [&mut device, &mut foreign] {
+            assert_eq!(
+                create_call(
+                    0,
+                    params.as_ptr().addr(),
+                    iid.as_ptr().addr(),
+                    (out as *mut usize).addr()
+                ),
+                0
+            );
+        }
+        assert_ne!(device, foreign);
+        assert_eq!(
+            direct(owned_queue, device, (&raw mut queue).addr(), 0, 0),
+            0
+        );
+        assert_eq!(
+            direct(owned_queue, foreign, (&raw mut foreign_queue).addr(), 0, 0),
+            0
+        );
+        assert_ne!(queue, foreign_queue);
+        let src = input.as_ptr().addr();
+        let dst = output.as_mut_ptr().addr();
+        assert_eq!(
+            direct(owned_submit, device, foreign_queue, src, dst),
+            E_FAIL
+        );
+        assert_eq!(output, [0x9d; 64]);
+        assert_eq!(direct(owned_submit, foreign, queue, src, dst), E_FAIL);
+        assert_eq!(output, [0x9d; 64]);
+        assert_eq!(direct(owned_submit, device, queue, src, dst), 0);
+        assert_eq!(output, input);
+        assert_eq!(direct(owned_submit, device, queue, src, dst), E_FAIL);
+        assert_eq!(method::<2>(device, 0, 0), 0);
+        assert_eq!(direct(owned_submit, device, queue, src, dst), E_FAIL);
+        assert_eq!(method::<2>(foreign, 0, 0), 0);
+    }
+    assert!(STATE.lock().unwrap().take().unwrap().live.is_empty());
+    assert_eq!(host::DROPS.load(Ordering::Relaxed), drops + 2);
 }
