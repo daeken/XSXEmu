@@ -159,6 +159,10 @@ pub(crate) fn audit(words: &[u32], vertex: bool) -> Outcome {
                 }
                 f.write(dst, None);
             }
+            Op::ConvertUintS10 { dst } => {
+                f.outcome.needs.extend([EntrySgpr, UintConversionRounding]);
+                f.write(dst, None);
+            }
             Op::ConvertUint { dst, src, byte0 } => {
                 // Byte0 conversion is always exactly representable. So is a
                 // known U32 with at most 24 significant bits after trailing zeros.
@@ -359,6 +363,14 @@ pub(crate) fn audit(words: &[u32], vertex: bool) -> Outcome {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unsigned_s10_conversion_requires_scalar_and_rounding_only() {
+        let outcome = audit(&[0x7e36_0c0a, 0xbf81_0000], true);
+        assert_eq!(
+            outcome.needs,
+            [Need::EntrySgpr, Need::UintConversionRounding].into()
+        );
+    }
     use super::*;
     use Gap::*;
     use Need::*;

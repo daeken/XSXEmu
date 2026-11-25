@@ -208,6 +208,19 @@ mod gpu {
         ];
         let literal_start = inputs.len();
         inputs.extend(literal_mul.iter().map(|(rhs, _)| [0, 0, 0, *rhs]));
+        let scalar_cvt = [
+            (0, 0x0000_0000),
+            (1, 0x3f80_0000),
+            (0x0100_0001, 0x4b80_0000), // tie: even lower
+            (0x0100_0003, 0x4b80_0002), // tie: even upper
+            (0x7fff_ff80, 0x4eff_ffff),
+            (0x8000_0000, 0x4f00_0000),
+            (0x8000_0080, 0x4f00_0000), // tie: even lower
+            (0x8000_0180, 0x4f00_0002), // tie: even upper
+            (0xffff_ffff, 0x4f80_0000),
+        ];
+        let scalar_cvt_start = inputs.len();
+        inputs.extend(scalar_cvt.iter().map(|(bits, _)| [0, 0, *bits, 0]));
         let bytes = std::mem::size_of_val(inputs.as_slice());
         let usage = MTLResourceOptions::StorageModeShared;
         let input = dev.new_buffer_with_data(inputs.as_ptr().cast(), bytes as u64, usage);
@@ -215,15 +228,15 @@ mod gpu {
         let out = output.contents().cast::<[u32; 4]>();
         let extra_output = dev.new_buffer(bytes as u64, usage);
         let extra_out = extra_output.contents().cast::<[u32; 4]>();
-        let literal_output = dev.new_buffer((inputs.len() * 4) as u64, usage);
-        let literal_out = literal_output.contents().cast::<u32>();
-        if out.is_null() || extra_out.is_null() || literal_out.is_null() {
+        let scalar_output = dev.new_buffer((inputs.len() * 8) as u64, usage);
+        let scalar_out = scalar_output.contents().cast::<[u32; 2]>();
+        if out.is_null() || extra_out.is_null() || scalar_out.is_null() {
             return Err("unmapped readback".into());
         }
         // Shared buffer is owned here; no CPU access during execution.
         unsafe { out.write_bytes(0xa5, 5 * inputs.len()) };
         unsafe { extra_out.write_bytes(0xa5, inputs.len()) };
-        unsafe { literal_out.write_bytes(0xa5, inputs.len()) };
+        unsafe { scalar_out.write_bytes(0xa5, inputs.len()) };
         let queue = dev.new_command_queue();
         let cmd = queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
@@ -231,7 +244,7 @@ mod gpu {
         enc.set_buffer(0, Some(&input), 0);
         enc.set_buffer(1, Some(&output), 0);
         enc.set_buffer(2, Some(&extra_output), 0);
-        enc.set_buffer(3, Some(&literal_output), 0);
+        enc.set_buffer(3, Some(&scalar_output), 0);
         enc.dispatch_threads(
             MTLSize::new(inputs.len() as u64, 1, 1),
             MTLSize::new(inputs.len() as u64, 1, 1),
@@ -395,7 +408,7 @@ mod gpu {
             let reference =
                 (f64::from(f32::from_bits(rhs)) * f64::from(f32::from_bits(0x3780_0080))) as f32;
             assert_eq!(reference.to_bits(), want);
-            let actual = unsafe { literal_out.add(literal_start + i).read() };
+            let actual = unsafe { scalar_out.add(literal_start + i).read() }[0];
             if actual != want {
                 return Err(format!(
                     "exact literal MUL row {i}: expected {want:08x}, got {actual:08x}"
@@ -403,8 +416,18 @@ mod gpu {
                 .into());
             }
         }
+        for (i, (bits, want)) in scalar_cvt.into_iter().enumerate() {
+            assert_eq!((f64::from(bits) as f32).to_bits(), want);
+            let actual = unsafe { scalar_out.add(scalar_cvt_start + i).read() }[1];
+            if actual != want {
+                return Err(format!(
+                    "unsigned s10 CVT row {i}: expected {want:08x}, got {actual:08x}"
+                )
+                .into());
+            }
+        }
         println!(
-            "{}: {profile}, 16/16 legacy words, 2/2 FMAC words, 5/5 e32 packed RTZ words, 5/5 e64 NEG0 packed RTZ words, 16/16 inline +0 packed RTZ words (in-place and separate), {mov_words}/{mov_words} raw MOV words 8/8 select words, 10/10 ordered CMP LT words, 8/8 subtract words 11/11 ordinary multiply checks, 7/7 exact literal MUL words, 8/8 ordinary add words 7/7 inline -1 add words 7/7 inline +1 subtract words and 36/36 mode-dependent CVT words",
+            "{}: {profile}, 16/16 legacy words, 2/2 FMAC words, 5/5 e32 packed RTZ words, 5/5 e64 NEG0 packed RTZ words, 16/16 inline +0 packed RTZ words (in-place and separate), {mov_words}/{mov_words} raw MOV words 8/8 select words, 10/10 ordered CMP LT words, 8/8 subtract words 11/11 ordinary multiply checks, 7/7 exact literal MUL words, 8/8 ordinary add words 7/7 inline -1 add words 7/7 inline +1 subtract words 36/36 mode-dependent CVT words, 9/9 unsigned s10 CVT words",
             dev.name(),
             mov_words = 4 * inputs.len()
         );

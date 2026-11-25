@@ -234,7 +234,9 @@ fn exact_opcode(
                 Op::AndMask { .. } => name == "v_and_b32_e32",
                 Op::ConvertInt { .. } => name == "v_cvt_f32_i32_e32",
                 Op::ConvertUint { byte0: true, .. } => name == "v_cvt_f32_ubyte0_e32",
-                Op::ConvertUint { byte0: false, .. } => name == "v_cvt_f32_u32_e32",
+                Op::ConvertUint { byte0: false, .. } | Op::ConvertUintS10 { .. } => {
+                    name == "v_cvt_f32_u32_e32"
+                }
                 Op::FmaUnpack { .. } => name == "v_fma_f32",
                 Op::NopOneCycle => name == "s_nop",
                 Op::PrefetchThreeLines => name == "s_inst_prefetch",
