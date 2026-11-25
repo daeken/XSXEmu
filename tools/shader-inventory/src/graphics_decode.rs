@@ -242,15 +242,20 @@ pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeErro
             },
         ));
     }
-    // VOP2 opcode 3, SRC0=255 (one literal dword), VSRC1 an ordinary VGPR.
-    if w & 0xfe00_01ff == 0x0600_00ff {
-        let literal_bits = ext()?;
+    // VOP2 opcode 3, ordinary VGPR VSRC1. Only inline -1.0 (243), or
+    // selector 255 with one finite normal literal dword, are accepted here.
+    if matches!(w & 0xfe00_01ff, 0x0600_00f3 | 0x0600_00ff) {
+        let (width, literal_bits) = if w & 511 == 243 {
+            (1, 0xbf80_0000)
+        } else {
+            (2, ext()?)
+        };
         // Scope the fixture to ordinary finite constants; no fp mode recovery.
         if !f32::from_bits(literal_bits).is_normal() {
             return Err(DecodeError::Unsupported(pc));
         }
         return Ok((
-            2,
+            width,
             Op::AddF32Literal {
                 dst: Vgpr((w >> 17) as u8),
                 src: Vgpr((w >> 9) as u8),

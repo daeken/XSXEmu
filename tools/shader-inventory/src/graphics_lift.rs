@@ -692,6 +692,7 @@ const EDGE_FMAC: &[u32] = &[0x5608_0300]; // v_fmac_f32_e32 v4, v0, v1
 const EDGE_RTZ: &[u32] = &[0x5e0a_0300]; // v_cvt_pkrtz_f16_f32_e32 v5, v0, v1
 
 const EDGE_ADD: &[u32] = &[0x061e_0300]; // v15 = v0 + v1
+const EDGE_ADD_INLINE: &[u32] = &[0x0620_00f3]; // v16 = -1.0 + v0
 
 const EDGE_MUL: &[u32] = &[0x101c_0300]; // v14 = v0 * v1
 
@@ -752,8 +753,15 @@ pub fn translate_legacy_edge_fixture() -> Result<String, DecodeError> {
     for pc in 0..EDGE_SUB.len() {
         body(&mut msl, &[decode(EDGE_SUB, pc)?.1]);
     }
-    body(&mut msl, &[decode(EDGE_MUL, 0)?.1, decode(EDGE_ADD, 0)?.1]);
-    msl.push_str("  out[4 * id] = uint4(r[2], r[3], r[4], r[5]);\n  out[4 * id + 1] = uint4(r[6], r[7], r[8], r[9]);\n  out[4 * id + 2] = uint4(r[10], r[11], r[12], r[13]);\n  out[4 * id + 3] = uint4(r[14], r[15], 0u, 0u);\n}\n");
+    body(
+        &mut msl,
+        &[
+            decode(EDGE_MUL, 0)?.1,
+            decode(EDGE_ADD, 0)?.1,
+            decode(EDGE_ADD_INLINE, 0)?.1,
+        ],
+    );
+    msl.push_str("  out[4 * id] = uint4(r[2], r[3], r[4], r[5]);\n  out[4 * id + 1] = uint4(r[6], r[7], r[8], r[9]);\n  out[4 * id + 2] = uint4(r[10], r[11], r[12], r[13]);\n  out[4 * id + 3] = uint4(r[14], r[15], r[16], 0u);\n}\n");
     Ok(msl)
 }
 
@@ -1551,6 +1559,7 @@ mod tests {
             "v_mov_b32_e32 v2, 0x3e800000\nexp mrt0 v2, off, off, off done vm\ns_endpgm\n",
         );
         asm.push_str("v_mul_f32_e32 v14, v0, v1\nv_add_f32_e32 v15, v0, v1\n");
+        asm.push_str("v_add_f32_e32 v16, -1.0, v0\n");
         asm.push_str("v_sub_f32_e32 v12, 0, v0\nv_sub_f32_e32 v13, 0, v1\n");
         asm.push_str("s_mov_b32 m0, s9\nv_interp_mov_f32_e32 v2, p0, attr0.x\nexp mrt0 v2, off, off, off done vm\ns_endpgm\n");
         for (sgpr, component) in [(9, "x"), (14, "z"), (9, "z")] {
@@ -1609,6 +1618,7 @@ mod tests {
             .chain(RED_PS)
             .chain(EDGE_MUL)
             .chain(EDGE_ADD)
+            .chain(EDGE_ADD_INLINE)
             .chain(EDGE_SUB)
             .chain(PARAM_MOV_PS)
             .chain(INTERP_X_PS)
@@ -1763,6 +1773,30 @@ mod tests {
             ps[i] ^= bits;
             assert!(lift(Stage::ConstantRedPixel, &ps).is_err());
         }
+    }
+
+    #[test]
+    fn inline_minus_one_add_is_one_word_and_requires_live_vgpr() {
+        let word = EDGE_ADD_INLINE[0];
+        assert_eq!(
+            decode(&[word, 0xbf81_0000], 0),
+            Ok((
+                1,
+                Op::AddF32Literal {
+                    dst: Vgpr(16),
+                    src: Vgpr(0),
+                    literal_bits: 0xbf80_0000
+                }
+            ))
+        );
+        for selector in [0, 128, 242, 244, 249, 250, 255] {
+            assert!(decode(&[(word & !511) | selector], 0).is_err());
+        }
+        assert!(lift(Stage::Vertex, &[EDGE_ADD_INLINE, VS].concat()).is_ok());
+        assert!(matches!(
+            lift(Stage::Vertex, &[&[word | (0x80 << 9)], VS].concat()),
+            Err(Reject::Uninitialized(0, 128))
+        ));
     }
 
     #[test]

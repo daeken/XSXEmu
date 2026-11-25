@@ -317,6 +317,27 @@ fn direct_operand_form(name: &str, words: [u32; 2], len: usize, bucket: &str) ->
                 _ => format!("{name}/selector-{selector}/no-modifiers/8B"),
             }
         }
+        "v_cvt_f32_i32_e64" if len == 8 && first & 0xffff_0000 == 0xd585_0000 => {
+            let src = match sources & 511 {
+                0..=105 => "SGPR".to_owned(),
+                256..=511 => "VGPR".to_owned(),
+                sel => format!("sel{sel}"),
+            };
+            format!(
+                "{name}/{src}/abs{:x}/neg{:x}/clamp{}/omod{}/opsel{:x}/other-src-fields{}/8B",
+                (first >> 8) & 7,
+                sources >> 29,
+                (first >> 15) & 1,
+                (sources >> 27) & 3,
+                (first >> 11) & 15,
+                (sources >> 9) & 0x3ffff != 0
+            )
+        }
+        "v_sub_f32_e32" if len == 4 && first & 0xfe00_0000 == 0x0800_0000 => match first & 511 {
+            0..=105 => format!("{name}/SGPR-VGPR/4B"),
+            256..=511 => format!("{name}/VGPR-VGPR/4B"),
+            sel => format!("{name}/selector-{sel}-VGPR/4B"),
+        },
         "v_interp_p1_f32_e32" | "v_interp_p2_f32_e32"
             if len == 4
                 && attr <= 32
@@ -386,6 +407,7 @@ pub(super) struct DirectGaps {
     pub operand_forms: BTreeMap<String, usize>,
     pub ordinary_vgpr_mul: usize,
     pub ordinary_vgpr_add: usize,
+    pub inline_minus_one_add: usize,
     pub signed_vgpr_convert: usize,
     pub inline_first_fma: [usize; 2],
     pub partial_param0: usize,
@@ -479,6 +501,16 @@ pub(super) fn direct_gaps(dis: &mut Disassembler, bytes: &[u8], slot: usize) -> 
             gaps.signed_vgpr_convert += usize::from(matches!(
                 decoded,
                 Some((1, crate::graphics_decode::Op::ConvertInt { .. }))
+            ));
+            gaps.inline_minus_one_add += usize::from(matches!(
+                decoded,
+                Some((
+                    1,
+                    crate::graphics_decode::Op::AddF32Literal {
+                        literal_bits: 0xbf80_0000,
+                        ..
+                    }
+                ))
             ));
             gaps.ordinary_vgpr_add += usize::from(matches!(
                 decoded,

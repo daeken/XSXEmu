@@ -225,6 +225,7 @@ struct GapCounts {
     exact: usize,
     ordinary_mul: (usize, usize),
     ordinary_add: (usize, usize),
+    inline_minus_one_add: (usize, usize),
     signed_convert: (usize, usize),
     inline_first_fma: [(usize, usize); 2], // (sites, windows), positive/negative pair
     partial_param0: [usize; 3],
@@ -244,6 +245,8 @@ impl GapCounts {
     fn note(&mut self, gaps: &DirectGaps) {
         self.ordinary_add.0 += gaps.ordinary_vgpr_add;
         self.ordinary_add.1 += usize::from(gaps.ordinary_vgpr_add > 0);
+        self.inline_minus_one_add.0 += gaps.inline_minus_one_add;
+        self.inline_minus_one_add.1 += usize::from(gaps.inline_minus_one_add > 0);
         self.partial_param0[0] += gaps.partial_param0;
         self.partial_param0[1] += usize::from(gaps.partial_param0 > 0);
         self.partial_param0[2] += gaps.partial_param0_noncanonical;
@@ -326,6 +329,10 @@ impl GapCounts {
         println!(
             "    exact two-VGPR v_add_f32_e32: {} sites in {} windows",
             self.ordinary_add.0, self.ordinary_add.1
+        );
+        println!(
+            "    exact inline -1 + VGPR v_add_f32_e32: {} sites in {} windows",
+            self.inline_minus_one_add.0, self.inline_minus_one_add.1
         );
         println!(
             "    exact signed VGPR e32 conversion: {} sites in {} windows",
@@ -456,6 +463,7 @@ pub(super) fn run_gaps(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), B
     let mut interp_spans = HashSet::new();
     let mut partial_param_spans = HashSet::new();
     let mut inline_first_fma_spans = [HashSet::new(), HashSet::new()];
+    let mut inline_minus_one_add_spans = [HashSet::new(), HashSet::new()];
     let mut setprio_spans = HashSet::new();
     let mut setprio: [[BTreeMap<Option<SetprioProjection>, usize>; 2]; STARTS.len()] =
         Default::default();
@@ -484,6 +492,9 @@ pub(super) fn run_gaps(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), B
                 for (w, wave) in waves.iter_mut().enumerate() {
                     if let Some(gaps) = direct_gaps(wave, window, slot) {
                         counts[slot][i][w].note(&gaps);
+                        if gaps.inline_minus_one_add != 0 {
+                            inline_minus_one_add_spans[slot].insert(reference.program);
+                        }
                         if gaps.inline_first_fma != [0, 0] {
                             inline_first_fma_spans[slot].insert(reference.program);
                         }
@@ -581,6 +592,10 @@ pub(super) fn run_gaps(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), B
             }
         }
     }
+    println!(
+        "  Distinct spans with exact inline -1 VOP2 ADD across hypotheses (PS / VS): {:?}",
+        inline_minus_one_add_spans.map(|spans| spans.len())
+    );
     let mut vs_sets: Vec<_> = vs_sets.into_iter().collect();
     vs_sets.sort_unstable_by(|(a, x), (b, y)| {
         a.len()

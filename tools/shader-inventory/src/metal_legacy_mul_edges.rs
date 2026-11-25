@@ -111,6 +111,19 @@ mod gpu {
         ];
         let add_start = inputs.len();
         inputs.extend(add_cases.iter().map(|([a, b], _)| [*a, *b, 0, 0]));
+        // Independent raw goldens for -1+x: half-ULP on each side of -1,
+        // both even choices, exact cancellation and both adjacent inputs to +1.
+        let inline_add_cases = [
+            (0x3300_0000, 0xbf80_0000), // +2^-25, tie to -1
+            (0x33c0_0000, 0xbf7f_fffe), // +3*2^-25, tie away from -1
+            (0xb380_0000, 0xbf80_0000), // -2^-24, tie to -1
+            (0xb440_0000, 0xbf80_0002), // -3*2^-24, tie away from -1
+            (0x3f80_0000, P0),
+            (0x3f7f_ffff, 0xb380_0000),
+            (0x3f80_0001, 0x3400_0000),
+        ];
+        let inline_add_start = inputs.len();
+        inputs.extend(inline_add_cases.iter().map(|(x, _)| [*x, 0, 0, 0]));
         let bytes = std::mem::size_of_val(inputs.as_slice());
         let usage = MTLResourceOptions::StorageModeShared;
         let input = dev.new_buffer_with_data(inputs.as_ptr().cast(), bytes as u64, usage);
@@ -240,8 +253,16 @@ mod gpu {
                 );
             }
         }
+        for (i, (_, want)) in inline_add_cases.into_iter().enumerate() {
+            let got = unsafe { out.add(4 * (inline_add_start + i) + 3).read() }[2];
+            if got != want {
+                return Err(
+                    format!("inline -1 add row {i}: expected {want:08x}, got {got:08x}").into(),
+                );
+            }
+        }
         println!(
-            "{}: strict arithmetic archive, 16/16 legacy words, 2/2 FMAC words, 3/3 packed RTZ words, {mov_words}/{mov_words} raw MOV words 8/8 select words, 8/8 subtract words 11/11 ordinary multiply checks and 8/8 ordinary add words",
+            "{}: strict arithmetic archive, 16/16 legacy words, 2/2 FMAC words, 3/3 packed RTZ words, {mov_words}/{mov_words} raw MOV words 8/8 select words, 8/8 subtract words 11/11 ordinary multiply checks 8/8 ordinary add words and 7/7 inline -1 add words",
             dev.name(),
             mov_words = 4 * inputs.len()
         );
