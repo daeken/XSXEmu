@@ -256,6 +256,9 @@ mod backing;
 #[cfg(all(test, target_arch = "x86_64"))]
 mod boot_abi;
 
+#[cfg(all(test, target_os = "macos"))]
+mod host_backing;
+
 #[cfg(test)]
 mod tests {
     use super::*;

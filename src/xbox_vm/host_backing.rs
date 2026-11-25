@@ -10,6 +10,10 @@
 
 #![cfg(target_os = "macos")]
 
+#[cfg(test)]
+#[path = "fixed_proof.rs"]
+mod fixed_proof;
+
 use std::{marker::PhantomData, ptr::without_provenance_mut, rc::Rc};
 
 pub const PAGE: u64 = 64 * 1024;
