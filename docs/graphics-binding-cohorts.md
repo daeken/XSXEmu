@@ -73,3 +73,20 @@ The complete aggregate histograms were identical between gfx1013 and gfx1030 wit
 | MS | 12,062 | 7,498 | 0 / 0 | 0 / 0 / 0 |
 
 Every program with stage-export closure had multiple passing starts; none established a unique entry. Of 13,383 exact VS+PS occurrences, both stages had stage-export closure on 12,794 (wave64), 12,798 (wave32), and 12,794 (same window in both waves for each stage). For the same-window projection, 550 had only VS closure, 39 only PS, and none had neither. No stage-export-qualified VS or PS window was encoding-complete under the owned decoder, so none of the pairs reached the output-binding-only tier. This is conditional static evidence about the tested library spans, not a runtime entry, binding, native variant selection, bake admission, or translation.
+
+## Independent evidence for distinguishing starts
+
+`--graphics-entry-evidence "$INFLATED_LIBRARY" "$TRUSTED_LLVM_21_DYLIB"` uses the exact 13,383 two-slot rows (2,921 distinct checked PS spans, 1,322 VS). It does not repeat the closure census or use wrapper joins. It checks the stage metadata footer fingerprint, then tests the third-group marker at `+26` as in [compute layout sites](compute-layout-sites.md). The marker supports interpreting the group at `+24` as part of the stored prefix, not a global execution rule. The comparisons beginning at `+24` are withheld for marked groups. Nonzero `0x42` sites are tested independently as aligned in-span scalar loads, without assuming they are reachable from any entry.
+
+For unmarked groups, the register check starts a straight-line decode at the earlier candidate. It rejects an instruction split at the later candidate and conservatively stops at unknown operations. For its small explicit operand whitelist it records ordinary S/V and M0 definitions in the skipped bytes, then looks up to 32 bytes past the later candidate for a read before a locally modeled overwrite. It reports the first witnessed register class, not every live input. The projection does not establish initial register contents, lane activity, EXEC equivalence, or behavior beyond that bound. For marked groups, the exact `s_inst_prefetch 3` encodings at `+36` are counted separately: they do not write a tracked register, but the comparison does not establish that it is safe to elide them or that either offset was used.
+
+The four LLVM 21.1.6 configurations (gfx1013 and gfx1030, each wave64 and wave32) agreed. Counts below are `[distinct stage/program/metadata tuples, stage occurrences]`, with one checked metadata tuple per stage/span in this baseline.
+
+| Independent comparison | PS | VS |
+|---|---|---|
+| Marked third group; `+36` → `+40` skips only exact prefetch | 2,917 / 13,364 | 1,320 / 13,364 |
+| Unmarked; `+24` → `+36` | M0 2 / 15; no read in bound 1 / 2; unresolved 1 / 2 | descriptor SGPR 2 / 19 |
+| Unmarked; `+24` → `+40` | M0 3 / 17; VGPR 1 / 2 | descriptor SGPR 2 / 19 |
+| Unmarked; `+36` → `+40` | M0 1 / 2; VGPR 3 / 17 | descriptor SGPR 2 / 19 |
+
+The two VS paths read omitted scalar definitions in a buffer descriptor; the PS reads include interpolation M0 and values consumed by arithmetic/packing. Every unmarked span has local evidence against treating `+36` and `+40` as interchangeable **given the same incoming state**. This still cannot choose between entries with different launch state. Four nonzero PS scalar-load metadata items (eight item occurrences across repeated PS slots) are all at `+40` or later, so their geometry does not discriminate these starts; none occurred on the exact-two-slot VS side. The common marked case remains ambiguous between including and excluding the prefetch, and the library does not supply authenticated entry or launch-state evidence. No runtime, translation, or bake gate changes.
