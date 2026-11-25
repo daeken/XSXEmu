@@ -1,9 +1,9 @@
 //! Anonymous macOS CPU backing with 64 KiB logical pages.
 //!
-//! This module is not registered with the runtime. Each handle has a single
-//! owner. Views of the same backing may alias but own independent virtual
-//! mappings, which keep the underlying object alive after the backing is dropped.
-//! Both handle types are `!Send` and `!Sync`: access through all aliases must
+//! Each handle has a single owner. The runtime can own a named object
+//! without creating any guest views. Views of the same backing may alias, but
+//! own independent mappings that keep the object alive after its right drops.
+//! `Backing` and `View` are `!Send` and `!Sync`: access through all aliases must
 //! stay on the creating thread. Copies are not atomic or synchronization
 //! operations. Do not access or remap these addresses through external APIs
 //! while a view is live. There are no GPU or console ABI guarantees.
@@ -88,14 +88,13 @@ fn map_range(offset: u64, len: u64, extent: u64) -> Result<(), Error> {
 }
 
 /// Owns one send right to a named, anonymous memory object.
-pub struct Backing {
+pub(crate) struct NamedObject {
     task: Port,
     entry: Port,
     len: u64,
-    _thread_bound: PhantomData<Rc<()>>,
 }
 
-impl Backing {
+impl NamedObject {
     /// Creates zero-filled backing of a nonzero multiple of [`PAGE`] bytes.
     pub fn new(len: u64) -> Result<Self, Error> {
         map_range(0, len, usize::MAX as u64)?;
@@ -113,23 +112,31 @@ impl Backing {
         if entry == 0 || entry == u32::MAX {
             return Err(Error::UnexpectedEntry);
         }
-        let backing = Self {
-            task,
-            entry,
-            len,
-            _thread_bound: PhantomData,
-        };
+        let backing = Self { task, entry, len };
         if size != len {
             return Err(Error::UnexpectedEntry); // Drop releases the acquired right.
         }
         Ok(backing)
     }
 
+    pub(crate) fn len(&self) -> u64 {
+        self.len
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)] // The allocation-provider tests run on x86_64.
+    pub(crate) fn into_test_backing(self) -> Backing {
+        Backing {
+            object: self,
+            _thread_bound: PhantomData,
+        }
+    }
+
     /// Maps a nonempty subrange. Both `offset` and `len` are byte counts and
     /// must be multiples of [`PAGE`]. The kernel chooses the virtual address.
     /// The returned view remains usable after dropping this backing handle.
-    pub fn map(&self, offset: u64, len: u64) -> Result<View, Error> {
-        map_range(offset, len, self.len)?;
+    fn map(&self, offset: u64, len: u64) -> Result<View, Error> {
+        map_range(offset, len, self.len())?;
         let mut base = 0;
         // SAFETY: Valid entry and bounded subrange. ANYWHERE without OVERWRITE
         // lets the kernel pick free VA using the low-bit alignment mask.
@@ -168,7 +175,26 @@ impl Backing {
     }
 }
 
-impl Drop for Backing {
+pub struct Backing {
+    object: NamedObject,
+    _thread_bound: PhantomData<Rc<()>>,
+}
+
+impl Backing {
+    pub fn new(len: u64) -> Result<Self, Error> {
+        Ok(Self {
+            object: NamedObject::new(len)?,
+            _thread_bound: PhantomData,
+        })
+    }
+
+    /// Maps a nonempty subrange at a kernel-selected address.
+    pub fn map(&self, offset: u64, len: u64) -> Result<View, Error> {
+        self.object.map(offset, len)
+    }
+}
+
+impl Drop for NamedObject {
     fn drop(&mut self) {
         // SAFETY: This handle uniquely owns the send right. The kernel holds
         // references to the underlying object for all still-live mappings.

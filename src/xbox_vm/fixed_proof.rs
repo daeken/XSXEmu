@@ -190,7 +190,7 @@ impl Arena {
             }
         }
         let offset = (first - batch.tokens.start) * PAGE;
-        self.replace(&slots, batch.backing.entry, offset, READ_WRITE);
+        self.replace(&slots, batch.backing.object.entry, offset, READ_WRITE);
         self.views.insert(slots.start, slots.end);
         Ok(())
     }
@@ -369,7 +369,7 @@ fn exact_shared_replacement_restore_and_live_token_reuse() {
 
     // Intentionally bypass token preflight for one negative kernel call. A
     // real in-task entry whose offset equals its extent cannot back this page.
-    let entry = arena.batch.as_ref().unwrap().backing.entry;
+    let entry = arena.batch.as_ref().unwrap().backing.object.entry;
     let (status, _) = arena.kernel_replace(&(3..4), entry, 2 * PAGE, READ_WRITE);
     assert_ne!(status, 0);
     assert_eq!(arena.views, views);

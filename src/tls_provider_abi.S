@@ -4,7 +4,7 @@
  * Incoming Win64 arguments 5–8 are above its return slot and home space.
  * Rust owns the exact-width ABI and never runs under guest GS. */
 .set TLS_BRIDGE_FRAME, 248
-.macro bridge entry, adapter, argc
+.macro bridge entry, adapter, argc, return_pc
     .if \argc > 8
         .error "static TLS bridge supports at most eight scalar arguments"
     .endif
@@ -69,6 +69,12 @@
     .if \argc >= 8
         movq TLS_BRIDGE_FRAME+64(%rsp), %rax
         movq %rax, 16(%rsp)
+    .endif
+    .if \return_pc
+        .if \argc != 3
+            .error "saved return PC supported only after three guest arguments"
+        .endif
+        movq TLS_BRIDGE_FRAME(%rsp), %r8
     .endif
     callq \adapter
     movq %rax, 216(%rsp)

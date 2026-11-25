@@ -458,6 +458,16 @@ pub fn run(
     })?
 }
 
+#[cfg(test)]
+/// Caller supplies an original, ABI-correct fixture; the mapping must stay live.
+pub(crate) unsafe fn run_owned_bridge_fixture(memory: &GuestMemory, entry: usize) -> Result<u32> {
+    memory.validate_target(entry)?;
+    with_context(0, false, |ctx, _| {
+        // SAFETY: test-only callers supply original, sealed Win64 code.
+        unsafe { xsxemu_tls_call(ctx, memory.base() + entry as u64, memory.base(), 1) }
+    })
+}
+
 fn with_context<T>(vector: u64, trace: bool, run: impl FnOnce(&Context, u32) -> T) -> Result<T> {
     let mut teb = [0u64; 32];
     let teb_ptr = teb.as_mut_ptr();

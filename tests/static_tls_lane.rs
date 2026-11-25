@@ -2527,6 +2527,24 @@ fn xmem_bridge_owns_exact_boot_reservations_and_cpu_mapping() {
     }
 }
 
+#[test]
+fn xmem_physical_bridge_rejects_unpinned_root_import() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let mut exe = image(Kind::Solo);
+    dir_import_one(&mut exe, b"XMEM.dll\0", b"XMemAllocatePhysicalPages\0");
+    let path = scratch.write("unpinned-xmem-physical.exe", &exe);
+    for flags in [
+        &[OPT, "--rust-providers"][..],
+        &[OPT, TRUSTED][..],
+        &[OPT, TRUSTED, "--rust-providers"][..],
+    ] {
+        expect(run(&path, flags), 1, "incomplete dependency graph");
+    }
+}
+
 const THREAD_ID_CODE_CAPACITY: usize = 0x180;
 
 #[repr(C)]

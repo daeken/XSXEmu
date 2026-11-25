@@ -37,6 +37,9 @@ pub const XMEM_VIRTUAL_ALLOC: HostExport = HostExport {
     symbol: "XMemVirtualAlloc",
     address: None,
 };
+pub const XMEM_PHYSICAL_IAT: u32 = 0x0679_3a10;
+pub const XMEM_ALLOCATE_PHYSICAL_PAGES: HostExport =
+    HostExport::private_bridge("xmem.dll", "XMemAllocatePhysicalPages");
 pub const GUEST_ENTROPY: HostExport = HostExport {
     provider: crate::guest_entropy::BASENAME,
     symbol: "SystemFunction036",

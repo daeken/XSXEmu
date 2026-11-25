@@ -256,7 +256,7 @@ mod backing;
 #[cfg(all(test, target_arch = "x86_64"))]
 mod boot_abi;
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, target_os = "macos", not(target_arch = "x86_64")))]
 mod host_backing;
 
 #[cfg(test)]

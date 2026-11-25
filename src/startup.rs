@@ -342,11 +342,15 @@ mod native {
         let mut gameinput_module = None;
         use crate::dstorage as ds;
         let mut expected_dstorage: std::collections::BTreeMap<_, _> = ds::bridges().collect();
+        let mut xmem_physical = false;
         let mut dstorage_module = None;
         let mut entropy_module = None;
         for &(importer, slot, target) in bindings {
             if let BindingTarget::Rust(export) = target {
-                use crate::providers::{D3D12_VM_CONFIGURE, GUEST_ENTROPY, XMEM_VIRTUAL_ALLOC};
+                use crate::providers::{
+                    D3D12_VM_CONFIGURE, GUEST_ENTROPY, XMEM_ALLOCATE_PHYSICAL_PAGES,
+                    XMEM_VIRTUAL_ALLOC,
+                };
                 if export.provider == win_loader::XGAMERUNTIME {
                     if importer == 0
                         || xgameruntime != Some(importer)
@@ -416,9 +420,21 @@ mod native {
                         "app notification bridge requires the trusted offline root image".into(),
                     );
                 }
-                if [D3D12_VM_CONFIGURE, XMEM_VIRTUAL_ALLOC].contains(&export)
+                if export == XMEM_ALLOCATE_PHYSICAL_PAGES {
+                    if slot != crate::providers::XMEM_PHYSICAL_IAT || xmem_physical {
+                        return Err("unexpected XMem physical allocation binding".into());
+                    }
+                    xmem_physical = true;
+                }
+                if [
+                    D3D12_VM_CONFIGURE,
+                    XMEM_VIRTUAL_ALLOC,
+                    XMEM_ALLOCATE_PHYSICAL_PAGES,
+                ]
+                .contains(&export)
                     && (!matches!(profile, Profile::TrustedOfflineTlsChild)
-                        || (export == XMEM_VIRTUAL_ALLOC && importer != 0))
+                        || !rust_providers
+                        || (export != D3D12_VM_CONFIGURE && importer != 0))
                 {
                     return Err(format!("{}!{} not available for this importer/profile; requires the trusted offline static TLS child", export.provider, export.symbol).into());
                 }
@@ -459,6 +475,9 @@ mod native {
             .collect::<std::result::Result<Vec<_>, _>>()?
             .into_iter()
             .unzip();
+        if xmem_physical {
+            crate::xbox_xmem_physical::validate_title(images[0].1, &pes[0])?;
+        }
         let tls_writes = static_tls
             .then(|| {
                 tls_runtime::PatchWrites::validate(&pes, bindings, missing, &cfgs, rust_providers)
@@ -619,6 +638,9 @@ mod native {
                 mem.validate_target(pe.entry_rva as usize)?;
             }
         }
+        let _xmem_physical = xmem_physical
+            .then(|| crate::xbox_xmem_physical::register_title(&memories[0]))
+            .transpose()?;
         // Install the mapped image graph before either execution lane can run
         // an attach callback, and keep it alive until after detach.
         let _loader = win_loader::register(

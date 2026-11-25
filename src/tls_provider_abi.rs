@@ -22,6 +22,15 @@ macro_rules! arg_count_token {
     };
 }
 
+macro_rules! return_pc_flag {
+    () => {
+        "0"
+    };
+    ($pc:ident) => {
+        "1"
+    };
+}
+
 macro_rules! target_for_child {
     ($target:path => $restricted:path) => {
         $restricted
@@ -39,18 +48,18 @@ macro_rules! target_for_child {
 // callbacks, re-enter guest code, unwind, or add aggregate, float or varargs.
 macro_rules! audited_bridges {
     ($($entry:ident, $adapter:ident : $dll:literal, $symbol:literal,
-        $target:path $(=> $restricted:path)?, ($($arg:ident: $ty:ty),*) -> $ret:ty;)*) => {
+        $target:path $(=> $restricted:path)?, ($($arg:ident: $ty:ty),*) $([$pc:ident : $pc_ty:ty])? -> $ret:ty;)*) => {
         unsafe extern "win64" {
             $(fn $entry($($arg: $ty),*) -> $ret;)*
         }
 
-        $(unsafe extern "C" fn $adapter(teb_error: *mut u32, $($arg: $ty),*) -> $ret {
-            let _: unsafe extern "win64" fn($($ty),*) -> $ret = $target;
-            let target: unsafe extern "win64" fn($($ty),*) -> $ret = target_for_child!($target $(=> $restricted)?);
+        $(unsafe extern "C" fn $adapter(teb_error: *mut u32, $($arg: $ty),* $(, $pc: $pc_ty)?) -> $ret {
+            let _: unsafe extern "win64" fn($($ty),* $(, $pc_ty)?) -> $ret = $target;
+            let target: unsafe extern "win64" fn($($ty),* $(, $pc_ty)?) -> $ret = target_for_child!($target $(=> $restricted)?);
             // SAFETY: bridge assembly checked host GS, and passed the live
             // calling thread's LastError DWORD. Each target was reviewed to
             // take only its declared arguments and never re-enter the guest.
-            unsafe { native::with_tls_child_last_error(teb_error, || target($($arg),*)) }
+            unsafe { native::with_tls_child_last_error(teb_error, || target($($arg),* $(, $pc)?)) }
         })*
 
         // Called after the bridge checks host GS. The return PC is logged as
@@ -68,7 +77,7 @@ macro_rules! audited_bridges {
             include_str!("tls_runtime.S"),
             include_str!("tls_provider_abi.S"),
             concat!($("bridge _", stringify!($entry), ",{", stringify!($adapter),
-                "},(0", $(arg_count_token!($arg),)* ")\n",)*),
+                "},(0", $(arg_count_token!($arg),)* "),", return_pc_flag!($($pc)?), "\n",)*),
             host_base = const offset_of!(Context, host_base),
             guest_base = const offset_of!(Context, guest_base),
             host0 = const offset_of!(Context, host0),
@@ -192,6 +201,8 @@ audited_bridges! {
         crate::xbox_d3d12_vm::configure, (config: *const u8) -> i32;
     xsxemu_tls_xmem_virtual_alloc, xmem_virtual_alloc: b"xmem.dll", b"XMemVirtualAlloc",
         crate::xbox_xmem::virtual_alloc, (base: usize, size: usize, flags: u32, attributes: u32, protect: u32) -> usize;
+    xsxemu_tls_xmem_allocate_physical, xmem_allocate_physical: b"xmem.dll", b"XMemAllocatePhysicalPages",
+        crate::xbox_xmem_physical::allocate, (flags: u32, count: usize, output: usize) [return_pc: u64] -> i32;
     xsxemu_tls_get_current_process, get_current_process: b"kernelbase.dll", b"GetCurrentProcess",
         proc::get_current_process, () -> usize;
     xsxemu_tls_set_process_priority_boost, set_process_priority_boost: b"kernelbase.dll", b"SetProcessPriorityBoost",

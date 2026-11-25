@@ -512,6 +512,7 @@ impl Builder<'_> {
     fn resolve_provider(
         &mut self,
         importer: usize,
+        iat_rva: u32,
         dll: &[u8],
         symbol: &Symbol,
     ) -> Result<BindingTarget, Unresolved> {
@@ -588,13 +589,17 @@ impl Builder<'_> {
             // Only direct named imports can use these offline Xbox shims,
             // never a different provider routed here or a PE forwarder.
             if seen.is_empty() && self.options.rust_providers && self.options.trusted_offline {
-                for shim in [providers::D3D12_VM_CONFIGURE, providers::XMEM_VIRTUAL_ALLOC]
-                    .into_iter()
-                    .chain(crate::appnotify::BRIDGES)
+                for shim in [
+                    providers::D3D12_VM_CONFIGURE,
+                    providers::XMEM_VIRTUAL_ALLOC,
+                    providers::XMEM_ALLOCATE_PHYSICAL_PAGES,
+                ]
+                .into_iter()
+                .chain(crate::appnotify::BRIDGES)
                 {
-                    if (importer == 0
-                        || (shim != providers::XMEM_VIRTUAL_ALLOC
-                            && !crate::appnotify::BRIDGES.contains(&shim)))
+                    if (importer == 0 || shim == providers::D3D12_VM_CONFIGURE)
+                        && (shim != providers::XMEM_ALLOCATE_PHYSICAL_PAGES
+                            || iat_rva == providers::XMEM_PHYSICAL_IAT)
                         && dll.eq_ignore_ascii_case(shim.provider.as_bytes())
                         && matches!(&symbol, Symbol::Name(name) if name == shim.symbol.as_bytes())
                     {
@@ -709,7 +714,7 @@ impl Builder<'_> {
                     }
                 }
                 for (iat_rva, symbol) in group.entries {
-                    let target = self.resolve_provider(index, &group.dll, &symbol);
+                    let target = self.resolve_provider(index, iat_rva, &group.dll, &symbol);
                     self.plan.modules[index].iat.push(IatBinding {
                         iat_rva,
                         dll: group.dll.clone(),

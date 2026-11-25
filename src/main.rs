@@ -14,6 +14,10 @@ mod link;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 mod title_data;
 use xsxemu::pe;
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+#[path = "xbox_vm/host_backing.rs"]
+#[allow(dead_code)] // Production allocation uses NamedObject, not host-selected views.
+mod host_backing;
 mod providers;
 mod startup;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
@@ -31,6 +35,8 @@ mod xbox_d3d12_vm;
 mod xbox_vm;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 mod xbox_xmem;
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+mod xbox_xmem_physical;
 mod xgameruntime_compat;
 
 use pe::{ExportTarget, ImportSymbol, Pe};
