@@ -28,6 +28,12 @@ Independent increment evidence outside the wrapper: the slot-14 call at `01f75fb
 
 See [Title-addressed descriptor heaps](title-descriptor-heaps.md) for the slot-14 wrapper's expected-base provenance, slot-15 stride arithmetic and optional slot-10 return. Those observations do not fix a numeric stride, heap layout, or callback ABI.
 
+### Bootstrap #26 is distinct from allocation-info #25
+
+- All three #26 calls target the device via the same global at `08759d00` and pass the same `rsp+0xd0` storage. No fifth argument is set up at these sites, and there is no intervening read from the storage or `RAX`. After the third call a 16-byte write at `02478783` begins repurposing that storage for queue creation at `0247878a`. This does not prove that every byte or any device-side effect is irrelevant, or give a writable result extent. The argument values and desktop comparison favor a heap-properties query over an allocation-info query.
+- On the **same device global**, calls at `0034413f`, `00344182` and `01a0dce9` instead load vtable `+0xc8` (**slot 25**). The observed shape is `RCX=out`, `RDX=device`, `R8D=1`, `R9D=1`, `S20=resource-description pointer`. At `00344145` and `00344188`, the caller copies 16 bytes from the result storage (the first path compares the qword at result `+8` with `0x1000`); `01a0dcef`–`01a0dcf6` reads low dwords at `+0` and `+8`. These sites consume the buffer, not `RAX`.
+- The slot-25 shape and result accesses fit desktop `GetResourceAllocationInfo` (`SizeInBytes` and `Alignment`, each `UINT64`), except that desktop Win64 orders `this` before the output pointer. This comparison does not supply Xbox sizing/alignment rules or define the input record. Keep the two methods separate: do not dispatch bootstrap #26 to a slot-25 allocation-info implementation or write a desktop heap-properties layout on this evidence alone.
+
 ## IID values used by the measured calls
 
 GUIDs below are canonical strings decoded from in-image bytes as little-endian GUID fields (not network-byte-order UUIDs). A UUID match only says what the caller requested; it does not establish that the desktop vtable or `QueryInterface` behavior matches. No inferred list of supported interfaces.
@@ -58,7 +64,7 @@ The owned `static_tls_lane` fixture exercises the IAT bridge with the observed r
 
 ## Owned ABI probe and implementation boundary
 
-`cargo test --offline --target x86_64-apple-darwin --test xbox_d3d12_abi` runs the original slot-26 probe on x86-64 (Rosetta on Apple Silicon); other x86-64 hosts can run the same test with their native target. The assembly caller supplies an owned vtable, shadow space, and the observed register order; a typed `extern "win64"` callee records distinct values into separate writable storage. The output is a synthetic ledger, not an Xbox heap-properties type. The test intentionally ignores `RAX` and registers no export or provider.
+`cargo test --offline --target x86_64-apple-darwin --test xbox_d3d12_abi` runs the original slot-26 probe on x86-64 (Rosetta on Apple Silicon); other x86-64 hosts can run the same test with their native target. The assembly caller supplies an owned vtable, shadow space, and the observed register order; a typed `extern "win64"` callee records distinct values into separate writable storage. The output is a synthetic ledger, not an Xbox heap-properties type. The test intentionally ignores `RAX` and registers no export or provider. A separate slot-25 fixture puts an original description token in the fifth Win64 argument and checks an owned two-qword result with surrounding canaries. It validates transport and the fixture's write boundary, not the Xbox resource-description layout, native write extent, or sizing policy.
 
 The [macOS CPU alias proof](xmem-cpu-alias.md) exercises shared backing and view lifetime with real host mappings. It does not verify `XMemMapPhysicalPages` or the GPU placement and visibility needs of slot 133.
 

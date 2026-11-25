@@ -1,5 +1,5 @@
-//! Owned x86-64 Win64 probe for the Xbox device #26 argument order.
-//! Not a provider, D3D12 implementation, or measured heap-properties layout.
+//! Owned x86-64 Win64 probes for distinct Xbox device #25 and #26 call shapes.
+//! No provider, D3D12 sizing policy, or assumed Xbox structure layout.
 #![cfg(target_arch = "x86_64")]
 
 use std::arch::asm;
@@ -87,4 +87,83 @@ fn device_26_passes_the_return_buffer_before_this() {
             kind,
         },
     );
+}
+
+const ALLOCATION_SLOT: usize = 25;
+type AllocationEntry =
+    unsafe extern "win64" fn(*mut [u64; 2], *const AllocationDevice, u32, u32, *const u64);
+
+#[repr(C)]
+struct AllocationDevice {
+    vtable: *const Option<AllocationEntry>,
+    cookie: u64,
+}
+
+#[repr(C)]
+struct GuardedResult {
+    before: u64,
+    words: [u64; 2],
+    after: u64,
+}
+
+unsafe extern "win64" fn record_allocation_call(
+    out: *mut [u64; 2],
+    device: *const AllocationDevice,
+    mask: u32,
+    count: u32,
+    description: *const u64,
+) {
+    // SAFETY: the fixture supplies the owned device, description token and result.
+    unsafe {
+        out.write([
+            (*device).cookie ^ *description,
+            (u64::from(mask) << 32) | u64::from(count),
+        ]);
+    }
+}
+
+#[test]
+fn device_25_reads_the_description_from_the_fifth_argument() {
+    assert_eq!(size_of::<Option<AllocationEntry>>(), 8);
+    let mut table: [Option<AllocationEntry>; SLOT + 1] = [None; SLOT + 1];
+    table[ALLOCATION_SLOT] = Some(record_allocation_call);
+    let device = AllocationDevice {
+        vtable: table.as_ptr(),
+        cookie: 0x29b7_610a_a3cd_e8ff,
+    };
+    let mut out = GuardedResult {
+        before: 0x0123_4567_89ab_cdef,
+        words: [0; 2],
+        after: 0xfedc_ba98_7654_3210,
+    };
+    let description = 0x4763_ed29_a81b_40c2_u64;
+    let mask = 0x1357_9bdf_u32;
+    let count = 0x0246_8ace_u32;
+
+    // SAFETY: live fixture pointers and the correct typed slot are supplied.
+    // 32 bytes of home space + 8 for the fifth argument + 8 for alignment.
+    // Nothing unwinds through the call, and RAX is not used as the result.
+    unsafe {
+        asm!(
+            "sub rsp, 48",
+            "mov [rsp + 0x20], r10",
+            "mov rax, [rdx]",
+            "call [rax + {offset}]",
+            "add rsp, 48",
+            offset = const ALLOCATION_SLOT * 8,
+            inlateout("rcx") &raw mut out.words => _,
+            inlateout("rdx") &raw const device => _,
+            inlateout("r8d") mask => _,
+            inlateout("r9d") count => _,
+            inlateout("r10") &raw const description => _,
+            clobber_abi("win64"),
+        );
+    }
+
+    assert_eq!(out.before, 0x0123_4567_89ab_cdef);
+    assert_eq!(
+        out.words,
+        [device.cookie ^ description, 0x1357_9bdf_0246_8ace]
+    );
+    assert_eq!(out.after, 0xfedc_ba98_7654_3210);
 }
