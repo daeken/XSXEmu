@@ -168,3 +168,20 @@ The separate snapshot fixture accepts only nonfinal scalar MRTZ → exact `s_wai
 Two overlapping draws use 1/8 and 1/4 as the captured depth and distinguishable packed colors. The RTZ inputs lie above the midpoint to the next half, so round-to-nearest would also fail the color oracle. Apple M4 matched 64/64 pixels from generated MSL and from an offline metallib. An independent late-read control sources depth from the overwritten packed RG word, where the bit pattern now represents 3/4 or 1 as float32. Both fail the strict-less test against the 1/2 clear, and readback verified all 64 pixels remained clear instead of the 30 expected color writes.
 
 The general stage lift and reference gap census still reject a standalone wait. The census reruns are unchanged, including both wait-bearing PS graphs; the owned dependency proof does not admit those whole graphs or validate retail bindings, floating-point modes or bake.
+
+### Contextual wait eligibility and next gates
+
+The separate static audit runs only on complete reference paths where exact `expcnt(0)` is the sole encoding gap. It requires contiguous fallthrough, one scalar nonfinal MRTZ directly before the wait, no other pending work or EXEC changes in the checked instruction set, local definitions of depth and both packed conversion inputs, an overwrite of the original depth VGPR, final full packed MRT0 consuming that overwritten value, and true termination. It assumes no incoming VGPR values. The proof accepts normalized depth in [0,1] and packed conversion sources that are signed zero or within the finite half-normal range. It does not use source metadata to supply values or ABI.
+
+Both eligible reference PS graphs pass these checks on both CPU and wave settings. They are **static snapshot-eligible**, not encoding-complete or translated: this covers the dependency under the checked entry and decoder hypotheses, not actual Xbox entry/EXEC/raster state, color binding, floating-point modes or attachment state. The context-free census is unchanged at 325/12,091 and 325/6,188 complete PS graphs without an encoding gap. No other wait is accepted.
+
+Remaining nearest cohorts, ranked by number of whole graphs affected on each reference (not predicted translation gains):
+
+| Gate | Whole-graph cohort | Remaining work |
+| --- | ---: | --- |
+| VS byte unpack and FMA | 104 at seven sites each | 102 share two ANDs, two byte-0-to-float conversions, two FMA and one shift; two substitute one U32 conversion. Another 18 have similar arithmetic plus a true wait and are separate. Exact operand fields still need checking. |
+| PS interpolation and linkage | 6 at three sites each; 2 more at four | Scalar MOV plus interpolation phase 1/2, and one subtraction in the latter two. Check exact scalar destination/immediate, paired attribute/channel/temporary selectors, and their actual dependency. |
+| PS export completion | 2 at one site each | Both meet the bounded static snapshot proof above; actual bindings and title execution are still unvalidated. |
+| PS higher color ordinals | 1 at three sites | Two nonfinal full-mask exports and one final partial export; an owned mapping would not establish a title attachment map. |
+
+The VS arithmetic cohort has the largest potential encoding gain. The next owned validation should target the PS interpolation pair because it tests a missing end-to-end native VS→native PS linkage path, not another export variant. Use one explicitly mapped PARAM/channel and an explicit interpolation qualifier; choose asymmetric vertex data and a CPU pixel-center oracle that detects an attribute/channel swap or wrong interpolation mode. Verify the phase pair and scalar setup on both references before admitting any exact forms. No retail ordinal or interpolation mode follows from that owned interface.

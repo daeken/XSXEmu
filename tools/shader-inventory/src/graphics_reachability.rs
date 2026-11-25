@@ -494,10 +494,127 @@ impl NearestGaps {
     }
 }
 
+// Analyze only a sole-wait, contiguous reference path. No entry VGPR ABI is
+// assumed. This is evidence about the dependency, not an executable profile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum WaitDependency {
+    ShapeUnproven,
+    ReuseUnproven,
+    DepthValueUnproven,
+    PackedOperandsUnproven,
+    StaticSnapshotEligible,
+}
+
+fn check_wait_dependency(bytes: &[u8]) -> WaitDependency {
+    use crate::graphics_decode::{Op, Vgpr, decode};
+    use WaitDependency::*;
+    // The narrow cohort is short. Bound scratch independently of input size.
+    if !bytes.len().is_multiple_of(4) || bytes.len() > 128 {
+        return ShapeUnproven;
+    }
+    let words: Vec<_> = bytes
+        .chunks_exact(4)
+        .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+        .collect();
+    #[derive(Clone, Copy)]
+    enum Value {
+        Unknown,
+        Bits(u32),
+        Packed { checked: bool, owns_reuse: bool },
+    }
+    let mut vgprs = [Value::Unknown; 256];
+    let mut pc = 0;
+    let mut depth = None;
+    let mut waited = false;
+    let mut final_color = None;
+    let admissible_f32 = |v: Value| match v {
+        Value::Bits(bits) => {
+            let x = f32::from_bits(bits).abs();
+            x == 0. || (2f32.powi(-14)..=65504.).contains(&x)
+        }
+        _ => false,
+    };
+    while pc < words.len() {
+        if words[pc] == WAIT_EXPORT_ZERO {
+            if waited || depth.is_none() || final_color.is_some() {
+                return ShapeUnproven;
+            }
+            waited = true;
+            pc += 1;
+            continue;
+        }
+        let Ok((width, op)) = decode(&words, pc) else {
+            return ShapeUnproven;
+        };
+        let read = |Vgpr(r)| vgprs[usize::from(r)];
+        match op {
+            Op::MoveBits { dst: Vgpr(d), bits } if depth.is_none() => {
+                vgprs[usize::from(d)] = Value::Bits(bits)
+            }
+            Op::Move { dst: Vgpr(d), src } if depth.is_none() => vgprs[usize::from(d)] = read(src),
+            Op::NopOneCycle | Op::PrefetchThreeLines
+                if (depth.is_none() || waited) && final_color.is_none() => {}
+            Op::PixelDepth {
+                src,
+                final_export: false,
+            } if depth.is_none() => {
+                let z_checked = match read(src) {
+                    Value::Bits(bits) => (0. ..=1.).contains(&f32::from_bits(bits)),
+                    _ => false,
+                };
+                depth = Some((src, z_checked));
+            }
+            Op::PackHalfRtz { dst: Vgpr(d), src } if waited && final_color.is_none() => {
+                let checked = src.into_iter().all(|r| admissible_f32(read(r)));
+                vgprs[usize::from(d)] = Value::Packed {
+                    checked,
+                    owns_reuse: depth.is_some_and(|(r, _)| r == Vgpr(d)),
+                };
+            }
+            Op::PackedColor {
+                slot: 0,
+                src,
+                done: true,
+                vm: true,
+            } if waited && final_color.is_none() => final_color = Some(src.map(read)),
+            Op::End if pc + width == words.len() => {
+                let (Some((_, depth_checked)), Some(packed)) = (depth, final_color) else {
+                    return ShapeUnproven;
+                };
+                if !packed.iter().any(|v| {
+                    matches!(
+                        v,
+                        Value::Packed {
+                            owns_reuse: true,
+                            ..
+                        }
+                    )
+                }) {
+                    return ReuseUnproven;
+                }
+                if !depth_checked {
+                    return DepthValueUnproven;
+                }
+                if !packed
+                    .iter()
+                    .all(|v| matches!(v, Value::Packed { checked: true, .. }))
+                {
+                    return PackedOperandsUnproven;
+                }
+                return StaticSnapshotEligible;
+            }
+            _ => return ShapeUnproven,
+        }
+        pc += width;
+    }
+    ShapeUnproven
+}
+
 #[derive(Default)]
 struct LiftGaps {
     complete: usize,
     sole_export_wait: usize,
+    wait_dependencies: BTreeMap<WaitDependency, usize>,
     sole_export_wait_with_depth_reuse: usize,
     no_encoding_gap: usize,
     no_exp_gap: usize,
@@ -613,6 +730,12 @@ impl LiftGaps {
             self.complete += 1;
             if sites - accepted == 1 && saw_export_wait {
                 self.sole_export_wait += 1;
+                let context = if linear {
+                    check_wait_dependency(&bytes[..bytes.len() - next_tail_len])
+                } else {
+                    WaitDependency::ShapeUnproven
+                };
+                *self.wait_dependencies.entry(context).or_default() += 1;
                 self.sole_export_wait_with_depth_reuse += usize::from(linear && depth_reused);
             }
             self.no_encoding_gap += usize::from(missing.is_empty());
@@ -653,6 +776,12 @@ impl LiftGaps {
             println!(
                 "    sole exact EXPCNT(0) gap: {} complete graphs; {} linear paths with adjacent nonfinal scalar MRTZ and later packed RTZ reusing its source VGPR",
                 self.sole_export_wait, self.sole_export_wait_with_depth_reuse
+            );
+        }
+        if !self.wait_dependencies.is_empty() {
+            println!(
+                "    conditional export snapshot audit (not encoding coverage): {:?}",
+                self.wait_dependencies
             );
         }
         self.nearest.report();
@@ -1447,6 +1576,50 @@ mod tests {
         assert_eq!((gaps.no_exp_gap, gaps.only_exp_gap), (1, 0));
         assert!(gaps.observe(&mut dis, &bytes).is_ok());
         assert_eq!((gaps.no_exp_gap, gaps.only_exp_gap), (1, 1));
+    }
+
+    #[test]
+    fn contextual_wait_proves_local_values_overwrite_and_final_use() {
+        use WaitDependency::*;
+        let exact = [
+            0x7e00_0280u32, // v0 = +0
+            0x7e02_02f0,    // v1 = +0.5
+            0x7e04_02ff,
+            0x3e00_0000, // v2 = +0.125
+            0xf800_0081,
+            2,
+            WAIT_EXPORT_ZERO,
+            0xbf80_0000,
+            0x5e04_0300, // v2 = packed v0, v1
+            0x5e06_0300, // v3 = packed v0, v1
+            0xf800_1c0f,
+            0x302,
+            0xbf81_0000,
+        ];
+        let check = |words: &[u32]| {
+            let bytes: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            check_wait_dependency(&bytes)
+        };
+        assert_eq!(check(&exact), StaticSnapshotEligible);
+        let mut changed = exact;
+        changed[5] = 7; // entry VGPR, not a local definition
+        assert_eq!(check(&changed), ReuseUnproven);
+        changed = exact;
+        changed[3] = f32::NAN.to_bits();
+        assert_eq!(check(&changed), DepthValueUnproven);
+        changed = exact;
+        changed[8] = 0x5e04_0307; // reuse exists, but its input is unproven
+        assert_eq!(check(&changed), PackedOperandsUnproven);
+        changed = exact;
+        changed[11] = 0x303; // both color operands ignore the reused VGPR
+        assert_eq!(check(&changed), ReuseUnproven);
+        changed = exact;
+        changed[6] = 0xbf8c_ff1f;
+        assert_eq!(check(&changed), ShapeUnproven);
+        changed = exact;
+        changed.swap(6, 7);
+        assert_eq!(check(&changed), ShapeUnproven);
+        assert_eq!(check(&exact[..12]), ShapeUnproven);
     }
 
     #[test]
