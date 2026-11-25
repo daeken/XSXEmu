@@ -118,6 +118,21 @@ pub(crate) enum DecodeError {
     Truncated(usize),
 }
 
+/// Exact full-F32 X/Z P1/P2 with an already bound attribute. The shared
+/// context-free decoder deliberately uses only attribute 0.
+pub(crate) fn decode_interp_phase(w: u32, attribute: u8) -> Option<Op> {
+    let channel = ((w >> 8) & 3) as u8;
+    (attribute <= 1
+        && w & 0xfc02_fc00 == (0xc800_0000 | (u32::from(attribute) << 10))
+        && matches!(channel, 0 | 2))
+    .then_some(Op::InterpPhase {
+        second: w & 0x1_0000 != 0,
+        dst: Vgpr((w >> 18) as u8),
+        coord: Vgpr(w as u8),
+        channel,
+    })
+}
+
 pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeError> {
     let w = words[pc];
     let ext = || words.get(pc + 1).copied().ok_or(DecodeError::Truncated(pc));
@@ -129,19 +144,8 @@ pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeErro
     if matches!(w, 0xbefc_0309 | 0xbefc_030e) {
         return Ok((1, Op::InitInterpM0 { sgpr: w as u8 }));
     }
-    if w & 0xfc02_fc00 == 0xc800_0000 {
-        let channel = ((w >> 8) & 3) as u8;
-        if matches!(channel, 0 | 2) {
-            return Ok((
-                1,
-                Op::InterpPhase {
-                    second: w & 0x1_0000 != 0,
-                    dst: Vgpr((w >> 18) as u8),
-                    coord: Vgpr(w as u8),
-                    channel,
-                },
-            ));
-        }
+    if let Some(op) = decode_interp_phase(w, 0) {
+        return Ok((1, op));
     }
     match w {
         0xbf80_0000 => return Ok((1, Op::NopOneCycle)),

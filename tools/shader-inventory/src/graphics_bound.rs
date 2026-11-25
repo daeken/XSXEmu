@@ -1,7 +1,7 @@
-//! Explicit owned binding contract for straight-line VS/PS, with at most one
-//! checked affine input. No live-title admission path.
+//! Explicit owned binding contract for straight-line VS/PS, with at most two
+//! independently checked affine inputs. No live-title admission path.
 use super::{MSL_HEADER, RTZ_HELPER, emit_body};
-use crate::graphics_decode::{Op, Target, Vgpr, decode};
+use crate::graphics_decode::{Op, Target, Vgpr, decode, decode_interp_phase};
 use std::{collections::BTreeSet, fmt::Write};
 
 #[derive(Clone, Copy, Debug)]
@@ -74,9 +74,9 @@ pub(crate) struct AffineLink {
 pub(crate) struct Bindings<'a> {
     pub vertex_inputs: &'a [VertexInput],
     pub position: Option<Position>,
-    /// Exact producer outputs with no consumer; disjoint from the linked PARAM.
+    /// Exact producer outputs with no consumer; disjoint from the linked PARAMs.
     pub no_ps_link: NoPsLink<'a>,
-    pub affine_link: Option<AffineLink>,
+    pub affine_links: &'a [AffineLink],
     pub color: Option<ColorBinding>,
     pub state: RasterState,
 }
@@ -209,12 +209,13 @@ pub(crate) fn translate(vs: &[u32], ps: &[u32], b: Bindings<'_>) -> Result<Metal
         return Err(Error::MissingPosition);
     }
     let color = b.color.ok_or(Error::MissingColor)?;
-    let link = b.affine_link;
+    let links = b.affine_links;
+    let affine = !links.is_empty();
     if color.native_mrt > 2
         || color.metal_color != 0
-        || color.fp16_abgr == link.is_some()
+        || color.fp16_abgr == affine
         || !color.rgba32_float
-        || (link.is_some() && (color.native_mrt != 0 || color.mask != Mask::Rgba))
+        || (affine && (color.native_mrt != 0 || color.mask != Mask::Rgba))
     {
         return Err(Error::ColorBinding);
     }
@@ -226,12 +227,19 @@ pub(crate) fn translate(vs: &[u32], ps: &[u32], b: Bindings<'_>) -> Result<Metal
     if params.len() != unconsumed.len() || params.iter().any(|&n| n > 6) {
         return Err(Error::ParameterBinding);
     }
-    if let Some(l) = link {
+    if links.len() > 2 {
+        return Err(Error::InterpolationBinding);
+    }
+    let mut producers = BTreeSet::new();
+    let mut attributes = BTreeSet::new();
+    for l in links {
         if l.param > 6
-            || l.attribute != 0
+            || l.attribute > 1
             || (l.i_vgpr, l.j_vgpr) != (0, 1)
-            || l.channel > 3
+            || !matches!(l.channel, 0 | 2)
             || params.contains(&l.param)
+            || !producers.insert(l.param)
+            || !attributes.insert(l.attribute)
             || l.m0_value != 0
             || l.mode != InterpolationMode::CenterNoPerspective
             || !l.full_precision
@@ -261,7 +269,7 @@ pub(crate) fn translate(vs: &[u32], ps: &[u32], b: Bindings<'_>) -> Result<Metal
     let mut msl = MSL_HEADER.to_owned();
     msl.push_str(RTZ_HELPER);
     msl.push_str("struct BoundPosition { float4 position [[position]];");
-    if let Some(l) = link {
+    for l in links {
         write!(
             msl,
             " float4 param{} [[user(param{}), center_no_perspective]];",
@@ -288,7 +296,7 @@ pub(crate) fn translate(vs: &[u32], ps: &[u32], b: Bindings<'_>) -> Result<Metal
     }
     let mut position = false;
     let mut discarded = BTreeSet::new();
-    let mut linked = false;
+    let mut linked = BTreeSet::new();
     walk(vs, |pc, op| {
         match op {
             Op::Move { dst, src } => f.write(dst, f.read(src, pc)?, pc)?,
@@ -319,9 +327,8 @@ pub(crate) fn translate(vs: &[u32], ps: &[u32], b: Bindings<'_>) -> Result<Metal
                 target: Target::Parameter(n),
                 src,
                 done: false,
-            } if link.is_some_and(|l| l.param == n) && !linked => {
+            } if producers.contains(&n) && linked.insert(n) => {
                 f.export(&src, pc)?;
-                linked = true;
             }
             Op::Export {
                 target: Target::Parameter(_),
@@ -330,7 +337,7 @@ pub(crate) fn translate(vs: &[u32], ps: &[u32], b: Bindings<'_>) -> Result<Metal
             Op::NopOneCycle | Op::PrefetchThreeLines | Op::End => {}
             _ => return Err(Error::Instruction(pc)),
         }
-        emit_body(&mut msl, &[op], "out", link.is_some());
+        emit_body(&mut msl, &[op], "out", affine);
         Ok(())
     })?;
     if !position {
@@ -339,7 +346,7 @@ pub(crate) fn translate(vs: &[u32], ps: &[u32], b: Bindings<'_>) -> Result<Metal
     if discarded != params {
         return Err(Error::ParameterBinding);
     }
-    if linked != link.is_some() {
+    if linked != producers {
         return Err(Error::InterpolationBinding);
     }
 
@@ -351,48 +358,61 @@ pub(crate) fn translate(vs: &[u32], ps: &[u32], b: Bindings<'_>) -> Result<Metal
         color.metal_color
     )
     .unwrap();
-    let mut prefix = 0;
-    if let Some(l) = link {
-        // The exact decoder accepts only attribute 0. I/J are explicitly
-        // fixed to center barycentric v0/v1 by the AffineLink contract.
-        if decode(ps, 0) != Ok((1, Op::InitInterpM0 { sgpr: l.m0_sgpr })) {
-            return Err(Error::InterpolationBinding);
-        }
-        let Ok((
-            1,
-            Op::InterpPhase {
+    if ps.len() > 1024 {
+        return Err(Error::Extent);
+    }
+    let prefix = links.len() * 3;
+    if affine {
+        msl.push_str("fragment BoundColor bound_ps(BoundPosition input [[stage_in]]) { uint r[256]; BoundColor out;\n");
+        let groups = ps.get(..prefix).ok_or(Error::InterpolationBinding)?;
+        let mut consumed = BTreeSet::new();
+        let mut results = BTreeSet::new();
+        // Match by the encoded PS attribute, not contract, export or prefix order.
+        // Each group initializes its declared M0, then runs adjacent P1/P2.
+        for (group, words) in groups.chunks_exact(3).enumerate() {
+            let pc = group * 3;
+            let attr = ((words[1] >> 10) & 0x3f) as u8;
+            let l = links
+                .iter()
+                .find(|l| l.attribute == attr)
+                .ok_or(Error::InterpolationBinding)?;
+            if !consumed.insert(attr)
+                || decode(words, 0) != Ok((1, Op::InitInterpM0 { sgpr: l.m0_sgpr }))
+            {
+                return Err(Error::InterpolationBinding);
+            }
+            let Some(Op::InterpPhase {
                 second: false,
                 dst,
                 coord: Vgpr(0),
                 channel,
-            },
-        )) = decode(ps, 1)
-        else {
-            return Err(Error::InterpolationBinding);
-        };
-        if dst.0 < 2
-            || channel != l.channel
-            || decode(ps, 2)
-                != Ok((
-                    1,
-                    Op::InterpPhase {
+            }) = decode_interp_phase(words[1], attr)
+            else {
+                return Err(Error::InterpolationBinding);
+            };
+            if dst.0 < 2
+                || !results.insert(dst.0)
+                || channel != l.channel
+                || decode_interp_phase(words[2], attr)
+                    != Some(Op::InterpPhase {
                         second: true,
                         dst,
                         coord: Vgpr(1),
                         channel,
-                    },
-                ))
-        {
-            return Err(Error::InterpolationBinding);
+                    })
+            {
+                return Err(Error::InterpolationBinding);
+            }
+            writeln!(
+                msl,
+                "  r[{}] = as_type<uint>(input.param{}[{}]);",
+                dst.0, l.param, channel
+            )
+            .unwrap();
+            f.write(dst, Fact::Runtime, pc + 2)?;
         }
-        writeln!(msl, "fragment BoundColor bound_ps(BoundPosition input [[stage_in]]) {{ uint r[256]; BoundColor out;\n  r[{}] = as_type<uint>(input.param{}[{}]);", dst.0, l.param, channel).unwrap();
-        f.write(dst, Fact::Runtime, 2)?;
-        prefix = 3;
     } else {
         msl.push_str("fragment BoundColor bound_ps() { uint r[256]; BoundColor out;\n");
-    }
-    if ps.len() > 1024 {
-        return Err(Error::Extent);
     }
     walk(&ps[prefix..], |offset, op| {
         let pc = offset + prefix;
@@ -411,7 +431,7 @@ pub(crate) fn translate(vs: &[u32], ps: &[u32], b: Bindings<'_>) -> Result<Metal
                 target: Target::Color,
                 src,
                 done: true,
-            } if link.is_some() && ps[pc] == 0xf800_080f => {
+            } if affine && ps[pc] == 0xf800_080f => {
                 f.export(&src, pc)?;
                 let [a, b, c, d] = src.map(|r| r.0);
                 writeln!(
@@ -427,7 +447,7 @@ pub(crate) fn translate(vs: &[u32], ps: &[u32], b: Bindings<'_>) -> Result<Metal
                 src,
                 done: true,
                 vm: true,
-            } if link.is_none() && slot == color.native_mrt && color.mask == Mask::Rgba => {
+            } if !affine && slot == color.native_mrt && color.mask == Mask::Rgba => {
                 for r in src {
                     require_packed(f.read(r, pc)?, pc)?;
                 }
@@ -450,7 +470,7 @@ pub(crate) fn translate(vs: &[u32], ps: &[u32], b: Bindings<'_>) -> Result<Metal
             // The shared decoder also recognizes a nonfinal MRT1 RG form.
             // Only the exact MRT0 form has DONE+VM in this encoding subset.
             Op::PackedRg { slot: 0, src }
-                if link.is_none() && color.native_mrt == 0 && color.mask == Mask::Rg =>
+                if !affine && color.native_mrt == 0 && color.mask == Mask::Rg =>
             {
                 require_packed(f.read(src, pc)?, pc)?;
                 emitted = true;
@@ -544,7 +564,7 @@ fn binding(rg: bool) -> Bindings<'static> {
         no_ps_link: NoPsLink {
             unconsumed_params: if rg { &[0] } else { &[2] },
         },
-        affine_link: None,
+        affine_links: &[],
         color: Some(ColorBinding {
             native_mrt: if rg { 0 } else { 1 },
             metal_color: 0,
@@ -592,19 +612,30 @@ pub(crate) fn owned_swapped_pair() -> Result<MetalPair, Error> {
     )
 }
 
-const AFFINE_INPUTS: [VertexInput; 8] = {
+const fn affine_inputs<const N: usize>() -> [VertexInput; N] {
     let mut inputs = [VertexInput {
         vgpr: 0,
         buffer: 0,
         component: 0,
-    }; 8];
+    }; N];
     let mut i = 0;
-    while i < 8 {
+    while i < N {
         inputs[i] = VertexInput {
             vgpr: i as u8,
             buffer: (i / 4) as u8,
             component: (i % 4) as u8,
         };
+        i += 1;
+    }
+    inputs
+}
+
+const AFFINE_INPUTS: [VertexInput; 8] = affine_inputs();
+const AFFINE_TWO_INPUTS: [VertexInput; 12] = {
+    let mut inputs = affine_inputs::<12>();
+    let mut i = 8;
+    while i < 12 {
+        inputs[i].vgpr += 1; // v8 is produced locally, never a live-in.
         i += 1;
     }
     inputs
@@ -619,6 +650,31 @@ pub(super) const AFFINE_Z_VS: [u32; 6] = [
     super::VS[5],
 ];
 
+const AFFINE_X_LINK: AffineLink = AffineLink {
+    param: 0,
+    attribute: 0,
+    i_vgpr: 0,
+    j_vgpr: 1,
+    channel: 0,
+    m0_sgpr: 9,
+    m0_value: 0,
+    mode: InterpolationMode::CenterNoPerspective,
+    full_precision: true,
+};
+const AFFINE_Z_LINK: AffineLink = AffineLink {
+    param: 2,
+    channel: 2,
+    m0_sgpr: 14,
+    ..AFFINE_X_LINK
+};
+const AFFINE_TWO_LINKS: [AffineLink; 2] = [
+    AFFINE_X_LINK,
+    AffineLink {
+        attribute: 1,
+        ..AFFINE_Z_LINK
+    },
+];
+
 fn affine_binding(z: bool) -> Bindings<'static> {
     let base = binding(false);
     Bindings {
@@ -626,17 +682,11 @@ fn affine_binding(z: bool) -> Bindings<'static> {
         no_ps_link: NoPsLink {
             unconsumed_params: &[],
         },
-        affine_link: Some(AffineLink {
-            param: if z { 2 } else { 0 },
-            attribute: 0,
-            i_vgpr: 0,
-            j_vgpr: 1,
-            channel: if z { 2 } else { 0 },
-            m0_sgpr: if z { 14 } else { 9 },
-            m0_value: 0,
-            mode: InterpolationMode::CenterNoPerspective,
-            full_precision: true,
-        }),
+        affine_links: if z {
+            &[AFFINE_Z_LINK]
+        } else {
+            &[AFFINE_X_LINK]
+        },
         color: Some(ColorBinding {
             native_mrt: 0,
             fp16_abgr: false,
@@ -644,6 +694,40 @@ fn affine_binding(z: bool) -> Bindings<'static> {
         }),
         ..base
     }
+}
+
+pub(super) const AFFINE_TWO_VS: [u32; 8] = [
+    super::VS[0],
+    0xf800_022f,
+    0x0c0b_0a09,
+    super::VS[1],
+    super::VS[2],
+    super::VS[3],
+    super::VS[4],
+    super::VS[5],
+];
+pub(super) const AFFINE_TWO_PS: [u32; 9] = [
+    0xbefc_030e,
+    0xc80c_0600,
+    0xc80d_0601,
+    0xbefc_0309,
+    0xc808_0000,
+    0xc809_0001,
+    0xf800_080f,
+    0x0203_0302,
+    0xbf81_0000,
+];
+
+fn two_affine_binding() -> Bindings<'static> {
+    Bindings {
+        vertex_inputs: &AFFINE_TWO_INPUTS,
+        affine_links: &AFFINE_TWO_LINKS,
+        ..affine_binding(false)
+    }
+}
+
+pub(crate) fn owned_two_affine() -> Result<MetalPair, Error> {
+    translate(&AFFINE_TWO_VS, &AFFINE_TWO_PS, two_affine_binding())
 }
 
 pub(crate) fn owned_affine(z: bool) -> Result<MetalPair, Error> {
@@ -663,7 +747,10 @@ pub(crate) fn archive_affine(
     let mut ps = [0; 6];
     ps.copy_from_slice(super::INTERP_X_PS);
     if changed {
-        b.affine_link.as_mut().unwrap().channel = 2;
+        b.affine_links = &[AffineLink {
+            channel: 2,
+            ..AFFINE_X_LINK
+        }];
         ps[1] |= 0x200;
         ps[2] |= 0x200;
     }
@@ -673,6 +760,89 @@ pub(crate) fn archive_affine(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn two_affine_links_match_attributes_independent_of_order() {
+        let b = two_affine_binding();
+        let pair = owned_two_affine().unwrap();
+        assert!(
+            pair.source
+                .contains("r[3] = as_type<uint>(input.param2[2])")
+        );
+        assert!(
+            pair.source
+                .contains("r[2] = as_type<uint>(input.param0[0])")
+        );
+        translate(
+            &AFFINE_TWO_VS,
+            &AFFINE_TWO_PS,
+            Bindings {
+                affine_links: &[AFFINE_TWO_LINKS[1], AFFINE_TWO_LINKS[0]],
+                ..b
+            },
+        )
+        .unwrap();
+        for links in [
+            [
+                AFFINE_TWO_LINKS[0],
+                AffineLink {
+                    attribute: 0,
+                    ..AFFINE_TWO_LINKS[1]
+                },
+            ],
+            [
+                AFFINE_TWO_LINKS[0],
+                AffineLink {
+                    param: 0,
+                    ..AFFINE_TWO_LINKS[1]
+                },
+            ],
+        ] {
+            assert_eq!(
+                translate(
+                    &AFFINE_TWO_VS,
+                    &AFFINE_TWO_PS,
+                    Bindings {
+                        affine_links: &links,
+                        ..b
+                    }
+                )
+                .unwrap_err(),
+                Error::InterpolationBinding
+            );
+        }
+        for (index, word) in [
+            (0, 0xbefc_0309), // wrong M0 setup on the second attribute
+            (2, 0xc80d_0201), // P2 switches attribute
+            (2, 0xc80d_0401), // P2 switches channel
+            (2, 0xc80d_0600), // P2 uses the I input, not J
+            (2, 0xc809_0601), // P2 switches destination
+        ] {
+            let mut ps = AFFINE_TWO_PS;
+            ps[index] = word;
+            assert_eq!(
+                translate(&AFFINE_TWO_VS, &ps, b).unwrap_err(),
+                Error::InterpolationBinding
+            );
+        }
+        let mut ps = AFFINE_TWO_PS;
+        ps.copy_within(0..3, 3); // repeated attribute hides a missing consumer
+        assert_eq!(
+            translate(&AFFINE_TWO_VS, &ps, b).unwrap_err(),
+            Error::InterpolationBinding
+        );
+        assert_eq!(
+            translate(&AFFINE_TWO_VS, &AFFINE_TWO_PS[..5], b).unwrap_err(),
+            Error::InterpolationBinding
+        );
+        assert_eq!(
+            translate(super::super::VS, &AFFINE_TWO_PS, b).unwrap_err(),
+            Error::InterpolationBinding
+        );
+        // The context-free decoder still refuses the attribute-1 words.
+        assert!(decode(&AFFINE_TWO_PS, 1).is_err());
+        assert!(decode(&AFFINE_TWO_PS, 2).is_err());
+    }
 
     #[test]
     fn archive_mutation_changes_only_the_interpolation_channel_bits() {
@@ -688,13 +858,13 @@ mod tests {
     #[test]
     fn affine_links_require_exact_producer_and_phase_contract() {
         let b = affine_binding(false);
-        let l = b.affine_link.unwrap();
+        let l = b.affine_links[0];
         let check = |l| {
             translate(
                 super::super::VS,
                 super::super::INTERP_X_PS,
                 Bindings {
-                    affine_link: Some(l),
+                    affine_links: &[l],
                     ..b
                 },
             )
@@ -748,7 +918,7 @@ mod tests {
                 vs,
                 ps,
                 Bindings {
-                    affine_link: None,
+                    affine_links: &[],
                     ..b
                 }
             )

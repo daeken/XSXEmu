@@ -179,6 +179,13 @@ test ! -e "$d/diagnostic-affine.metalar.identity"
 "$p" --expect-bound-affine-wrong-mode
 "$p" --expect-bound-affine-wrong-channel
 
+# Native independent PARAM0.X and PARAM2.Z links with a producer-swap control.
+"$p" --bound-two-affine-source
+"$p" --emit-bound-two-affine-msl > "$d/bound-two-affine.metal"
+compile bound-two-affine
+"$p" --load-bound-two-affine-metallib "$d/bound-two-affine.metallib"
+"$p" --expect-bound-two-affine-swapped
+
 # Two explicitly mapped FP16_ABGR exports, each with independent readback.
 "$p" --dual-source
 "$p" --emit-dual-msl > "$d/dual.metal"

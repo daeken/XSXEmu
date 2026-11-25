@@ -57,7 +57,9 @@ pub(crate) fn ready_affine(
 ) -> Result<ReadyJob, String> {
     let (pair, vs, ps, b) = crate::graphics_lift::bound::archive_affine(changed)
         .map_err(|e| format!("bound archive lift rejected: {e:?}"))?;
-    let l = b.affine_link.ok_or("missing verified affine link")?;
+    let [l] = b.affine_links else {
+        return Err("owned archive requires exactly one verified affine link".into());
+    };
     let c = pair.color;
     // The owned adapter is narrower than the reusable lift. Every identity
     // below describes the actual fixed render path used by this smoke.

@@ -1313,6 +1313,7 @@ mod tests {
         for (sgpr, component) in [(9, "x"), (14, "z"), (9, "z")] {
             writeln!(asm, "s_mov_b32 m0, s{sgpr}\nv_interp_p1_f32_e32 v2, v0, attr0.{component}\nv_interp_p2_f32_e32 v2, v1, attr0.{component}\nexp mrt0 v2, v2, v2, v2 done\ns_endpgm").unwrap();
         }
+        asm.push_str("v_mov_b32_e32 v8, v4\nexp param2 v9, v10, v11, v12\nexp param0 v8, v5, v6, v7\nexp pos0 v0, v1, v2, v3 done\ns_endpgm\ns_mov_b32 m0, s14\nv_interp_p1_f32_e32 v3, v0, attr1.z\nv_interp_p2_f32_e32 v3, v1, attr1.z\ns_mov_b32 m0, s9\nv_interp_p1_f32_e32 v2, v0, attr0.x\nv_interp_p2_f32_e32 v2, v1, attr0.x\nexp mrt0 v2, v3, v3, v2 done\ns_endpgm\n");
         asm.push_str("exp pos0 v0, v1, v2, v3 done\ns_waitcnt expcnt(0)\nv_mov_b32_e32 v0, v4\nexp param0 v0, v5, v6, v7\ns_endpgm\n");
         asm.push_str("v_mov_b32_e32 v0, 0x3f801800\nv_mov_b32_e32 v1, 0xc0001800\nv_cvt_pkrtz_f16_f32_e32 v2, v0, v1\nv_mov_b32_e32 v0, 0x80000000\nv_mov_b32_e32 v1, 0x38800000\nv_cvt_pkrtz_f16_f32_e32 v3, v0, v1\nexp mrt0 v2, v2, v3, v3 done compr vm\ns_endpgm\n");
         asm.push_str("v_mov_b32_e32 v0, 0x3f801800\nv_mov_b32_e32 v1, 0xc0001800\nv_cvt_pkrtz_f16_f32_e32 v2, v0, v1\nexp mrt0 v2, v2, off, off done compr vm\ns_endpgm\n");
@@ -1355,6 +1356,8 @@ mod tests {
             .chain(INTERP_X_PS)
             .chain(INTERP_Z_PS)
             .chain(&bound::archive_affine(true).unwrap().2)
+            .chain(&bound::AFFINE_TWO_VS)
+            .chain(&bound::AFFINE_TWO_PS)
             .chain(WAIT_POS_VS)
             .chain(CONSTANT_RTZ_PS)
             .chain(CONSTANT_RTZ_RG_PS)

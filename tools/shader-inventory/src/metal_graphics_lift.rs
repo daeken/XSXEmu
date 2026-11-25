@@ -104,6 +104,20 @@ mod gpu {
             / weights.iter().sum::<f64>()) as f32
     }
 
+    fn expected_two_affine(x: usize, y: usize, swapped: bool) -> [f32; 4] {
+        let b = (x as f64 + 0.5) / 16.;
+        let c = (7.5 - y as f64) / 16.;
+        let interpolate = |[p, q, r]: [f64; 3]| ((1. - b - c) * p + b * q + c * r) as f32;
+        let (x_values, z_values) = if swapped {
+            ([-0.75, -0.375, -0.5], [0.75, 0.25, 0.5])
+        } else {
+            ([0.125, 0.625, 0.375], [0.875, 0.75, 0.9375])
+        };
+        let x = interpolate(x_values);
+        let z = interpolate(z_values);
+        [x, z, z, x]
+    }
+
     enum Mode<'a> {
         Source,
         PackedSource(bool),
@@ -113,6 +127,8 @@ mod gpu {
         MrtLoad(&'a Path, MrtFixture),
         InterpSource(InterpFixture),
         InterpLoad(&'a Path, InterpFixture),
+        BoundTwoAffineSource(bool),
+        BoundTwoAffineLoad(&'a Path),
         BoundAffineSource(bool),
         BoundAffineControl(InterpFixture),
         BoundAffineLoad(&'a Path, bool),
@@ -171,6 +187,12 @@ mod gpu {
             [mode] if mode == "--emit-dual-msl" || mode == "--emit-triple-msl" || mode == "--emit-triple-rg-msl" => {
                 let fixture = if mode == "--emit-triple-rg-msl" { MrtFixture::TripleRg } else if mode == "--emit-triple-msl" { MrtFixture::Triple } else { MrtFixture::Dual };
                 print!("{}", graphics_lift::translate_mrt_fixture(fixture).map_err(|e| format!("MRT lift rejected: {e:?}"))?);
+                return Ok(());
+            }
+            [mode] if mode == "--bound-two-affine-source" || mode == "--expect-bound-two-affine-swapped" => Mode::BoundTwoAffineSource(mode == "--expect-bound-two-affine-swapped"),
+            [mode, lib] if mode == "--load-bound-two-affine-metallib" => Mode::BoundTwoAffineLoad(Path::new(lib)),
+            [mode] if mode == "--emit-bound-two-affine-msl" => {
+                print!("{}", graphics_lift::bound::owned_two_affine().map_err(|e| format!("two-affine binding rejected: {e:?}"))?.source);
                 return Ok(());
             }
             [mode] if mode == "--expect-bound-affine-wrong-mode" => Mode::BoundAffineControl(InterpFixture::WrongPerspective),
@@ -262,7 +284,7 @@ mod gpu {
             [mode, lib, archive, compiler] if mode == "--bake-bound-affine-archive" || mode == "--replay-bound-affine-archive" || mode == "--replay-bound-affine-mutated-archive" => Mode::Archive(Path::new(lib), Path::new(archive), mode == "--bake-bound-affine-archive", mode == "--replay-bound-affine-mutated-archive", owned_graphics_artifact::compiler_profile(compiler)?, true),
             [mode, lib, archive] if mode == "--expect-owned-metal-miss" => Mode::ExpectStrictMiss(Path::new(lib), Path::new(archive), false),
             [mode, lib, archive, compiler] if mode == "--bake-archive" || mode == "--replay-archive" || mode == "--replay-mutated-archive" => Mode::Archive(Path::new(lib), Path::new(archive), mode == "--bake-archive", mode == "--replay-mutated-archive", owned_graphics_artifact::compiler_profile(compiler)?, false),
-            _ => return Err("usage: shader-metal-graphics-lift [--expect-swapped-triple | --triple-rg-source | --emit-triple-rg-msl | --load-triple-rg-metallib LIB | --triple-source | --emit-triple-msl | --load-triple-metallib LIB | --dual-source | --emit-dual-msl | --load-dual-metallib LIB | --expect-bound-affine-wrong-mode | --expect-bound-affine-wrong-channel | --bound-affine-{x,z}-source | --emit-bound-affine-{x,z}-msl | --load-bound-affine-{x,z}-metallib LIB | --interp-x-source | --interp-z-source | --expect-interp-wrong-mode | --expect-interp-wrong-channel | --emit-interp-x-msl | --emit-interp-z-msl | --load-interp-x-metallib LIB | --load-interp-z-metallib LIB | --constant-rtz[-rg]-source | --emit-constant-rtz[-rg]-msl | --load-constant-rtz[-rg]-metallib LIB | --expect-bound-swapped-component | --bound[-rg]-source | --emit-bound[-rg]-msl | --load-bound[-rg]-metallib LIB | --pos-first-source | --emit-pos-first-msl | --load-pos-first-metallib LIB | --wait-pos-source | --emit-wait-pos-msl | --load-wait-pos-metallib LIB | --expect-late-pos-read | --unpack-{byte,uint}-source | --emit-unpack-{byte,uint}-msl | --load-unpack-{byte,uint}-metallib LIB | --multi-source | --emit-multi-msl | --load-multi-metallib LIB | --packed-rg-source | --emit-packed-rg-msl | --load-packed-rg-metallib LIB | --wait-depth-source | --emit-wait-depth-msl | --load-wait-depth-metallib LIB | --expect-late-depth-read | --early-depth-source | --emit-early-depth-msl | --load-early-depth-metallib LIB | --depth-source | --emit-depth-msl | --load-depth-metallib LIB | --packed-source | --emit-packed-msl | --load-packed-metallib LIB | --emit-msl | --emit-mutated-msl | --load-metallib LIB | --load-mutated-metallib LIB | {--bake-archive|--replay-archive|--replay-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-owned-metal-miss MUTATED_LIB ARCHIVE | --emit-bound-affine-mutated-msl | --load-bound-affine-mutated-metallib LIB | {--bake-bound-affine-archive|--replay-bound-affine-archive|--replay-bound-affine-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-bound-affine-metal-miss MUTATED_LIB ARCHIVE]".into()),
+            _ => return Err("usage: shader-metal-graphics-lift [--expect-swapped-triple | --triple-rg-source | --emit-triple-rg-msl | --load-triple-rg-metallib LIB | --triple-source | --emit-triple-msl | --load-triple-metallib LIB | --dual-source | --emit-dual-msl | --load-dual-metallib LIB | --bound-two-affine-source | --expect-bound-two-affine-swapped | --emit-bound-two-affine-msl | --load-bound-two-affine-metallib LIB | --expect-bound-affine-wrong-mode | --expect-bound-affine-wrong-channel | --bound-affine-{x,z}-source | --emit-bound-affine-{x,z}-msl | --load-bound-affine-{x,z}-metallib LIB | --interp-x-source | --interp-z-source | --expect-interp-wrong-mode | --expect-interp-wrong-channel | --emit-interp-x-msl | --emit-interp-z-msl | --load-interp-x-metallib LIB | --load-interp-z-metallib LIB | --constant-rtz[-rg]-source | --emit-constant-rtz[-rg]-msl | --load-constant-rtz[-rg]-metallib LIB | --expect-bound-swapped-component | --bound[-rg]-source | --emit-bound[-rg]-msl | --load-bound[-rg]-metallib LIB | --pos-first-source | --emit-pos-first-msl | --load-pos-first-metallib LIB | --wait-pos-source | --emit-wait-pos-msl | --load-wait-pos-metallib LIB | --expect-late-pos-read | --unpack-{byte,uint}-source | --emit-unpack-{byte,uint}-msl | --load-unpack-{byte,uint}-metallib LIB | --multi-source | --emit-multi-msl | --load-multi-metallib LIB | --packed-rg-source | --emit-packed-rg-msl | --load-packed-rg-metallib LIB | --wait-depth-source | --emit-wait-depth-msl | --load-wait-depth-metallib LIB | --expect-late-depth-read | --early-depth-source | --emit-early-depth-msl | --load-early-depth-metallib LIB | --depth-source | --emit-depth-msl | --load-depth-metallib LIB | --packed-source | --emit-packed-msl | --load-packed-metallib LIB | --emit-msl | --emit-mutated-msl | --load-metallib LIB | --load-mutated-metallib LIB | {--bake-archive|--replay-archive|--replay-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-owned-metal-miss MUTATED_LIB ARCHIVE | --emit-bound-affine-mutated-msl | --load-bound-affine-mutated-metallib LIB | {--bake-bound-affine-archive|--replay-bound-affine-archive|--replay-bound-affine-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-bound-affine-metal-miss MUTATED_LIB ARCHIVE]".into()),
         };
         if matches!(mode, Mode::Archive(..) | Mode::ExpectStrictMiss(..))
             && std::env::var_os("MTL_SHADER_VALIDATION").is_some()
@@ -294,6 +316,11 @@ mod gpu {
         let late_read = matches!(mode, Mode::WaitDepthSource(true));
         let depth = wait_depth || matches!(mode, Mode::DepthSource(_) | Mode::DepthLoad(..));
         let early_depth = matches!(mode, Mode::DepthSource(true) | Mode::DepthLoad(_, true));
+        let two_affine = matches!(
+            mode,
+            Mode::BoundTwoAffineSource(_) | Mode::BoundTwoAffineLoad(_)
+        );
+        let two_affine_swapped = matches!(mode, Mode::BoundTwoAffineSource(true));
         let bound_affine = match mode {
             Mode::BoundAffineSource(z) | Mode::BoundAffineLoad(_, z) => Some(z),
             Mode::Archive(_, _, _, changed, _, true) => Some(changed),
@@ -364,6 +391,7 @@ mod gpu {
             | Mode::DepthSource(_)
             | Mode::WaitDepthSource(_)
             | Mode::InterpSource(_)
+            | Mode::BoundTwoAffineSource(_)
             | Mode::BoundAffineSource(_)
             | Mode::BoundAffineControl(_)
             | Mode::ConstantRtzSource(_)
@@ -377,6 +405,18 @@ mod gpu {
             | Mode::SwappedTripleSource => {
                 let msl = if let Some(fixture) = fixture {
                     graphics_lift::translate_mrt_fixture(fixture)
+                } else if two_affine {
+                    let source = graphics_lift::bound::owned_two_affine()
+                        .map_err(|e| format!("two-affine binding rejected: {e:?}"))?
+                        .source;
+                    // Harness-only swap of the two lookup producers, retaining channels.
+                    Ok(if two_affine_swapped {
+                        source
+                            .replace("input.param0[0]", "input.param2[0]")
+                            .replace("input.param2[2]", "input.param0[2]")
+                    } else {
+                        source
+                    })
                 } else if let Some(z) = bound_affine {
                     let source = graphics_lift::bound::owned_affine(z)
                         .map_err(|e| format!("affine binding rejected: {e:?}"))?
@@ -422,6 +462,7 @@ mod gpu {
             }
             Mode::PackedLoad(path, _)
             | Mode::InterpLoad(path, _)
+            | Mode::BoundTwoAffineLoad(path)
             | Mode::BoundAffineLoad(path, _)
             | Mode::BoundAffineMutatedLoad(path)
             | Mode::ConstantRtzLoad(path, _)
@@ -454,7 +495,7 @@ mod gpu {
             (MTLPixelFormat::RGBA32Float, 16, "wait_pos_ps")
         } else if unpack.is_some() {
             (MTLPixelFormat::RGBA32Float, 16, "unpack_ps")
-        } else if bound_affine.is_some() {
+        } else if bound_affine.is_some() || two_affine {
             (MTLPixelFormat::RGBA32Float, 16, "bound_ps")
         } else if interp.is_some() {
             (MTLPixelFormat::RGBA32Float, 16, "interp_ps")
@@ -662,14 +703,14 @@ mod gpu {
                     .map(|record| record.map(f32::to_bits));
             enc.set_vertex_bytes(5, std::mem::size_of_val(&data) as u64, data.as_ptr().cast());
         }
-        if interp.is_some() {
+        if interp.is_some() || two_affine {
             // Equal NDC positions to the baseline, but W varies across vertices.
             let data: [[f32; 8]; 3] = [
                 [-1., -1., 0., 1., 0.125, 0., 0.75, 0.],
                 [6., -2., 0., 2., 0.625, 0., 0.25, 0.],
                 [-4., 12., 0., 4., 0.375, 0., 0.5, 0.],
             ];
-            if bound_affine.is_some() {
+            if bound_affine.is_some() || two_affine {
                 let position = data.map(|r| [r[0], r[1], r[2], r[3]]);
                 let param = data.map(|r| [r[4], r[5], r[6], r[7]]);
                 enc.set_vertex_bytes(
@@ -685,6 +726,18 @@ mod gpu {
             } else {
                 enc.set_vertex_bytes(0, std::mem::size_of_val(&data) as u64, data.as_ptr().cast());
             }
+        }
+        if two_affine {
+            let param2 = [
+                [-0.75f32, 0., 0.875, 0.],
+                [-0.375, 0., 0.75, 0.],
+                [-0.5, 0., 0.9375, 0.],
+            ];
+            enc.set_vertex_bytes(
+                2,
+                std::mem::size_of_val(&param2) as u64,
+                param2.as_ptr().cast(),
+            );
         }
         if multi {
             let mut data = [[[0.0f32; 4]; 8]; 3];
@@ -975,6 +1028,39 @@ mod gpu {
             println!(
                 "{} owned native VS unpack/FMA (uint={uint}): 64/64 pixels bit-exact",
                 dev.name()
+            );
+            return Ok(());
+        }
+        if two_affine {
+            for y in 0..SIDE {
+                for x in 0..SIDE {
+                    let at = y * STRIDE + x * 16;
+                    let want = expected_two_affine(x, y, two_affine_swapped);
+                    let normal = expected_two_affine(x, y, false);
+                    for (i, bytes) in pixels[at..at + 16].chunks_exact(4).enumerate() {
+                        let got = f32::from_le_bytes(bytes.try_into().unwrap());
+                        if !got.is_finite() || (got - want[i]).abs() >= 1e-6 {
+                            return Err(format!(
+                                "two affine links ({x},{y}) channel {i}: expected {}, got {got}",
+                                want[i]
+                            ));
+                        }
+                        if two_affine_swapped && (got - normal[i]).abs() < 1e-6 {
+                            return Err(format!(
+                                "swapped producer did not change ({x},{y}) channel {i}"
+                            ));
+                        }
+                    }
+                }
+            }
+            println!(
+                "{} owned two affine links (swapped={two_affine_swapped}): 64/64 RGBA32Float pixels matched{}",
+                dev.name(),
+                if two_affine_swapped {
+                    ", both links differ at every pixel"
+                } else {
+                    ""
+                }
             );
             return Ok(());
         }
