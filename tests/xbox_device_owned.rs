@@ -1,93 +1,104 @@
 //! Original owned Win64 boundary. Not registered in the launcher.
-#![cfg(target_arch = "x86_64")]
+#![cfg(all(target_arch = "x86_64", target_os = "macos"))]
 
-use std::{arch::asm, sync::Mutex};
+#[path = "support/owned_device_host.rs"]
+mod host;
+use host::{MetalBackend, read, write_word};
+use std::{
+    arch::asm,
+    sync::{Mutex, OnceLock, atomic::Ordering},
+};
 use xsxemu::xbox_device::{DeviceId, Error, IUNKNOWN, OBSERVED_DEVICE_IID, OwnedDevices};
 
 const E_POINTER: i32 = 0x8000_4003u32 as i32;
 const E_NOINTERFACE: i32 = 0x8000_4002u32 as i32;
 const E_NOTIMPL: i32 = 0x8000_4001u32 as i32;
 const E_FAIL: i32 = 0x8000_4005u32 as i32;
+const PREFIX: [u8; 80] = [0x5a; 80];
 
 struct State {
-    ledger: OwnedDevices,
-    // Only the first word of a boxed prefix is visible to the owned caller.
+    ledger: OwnedDevices<MetalBackend>,
+    fixture_enabled: bool,
+    backend_enabled: bool,
     live: Option<(DeviceId, Box<usize>)>,
 }
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
-#[repr(C)]
-struct Table {
-    query: unsafe extern "win64" fn(usize, *const [u8; 16], *mut usize) -> i32,
-    add_ref: extern "win64" fn(usize) -> u32,
-    release: extern "win64" fn(usize) -> u32,
+extern "win64" fn unsupported() -> ! {
+    eprintln!("owned Xbox device: unsupported method");
+    std::process::exit(79)
 }
-static VTABLE: Table = Table {
-    query,
-    add_ref,
-    release,
-};
+
+fn vtable() -> &'static [usize; 134] {
+    // Fixture bound covers measured slots, not a claim about the retail table length.
+    static TABLE: OnceLock<[usize; 134]> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut table = [unsupported as *const () as usize; 134];
+        table[0] = query as *const () as usize;
+        table[1] = add_ref as *const () as usize;
+        table[2] = release as *const () as usize;
+        table
+    })
+}
 
 fn live_id(state: &State, this: usize) -> Option<DeviceId> {
     let (id, prefix) = state.live.as_ref()?;
     (std::ptr::from_ref(prefix.as_ref()).addr() == this).then_some(*id)
 }
 
-unsafe extern "win64" fn create(
-    adapter: usize,
-    params: *const [u8; 80],
-    iid: *const [u8; 16],
-    out: *mut usize,
-) -> i32 {
-    if out.is_null() {
+extern "win64" fn create(adapter: usize, params: usize, iid: usize, out: usize) -> i32 {
+    let params = read::<80>(params);
+    let iid = read::<16>(iid);
+    if !write_word(out, 0) {
         return E_POINTER;
     }
-    // SAFETY: the only caller is the fixture; writable output is separate.
-    unsafe { out.write_unaligned(0) };
-    if params.is_null() || iid.is_null() {
+    let (Some(params), Some(iid)) = (params, iid) else {
         return E_POINTER;
-    }
+    };
     let mut guard = STATE.lock().unwrap();
     let state = guard.as_mut().unwrap();
-    // SAFETY: nonnull pointers supplied by the fixture are live full arrays.
-    let result = unsafe {
-        state
-            .ledger
-            .create(adapter != 0, iid.read_unaligned(), params.read_unaligned())
-    };
-    let id = match result {
+    if !state.fixture_enabled {
+        return E_NOTIMPL;
+    }
+    let enabled = state.backend_enabled;
+    let id = match state
+        .ledger
+        .create_with_backend(adapter != 0, iid, params, &PREFIX, || {
+            enabled.then(MetalBackend::open).flatten()
+        }) {
         Ok(id) => id,
-        Err(Error::UnsupportedAdapter) => return E_NOTIMPL,
+        Err(Error::UnsupportedAdapter | Error::UnsupportedParameters) => return E_NOTIMPL,
         Err(Error::UnsupportedInterface) => return E_NOINTERFACE,
         Err(_) => return E_FAIL,
     };
-    let prefix = Box::new(std::ptr::from_ref(&VTABLE).addr());
+    let prefix = Box::new(vtable().as_ptr().addr());
     let address = std::ptr::from_ref(prefix.as_ref()).addr();
+    if !write_word(out, address) {
+        state.ledger.release(id).unwrap();
+        return E_POINTER;
+    }
     state.live = Some((id, prefix));
-    // SAFETY: output is still owned and writable across the entire call.
-    unsafe { out.write_unaligned(address) };
     0
 }
 
-unsafe extern "win64" fn query(this: usize, iid: *const [u8; 16], out: *mut usize) -> i32 {
-    if out.is_null() {
+extern "win64" fn query(this: usize, iid: usize, out: usize) -> i32 {
+    let iid = read::<16>(iid);
+    if !write_word(out, 0) {
         return E_POINTER;
     }
-    // SAFETY: all nonnull outputs are owned by the fixture.
-    unsafe { out.write_unaligned(0) };
-    if iid.is_null() {
+    let Some(iid) = iid else {
         return E_POINTER;
-    }
+    };
     let mut guard = STATE.lock().unwrap();
     let state = guard.as_mut().unwrap();
     let Some(id) = live_id(state, this) else {
         return E_FAIL;
     };
-    // SAFETY: nonnull IID inputs are live owned arrays.
-    match state.ledger.query(id, unsafe { iid.read_unaligned() }) {
+    match state.ledger.query(id, iid) {
+        Ok(_) if write_word(out, this) => 0,
         Ok(_) => {
-            unsafe { out.write_unaligned(this) };
-            0
+            state.ledger.release(id).unwrap();
+            E_POINTER
         }
         Err(Error::UnsupportedInterface) => E_NOINTERFACE,
         Err(_) => E_FAIL,
@@ -140,17 +151,49 @@ unsafe fn method<const SLOT: usize>(this: usize, a: usize, b: usize) -> u32 {
     result
 }
 
+struct Guarded(usize);
+const PAGE: usize = 0x4000;
+unsafe extern "C" {
+    fn mmap(addr: usize, size: usize, prot: i32, flags: i32, fd: i32, off: i64) -> usize;
+    fn mprotect(addr: usize, size: usize, prot: i32) -> i32;
+    fn munmap(addr: usize, size: usize) -> i32;
+}
+impl Guarded {
+    fn new() -> Self {
+        // SAFETY: private anonymous mapping. PAGE is a multiple of the host page size.
+        let address = unsafe { mmap(0, 2 * PAGE, 3, 0x1002, -1, 0) };
+        assert_ne!(address, usize::MAX);
+        let mapping = Self(address);
+        unsafe {
+            std::ptr::copy_nonoverlapping(PREFIX.as_ptr(), (address + PAGE - 80) as *mut u8, 80);
+            assert_eq!(mprotect(address, PAGE, 1), 0);
+            assert_eq!(mprotect(address + PAGE, PAGE, 0), 0);
+        }
+        mapping
+    }
+}
+impl Drop for Guarded {
+    fn drop(&mut self) {
+        // SAFETY: exactly this fixture's still-live mapping.
+        unsafe { munmap(self.0, 2 * PAGE) };
+    }
+}
+
 #[test]
 fn owned_create_and_iunknown_prefix_obey_win64_and_reference_lifetime() {
     *STATE.lock().unwrap() = Some(State {
         ledger: OwnedDevices::new(1),
+        fixture_enabled: false,
+        backend_enabled: false,
         live: None,
     });
-    let params = [0x5a; 80];
+    STATE.lock().unwrap().as_mut().unwrap().fixture_enabled = true;
+    let params = PREFIX;
+    let guard_page = Guarded::new();
     let iid = OBSERVED_DEVICE_IID;
     let unknown = IUNKNOWN;
     let unsupported = [0x97_u8; 16];
-    let in_ptr = params.as_ptr().addr();
+    let in_ptr = guard_page.0 + PAGE - params.len();
     let iid_ptr = iid.as_ptr().addr();
     let mut device = usize::MAX;
     let mut out = usize::MAX;
@@ -158,6 +201,12 @@ fn owned_create_and_iunknown_prefix_obey_win64_and_reference_lifetime() {
     // owned, populated and distinct. No vtable read after final Release.
     unsafe {
         assert_eq!(create_call(0, in_ptr, iid_ptr, 0), E_POINTER);
+        assert_eq!(create_call(0, in_ptr, iid_ptr, in_ptr), E_POINTER);
+        assert_eq!(
+            create_call(0, in_ptr + 1, iid_ptr, (&raw mut device).addr()),
+            E_POINTER
+        );
+        assert_eq!(device, 0);
         assert_eq!(
             create_call(0, 0, iid_ptr, (&raw mut device).addr()),
             E_POINTER
@@ -178,8 +227,33 @@ fn owned_create_and_iunknown_prefix_obey_win64_and_reference_lifetime() {
             E_NOINTERFACE
         );
         assert_eq!(device, 0);
+        STATE.lock().unwrap().as_mut().unwrap().fixture_enabled = false;
+        assert_eq!(
+            create_call(0, in_ptr, iid_ptr, (&raw mut device).addr()),
+            E_NOTIMPL
+        );
+        assert_eq!(device, 0);
+        STATE.lock().unwrap().as_mut().unwrap().fixture_enabled = true;
+        assert_eq!(
+            create_call(0, in_ptr, iid_ptr, (&raw mut device).addr()),
+            E_FAIL
+        );
+        assert_eq!(device, 0);
+        assert_eq!(host::DROPS.load(Ordering::Relaxed), 0);
+        STATE.lock().unwrap().as_mut().unwrap().backend_enabled = true;
+        let mut bad = params;
+        bad[79] ^= 1;
+        assert_eq!(
+            create_call(0, bad.as_ptr().addr(), iid_ptr, (&raw mut device).addr()),
+            E_NOTIMPL
+        );
+        assert_eq!(device, 0);
         assert_eq!(create_call(0, in_ptr, iid_ptr, (&raw mut device).addr()), 0);
         assert_ne!(device, 0);
+        if std::env::var_os("XSXEMU_OWNED_DEVICE_UNSUPPORTED_CHILD").is_some() {
+            method::<48>(device, 0, 0);
+            panic!("unknown slot returned instead of refusing");
+        }
         assert_eq!(
             create_call(0, in_ptr, iid_ptr, (&raw mut out).addr()),
             E_FAIL
@@ -198,8 +272,24 @@ fn owned_create_and_iunknown_prefix_obey_win64_and_reference_lifetime() {
         assert_eq!(method::<1>(out, 0, 0), 3);
         assert_eq!(method::<2>(device, 0, 0), 2);
         assert_eq!(method::<2>(device, 0, 0), 1);
+        assert_eq!(host::DROPS.load(Ordering::Relaxed), 0);
         assert_eq!(method::<2>(device, 0, 0), 0);
     }
     let mut guard = STATE.lock().unwrap();
     assert!(guard.take().unwrap().live.is_none());
+    assert_eq!(host::DROPS.load(Ordering::Relaxed), 1);
+    drop(guard);
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "--nocapture",
+            "owned_create_and_iunknown_prefix_obey_win64_and_reference_lifetime",
+        ])
+        .env("XSXEMU_OWNED_DEVICE_UNSUPPORTED_CHILD", "1")
+        .output()
+        .unwrap();
+    assert_eq!(child.status.code(), Some(79));
+    assert!(
+        String::from_utf8_lossy(&child.stderr).contains("owned Xbox device: unsupported method")
+    );
 }

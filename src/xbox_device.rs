@@ -23,12 +23,15 @@ pub struct DeviceId(NonZeroU64);
 pub enum Error {
     UnsupportedAdapter,
     UnsupportedInterface,
+    UnsupportedParameters,
+    BackendUnavailable,
     Capacity,
     UnknownDevice,
     ReferenceOverflow,
 }
 
-struct Device {
+struct Device<B> {
+    backend: B,
     creation_prefix: [u8; OBSERVED_INITIALIZED_PREFIX],
     references: u32,
 }
@@ -36,14 +39,14 @@ struct Device {
 /// A bounded host-side ledger. Its IDs are not guest pointers/COM addresses.
 /// Use external synchronization if dispatching concurrently. Guest-facing ABI
 /// and writable/readable memory checks must be implemented at another boundary.
-pub struct OwnedDevices {
-    devices: BTreeMap<DeviceId, Device>,
+pub struct OwnedDevices<B = ()> {
+    devices: BTreeMap<DeviceId, Device<B>>,
     capacity: usize,
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
-impl OwnedDevices {
+impl<B> OwnedDevices<B> {
     pub fn new(capacity: usize) -> Self {
         Self {
             devices: BTreeMap::new(),
@@ -53,11 +56,13 @@ impl OwnedDevices {
 
     /// Construct an owned object only. Snapshot bytes are stored opaquely and
     /// do not authorize a retail call or establish VM/GPU creation success.
-    pub fn create(
+    pub fn create_with_backend(
         &mut self,
         has_adapter: bool,
         iid: [u8; 16],
         creation_prefix: [u8; OBSERVED_INITIALIZED_PREFIX],
+        allowed_prefix: &[u8; OBSERVED_INITIALIZED_PREFIX],
+        make_backend: impl FnOnce() -> Option<B>,
     ) -> Result<DeviceId, Error> {
         if has_adapter {
             return Err(Error::UnsupportedAdapter);
@@ -65,9 +70,13 @@ impl OwnedDevices {
         if iid != OBSERVED_DEVICE_IID {
             return Err(Error::UnsupportedInterface);
         }
+        if &creation_prefix != allowed_prefix {
+            return Err(Error::UnsupportedParameters);
+        }
         if self.devices.len() >= self.capacity {
             return Err(Error::Capacity);
         }
+        let backend = make_backend().ok_or(Error::BackendUnavailable)?;
         let next = NEXT_ID
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .map_err(|_| Error::Capacity)?;
@@ -75,11 +84,17 @@ impl OwnedDevices {
         self.devices.insert(
             id,
             Device {
+                backend,
                 creation_prefix,
                 references: 1,
             },
         );
         Ok(id)
+    }
+
+    /// Borrow the retained backend only while the device lifetime is live.
+    pub fn backend(&self, id: DeviceId) -> Result<&B, Error> {
+        Ok(&self.devices.get(&id).ok_or(Error::UnknownDevice)?.backend)
     }
 
     pub fn creation_prefix(
@@ -102,7 +117,7 @@ impl OwnedDevices {
         Ok(id)
     }
 
-    fn retain(device: &mut Device) -> Result<u32, Error> {
+    fn retain(device: &mut Device<B>) -> Result<u32, Error> {
         device.references = device
             .references
             .checked_add(1)
@@ -128,6 +143,17 @@ impl OwnedDevices {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl OwnedDevices<()> {
+        fn create(
+            &mut self,
+            adapter: bool,
+            iid: [u8; 16],
+            bytes: [u8; 80],
+        ) -> Result<DeviceId, Error> {
+            self.create_with_backend(adapter, iid, bytes, &bytes, || Some(()))
+        }
+    }
 
     #[test]
     fn exhaustion_cannot_wrap_references_or_resurrect_an_identity() {
