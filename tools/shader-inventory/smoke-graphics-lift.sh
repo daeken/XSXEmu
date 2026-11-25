@@ -157,6 +157,24 @@ for channel in x z; do
     "$p" "--load-$variant-metallib" "$d/$variant.metallib"
 done
 
+# Offline bake and fresh-process strict replay of the exact bound PARAM0/X pair.
+"$p" --bake-bound-affine-archive "$d/bound-affine-x.metallib" "$d/bound-affine.metalar" "$compiler"
+"$p" --replay-bound-affine-archive "$d/bound-affine-x.metallib" "$d/bound-affine.metalar" "$compiler"
+
+# Change just the verified channel and its two matching native fields, not
+# the producer PARAM, M0 source, resource layout, or render descriptor.
+"$p" --emit-bound-affine-mutated-msl > "$d/bound-affine-mutated.metal"
+compile bound-affine-mutated
+"$p" --load-bound-affine-mutated-metallib "$d/bound-affine-mutated.metallib"
+expect_mismatch --replay-bound-affine-mutated-archive "$d/bound-affine-x.metallib" "$d/bound-affine.metalar" "$compiler"
+expect_mismatch --replay-bound-affine-archive "$d/bound-affine-mutated.metallib" "$d/bound-affine.metalar" "$compiler"
+expect_mismatch --replay-bound-affine-archive "$d/bound-affine-x.metallib" "$d/bound-affine.metalar" "$changed_compiler"
+
+# Separate Metal diagnostic, with no identity sidecar or fallback compilation.
+cp "$d/bound-affine.metalar" "$d/diagnostic-affine.metalar"
+test ! -e "$d/diagnostic-affine.metalar.identity"
+"$p" --expect-bound-affine-metal-miss "$d/bound-affine-mutated.metallib" "$d/diagnostic-affine.metalar"
+
 # Harness-only mutations of MSL produced by the bound API; neither contract is admitted.
 "$p" --expect-bound-affine-wrong-mode
 "$p" --expect-bound-affine-wrong-channel

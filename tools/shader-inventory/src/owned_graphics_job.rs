@@ -50,6 +50,91 @@ pub(crate) fn ready(mutated: bool, compiler: Digest, device: Digest) -> Result<R
     }.ready().map_err(|e| format!("owned ready job rejected: {e:?}"))
 }
 
+pub(crate) fn ready_affine(
+    changed: bool,
+    compiler: Digest,
+    device: Digest,
+) -> Result<ReadyJob, String> {
+    let (pair, vs, ps, b) = crate::graphics_lift::bound::archive_affine(changed)
+        .map_err(|e| format!("bound archive lift rejected: {e:?}"))?;
+    let l = b.affine_link.ok_or("missing verified affine link")?;
+    let c = pair.color;
+    // The owned adapter is narrower than the reusable lift. Every identity
+    // below describes the actual fixed render path used by this smoke.
+    if c.native_mrt != 0
+        || c.metal_color != 0
+        || c.fp16_abgr
+        || !c.rgba32_float
+        || c.mask != crate::graphics_lift::bound::Mask::Rgba
+        || !b.no_ps_link.unconsumed_params.is_empty()
+    {
+        return Err("unsupported owned affine archive descriptor".into());
+    }
+    let mut vs_abi =
+        b"owned raw uint4 tight stride 16 indexed by vertex_id, POS0 Metal clip v1\0".to_vec();
+    let mut buffers = std::collections::BTreeSet::new();
+    for input in b.vertex_inputs {
+        vs_abi.extend([input.vgpr, input.buffer, input.component]);
+        buffers.insert(input.buffer);
+    }
+    let mut link = b"full F32 center no-perspective; PARAM to attr/channel; M0/I/J v1\0".to_vec();
+    link.extend([
+        l.param,
+        l.attribute,
+        l.channel,
+        l.m0_sgpr,
+        l.i_vgpr,
+        l.j_vgpr,
+    ]);
+    link.extend(l.m0_value.to_le_bytes());
+    let mut ps_abi = link.clone();
+    ps_abi.extend(b"uncompressed native MRT0 to Metal color0, RGBA32Float, full mask");
+    let mut layout = vs_abi.clone();
+    layout.extend(link);
+    let module = digest(pair.source.as_bytes());
+    let stage = |stage, words: &[u32], entry: &str, abi: &[u8]| {
+        let program: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        Validated(StageIdentity {
+            stage,
+            native_program: digest(&program),
+            native_entry: 0,
+            variant_contract: digest(b"owned verified exact entry; no runtime patches v1"),
+            stage_abi: digest(abi),
+            translated_module: module,
+            translated_entry: entry.into(),
+        })
+    };
+    Request {
+        namespace: Validated(digest(b"XSXEmu owned bound affine archive v1")),
+        target: Validated(Target {
+            backend: digest(b"Metal offline metallib + FailOnBinaryArchiveMiss v1"),
+            translator_and_ir: digest(b"owned explicitly bound affine graphics lift v1"),
+            compiler_and_options: compiler,
+            device_and_os_profile: device,
+        }),
+        stages: vec![
+            stage(Stage::Vertex, vs, "translated_vs", &vs_abi),
+            stage(Stage::Fragment, &ps, "bound_ps", &ps_abi),
+        ],
+        descriptor: Validated(Descriptor {
+            pipeline: Pipeline::ProceduralTriangleRgba32Float,
+            linkage_and_layout_abi: digest(&layout),
+            bindings: buffers
+                .into_iter()
+                .map(|slot| Binding {
+                    stage: Stage::Vertex,
+                    group: 0,
+                    index: slot.into(),
+                    resource: Resource::StorageRead,
+                })
+                .collect(),
+            specialization: vec![],
+        }),
+    }
+    .ready()
+    .map_err(|e| format!("owned affine job rejected: {e:?}"))
+}
+
 pub(crate) fn identity(
     job: &ReadyJob,
     lib: Digest,
@@ -87,6 +172,39 @@ mod tests {
         assert_ne!(base.key(), ready(false, [3; 32], [2; 32]).unwrap().key());
         assert_ne!(base.key(), ready(false, [1; 32], [3; 32]).unwrap().key());
         assert!(ready(false, [0; 32], [2; 32]).is_err());
+    }
+
+    #[test]
+    fn one_affine_channel_change_keys_exact_words_module_and_linkage() {
+        let x = ready_affine(false, [1; 32], [2; 32]).unwrap();
+        let z = ready_affine(true, [1; 32], [2; 32]).unwrap();
+        assert_eq!(x.stages()[0].native_program, z.stages()[0].native_program);
+        assert_eq!(x.stages()[0].stage_abi, z.stages()[0].stage_abi);
+        assert_ne!(x.stages()[1].native_program, z.stages()[1].native_program);
+        assert_ne!(x.stages()[1].stage_abi, z.stages()[1].stage_abi);
+        assert_ne!(
+            x.stages()[1].translated_module,
+            z.stages()[1].translated_module
+        );
+        assert_eq!(x.descriptor().pipeline, z.descriptor().pipeline);
+        assert_eq!(x.descriptor().bindings, z.descriptor().bindings);
+        assert_ne!(
+            x.descriptor().linkage_and_layout_abi,
+            z.descriptor().linkage_and_layout_abi
+        );
+        assert_ne!(x.key(), z.key());
+        assert_ne!(
+            x.key(),
+            ready_affine(false, [3; 32], [2; 32]).unwrap().key()
+        );
+        assert_ne!(
+            x.key(),
+            ready_affine(false, [1; 32], [3; 32]).unwrap().key()
+        );
+        assert_ne!(
+            identity(&x, [3; 32], [4; 32]),
+            identity(&z, [3; 32], [4; 32])
+        );
     }
 
     #[test]

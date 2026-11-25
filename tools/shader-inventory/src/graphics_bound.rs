@@ -647,20 +647,43 @@ fn affine_binding(z: bool) -> Bindings<'static> {
 }
 
 pub(crate) fn owned_affine(z: bool) -> Result<MetalPair, Error> {
-    translate(
-        if z { &AFFINE_Z_VS } else { super::VS },
-        if z {
-            super::INTERP_Z_PS
-        } else {
-            super::INTERP_X_PS
-        },
-        affine_binding(z),
-    )
+    if z {
+        translate(&AFFINE_Z_VS, super::INTERP_Z_PS, affine_binding(true))
+    } else {
+        Ok(archive_affine(false)?.0)
+    }
+}
+
+/// Same producer, layout and M0 setup; only the two channel fields change.
+/// The returned evidence is the exact contract and native words passed to the lift.
+pub(crate) fn archive_affine(
+    changed: bool,
+) -> Result<(MetalPair, &'static [u32], [u32; 6], Bindings<'static>), Error> {
+    let mut b = affine_binding(false);
+    let mut ps = [0; 6];
+    ps.copy_from_slice(super::INTERP_X_PS);
+    if changed {
+        b.affine_link.as_mut().unwrap().channel = 2;
+        ps[1] |= 0x200;
+        ps[2] |= 0x200;
+    }
+    Ok((translate(super::VS, &ps, b)?, super::VS, ps, b))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn archive_mutation_changes_only_the_interpolation_channel_bits() {
+        let (_, vs, ps, _) = archive_affine(false).unwrap();
+        let (_, changed_vs, changed_ps, _) = archive_affine(true).unwrap();
+        assert_eq!(vs, changed_vs);
+        assert_eq!(
+            std::array::from_fn(|i| ps[i] ^ changed_ps[i]),
+            [0, 0x200, 0x200, 0, 0, 0]
+        );
+    }
 
     #[test]
     fn affine_links_require_exact_producer_and_phase_contract() {

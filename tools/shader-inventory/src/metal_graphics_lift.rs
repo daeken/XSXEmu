@@ -116,6 +116,7 @@ mod gpu {
         BoundAffineSource(bool),
         BoundAffineControl(InterpFixture),
         BoundAffineLoad(&'a Path, bool),
+        BoundAffineMutatedLoad(&'a Path),
         ConstantRtzSource(bool),
         ConstantRtzLoad(&'a Path, bool),
         BoundSource(bool),
@@ -134,8 +135,8 @@ mod gpu {
         WaitDepthSource(bool),
         WaitDepthLoad(&'a Path),
         Load(&'a Path, bool),
-        Archive(&'a Path, &'a Path, bool, bool, [u8; 32]),
-        ExpectStrictMiss(&'a Path, &'a Path),
+        Archive(&'a Path, &'a Path, bool, bool, [u8; 32], bool),
+        ExpectStrictMiss(&'a Path, &'a Path, bool),
     }
 
     fn strict(
@@ -252,9 +253,16 @@ mod gpu {
                 return Ok(());
             }
             [mode, lib] if mode == "--load-metallib" || mode == "--load-mutated-metallib" => Mode::Load(Path::new(lib), mode == "--load-mutated-metallib"),
-            [mode, lib, archive] if mode == "--expect-owned-metal-miss" => Mode::ExpectStrictMiss(Path::new(lib), Path::new(archive)),
-            [mode, lib, archive, compiler] if mode == "--bake-archive" || mode == "--replay-archive" || mode == "--replay-mutated-archive" => Mode::Archive(Path::new(lib), Path::new(archive), mode == "--bake-archive", mode == "--replay-mutated-archive", owned_graphics_artifact::compiler_profile(compiler)?),
-            _ => return Err("usage: shader-metal-graphics-lift [--expect-swapped-triple | --triple-rg-source | --emit-triple-rg-msl | --load-triple-rg-metallib LIB | --triple-source | --emit-triple-msl | --load-triple-metallib LIB | --dual-source | --emit-dual-msl | --load-dual-metallib LIB | --expect-bound-affine-wrong-mode | --expect-bound-affine-wrong-channel | --bound-affine-{x,z}-source | --emit-bound-affine-{x,z}-msl | --load-bound-affine-{x,z}-metallib LIB | --interp-x-source | --interp-z-source | --expect-interp-wrong-mode | --expect-interp-wrong-channel | --emit-interp-x-msl | --emit-interp-z-msl | --load-interp-x-metallib LIB | --load-interp-z-metallib LIB | --constant-rtz[-rg]-source | --emit-constant-rtz[-rg]-msl | --load-constant-rtz[-rg]-metallib LIB | --expect-bound-swapped-component | --bound[-rg]-source | --emit-bound[-rg]-msl | --load-bound[-rg]-metallib LIB | --pos-first-source | --emit-pos-first-msl | --load-pos-first-metallib LIB | --wait-pos-source | --emit-wait-pos-msl | --load-wait-pos-metallib LIB | --expect-late-pos-read | --unpack-{byte,uint}-source | --emit-unpack-{byte,uint}-msl | --load-unpack-{byte,uint}-metallib LIB | --multi-source | --emit-multi-msl | --load-multi-metallib LIB | --packed-rg-source | --emit-packed-rg-msl | --load-packed-rg-metallib LIB | --wait-depth-source | --emit-wait-depth-msl | --load-wait-depth-metallib LIB | --expect-late-depth-read | --early-depth-source | --emit-early-depth-msl | --load-early-depth-metallib LIB | --depth-source | --emit-depth-msl | --load-depth-metallib LIB | --packed-source | --emit-packed-msl | --load-packed-metallib LIB | --emit-msl | --emit-mutated-msl | --load-metallib LIB | --load-mutated-metallib LIB | {--bake-archive|--replay-archive|--replay-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-owned-metal-miss MUTATED_LIB ARCHIVE]".into()),
+            [mode] if mode == "--emit-bound-affine-mutated-msl" => {
+                print!("{}", graphics_lift::bound::archive_affine(true).map_err(|e| format!("archive lift rejected: {e:?}"))?.0.source);
+                return Ok(());
+            }
+            [mode, lib] if mode == "--load-bound-affine-mutated-metallib" => Mode::BoundAffineMutatedLoad(Path::new(lib)),
+            [mode, lib, archive] if mode == "--expect-bound-affine-metal-miss" => Mode::ExpectStrictMiss(Path::new(lib), Path::new(archive), true),
+            [mode, lib, archive, compiler] if mode == "--bake-bound-affine-archive" || mode == "--replay-bound-affine-archive" || mode == "--replay-bound-affine-mutated-archive" => Mode::Archive(Path::new(lib), Path::new(archive), mode == "--bake-bound-affine-archive", mode == "--replay-bound-affine-mutated-archive", owned_graphics_artifact::compiler_profile(compiler)?, true),
+            [mode, lib, archive] if mode == "--expect-owned-metal-miss" => Mode::ExpectStrictMiss(Path::new(lib), Path::new(archive), false),
+            [mode, lib, archive, compiler] if mode == "--bake-archive" || mode == "--replay-archive" || mode == "--replay-mutated-archive" => Mode::Archive(Path::new(lib), Path::new(archive), mode == "--bake-archive", mode == "--replay-mutated-archive", owned_graphics_artifact::compiler_profile(compiler)?, false),
+            _ => return Err("usage: shader-metal-graphics-lift [--expect-swapped-triple | --triple-rg-source | --emit-triple-rg-msl | --load-triple-rg-metallib LIB | --triple-source | --emit-triple-msl | --load-triple-metallib LIB | --dual-source | --emit-dual-msl | --load-dual-metallib LIB | --expect-bound-affine-wrong-mode | --expect-bound-affine-wrong-channel | --bound-affine-{x,z}-source | --emit-bound-affine-{x,z}-msl | --load-bound-affine-{x,z}-metallib LIB | --interp-x-source | --interp-z-source | --expect-interp-wrong-mode | --expect-interp-wrong-channel | --emit-interp-x-msl | --emit-interp-z-msl | --load-interp-x-metallib LIB | --load-interp-z-metallib LIB | --constant-rtz[-rg]-source | --emit-constant-rtz[-rg]-msl | --load-constant-rtz[-rg]-metallib LIB | --expect-bound-swapped-component | --bound[-rg]-source | --emit-bound[-rg]-msl | --load-bound[-rg]-metallib LIB | --pos-first-source | --emit-pos-first-msl | --load-pos-first-metallib LIB | --wait-pos-source | --emit-wait-pos-msl | --load-wait-pos-metallib LIB | --expect-late-pos-read | --unpack-{byte,uint}-source | --emit-unpack-{byte,uint}-msl | --load-unpack-{byte,uint}-metallib LIB | --multi-source | --emit-multi-msl | --load-multi-metallib LIB | --packed-rg-source | --emit-packed-rg-msl | --load-packed-rg-metallib LIB | --wait-depth-source | --emit-wait-depth-msl | --load-wait-depth-metallib LIB | --expect-late-depth-read | --early-depth-source | --emit-early-depth-msl | --load-early-depth-metallib LIB | --depth-source | --emit-depth-msl | --load-depth-metallib LIB | --packed-source | --emit-packed-msl | --load-packed-metallib LIB | --emit-msl | --emit-mutated-msl | --load-metallib LIB | --load-mutated-metallib LIB | {--bake-archive|--replay-archive|--replay-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-owned-metal-miss MUTATED_LIB ARCHIVE | --emit-bound-affine-mutated-msl | --load-bound-affine-mutated-metallib LIB | {--bake-bound-affine-archive|--replay-bound-affine-archive|--replay-bound-affine-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-bound-affine-metal-miss MUTATED_LIB ARCHIVE]".into()),
         };
         if matches!(mode, Mode::Archive(..) | Mode::ExpectStrictMiss(..))
             && std::env::var_os("MTL_SHADER_VALIDATION").is_some()
@@ -262,9 +270,13 @@ mod gpu {
             return Err("translated archive fixture requires MTL_SHADER_VALIDATION unset".into());
         }
         let dev = Device::system_default().ok_or("no Metal device")?;
-        let admitted = if let Mode::Archive(lib, path, bake, mutated, compiler) = mode {
+        let admitted = if let Mode::Archive(lib, path, bake, mutated, compiler, affine) = mode {
             let profile = owned_graphics_artifact::device_profile(&dev)?;
-            let job = owned_graphics_job::ready(mutated, compiler, profile)?;
+            let job = if affine {
+                owned_graphics_job::ready_affine(mutated, compiler, profile)?
+            } else {
+                owned_graphics_job::ready(mutated, compiler, profile)?
+            };
             let lib = owned_graphics_artifact::artifact_digest(lib)?;
             if bake {
                 owned_graphics_artifact::require_new_identity(path)?;
@@ -284,12 +296,20 @@ mod gpu {
         let early_depth = matches!(mode, Mode::DepthSource(true) | Mode::DepthLoad(_, true));
         let bound_affine = match mode {
             Mode::BoundAffineSource(z) | Mode::BoundAffineLoad(_, z) => Some(z),
+            Mode::Archive(_, _, _, changed, _, true) => Some(changed),
+            Mode::ExpectStrictMiss(_, _, true) | Mode::BoundAffineMutatedLoad(_) => Some(true),
             Mode::BoundAffineControl(_) => Some(false),
             _ => None,
         };
         let interp = match mode {
             Mode::InterpSource(f) | Mode::InterpLoad(_, f) => Some(f),
+            Mode::Archive(_, _, _, changed, _, true) => Some(if changed {
+                InterpFixture::AffineZ
+            } else {
+                InterpFixture::AffineX
+            }),
             Mode::BoundAffineControl(f) => Some(f),
+            Mode::BoundAffineMutatedLoad(_) => Some(InterpFixture::AffineZ),
             Mode::BoundAffineSource(z) | Mode::BoundAffineLoad(_, z) => Some(if z {
                 InterpFixture::AffineZ
             } else {
@@ -403,6 +423,7 @@ mod gpu {
             Mode::PackedLoad(path, _)
             | Mode::InterpLoad(path, _)
             | Mode::BoundAffineLoad(path, _)
+            | Mode::BoundAffineMutatedLoad(path)
             | Mode::ConstantRtzLoad(path, _)
             | Mode::BoundLoad(path, _)
             | Mode::PosFirstLoad(path)
@@ -413,8 +434,8 @@ mod gpu {
             | Mode::DepthLoad(path, _)
             | Mode::WaitDepthLoad(path)
             | Mode::Load(path, _)
-            | Mode::Archive(path, _, _, _, _)
-            | Mode::ExpectStrictMiss(path, _) => {
+            | Mode::Archive(path, _, _, _, _, _)
+            | Mode::ExpectStrictMiss(path, _, _) => {
                 metal_artifact::file_url(path, false).map_err(|e| e.to_string())?;
                 dev.new_library_with_file(path)?
             }
@@ -501,7 +522,7 @@ mod gpu {
         }
         // Independent owned negative control. No sidecar is read or written;
         // success is possible only for the specific Metal archive-miss error.
-        if let Mode::ExpectStrictMiss(_, path) = mode {
+        if let Mode::ExpectStrictMiss(_, path, affine) = mode {
             let url = metal_artifact::file_url(path, false).map_err(|e| e.to_string())?;
             let descriptor = BinaryArchiveDescriptor::new();
             descriptor.set_url(&url);
@@ -509,8 +530,11 @@ mod gpu {
             desc.set_binary_archives(&[&archive]);
             return match strict(&dev, &desc) {
                 Err(err)
-                    if err.contains("Unable to find function \"translated_ps\"")
-                        && err.contains("in binary archives") =>
+                    if err.contains(if affine {
+                        "Unable to find function \"bound_ps\""
+                    } else {
+                        "Unable to find function \"translated_ps\""
+                    }) && err.contains("in binary archives") =>
                 {
                     println!("independent Metal strict miss: {err}");
                     Ok(())
@@ -520,7 +544,7 @@ mod gpu {
             };
         }
         let pipeline = match mode {
-            Mode::Archive(_, path, bake, _, _) => {
+            Mode::Archive(_, path, bake, _, _, _) => {
                 let url = metal_artifact::file_url(path, bake).map_err(|e| e.to_string())?;
                 let descriptor = BinaryArchiveDescriptor::new();
                 if !bake {
@@ -958,9 +982,12 @@ mod gpu {
             let negative = matches!(
                 interp,
                 InterpFixture::WrongPerspective | InterpFixture::WrongChannel
-            );
+            ) || matches!(mode, Mode::BoundAffineMutatedLoad(_));
             let label = match interp {
                 InterpFixture::AffineX => "affine X",
+                InterpFixture::AffineZ if matches!(mode, Mode::BoundAffineMutatedLoad(_)) => {
+                    "channel-only PARAM0/Z variant"
+                }
                 InterpFixture::AffineZ => "affine Z",
                 InterpFixture::WrongPerspective => "wrong perspective mode",
                 InterpFixture::WrongChannel => "wrong channel",
@@ -985,6 +1012,11 @@ mod gpu {
                     );
                 }
             }
+            if let (Mode::Archive(_, path, true, _, _, true), Some((job, lib))) = (mode, &admitted)
+            {
+                owned_graphics_artifact::publish(job, *lib, path)?;
+                println!("published owned affine graphics artifact identity");
+            }
             if negative && differs != SIDE * SIDE {
                 return Err(format!("{label} only discriminates {differs} pixels"));
             }
@@ -1004,7 +1036,10 @@ mod gpu {
             );
             return Ok(());
         }
-        let mutated = matches!(mode, Mode::Load(_, true) | Mode::Archive(_, _, _, true, _));
+        let mutated = matches!(
+            mode,
+            Mode::Load(_, true) | Mode::Archive(_, _, _, true, _, false)
+        );
         let mut mapping_mismatches = 0;
         let mut late_read_differences = 0;
         for y in 0..SIDE {
@@ -1109,7 +1144,7 @@ mod gpu {
             );
             return Ok(());
         }
-        if let (Mode::Archive(_, path, true, _, _), Some((job, lib))) = (mode, admitted) {
+        if let (Mode::Archive(_, path, true, _, _, false), Some((job, lib))) = (mode, admitted) {
             owned_graphics_artifact::publish(&job, lib, path)?;
             println!("published owned graphics artifact identity");
         }
