@@ -378,3 +378,15 @@ The shared decoder now accepts precisely `0xf800040c` and `0xf8001c1c` in additi
 Apple M4 again matched **128/128** attachment pixels separately from generated source and offline metallib. The unchanged same-metallib controls reproduced the two independent mask failures (20 affected pixels on the selected attachment only) and the swapped bindings (64 affected pixels per texture).
 
 Against `cf6fc73`, the measured strict census increases **231→232** and the distinct attachment-only census **222→223** for both +36/+40 starts, both CPUs, and both waves (6,161 qualified wave64; 6,191 wave32). The gain is the same one span and row with no local gaps and only `AttachmentFormatAndMask` unresolved. +0/+24 PS and VS closure stay unchanged. The prior final-MRT0 EN12-specific counter still counts only that older form, not the new pair.
+
+### Pixel blocker ranking after dual B/A recognition
+
+At `13f7fae`, all four strict reports (graphics gaps and attachment census on gfx1013 and gfx1030) reproduce the dual B/A result. At each +36/+40 and wave32/wave64 hypothesis, 232 PS windows are encoding-complete and 223 distinct PS spans need only attachment state. Rank the nearest contiguous windows by the full operand forms needed, not by mnemonic frequency:
+
+| Remaining forms | Contiguous windows per hypothesis | Decision |
+| --- | ---: | --- |
+| Attr0 Y/W VINTRP P1/P2 | 6 | At +36, five need all four forms; at +40, four need all four and one needs just W P1/P2 and Y P2. Only one needs just the exact Y pair at either start. Hold for M0/LDS coefficient layout, I/J, FP mode and producer linkage evidence. |
+| Attr0 VINTRP MOV, selector 2 (P0) | 3 | Eight sites at +36 (X, YZW, XYZW) and seven at +40 (X, ZW, XYZW). Only one window needs just X at either start. The owned explicit P0 input does not establish native LDS provenance. |
+| `v_cvt_pkrtz_f16_f32_e32` with SRC0 selector 128 (+0), VSRC1 VGPR | 1 | Smallest independently testable decode gap. Validate with owned explicit finite normal/zero inputs and raw packed-word readback; do not derive the native interpolant. |
+
+LLVM MC independently assembles the exact inline-zero form on both CPU and wave references (`w & 0xfe0001ff == 0x5e000080`). The same one-site window has an in-place pack of an already decoded interpolation P2 result, subsequently consumed as VSRC1 by the nonfinal B/A MRT0 export; the final B/A MRT1 uses a different local value. Inline +0 contributes the low half, the VGPR conversion the high half. A scratch dataflow projection that recognizes only this selector and reads only the VGPR projects **232→233** encoding-complete windows, on the same one distinct PS span and row in all eight hypotheses, without changes to +0/+24 or VS closure. The projection finds no local gaps but retains `EntryVgpr`, `EntrySgpr`, `InterpolationLink`, `F32ArithmeticMode`, `PackedRtzDomain`, and `AttachmentFormatAndMask`. Attachment-only stays **223**, and there is no fully resolved gain. This audit changes neither production decoding nor title admission.
