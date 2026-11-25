@@ -246,3 +246,12 @@ compile triple-alias
 "$p" --load-triple-alias-metallib "$d/triple-alias.metallib"
 "$p" --expect-triple-alias-all-mask "$d/triple-alias.metallib"
 "$p" --expect-triple-alias-swapped "$d/triple-alias.metallib"
+
+# B/A only on both attachments; independently break each mask and swap routing.
+"$p" --dual-ba-source
+"$p" --emit-dual-ba-msl > "$d/dual-ba.metal"
+compile dual-ba
+"$p" --load-dual-ba-metallib "$d/dual-ba.metallib"
+"$p" --expect-dual-ba-mrt0-all-mask "$d/dual-ba.metallib"
+"$p" --expect-dual-ba-mrt1-all-mask "$d/dual-ba.metallib"
+"$p" --expect-dual-ba-swapped "$d/dual-ba.metallib"

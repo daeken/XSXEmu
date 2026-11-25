@@ -227,6 +227,12 @@ mod gpu {
             [mode, lib] if mode == "--load-dual-rg-metallib" || mode == "--expect-dual-rg-all-mask" => Mode::MrtLoad(Path::new(lib), MrtFixture::DualRg),
             [mode] if mode == "--dual-red-source" => Mode::MrtSource(MrtFixture::DualRed),
             [mode, lib] if mode == "--load-dual-red-metallib" || mode == "--expect-dual-red-all-mask" => Mode::MrtLoad(Path::new(lib), MrtFixture::DualRed),
+            [mode] if mode == "--dual-ba-source" => Mode::MrtSource(MrtFixture::DualBa),
+            [mode, lib] if mode == "--load-dual-ba-metallib" || mode == "--expect-dual-ba-mrt0-all-mask" || mode == "--expect-dual-ba-mrt1-all-mask" || mode == "--expect-dual-ba-swapped" => Mode::MrtLoad(Path::new(lib), MrtFixture::DualBa),
+            [mode] if mode == "--emit-dual-ba-msl" => {
+                print!("{}", graphics_lift::translate_mrt_fixture(MrtFixture::DualBa).map_err(|e| format!("MRT lift rejected: {e:?}"))?);
+                return Ok(());
+            }
             [mode] if mode == "--triple-source" => Mode::MrtSource(MrtFixture::Triple),
             [mode] if mode == "--triple-alias-source" => Mode::MrtSource(MrtFixture::TripleAlias),
             [mode, lib] if mode == "--load-triple-alias-metallib" || mode == "--expect-triple-alias-all-mask" || mode == "--expect-triple-alias-swapped" => Mode::MrtLoad(Path::new(lib), MrtFixture::TripleAlias),
@@ -485,6 +491,15 @@ mod gpu {
         let mrt = fixture.is_some();
         let dual_rg = matches!(fixture, Some(MrtFixture::DualRg));
         let dual_rg_all = dual_rg && args[0] == "--expect-dual-rg-all-mask";
+        let dual_ba = matches!(fixture, Some(MrtFixture::DualBa));
+        let dual_ba_wrong_mask = if dual_ba && args[0] == "--expect-dual-ba-mrt0-all-mask" {
+            Some(0)
+        } else if dual_ba && args[0] == "--expect-dual-ba-mrt1-all-mask" {
+            Some(1)
+        } else {
+            None
+        };
+        let dual_ba_swap = dual_ba && args[0] == "--expect-dual-ba-swapped";
         let triple_alias = matches!(fixture, Some(MrtFixture::TripleAlias));
         let alias_all = triple_alias && args[0] == "--expect-triple-alias-all-mask";
         let partial_mrt = dual_rg
@@ -498,7 +513,9 @@ mod gpu {
             || (triple_alias && args[0] == "--expect-triple-alias-swapped");
         let attachment_count = match fixture {
             None => 1,
-            Some(MrtFixture::Dual | MrtFixture::DualRed | MrtFixture::DualRg) => 2,
+            Some(
+                MrtFixture::Dual | MrtFixture::DualRed | MrtFixture::DualRg | MrtFixture::DualBa,
+            ) => 2,
             _ => 3,
         };
         let lib = match mode {
@@ -691,7 +708,7 @@ mod gpu {
         color_attachment.set_pixel_format(format);
         color_attachment.set_write_mask(if red {
             MTLColorWriteMask::Red
-        } else if packed_ba && !packed_ba_all_mask {
+        } else if (packed_ba && !packed_ba_all_mask) || (dual_ba && dual_ba_wrong_mask != Some(0)) {
             MTLColorWriteMask::Blue | MTLColorWriteMask::Alpha
         } else if partial && !packed_rg_all_mask {
             MTLColorWriteMask::Red | MTLColorWriteMask::Green
@@ -705,7 +722,9 @@ mod gpu {
                 .object_at(slot as u64)
                 .ok_or_else(|| format!("no pipeline slot {slot}"))?;
             attachment.set_pixel_format(format);
-            attachment.set_write_mask(if dual_red && !dual_red_all && slot == 1 {
+            attachment.set_write_mask(if dual_ba && dual_ba_wrong_mask != Some(slot) {
+                MTLColorWriteMask::Blue | MTLColorWriteMask::Alpha
+            } else if dual_red && !dual_red_all && slot == 1 {
                 MTLColorWriteMask::Red
             } else if partial_mrt && !dual_rg_all && !alias_all && slot == 1 {
                 MTLColorWriteMask::Red | MTLColorWriteMask::Green
@@ -807,7 +826,13 @@ mod gpu {
         .enumerate()
         {
             let slot = index + 1;
-            let bound = if swapped { 3 - slot } else { slot };
+            let bound = if dual_ba_swap {
+                0
+            } else if swapped {
+                3 - slot
+            } else {
+                slot
+            };
             let attachment = pass
                 .color_attachments()
                 .object_at(slot as u64)
@@ -816,6 +841,22 @@ mod gpu {
             attachment.set_clear_color(clear);
             attachment.set_load_action(MTLLoadAction::Clear);
             attachment.set_store_action(MTLStoreAction::Store);
+        }
+        if dual_ba {
+            pass.color_attachments()
+                .object_at(0)
+                .ok_or("no dual B/A slot 0")?
+                .set_texture(Some(&colors[usize::from(dual_ba_swap)]));
+            for (slot, rgba) in [[0.125, 0.25, 0.375, 0.5], [0.625, 0.75, 0.875, -1.]]
+                .into_iter()
+                .enumerate()
+            {
+                let [r, g, b, a] = rgba;
+                pass.color_attachments()
+                    .object_at(slot as u64)
+                    .ok_or("no dual B/A pass slot")?
+                    .set_clear_color(MTLClearColor::new(r, g, b, a));
+            }
         }
         let depth_texture = depth.then(|| {
             texture_desc.set_pixel_format(DEPTH_FORMAT);
@@ -1030,7 +1071,7 @@ mod gpu {
             } else {
                 &[0xb800_3e00u32, 0x3400_c000u32][..]
             };
-            if !triple_alias {
+            if !triple_alias && !dual_ba {
                 enc.set_fragment_bytes(
                     0,
                     std::mem::size_of_val(inputs) as u64,
@@ -1073,6 +1114,49 @@ mod gpu {
         }
         // The GPU writes have completed and the owned buffer remains alive through the last read.
         let pixels = unsafe { std::slice::from_raw_parts(ptr, extent) };
+        if dual_ba {
+            // Independent CPU oracle in RGBA order: distinct clears and distinct half pairs.
+            let clear: [[f32; 4]; 2] = [[0.125, 0.25, 0.375, 0.5], [0.625, 0.75, 0.875, -1.]];
+            let covered: [[f32; 4]; 2] = [[0.125, 0.25, 0., 1.], [0.625, 0.75, -2., 0.25]];
+            let mut differences = [0; 2];
+            for (tex, count) in differences.iter_mut().enumerate() {
+                let slot = if dual_ba_swap { 1 - tex } else { tex };
+                for y in 0..SIDE {
+                    for x in 0..SIDE {
+                        let inside = (2..6).contains(&x) && (1..6).contains(&y);
+                        let normal = if inside { covered[tex] } else { clear[tex] };
+                        let mut want = if inside { covered[slot] } else { clear[slot] };
+                        if inside && dual_ba_wrong_mask == Some(slot) {
+                            want[..2].fill(0.);
+                        }
+                        let at = tex * BYTES + y * STRIDE + x * 16;
+                        let got = &pixels[at..at + 16];
+                        if got != want.map(f32::to_le_bytes).as_flattened() {
+                            return Err(format!(
+                                "dual B/A texture {tex} pixel ({x},{y}): expected {want:?}, got {got:?}"
+                            ));
+                        }
+                        *count += usize::from(got != normal.map(f32::to_le_bytes).as_flattened());
+                    }
+                }
+            }
+            let expected = match (dual_ba_swap, dual_ba_wrong_mask) {
+                (true, _) => [64, 64],
+                (_, Some(0)) => [20, 0],
+                (_, Some(1)) => [0, 20],
+                _ => [0, 0],
+            };
+            if differences != expected {
+                return Err(format!(
+                    "dual B/A: expected {expected:?} normal-oracle differences, got {differences:?}"
+                ));
+            }
+            println!(
+                "{} owned dual B/A: 128/128 bit-exact attachment pixels; normal-oracle differences by texture: {differences:?}",
+                dev.name()
+            );
+            return Ok(());
+        }
         if let Some(rg) = bound_rg {
             // The diagonal in Metal screen space joins (0,-8) to (8,8).
             let written: [u32; 4] = if rg {

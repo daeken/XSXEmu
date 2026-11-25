@@ -1125,12 +1125,50 @@ fn dual_red_exports(words: &[u32]) -> Result<([Vgpr; 2], Vgpr), Reject> {
     Ok((src, red))
 }
 
+// Owned raw fixture: two distinct locally defined B/A sources; no fragment inputs.
+const DUAL_BA_PS: [u32; 8] = [
+    0x7e10_70bc, // v_bfrev_b32 v8, 60
+    0x7e12_02ff,
+    0x3400_c000, // v_mov_b32 v9, packed [-2, 0.25]
+    0xf800_040c,
+    0xfefd_08fc,
+    0xf800_1c1c,
+    0xfafb_09f9,
+    0xbf81_0000,
+];
+
+// Separate owned profile, not a shared decode or bound-translation admission.
+fn dual_ba_words(words: &[u32]) -> Result<[u32; 2], Reject> {
+    if words.len() != DUAL_BA_PS.len() {
+        return Err(Reject::Extent);
+    }
+    let Ok((1, Op::BfrevInline60 { dst: first })) = decode(words, 0) else {
+        return Err(Reject::Unsupported(0));
+    };
+    let Ok((2, Op::MoveBits { dst: second, bits })) = decode(words, 1) else {
+        return Err(Reject::Unsupported(1));
+    };
+    if first == second {
+        return Err(Reject::BadExports(3));
+    }
+    for (pc, header, Vgpr(src)) in [(3, 0xf800_040c, first), (5, 0xf800_1c1c, second)] {
+        if words[pc] != header || (words[pc + 1] >> 8) as u8 != src {
+            return Err(Reject::BadExports(pc));
+        }
+    }
+    if decode(words, 7) != Ok((1, Op::End)) {
+        return Err(Reject::BadEnd(7));
+    }
+    Ok([crate::graphics_decode::BFREV_INLINE_60_BITS, bits])
+}
+
 #[allow(dead_code)] // Separate MRT render probe.
 #[derive(Clone, Copy)]
 pub(crate) enum MrtFixture {
     Dual,
     DualRed,
     DualRg,
+    DualBa,
     Triple,
     TripleRg,
     TripleAlias,
@@ -1143,6 +1181,7 @@ impl MrtFixture {
             Self::Dual => "dual_ps",
             Self::DualRed => "dual_red_ps",
             Self::DualRg => "dual_rg_ps",
+            Self::DualBa => "dual_ba_ps",
             Self::Triple => "triple_ps",
             Self::TripleRg => "triple_rg_ps",
             Self::TripleAlias => "triple_alias_ps",
@@ -1156,6 +1195,12 @@ pub(crate) fn translate_mrt_fixture(fixture: MrtFixture) -> Result<String, Rejec
     let ps = match fixture {
         MrtFixture::Dual => lift(Stage::DualPackedPixel, DUAL_PS)?,
         MrtFixture::DualRg => lift(Stage::DualPackedRgPixel, DUAL_RG_PS)?,
+        MrtFixture::DualBa => {
+            let [ba0, ba1] = dual_ba_words(&DUAL_BA_PS)?;
+            let mut msl = vertex_module(&vs);
+            writeln!(msl, "struct Colors {{ float4 color0 [[color(0)]]; float4 color1 [[color(1)]]; }};\nfragment Colors dual_ba_ps() {{\n  return {{ float4(0.0f, 0.0f, float2(as_type<half2>(0x{ba0:08x}u))), float4(0.0f, 0.0f, float2(as_type<half2>(0x{ba1:08x}u))) }};\n}}").unwrap();
+            return Ok(msl);
+        }
         MrtFixture::DualRed => {
             let ([Vgpr(rg), Vgpr(ba)], Vgpr(red)) = dual_red_exports(DUAL_RED_PS)?;
             let mut msl = vertex_module(&vs);
@@ -2307,6 +2352,38 @@ mod tests {
             decode(&[0xf800_1c1f, 0x10001], 0),
             Err(DecodeError::Unsupported(0))
         );
+    }
+
+    #[test]
+    fn isolated_dual_ba_checks_definitions_active_selectors_order_and_end() {
+        let expected = Ok([0x3c00_0000, 0x3400_c000]);
+        assert_eq!(dual_ba_words(&DUAL_BA_PS), expected);
+        assert!(dual_ba_words(&DUAL_BA_PS[..7]).is_err());
+        let mut canonical = DUAL_BA_PS;
+        canonical[4] &= 0xff00;
+        canonical[6] &= 0xff00;
+        assert_eq!(dual_ba_words(&canonical), expected);
+        for (pc, bit) in [
+            (0, 1),
+            (1, 1 << 17),
+            (3, 1),
+            (3, 1 << 11),
+            (4, 1 << 8),
+            (5, 1 << 4),
+            (5, 1 << 12),
+            (6, 1 << 8),
+            (7, 1),
+        ] {
+            let mut words = DUAL_BA_PS;
+            words[pc] ^= bit;
+            assert!(dual_ba_words(&words).is_err(), "{pc}:{bit}");
+        }
+        let mut swapped = DUAL_BA_PS;
+        swapped[3..7].rotate_left(2);
+        assert!(dual_ba_words(&swapped).is_err());
+        for pc in [3, 5] {
+            assert_eq!(decode(&DUAL_BA_PS, pc), Err(DecodeError::Unsupported(pc)));
+        }
     }
 
     #[test]
