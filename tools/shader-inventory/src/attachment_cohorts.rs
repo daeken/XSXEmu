@@ -3,7 +3,7 @@ use crate::{
     ARCHIVE_LIMIT,
     graphics_decode::{Op, Target, decode},
     graphics_reachability::exact_semantics,
-    graphics_semantics::Need,
+    graphics_semantics::{Gap, Need},
     llvm::{Cpu, Llvm},
 };
 use std::{
@@ -57,24 +57,12 @@ fn shape(bytes: &[u8]) -> Option<Shape> {
     None
 }
 
-fn residual(state: &[u8], base: usize) -> Option<(usize, u8)> {
-    let (chunks, tail) = state.get(base..)?.as_chunks::<8>();
-    if !tail.is_empty() || chunks.len() > 8 {
-        return None;
-    }
-    Some((
-        chunks.len(),
-        chunks
-            .iter()
-            .enumerate()
-            .fold(0, |mask, (i, w)| mask | (u8::from(*w != [0; 8]) << i)),
-    ))
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Evidence {
     only_attachment: bool,
     shape: Shape,
+    gaps: std::collections::BTreeSet<Gap>,
+    needs: std::collections::BTreeSet<Need>,
 }
 
 #[derive(Default)]
@@ -84,8 +72,6 @@ struct Tally {
     pairs: HashSet<(ProgramId, ProgramId)>,
     states: HashSet<u32>,
     rows: usize,
-    structural: [usize; 5],
-    residual_shapes: BTreeMap<Option<(usize, u8)>, usize>,
 }
 
 pub(super) fn run(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), Box<dyn Error>> {
@@ -117,11 +103,6 @@ pub(super) fn run(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), Box<dy
             5 => row.slots[2],
             _ => None,
         };
-        let base = match slots {
-            3 | 67 => Some(380),
-            5 => Some(464),
-            _ => None,
-        };
         let cohort = cohorts.entry(slots).or_default();
         cohort.rows += 1;
         cohort.ps_spans.insert(ps.program);
@@ -136,6 +117,8 @@ pub(super) fn run(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), Box<dy
                     && o.needs.contains(&Need::AttachmentFormatAndMask);
                 Some(Evidence {
                     only_attachment,
+                    gaps: o.gaps,
+                    needs: o.needs,
                     shape,
                 })
             })
@@ -157,19 +140,6 @@ pub(super) fn run(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), Box<dy
             }
             t.states.insert(row.state.0);
             t.rows += 1;
-            let r =
-                base.and_then(|base| residual(lib.blob(row.state).expect("validated state"), base));
-            *t.residual_shapes.entry(r).or_default() += 1;
-            if let Some((n, occupancy)) = r {
-                let colors = e.shape.color.iter().fold(0u8, |m, (slot, _, _)| {
-                    m | 1u8.checked_shl((*slot).into()).unwrap_or(0)
-                });
-                t.structural[0] += 1;
-                t.structural[1] += usize::from(n == colors.count_ones() as usize);
-                t.structural[2] += usize::from(occupancy == colors);
-                t.structural[3] += usize::from(n == 0);
-                t.structural[4] += usize::from(occupancy == 0);
-            }
         }
     }
     println!(
@@ -230,10 +200,6 @@ pub(super) fn run(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), Box<dy
                     t.pairs.len(),
                     t.states.len()
                 );
-                println!(
-                    "      tested raw residual: applicable / chunk count equals color count / nonzero slots equal color slots / no chunks / no occupied chunks = {:?}; histogram {:?}",
-                    t.structural, t.residual_shapes
-                );
             }
         }
     }
@@ -257,16 +223,5 @@ mod tests {
             })
         );
         assert_eq!(shape(&bytes[..8]), None);
-    }
-
-    #[test]
-    fn residual_geometry_preserves_zero_slots_and_rejects_partial_or_excess() {
-        assert_eq!(residual(&[0; 379], 380), None);
-        assert_eq!(residual(&[0; 381], 380), None);
-        assert_eq!(residual(&[0; 452], 380), None);
-        assert_eq!(residual(&[0; 380], 380), Some((0, 0)));
-        let mut state = [0; 396];
-        state[388] = 1;
-        assert_eq!(residual(&state, 380), Some((2, 2)));
     }
 }
