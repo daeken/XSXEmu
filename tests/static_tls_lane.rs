@@ -2031,9 +2031,9 @@ fn guest_locale_name_bridge_matches_kernelbase_copy_semantics() {
 const LOCALE_CODE_CAPACITY: usize = 0x200;
 
 #[repr(C)]
-struct LocaleFixture {
+struct LocaleFixture<const N: usize> {
     entry: u32,
-    code: [u8; LOCALE_CODE_CAPACITY],
+    code: [u8; N],
 }
 
 global_asm!(include_str!("fixtures/static_tls_locale_name.S"),
@@ -2043,7 +2043,44 @@ global_asm!(include_str!("fixtures/static_tls_locale_name.S"),
 );
 
 unsafe extern "C" {
-    static static_tls_locale_fixture: LocaleFixture;
+    static static_tls_locale_fixture: LocaleFixture<LOCALE_CODE_CAPACITY>;
+}
+
+const LCID_CODE_CAPACITY: usize = 0x300;
+
+global_asm!(include_str!("fixtures/static_tls_locale_lcid.S"),
+    capacity = const LCID_CODE_CAPACITY,
+    iat_delta = const IAT - TEXT,
+    options(att_syntax),
+);
+
+unsafe extern "C" {
+    static static_tls_locale_lcid_fixture: LocaleFixture<LCID_CODE_CAPACITY>;
+}
+
+#[test]
+fn guest_locale_name_to_lcid_bridge_uses_guest_defaults() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let mut exe = image(Kind::Solo);
+    let fixture = unsafe { &static_tls_locale_lcid_fixture };
+    exe[file(TEXT)..file(TEXT) + RAW].fill(0xcc);
+    put(&mut exe, file(TEXT), &fixture.code);
+    w32(&mut exe, OP + 16, TEXT + fixture.entry as usize);
+    w64(&mut exe, file(ARRAY), PREFERRED + TEXT);
+    dir_import_one(
+        &mut exe,
+        b"api-ms-win-core-localization-l1-2-0.dll\0",
+        b"LocaleNameToLCID\0",
+    );
+    let path = scratch.write("locale-lcid.exe", &exe);
+    expect(
+        run(&path, &[OPT, "--rust-providers"]),
+        52,
+        "Guest entry returned 52",
+    );
 }
 
 #[test]

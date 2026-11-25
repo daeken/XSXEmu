@@ -98,6 +98,11 @@ pub(crate) fn lookup(dll: &[u8], name: &[u8]) -> Option<HostExport> {
             "GetUserDefaultLocaleName",
             native::get_user_default_locale_name
         ),
+        (KERNELBASE | KERNEL32 | LOCALIZATION, b"LocaleNameToLCID") => export!(
+            "kernelbase.dll",
+            "LocaleNameToLCID",
+            native::locale_name_to_lcid
+        ),
         (KERNELBASE | KERNEL32 | LOCALIZATION, b"GetUserDefaultLCID") => {
             export!(
                 "kernelbase.dll",
@@ -771,6 +776,47 @@ const CASE_CHANGES: [(u16, u16, u16); 121] = [
         } else {
             (written + 1) as i32
         }
+    }
+    pub(crate) unsafe extern "win64" fn locale_name_to_lcid(name: *const u16, flags: u32) -> u32 {
+        const ALLOW_NEUTRAL_NAMES: u32 = 0x0800_0000;
+        const LOCALE_NAME_MAX_LENGTH: usize = 85; // including NUL
+        const INVARIANT: u32 = 0x007f;
+        const LANG_ENGLISH: u32 = 0x0009;
+        // Both invalid names and unrecognized flag bits give INVALID_PARAMETER.
+        let invalid = || {
+            set_last_error(INVALID);
+            0
+        };
+        if flags & !ALLOW_NEUTRAL_NAMES != 0 {
+            return invalid();
+        }
+        if name.is_null() {
+            return EN_US; // LOCALE_NAME_USER_DEFAULT
+        }
+        if !good(name) {
+            return invalid();
+        }
+        let mut ascii = [0u8; LOCALE_NAME_MAX_LENGTH];
+        for i in 0..ascii.len() {
+            let unit = unsafe { name.add(i).read() };
+            if unit == 0 {
+                let name = &ascii[..i];
+                // Both guest defaults are en-US. Recognizing a neutral or
+                // invariant LCID here does not install that NLS locale.
+                return match name {
+                    b"" => INVARIANT,
+                    b"en" if flags == ALLOW_NEUTRAL_NAMES => LANG_ENGLISH,
+                    b"en" | b"!x-sys-default-locale" => EN_US,
+                    _ if name.eq_ignore_ascii_case(USER_LOCALE_NAME.as_bytes()) => EN_US,
+                    _ => invalid(), // No other locale names are installed in this profile.
+                };
+            }
+            if unit > 0x7f {
+                return invalid();
+            }
+            ascii[i] = (unit as u8).to_ascii_lowercase();
+        }
+        invalid()
     }
     pub(super) extern "win64" fn get_user_default_lcid() -> u32 {
         EN_US

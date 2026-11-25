@@ -334,6 +334,8 @@ audited_bridges! {
         text::get_user_default_geo_name, (target: *mut u16, capacity: i32) -> i32;
     xsxemu_tls_get_user_default_locale_name, get_user_default_locale_name: b"kernelbase.dll", b"GetUserDefaultLocaleName",
         text::get_user_default_locale_name, (target: *mut u16, capacity: i32) -> i32;
+    xsxemu_tls_locale_name_to_lcid, locale_name_to_lcid: b"kernelbase.dll", b"LocaleNameToLCID",
+        text::locale_name_to_lcid, (name: *const u16, flags: u32) -> u32;
     xsxemu_tls_get_acp, get_acp: b"kernelbase.dll", b"GetACP",
         text::get_acp, () -> u32;
     xsxemu_tls_is_valid_code_page, is_valid_code_page: b"kernelbase.dll", b"IsValidCodePage",
