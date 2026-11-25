@@ -137,6 +137,69 @@ pub(crate) fn ready_affine(
     .map_err(|e| format!("owned affine job rejected: {e:?}"))
 }
 
+pub(crate) const TRIPLE_MASKS: [u8; 3] = [15, 3, 15];
+pub(crate) const TRIPLE_ALL_MASKS: [u8; 3] = [15; 3];
+
+pub(crate) fn ready_triple(
+    write_masks: [u8; 3],
+    compiler: Digest,
+    device: Digest,
+) -> Result<ReadyJob, String> {
+    let (source, vs, ps) = crate::graphics_lift::archive_triple_alias(false)
+        .map_err(|e| format!("triple archive lift rejected: {e:?}"))?;
+    let module = digest(source.as_bytes());
+    let stage = |stage, words: &[u32], entry: &str, abi: &[u8]| {
+        let program: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        Validated(StageIdentity {
+            stage,
+            native_program: digest(&program),
+            native_entry: 0,
+            variant_contract: digest(b"owned exact positional fixture; no patches v1"),
+            stage_abi: digest(abi),
+            translated_module: module,
+            translated_entry: entry.into(),
+        })
+    };
+    Request {
+        namespace: Validated(digest(b"XSXEmu owned triple alias archive v1")),
+        target: Validated(Target {
+            backend: digest(b"Metal offline metallib + FailOnBinaryArchiveMiss v1"),
+            translator_and_ir: digest(b"owned ordered triple alias lift v1"),
+            compiler_and_options: compiler,
+            device_and_os_profile: device,
+        }),
+        stages: vec![
+            stage(
+                Stage::Vertex,
+                vs,
+                "translated_vs",
+                b"owned VS buffer(0) stride 32; position@0, PARAM0@16 float4",
+            ),
+            stage(
+                Stage::Fragment,
+                &ps,
+                "triple_alias_ps",
+                b"owned no live-ins; native packed MRT0/1/2 to Metal slots 0/1/2",
+            ),
+        ],
+        descriptor: Validated(Descriptor {
+            pipeline: Pipeline::ProceduralTriangleTripleRgba32Float { write_masks },
+            linkage_and_layout_abi: digest(
+                b"owned manual VS fetch; unconsumed PARAM0; ordered MRT0/1/2 v1",
+            ),
+            bindings: vec![Binding {
+                stage: Stage::Vertex,
+                group: 0,
+                index: 0,
+                resource: Resource::StorageRead,
+            }],
+            specialization: vec![],
+        }),
+    }
+    .ready()
+    .map_err(|e| format!("owned triple job rejected: {e:?}"))
+}
+
 pub(crate) fn identity(
     job: &ReadyJob,
     lib: Digest,
@@ -151,6 +214,18 @@ pub(crate) fn identity(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn triple_archive_identity_retains_ordered_write_masks() {
+        let build = |masks| ready_triple(masks, [1; 32], [2; 32]);
+        let base = build(TRIPLE_MASKS).unwrap();
+        for changed in [TRIPLE_ALL_MASKS, [3, 15, 15], [15, 15, 3]] {
+            let other = build(changed).unwrap();
+            assert_eq!(base.stages(), other.stages());
+            assert_ne!(base.key(), other.key());
+        }
+        assert!(build([15, 16, 15]).is_err());
+    }
 
     #[test]
     fn exact_native_and_module_identity_from_verified_owned_lift() {

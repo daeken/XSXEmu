@@ -86,6 +86,10 @@ pub enum Pipeline {
     /// Procedural triangle list, filled, no culling, one sample, one linear
     /// RGBA32Float attachment, all channels written, no blend, depth or stencil.
     ProceduralTriangleRgba32Float,
+    /// Same fixed raster state, three linear RGBA32Float slots in ordinal order.
+    ProceduralTriangleTripleRgba32Float {
+        write_masks: [u8; 3],
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -216,6 +220,15 @@ impl Request {
             (Pipeline::ProceduralTriangleRgba32Float, [Stage::Vertex, Stage::Fragment]) => {
                 // Tag 3 fully specifies the fixed profile; tags 1 and 2 are unchanged.
                 pipeline.push(3);
+            }
+            (
+                Pipeline::ProceduralTriangleTripleRgba32Float { write_masks },
+                [Stage::Vertex, Stage::Fragment],
+            ) => {
+                if write_masks.iter().any(|m| m & !15 != 0) {
+                    return Err(Failure::Invalid);
+                }
+                pipeline.extend([4, write_masks[0], write_masks[1], write_masks[2]]);
             }
             _ => return Err(Failure::Unsupported),
         }

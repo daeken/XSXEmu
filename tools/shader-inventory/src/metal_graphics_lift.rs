@@ -196,6 +196,9 @@ mod gpu {
         WaitDepthSource(bool),
         WaitDepthLoad(&'a Path),
         Load(&'a Path, bool),
+        TripleArchive(&'a Path, &'a Path, bool, bool, [u8; 32]),
+        TripleMiss(&'a Path, &'a Path),
+        TripleMutant(&'a Path),
         Archive(&'a Path, &'a Path, bool, bool, [u8; 32], bool),
         ExpectStrictMiss(&'a Path, &'a Path, bool),
     }
@@ -370,17 +373,48 @@ mod gpu {
             [mode, lib] if mode == "--load-bound-affine-mutated-metallib" => Mode::BoundAffineMutatedLoad(Path::new(lib)),
             [mode, lib, archive] if mode == "--expect-bound-affine-metal-miss" => Mode::ExpectStrictMiss(Path::new(lib), Path::new(archive), true),
             [mode, lib, archive, compiler] if mode == "--bake-bound-affine-archive" || mode == "--replay-bound-affine-archive" || mode == "--replay-bound-affine-mutated-archive" => Mode::Archive(Path::new(lib), Path::new(archive), mode == "--bake-bound-affine-archive", mode == "--replay-bound-affine-mutated-archive", owned_graphics_artifact::compiler_profile(compiler)?, true),
+            [mode, lib, archive, compiler] if mode == "--bake-triple-alias-archive" || mode == "--replay-triple-alias-archive" || mode == "--replay-triple-alias-all-mask" => Mode::TripleArchive(Path::new(lib), Path::new(archive), mode == "--bake-triple-alias-archive", mode == "--replay-triple-alias-all-mask", owned_graphics_artifact::compiler_profile(compiler)?),
+            [mode] if mode == "--emit-triple-alias-mutated-msl" => {
+                print!("{}", graphics_lift::archive_triple_alias(true).map_err(|e| format!("triple lift rejected: {e:?}"))?.0);
+                return Ok(());
+            }
+            [mode, lib] if mode == "--load-triple-alias-mutated-metallib" => Mode::TripleMutant(Path::new(lib)),
+            [mode, lib, archive] if mode == "--expect-triple-alias-metal-miss" => Mode::TripleMiss(Path::new(lib), Path::new(archive)),
             [mode, lib, archive] if mode == "--expect-owned-metal-miss" => Mode::ExpectStrictMiss(Path::new(lib), Path::new(archive), false),
             [mode, lib, archive, compiler] if mode == "--bake-archive" || mode == "--replay-archive" || mode == "--replay-mutated-archive" => Mode::Archive(Path::new(lib), Path::new(archive), mode == "--bake-archive", mode == "--replay-mutated-archive", owned_graphics_artifact::compiler_profile(compiler)?, false),
             _ => return Err("usage: shader-metal-graphics-lift [--param-mov-source | --emit-param-mov-msl | --load-param-mov-metallib LIB | --expect-param-mov-other-coefficient LIB | --expect-swapped-triple | --triple-alias-source | --emit-triple-alias-msl | --load-triple-alias-metallib LIB | --expect-triple-alias-all-mask LIB | --expect-triple-alias-swapped LIB | --triple-rg-source | --emit-triple-rg-msl | --load-triple-rg-metallib LIB | --triple-source | --emit-triple-msl | --load-triple-metallib LIB | --dual-rg-source | --emit-dual-rg-msl | --load-dual-rg-metallib LIB | --expect-dual-rg-all-mask LIB | --dual-red-source | --emit-dual-red-msl | --load-dual-red-metallib LIB | --expect-dual-red-all-mask LIB | --dual-source | --emit-dual-msl | --load-dual-metallib LIB | --bound-two-affine-source | --expect-bound-two-affine-swapped | --emit-bound-two-affine-msl | --load-bound-two-affine-metallib LIB | --expect-bound-affine-wrong-mode | --expect-bound-affine-wrong-channel | --bound-affine-{x,z}-source | --emit-bound-affine-{x,z}-msl | --load-bound-affine-{x,z}-metallib LIB | --interp-x-source | --interp-z-source | --expect-interp-wrong-mode | --expect-interp-wrong-channel | --emit-interp-x-msl | --emit-interp-z-msl | --load-interp-x-metallib LIB | --load-interp-z-metallib LIB | --constant-rtz[-rg]-source | --emit-constant-rtz[-rg]-msl | --load-constant-rtz[-rg]-metallib LIB | --expect-bound-swapped-component | --bound[-rg]-source | --emit-bound[-rg]-msl | --load-bound[-rg]-metallib LIB | --pos-first-source | --emit-pos-first-msl | --load-pos-first-metallib LIB | --wait-pos-source | --emit-wait-pos-msl | --load-wait-pos-metallib LIB | --expect-late-pos-read | --unpack-{byte,uint}-source | --emit-unpack-{byte,uint}-msl | --load-unpack-{byte,uint}-metallib LIB | --multi-source | --emit-multi-msl | --load-multi-metallib LIB | --packed-ba-source | --emit-packed-ba-msl | --load-packed-ba-metallib LIB | --expect-packed-ba-all-mask LIB | --expect-packed-rg-all-mask LIB | --packed-rg-source | --emit-packed-rg-msl | --load-packed-rg-metallib LIB | --wait-depth-source | --emit-wait-depth-msl | --load-wait-depth-metallib LIB | --expect-late-depth-read | --early-depth-source | --emit-early-depth-msl | --load-early-depth-metallib LIB | --depth-source | --emit-depth-msl | --load-depth-metallib LIB | --packed-source | --emit-packed-msl | --load-packed-metallib LIB | --emit-msl | --emit-mutated-msl | --load-metallib LIB | --load-mutated-metallib LIB | {--bake-archive|--replay-archive|--replay-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-owned-metal-miss MUTATED_LIB ARCHIVE | --emit-bound-affine-mutated-msl | --load-bound-affine-mutated-metallib LIB | {--bake-bound-affine-archive|--replay-bound-affine-archive|--replay-bound-affine-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-bound-affine-metal-miss MUTATED_LIB ARCHIVE]".into()),
         };
-        if matches!(mode, Mode::Archive(..) | Mode::ExpectStrictMiss(..))
-            && std::env::var_os("MTL_SHADER_VALIDATION").is_some()
+        if matches!(
+            mode,
+            Mode::Archive(..)
+                | Mode::ExpectStrictMiss(..)
+                | Mode::TripleArchive(..)
+                | Mode::TripleMiss(..)
+        ) && std::env::var_os("MTL_SHADER_VALIDATION").is_some()
         {
             return Err("translated archive fixture requires MTL_SHADER_VALIDATION unset".into());
         }
         let dev = Device::system_default().ok_or("no Metal device")?;
-        let admitted = if let Mode::Archive(lib, path, bake, mutated, compiler, affine) = mode {
+        let admitted = if let Mode::TripleArchive(lib, path, bake, all, compiler) = mode {
+            let masks = if all {
+                owned_graphics_job::TRIPLE_ALL_MASKS
+            } else {
+                owned_graphics_job::TRIPLE_MASKS
+            };
+            let job = owned_graphics_job::ready_triple(
+                masks,
+                compiler,
+                owned_graphics_artifact::device_profile(&dev)?,
+            )?;
+            let lib = owned_graphics_artifact::artifact_digest(lib)?;
+            if bake {
+                owned_graphics_artifact::require_new_identity(path)?;
+            } else {
+                owned_graphics_artifact::verify(&job, lib, path)?;
+                println!("owned triple MRT artifact identity matched");
+            }
+            Some((job, lib))
+        } else if let Mode::Archive(lib, path, bake, mutated, compiler, affine) = mode {
             let profile = owned_graphics_artifact::device_profile(&dev)?;
             let job = if affine {
                 owned_graphics_job::ready_affine(mutated, compiler, profile)?
@@ -485,6 +519,9 @@ mod gpu {
         let multi = matches!(mode, Mode::MultiSource | Mode::MultiLoad(_));
         let fixture = match mode {
             Mode::MrtSource(f) | Mode::MrtLoad(_, f) => Some(f),
+            Mode::TripleArchive(..) | Mode::TripleMiss(..) | Mode::TripleMutant(..) => {
+                Some(MrtFixture::TripleAlias)
+            }
             Mode::SwappedTripleSource => Some(MrtFixture::Triple),
             _ => None,
         };
@@ -501,7 +538,10 @@ mod gpu {
         };
         let dual_ba_swap = dual_ba && args[0] == "--expect-dual-ba-swapped";
         let triple_alias = matches!(fixture, Some(MrtFixture::TripleAlias));
-        let alias_all = triple_alias && args[0] == "--expect-triple-alias-all-mask";
+        let alias_all = triple_alias
+            && (args[0] == "--expect-triple-alias-all-mask"
+                || matches!(mode, Mode::TripleArchive(_, _, _, true, _)));
+        let alias_mutated = matches!(mode, Mode::TripleMutant(_));
         let partial_mrt = dual_rg
             || matches!(
                 fixture,
@@ -625,6 +665,9 @@ mod gpu {
             | Mode::DepthLoad(path, _)
             | Mode::WaitDepthLoad(path)
             | Mode::Load(path, _)
+            | Mode::TripleArchive(path, _, _, _, _)
+            | Mode::TripleMiss(path, _)
+            | Mode::TripleMutant(path)
             | Mode::Archive(path, _, _, _, _, _)
             | Mode::ExpectStrictMiss(path, _, _) => {
                 metal_artifact::file_url(path, false).map_err(|e| e.to_string())?;
@@ -735,7 +778,12 @@ mod gpu {
         }
         // Independent owned negative control. No sidecar is read or written;
         // success is possible only for the specific Metal archive-miss error.
-        if let Mode::ExpectStrictMiss(_, path, affine) = mode {
+        if let Mode::ExpectStrictMiss(_, path, _) | Mode::TripleMiss(_, path) = mode {
+            let missing = match mode {
+                Mode::TripleMiss(..) => "triple_alias_ps",
+                Mode::ExpectStrictMiss(_, _, true) => "bound_ps",
+                _ => "translated_ps",
+            };
             let url = metal_artifact::file_url(path, false).map_err(|e| e.to_string())?;
             let descriptor = BinaryArchiveDescriptor::new();
             descriptor.set_url(&url);
@@ -743,11 +791,8 @@ mod gpu {
             desc.set_binary_archives(&[&archive]);
             return match strict(&dev, &desc) {
                 Err(err)
-                    if err.contains(if affine {
-                        "Unable to find function \"bound_ps\""
-                    } else {
-                        "Unable to find function \"translated_ps\""
-                    }) && err.contains("in binary archives") =>
+                    if err.contains(&format!("Unable to find function \"{missing}\""))
+                        && err.contains("in binary archives") =>
                 {
                     println!("independent Metal strict miss: {err}");
                     Ok(())
@@ -757,7 +802,7 @@ mod gpu {
             };
         }
         let pipeline = match mode {
-            Mode::Archive(_, path, bake, _, _, _) => {
+            Mode::Archive(_, path, bake, _, _, _) | Mode::TripleArchive(_, path, bake, _, _) => {
                 let url = metal_artifact::file_url(path, bake).map_err(|e| e.to_string())?;
                 let descriptor = BinaryArchiveDescriptor::new();
                 if !bake {
@@ -1527,7 +1572,9 @@ mod gpu {
                 } else if packed || mrt {
                     // Independent numeric oracle; this does not unpack input dwords.
                     let rgba: [f32; 4] = if (2..6).contains(&x) && (1..6).contains(&y) {
-                        if triple_alias {
+                        if alias_mutated {
+                            [-2., 0.25, -2., 0.25]
+                        } else if triple_alias {
                             [1.5, -0.5, 1.5, -0.5]
                         } else if packed_rg_all_mask {
                             [-2., 0.25, 0., 0.]
@@ -1557,6 +1604,8 @@ mod gpu {
                             } else {
                                 [red, 0.5, 0.75, 1.]
                             }
+                        } else if alias_mutated {
+                            [-2., 0.25, 0.75, 1.]
                         } else if dual_rg_all || alias_all {
                             [1.5, -0.5, 0., 0.]
                         } else if partial_mrt {
@@ -1564,7 +1613,7 @@ mod gpu {
                         } else {
                             [1.5, -0.5, -2., 0.25]
                         },
-                        if triple_alias {
+                        if triple_alias && !alias_mutated {
                             [1.5, -0.5, 1.5, -0.5]
                         } else {
                             [-2., 0.25, -2., 0.25]
@@ -1676,9 +1725,13 @@ mod gpu {
                 ));
             }
             println!(
-                "{} owned all-alias triple (all-mask={alias_all}): 192/192 bit-exact attachment pixels; {differences} differ from the correct-mask oracle",
+                "{} owned all-alias triple (all-mask={alias_all}): 192/192 bit-exact attachment pixels (mutated={alias_mutated}); {differences} differ from the correct-mask oracle",
                 dev.name()
             );
+            if let (Mode::TripleArchive(_, path, true, _, _), Some((job, lib))) = (mode, &admitted)
+            {
+                owned_graphics_artifact::publish(job, *lib, path)?;
+            }
             return Ok(());
         }
         if swapped {

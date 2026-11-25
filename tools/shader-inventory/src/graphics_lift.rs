@@ -1238,6 +1238,21 @@ impl MrtFixture {
 
 #[allow(dead_code)]
 pub(crate) fn translate_mrt_fixture(fixture: MrtFixture) -> Result<String, Reject> {
+    translate_mrt(fixture, &TRIPLE_ALIAS_PS)
+}
+
+#[allow(dead_code)]
+pub(crate) fn archive_triple_alias(
+    changed: bool,
+) -> Result<(String, &'static [u32], [u32; 9]), Reject> {
+    let mut ps = TRIPLE_ALIAS_PS;
+    if changed {
+        ps[1] = 0x3400_c000;
+    } // (-2, .25) replaces (1.5, -.5)
+    Ok((translate_mrt(MrtFixture::TripleAlias, &ps)?, VS, ps))
+}
+
+fn translate_mrt(fixture: MrtFixture, alias: &[u32]) -> Result<String, Reject> {
     let vs = lift(Stage::Vertex, VS)?;
     let ps = match fixture {
         MrtFixture::Dual => lift(Stage::DualPackedPixel, DUAL_PS)?,
@@ -1256,7 +1271,7 @@ pub(crate) fn translate_mrt_fixture(fixture: MrtFixture) -> Result<String, Rejec
         }
         MrtFixture::Triple => lift(Stage::TriplePackedPixel, TRIPLE_PS)?,
         MrtFixture::TripleRg => lift(Stage::TriplePackedRgPixel, TRIPLE_RG_PS)?,
-        MrtFixture::TripleAlias => lift(Stage::TriplePackedRgPixel, &TRIPLE_ALIAS_PS)?,
+        MrtFixture::TripleAlias => lift(Stage::TriplePackedRgPixel, alias)?,
     };
     let mut msl = vertex_module(&vs);
     msl.push_str("struct PackedColors { float4 color0 [[color(0)]]; float4 color1 [[color(1)]];");
