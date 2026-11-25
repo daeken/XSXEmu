@@ -340,6 +340,7 @@ fn lift(stage: Stage, words: &[u32]) -> Result<Vec<Op>, Reject> {
                 }
                 live[usize::from(dst.0)] = true;
             }
+            Op::ExportParam0Xy { .. } => return Err(Reject::BadExports(pc)),
             Op::Export { target, src, done } => {
                 if stage.exports().get(exported) != Some(&(target, done)) {
                     return Err(Reject::BadExports(pc));
@@ -580,6 +581,15 @@ fn emit_body(out: &mut String, ops: &[Op], packed_color_lvalue: &str, multi: boo
                 writeln!(
                     out,
                     "  r[{d}] = as_type<uint>(fma(as_type<float>(r[{s}]), {a}, {b}));"
+                )
+                .unwrap();
+            }
+            Op::ExportParam0Xy {
+                src: [Vgpr(x), Vgpr(y)],
+            } => {
+                writeln!(
+                    out,
+                    "  out.parameter = as_type<float2>(uint2(r[{x}], r[{y}]));"
                 )
                 .unwrap();
             }
@@ -1449,6 +1459,57 @@ pub(crate) fn translate_unpack_fixture(uint: bool, signed: bool) -> Result<Strin
     Ok(msl)
 }
 
+const PARAM0_XY_VS: &[u32] = &[
+    0xf800_0203,
+    0xbbaa_0504,
+    0xf800_08cf,
+    0x0302_0100,
+    0xbf81_0000,
+];
+
+fn partial_param_fixture(words: &[u32]) -> Result<[Op; 3], Reject> {
+    if words.len() != 5 || words[4] != 0xbf81_0000 {
+        return Err(Reject::BadEnd(4));
+    }
+    let Ok((2, xy @ Op::ExportParam0Xy { src })) = decode(words, 0) else {
+        return Err(Reject::BadExports(0));
+    };
+    for r in src {
+        if r.0 >= 8 {
+            return Err(Reject::Uninitialized(0, r.0));
+        }
+    }
+    let Ok((
+        2,
+        pos @ Op::Export {
+            target: Target::Position,
+            done: true,
+            src: [Vgpr(0), Vgpr(1), Vgpr(2), Vgpr(3)],
+        },
+    )) = decode(words, 2)
+    else {
+        return Err(Reject::BadExports(2));
+    };
+    Ok([xy, pos, Op::End])
+}
+
+#[allow(dead_code)]
+pub(crate) fn translate_partial_param_fixture() -> Result<String, Reject> {
+    let mut msl = vertex_module(&partial_param_fixture(PARAM0_XY_VS)?)
+        .replace(
+            "float4 parameter [[center_no_perspective]]",
+            "float2 parameter [[user(param0), flat]]",
+        )
+        .replace("float4 parameter; };", "uint4 parameter; };")
+        .replace(
+            "as_type<uint4>(input[vid].parameter)",
+            "input[vid].parameter",
+        );
+    // Z/W are fragment sentinels, never vertex exports or inferred fills.
+    msl.push_str("fragment float4 unpack_ps(Varyings input [[stage_in]]) { return float4(input.parameter, 0.625f, -0.875f); }\n");
+    Ok(msl)
+}
+
 fn vertex_module(vs: &[Op]) -> String {
     // Only the entry/binding convention and one interpolation rule are authored
     // here. All moves, arithmetic, output operands and returns come from the lift.
@@ -1518,6 +1579,7 @@ mod tests {
         );
         asm.push_str("v_bfrev_b32_e32 v3, 60\nexp mrtz v2, off, off, off\nexp mrt0 v1, v1, v3, v3 done compr vm\ns_endpgm\n");
         asm.push_str("v_cvt_f32_i32_e32 v8, v4\nv_cvt_f32_i32_e32 v9, v5\nexp param0 v8, v9, v8, v9\nexp pos0 v0, v1, v2, v3 done\ns_endpgm\n");
+        asm.push_str("exp param0 v4, v5, off, off\nexp pos0 v0, v1, v2, v3 done\ns_endpgm\n");
         let expected: Vec<u8> = VS
             .iter()
             .chain(PS)
@@ -1566,6 +1628,13 @@ mod tests {
                 BFREV_DEPTH_PS[5],
             ])
             .chain(SIGNED_VS)
+            .chain(&[
+                PARAM0_XY_VS[0],
+                0x0504,
+                PARAM0_XY_VS[2],
+                PARAM0_XY_VS[3],
+                PARAM0_XY_VS[4],
+            ])
             .flat_map(|w| w.to_le_bytes())
             .collect();
         for cpu in ["gfx1013", "gfx1030"] {
@@ -1748,6 +1817,25 @@ mod tests {
         let mut words = WAIT_POS_VS.to_vec();
         words.swap(2, 3);
         assert!(lift_pos_snapshot(&words, false).is_err());
+    }
+
+    #[test]
+    fn partial_param_checks_header_and_only_enabled_sources() {
+        let ok = partial_param_fixture(PARAM0_XY_VS);
+        assert!(ok.is_ok());
+        let mut words = PARAM0_XY_VS.to_vec();
+        words[1] ^= 0xffff_0000;
+        assert_eq!(partial_param_fixture(&words), ok);
+        for bit in [1, 4, 0x10, 0x400, 0x800, 0x1000, 0x2000] {
+            words[0] = PARAM0_XY_VS[0] ^ bit;
+            assert!(partial_param_fixture(&words).is_err());
+        }
+        words[0] = PARAM0_XY_VS[0];
+        words[1] ^= 0x08;
+        assert_eq!(
+            partial_param_fixture(&words),
+            Err(Reject::Uninitialized(0, 12))
+        );
     }
 
     #[test]

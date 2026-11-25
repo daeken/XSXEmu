@@ -148,6 +148,13 @@ for kind in byte uint signed; do
     "$p" "--load-unpack-$kind-metallib" "$d/unpack-$kind.metallib"
 done
 
+# Owned partial PARAM0 exports only XY; the separate consumer supplies Z/W sentinels.
+"$p" --partial-param-source
+"$p" --emit-partial-param-msl > "$d/partial-param.metal"
+compile partial-param
+"$p" --load-partial-param-metallib "$d/partial-param.metallib"
+"$p" --expect-partial-param-swap "$d/partial-param.metallib"
+
 # Owned native VS→native PS PARAM0 and exact interpolation pairs.
 for channel in x z; do
     "$p" "--interp-$channel-source"

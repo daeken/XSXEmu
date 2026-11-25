@@ -296,6 +296,12 @@ mod gpu {
                 print!("{}", graphics_lift::translate_wait_pos_fixture(false).map_err(|e| format!("position wait lift rejected: {e:?}"))?);
                 return Ok(());
             }
+            [mode] if mode == "--partial-param-source" => Mode::UnpackSource(false),
+            [mode, lib] if mode == "--load-partial-param-metallib" || mode == "--expect-partial-param-swap" => Mode::UnpackLoad(Path::new(lib), false),
+            [mode] if mode == "--emit-partial-param-msl" => {
+                print!("{}", graphics_lift::translate_partial_param_fixture().map_err(|e| format!("partial param lift rejected: {e:?}"))?);
+                return Ok(());
+            }
             [mode] if mode == "--unpack-byte-source" || mode == "--unpack-uint-source" || mode == "--unpack-signed-source" => Mode::UnpackSource(mode == "--unpack-uint-source"),
             [mode, lib] if mode == "--load-unpack-byte-metallib" || mode == "--load-unpack-uint-metallib" || mode == "--load-unpack-signed-metallib" => Mode::UnpackLoad(Path::new(lib), mode == "--load-unpack-uint-metallib"),
             [mode] if mode == "--emit-unpack-byte-msl" || mode == "--emit-unpack-uint-msl" || mode == "--emit-unpack-signed-msl" => {
@@ -438,6 +444,12 @@ mod gpu {
         let wait_pos = matches!(mode, Mode::WaitPosSource(_) | Mode::WaitPosLoad(_));
         let pos_first = matches!(mode, Mode::PosFirstSource | Mode::PosFirstLoad(_));
         let late_pos = matches!(mode, Mode::WaitPosSource(true));
+        let partial_param = args.first().is_some_and(|a| {
+            a == "--partial-param-source"
+                || a == "--load-partial-param-metallib"
+                || a == "--expect-partial-param-swap"
+        });
+        let param_swap = partial_param && args[0] == "--expect-partial-param-swap";
         let signed_unpack = args
             .first()
             .is_some_and(|a| a == "--unpack-signed-source" || a == "--load-unpack-signed-metallib");
@@ -525,7 +537,11 @@ mod gpu {
                 } else if wait_pos {
                     graphics_lift::translate_wait_pos_fixture(late_pos)
                 } else if let Some(uint) = unpack {
-                    graphics_lift::translate_unpack_fixture(uint, signed_unpack)
+                    if partial_param {
+                        graphics_lift::translate_partial_param_fixture()
+                    } else {
+                        graphics_lift::translate_unpack_fixture(uint, signed_unpack)
+                    }
                 } else if multi {
                     graphics_lift::translate_multi_vertex_fixture()
                 } else if wait_depth {
@@ -862,7 +878,10 @@ mod gpu {
         if unpack.is_some() {
             // Each pair drives a two-column stripe with the same words at
             // all three vertices. The MSB of the shift source is discarded.
-            for (stripe, [a, b]) in (if signed_unpack {
+            for (stripe, [mut a, mut b]) in (if partial_param {
+                [[0.25f32, -0.5], [-0.75, 1.25], [2.0, -3.0], [-4.0, 5.0]]
+                    .map(|p| p.map(f32::to_bits))
+            } else if signed_unpack {
                 SIGNED_INPUTS
             } else {
                 [
@@ -875,6 +894,9 @@ mod gpu {
             .into_iter()
             .enumerate()
             {
+                if param_swap {
+                    std::mem::swap(&mut a, &mut b);
+                }
                 let data: [[u32; 8]; 3] = vertices.map(|v| {
                     [
                         v[0].to_bits(),
@@ -1160,7 +1182,14 @@ mod gpu {
         if let Some(uint) = unpack {
             // Independent expected [2*x-1, 1-2*y, x, y]. The U32 table
             // explicitly fixes both ties at 2^25 and the carry to 2^32.
-            let expected: [[f32; 4]; 4] = if signed_unpack {
+            let expected: [[f32; 4]; 4] = if partial_param {
+                [
+                    [0.25, -0.5, 0.625, -0.875],
+                    [-0.75, 1.25, 0.625, -0.875],
+                    [2.0, -3.0, 0.625, -0.875],
+                    [-4.0, 5.0, 0.625, -0.875],
+                ]
+            } else if signed_unpack {
                 SIGNED_EXPECTED.map(|[a, b]| [a, b, a, b])
             } else if uint {
                 [
@@ -1179,17 +1208,32 @@ mod gpu {
             };
             for y in 0..SIDE {
                 for x in 0..SIDE {
-                    let want = expected[x / 2].map(f32::to_bits);
+                    let normal = expected[x / 2];
+                    let mut control = normal;
+                    if param_swap {
+                        control.swap(0, 1);
+                    }
+                    let want = control.map(f32::to_bits);
                     let at = y * STRIDE + x * 16;
                     let got: [u32; 4] = std::array::from_fn(|i| {
                         u32::from_le_bytes(pixels[at + 4 * i..at + 4 * i + 4].try_into().unwrap())
                     });
+                    if param_swap && got == normal.map(f32::to_bits) {
+                        return Err("swapped PARAM0 unexpectedly matched the normal oracle".into());
+                    }
                     if got != want {
                         return Err(format!(
                             "unpack uint={uint} ({x},{y}): expected {want:08x?}, got {got:08x?}"
                         ));
                     }
                 }
+            }
+            if partial_param {
+                println!(
+                    "{} owned PARAM0 XY (swapped={param_swap}): 64/64 pixels bit-exact; Z/W from consumer sentinels",
+                    dev.name()
+                );
+                return Ok(());
             }
             println!(
                 "{} owned native VS unpack (uint={uint}, signed={signed_unpack}): 64/64 pixels bit-exact",

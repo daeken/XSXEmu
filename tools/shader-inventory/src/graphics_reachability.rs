@@ -248,6 +248,7 @@ fn exact_opcode(
                     accumulate: false, ..
                 } => name == "v_fma_f32",
                 Op::Export { .. }
+                | Op::ExportParam0Xy { .. }
                 | Op::PackedColor { .. }
                 | Op::PackedRg { .. }
                 | Op::ExportRed { .. }
@@ -370,6 +371,8 @@ pub(super) struct DirectGaps {
     pub ordinary_vgpr_mul: usize,
     pub ordinary_vgpr_add: usize,
     pub signed_vgpr_convert: usize,
+    pub partial_param0: usize,
+    pub partial_param0_noncanonical: usize,
     pub contiguous: bool,
     pub interp_mov: BTreeMap<Option<(u8, u8, u8)>, usize>,
     pub packed_mrt0_noncanonical: [usize; 2], // RG / RGBA
@@ -441,6 +444,13 @@ pub(super) fn direct_gaps(dis: &mut Disassembler, bytes: &[u8], slot: usize) -> 
                     0xf800_1c0f if words[1] >> 16 != 0 => gaps.packed_mrt0_noncanonical[1] += 1,
                     _ => (),
                 }
+            }
+            if matches!(
+                decoded,
+                Some((2, crate::graphics_decode::Op::ExportParam0Xy { .. }))
+            ) {
+                gaps.partial_param0 += 1;
+                gaps.partial_param0_noncanonical += usize::from(words[1] >> 16 != 0);
             }
             gaps.signed_vgpr_convert += usize::from(matches!(
                 decoded,

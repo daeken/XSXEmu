@@ -251,6 +251,7 @@ pub(crate) fn audit(words: &[u32], vertex: bool) -> Outcome {
             }
             Op::NopOneCycle | Op::PrefetchThreeLines => {}
             op @ (Op::Export { .. }
+            | Op::ExportParam0Xy { .. }
             | Op::PackedColor { .. }
             | Op::PackedRg { .. }
             | Op::ExportRed { .. }
@@ -259,6 +260,7 @@ pub(crate) fn audit(words: &[u32], vertex: bool) -> Outcome {
                 // raw VM/DONE bits, rather than defaults from the owned emitter.
                 let (target, src): (_, &[_]) = match &op {
                     Op::Export { target, src, .. } => (Some(*target), src),
+                    Op::ExportParam0Xy { src } => (Some(Target::Parameter(0)), src),
                     Op::PackedColor { src, .. } => (Some(Target::Color), src),
                     Op::PackedRg { src, .. } | Op::ExportRed { src, .. } => {
                         (Some(Target::Color), std::slice::from_ref(src))

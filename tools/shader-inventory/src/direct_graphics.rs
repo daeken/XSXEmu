@@ -225,6 +225,7 @@ struct GapCounts {
     ordinary_mul: (usize, usize),
     ordinary_add: (usize, usize),
     signed_convert: (usize, usize),
+    partial_param0: [usize; 3],
     bfrev_depth: BTreeMap<[usize; 7], usize>,
     packed_cleared: [usize; 2],
     interp_sole: BTreeMap<(usize, Option<(u8, u8, u8)>), usize>,
@@ -241,6 +242,9 @@ impl GapCounts {
     fn note(&mut self, gaps: &DirectGaps) {
         self.ordinary_add.0 += gaps.ordinary_vgpr_add;
         self.ordinary_add.1 += usize::from(gaps.ordinary_vgpr_add > 0);
+        self.partial_param0[0] += gaps.partial_param0;
+        self.partial_param0[1] += usize::from(gaps.partial_param0 > 0);
+        self.partial_param0[2] += gaps.partial_param0_noncanonical;
         self.signed_convert.0 += gaps.signed_vgpr_convert;
         self.signed_convert.1 += usize::from(gaps.signed_vgpr_convert > 0);
         self.ordinary_mul.0 += gaps.ordinary_vgpr_mul;
@@ -321,6 +325,12 @@ impl GapCounts {
             "    exact signed VGPR e32 conversion: {} sites in {} windows",
             self.signed_convert.0, self.signed_convert.1
         );
+        if stage == "VS" {
+            println!(
+                "    exact partial PARAM0 EN3 (sites, windows, sites with nonzero disabled selectors): {:?}",
+                self.partial_param0
+            );
+        }
         if stage == "PS" {
             println!(
                 "    sole prior packed-selector blocker (RG / RGBA): {:?} windows",
@@ -434,6 +444,7 @@ pub(super) fn run_gaps(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), B
     let mut waves = [llvm.context(cpu, false)?, llvm.context(cpu, true)?];
     let mut distinct = HashSet::new();
     let mut interp_spans = HashSet::new();
+    let mut partial_param_spans = HashSet::new();
     let mut packed_spans = [HashSet::new(), HashSet::new()];
     let mut vs_sets = BTreeMap::<Vec<String>, HashMap<_, (usize, u8)>>::new();
     let mut pair_spans = [PairSpans::new(), PairSpans::new()];
@@ -459,6 +470,9 @@ pub(super) fn run_gaps(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), B
                 for (w, wave) in waves.iter_mut().enumerate() {
                     if let Some(gaps) = direct_gaps(wave, window, slot) {
                         counts[slot][i][w].note(&gaps);
+                        if slot == 1 && gaps.partial_param0 != 0 {
+                            partial_param_spans.insert(reference.program);
+                        }
                         if slot == 1 && !gaps.operand_forms.is_empty() {
                             let key = gaps.operand_forms.keys().cloned().collect();
                             let sites = gaps.operand_forms.values().sum();
@@ -520,6 +534,10 @@ pub(super) fn run_gaps(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), B
         buckets.report(stage, "gap buckets");
         operands.report(stage, "operand forms");
     }
+    println!(
+        "  Distinct VS spans with exact partial PARAM0 EN3 across hypotheses: {}",
+        partial_param_spans.len()
+    );
     let mut vs_sets: Vec<_> = vs_sets.into_iter().collect();
     vs_sets.sort_unstable_by(|(a, x), (b, y)| {
         a.len()

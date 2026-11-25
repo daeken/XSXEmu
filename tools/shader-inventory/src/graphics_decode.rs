@@ -100,6 +100,9 @@ pub(crate) enum Op {
         src: [Vgpr; 4],
         done: bool,
     },
+    ExportParam0Xy {
+        src: [Vgpr; 2],
+    },
     PackedColor {
         slot: u8,
         src: [Vgpr; 2],
@@ -439,6 +442,17 @@ pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeErro
             Op::ExportRed {
                 slot: ((w >> 4) & 63) as u8,
                 src: Vgpr(ext()? as u8),
+            },
+        ));
+    }
+    // Exact nonfinal uncompressed PARAM0 EN=3, with VM and reserved bits clear.
+    // Only X/Y selectors are consumed; this does not define Z/W values.
+    if w == 0xf800_0203 {
+        let [x, y, _, _] = ext()?.to_le_bytes();
+        return Ok((
+            2,
+            Op::ExportParam0Xy {
+                src: [Vgpr(x), Vgpr(y)],
             },
         ));
     }

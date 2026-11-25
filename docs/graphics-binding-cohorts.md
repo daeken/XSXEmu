@@ -158,6 +158,12 @@ Only `v_cvt_f32_i32_e32` with ordinary VGPR input was added. Both LLVM MC refere
 
 This covers 434 exact VS sites in 219 windows at each +36/+40 CPU/wave profile. The 59-span group falls to three missing buckets (four sites minimum), but **whole-window encoding closure stays 0 → 0 VS** and 225 → 225 PS at +36/+40. Neither +0 nor +24 gains closure. PARAM linkage, priority, waits, launch state, and entry remain outside the owned contract.
 
+### Partial PARAM0 X/Y export
+
+The shared decoder accepts only header `0xf8000203` for this form: PARAM0, EN=3, nonfinal, uncompressed, VM/DONE clear and reserved bits zero. Only VSRC0/1 are read; no architectural Z/W fill is modeled. LLVM MC confirms the canonical form on both reference CPUs. Owned tests vary the inactive selector bytes, reject undefined enabled sources and changed target/mask/flags, and require final full POS0 and real END. The separate Metal contract declares a `float2` varying; the fragment supplies independently known Z/W sentinels, not values from the VS. On Apple M4, source and offline metallib each match 64/64 pixels bit-for-bit. Swapping only X/Y inputs using the same metallib differs from the normal oracle at all 64 pixels and preserves both consumer sentinels.
+
+At +36 and +40, each CPU/wave profile contains one site in each of the same 119 distinct VS spans (of 1,304 qualified), all with nonzero disabled selector bytes. None at +0/+24. The 59 nearest VS now have two remaining buckets and at least three sites: SETPRIO imm3 and unclassified VOP3 FMA. Whole-window closure remains 0 VS and 225 PS per applicable profile. Native PARAM linkage, interpolant state, priority, waits and entry are not inferred.
+
 ## Independent evidence for distinguishing starts
 
 `--graphics-entry-evidence "$INFLATED_LIBRARY" "$TRUSTED_LLVM_21_DYLIB"` uses the exact 13,383 two-slot rows (2,921 distinct checked PS spans, 1,322 VS). It does not repeat the closure census or use wrapper joins. It checks the stage metadata footer fingerprint, then tests the third-group marker at `+26` as in [compute layout sites](compute-layout-sites.md). The marker supports interpreting the group at `+24` as part of the stored prefix, not a global execution rule. The comparisons beginning at `+24` are withheld for marked groups. Nonzero `0x42` sites are tested independently as aligned in-span scalar loads, without assuming they are reachable from any entry.
