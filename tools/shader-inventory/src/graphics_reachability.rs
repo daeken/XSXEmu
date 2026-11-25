@@ -1711,6 +1711,43 @@ struct MeshComparison {
     projected_prim_present: usize,
 }
 
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct MeshGate {
+    strict: ResultClass,
+    // None unless a known message was the strict blocker. No fallthrough is
+    // added to the strict audit or to any lowering by this diagnostic.
+    projection: Option<ResultClass>,
+    projected_prim_shape: Option<(usize, u16, [usize; 8])>, // sites, EN-value bitset, flags histogram
+    projected_allocs: usize,
+}
+
+pub(super) fn direct_mesh_gate(dis: &mut Disassembler, bytes: &[u8]) -> MeshGate {
+    let strict = result_class(checked_exports(dis, bytes));
+    let mut projected_allocs = 0;
+    let projected = matches!(strict, ResultClass::SendMsg(SendMsgClass::GsAllocReq)).then(|| {
+        project_exports_observe(dis, bytes, true, |tail, len, text| {
+            if sendmsg_class(word(tail, 0).unwrap_or_default() as u32, len, text)
+                == SendMsgClass::GsAllocReq
+            {
+                projected_allocs += 1;
+            }
+        })
+    });
+    let projected_prim_shape = projected.as_ref().and_then(|r| r.as_ref().ok()).map(|e| {
+        (
+            e.primitive_sites.sites,
+            e.primitive_en_values,
+            e.primitive_sites.raw_bits_10_to_12,
+        )
+    });
+    MeshGate {
+        strict,
+        projection: projected.map(result_class),
+        projected_prim_shape,
+        projected_allocs,
+    }
+}
+
 fn wrapped_mesh_exports(
     dis: &mut Disassembler,
     bytes: &[u8],
@@ -2100,6 +2137,18 @@ mod tests {
                 let mut dis = llvm.context(cpu, wave32).unwrap();
                 let (strict, projected) = wrapped_mesh_exports(&mut dis, &bytes);
                 assert_eq!(strict, ResultClass::SendMsg(SendMsgClass::GsAllocReq));
+                let gate = direct_mesh_gate(&mut dis, &bytes);
+                assert_eq!(gate.strict, strict);
+                assert_eq!(gate.projection, Some(ResultClass::CompleteWithExp));
+                assert_eq!(gate.projected_allocs, 1);
+                assert_eq!(
+                    gate.projected_prim_shape,
+                    Some((1, 1 << 1, [0, 0, 1, 0, 0, 0, 0, 0]))
+                );
+                let truncated = direct_mesh_gate(&mut dis, &bytes[..12]);
+                assert_eq!(truncated.strict, strict);
+                assert_eq!(truncated.projection, Some(ResultClass::BadSuccessor));
+                assert_eq!(truncated.projected_prim_shape, None);
                 let sites = projected.unwrap().unwrap().primitive_sites;
                 assert_eq!(
                     sites,

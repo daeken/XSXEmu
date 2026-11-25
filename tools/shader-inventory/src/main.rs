@@ -13,6 +13,7 @@ mod graphics_reachability;
 mod graphics_semantics;
 mod library_index;
 mod llvm;
+mod mesh_cohorts;
 mod native_pairs;
 mod reachable;
 mod signatures;
@@ -321,6 +322,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             direct_graphics::run(library.as_ref(), &llvm, cpu)
         };
+    }
+    if first == "--direct-ps-mesh" {
+        let usage = "usage: xsx-shader-inventory --direct-ps-mesh <expanded PS/0/9 library> <trusted LLVM 21 library> <gfx1013|gfx1030>";
+        let library = args.next().ok_or(usage)?;
+        let llvm = args.next().ok_or(usage)?;
+        let cpu = llvm::Cpu::parse(&args.next().filter(|_| args.next().is_none()).ok_or(usage)?)
+            .ok_or(usage)?;
+        return mesh_cohorts::run(library.as_ref(), &llvm, cpu);
     }
     if first == "--direct-ps-attachments" {
         let usage = "usage: xsx-shader-inventory --direct-ps-attachments <expanded PS/0/9 library> <trusted LLVM 21 library> <gfx1013|gfx1030>";

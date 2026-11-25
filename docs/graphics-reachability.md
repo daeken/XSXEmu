@@ -34,6 +34,20 @@ In the complete mesh projections, every payload has both raw `EN=0` and `EN=15` 
 
 Counting reachable instruction starts, every complete mesh projection contains exactly two checked `PRIM` sites: 18,564 sites for `gfx1013` or 16,516 for `gfx1030`, independently under either wave setting. Every first dword has raw bit 11 set and bits 10 and 12 clear. In the validated local graph, the immediate fallthrough successor of each is a non-export linear instruction, not `POS0`, another `EXP`, a direct jump or fork, or `s_endpgm`. The raw bit does not terminate the projected graph. Two static sites do not imply two primitive exports execute or identify the primitive count, indices, or payload semantics.
 
+### Direct mesh companions of encoding-complete pixels
+
+Run `xsx-shader-inventory --direct-ps-mesh "$INFLATED_LIBRARY" "$TRUSTED_LLVM_21_DYLIB" gfx1013` (repeat with `gfx1030`). This joins active-export, encoding-complete PS windows only to their exact two-slot PS+MS library row, tests the companion at the same stored +36 or +40 hypothesis, and counts rows and distinct programs/pairs separately. Both CPUs and both wave settings agree per start: 353 rows, 214 PS spans, and 319 MS spans / pairs. These are not wrapped payload matches or verified entry offsets.
+
+| First strict MS blocker | Separate message-fallthrough projection | Rows | MS spans / pairs |
+|---|---|---:|---:|
+| `MSG_GS_ALLOC_REQ` | Reference CFG with EXP closes | 345 | 311 |
+| Decode | Not attempted | 7 | 7 |
+| `MSG_GS_ALLOC_REQ` | Decode still stops | 1 | 1 |
+
+The 311 closed projections each contain one checked allocation message and one static PRIM site with raw EN=1 and raw bit 11 set (bits 10/12 clear). This follows reference control flow after checked messages **only in the diagnostic**. It does not model resource allocation, primitive counts or payload, the number of dynamic exports, export completion, or native linkage. Zero mesh companions clear strict reachability. The two-PRIM observation in the wrapped survey is a different corpus and must not be assumed here.
+
+Prioritize the **allocation-to-PRIM contract** before individual ALU gaps or the eight decoder failures: independently establish the allocation operands/counts (including M0 provenance if used), then prove vertex/primitive indexing, null/validity behavior, and output ordering on an owned mesh fixture that observes counts and topology. Keep allocation and PRIM unsupported until those semantics are established. The census changes no admission, lowering, or PSO binding.
+
 ### Same-wrapper mesh output comparison
 
 ```sh
