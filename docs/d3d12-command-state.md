@@ -57,6 +57,26 @@ Run the owned lifecycle fixtures with
 `cargo test --offline --test d3d12_command_state`. They supply explicit
 completion inputs and need no GPU, console DLL, or title assets.
 
+## Owned Metal validation
+
+On macOS with a Metal device, run:
+
+```sh
+cargo run --offline --locked --manifest-path tools/shader-inventory/Cargo.toml \
+  --features metal-probe --bin command-state-metal-probe
+```
+
+The opt-in probe commits two real blit command buffers to one Metal queue,
+with a separate model copy list and allocator for each. A Metal shared event
+keeps both blits pending until the CPU releases their gates one at a time.
+The probe checks that both allocator resets fail while the blits are gated.
+Releasing a gate is not a completion signal: each token is passed to the
+model only after Metal reports `Completed` and the probe checks all 64
+bytes of that blit's output. The first retirement makes only the first
+allocator resettable; the second remains pinned until its own completion.
+Metal errors, timeouts, and readback mismatches fail the probe. This validates
+the standalone seam, not a guest provider or Xbox queue semantics.
+
 [create]: https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device-createcommandlist
 [close]: https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12graphicscommandlist-close
 [list-reset]: https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12graphicscommandlist-reset
