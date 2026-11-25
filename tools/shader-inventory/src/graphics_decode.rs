@@ -38,6 +38,25 @@ pub(crate) enum Op {
         coord: Vgpr,
         channel: u8,
     },
+    ShiftLeftOne {
+        dst: Vgpr,
+        src: Vgpr,
+    },
+    AndMask {
+        dst: Vgpr,
+        src: Vgpr,
+        mask: u32,
+    },
+    ConvertUint {
+        dst: Vgpr,
+        src: Vgpr,
+        byte0: bool,
+    },
+    FmaUnpack {
+        dst: Vgpr,
+        src: Vgpr,
+        negative: bool,
+    },
     NopOneCycle,
     PrefetchThreeLines,
     AddF32Literal {
@@ -240,9 +259,45 @@ pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeErro
             },
         ));
     }
+    let dst = Vgpr((w >> 17) as u8);
+    let vsrc1 = Vgpr((w >> 9) as u8);
+    match w & 0xfe00_01ff {
+        0x3400_0081 => return Ok((1, Op::ShiftLeftOne { dst, src: vsrc1 })),
+        0x3600_0082 | 0x3600_00c2 => {
+            return Ok((
+                1,
+                Op::AndMask {
+                    dst,
+                    src: vsrc1,
+                    mask: if w as u8 == 130 { 2 } else { u32::MAX - 1 },
+                },
+            ));
+        }
+        _ => {}
+    }
+    if matches!(w & 0xfe01_ff00, 0x7e00_2300 | 0x7e00_0d00) {
+        return Ok((
+            1,
+            Op::ConvertUint {
+                dst,
+                src: Vgpr(w as u8),
+                byte0: w & 0x2000 != 0,
+            },
+        ));
+    }
     // VOP3 v_fma_f32: ordinary VGPRs only. No abs, neg, clamp or output modifier.
     if w & 0xffff_ff00 == 0xd54b_0000 {
         let fields = ext()?;
+        if matches!(fields & 0xffff_ff00, 0x03cd_e900 | 0x03c9_eb00) {
+            return Ok((
+                2,
+                Op::FmaUnpack {
+                    dst: Vgpr(w as u8),
+                    src: Vgpr(fields as u8),
+                    negative: fields & 0x0000_0200 != 0,
+                },
+            ));
+        }
         if fields & 0xfc02_0100 != 0x0402_0100 {
             return Err(DecodeError::Unsupported(pc));
         }

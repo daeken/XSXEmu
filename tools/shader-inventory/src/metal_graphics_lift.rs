@@ -113,6 +113,8 @@ mod gpu {
         MrtLoad(&'a Path, MrtFixture),
         InterpSource(InterpFixture),
         InterpLoad(&'a Path, InterpFixture),
+        UnpackSource(bool),
+        UnpackLoad(&'a Path, bool),
         MultiSource,
         MultiLoad(&'a Path),
         DepthSource(bool),
@@ -169,6 +171,12 @@ mod gpu {
                 print!("{}", graphics_lift::translate_interp_fixture(fixture).map_err(|e| format!("interpolation lift rejected: {e:?}"))?);
                 return Ok(());
             }
+            [mode] if mode == "--unpack-byte-source" || mode == "--unpack-uint-source" => Mode::UnpackSource(mode == "--unpack-uint-source"),
+            [mode, lib] if mode == "--load-unpack-byte-metallib" || mode == "--load-unpack-uint-metallib" => Mode::UnpackLoad(Path::new(lib), mode == "--load-unpack-uint-metallib"),
+            [mode] if mode == "--emit-unpack-byte-msl" || mode == "--emit-unpack-uint-msl" => {
+                print!("{}", graphics_lift::translate_unpack_fixture(mode == "--emit-unpack-uint-msl").map_err(|e| format!("unpack lift rejected: {e:?}"))?);
+                return Ok(());
+            }
             [mode] if mode == "--multi-source" => Mode::MultiSource,
             [mode, lib] if mode == "--load-multi-metallib" => Mode::MultiLoad(Path::new(lib)),
             [mode] if mode == "--emit-multi-msl" => {
@@ -201,7 +209,7 @@ mod gpu {
             [mode, lib] if mode == "--load-metallib" || mode == "--load-mutated-metallib" => Mode::Load(Path::new(lib), mode == "--load-mutated-metallib"),
             [mode, lib, archive] if mode == "--expect-owned-metal-miss" => Mode::ExpectStrictMiss(Path::new(lib), Path::new(archive)),
             [mode, lib, archive, compiler] if mode == "--bake-archive" || mode == "--replay-archive" || mode == "--replay-mutated-archive" => Mode::Archive(Path::new(lib), Path::new(archive), mode == "--bake-archive", mode == "--replay-mutated-archive", owned_graphics_artifact::compiler_profile(compiler)?),
-            _ => return Err("usage: shader-metal-graphics-lift [--expect-swapped-triple | --triple-rg-source | --emit-triple-rg-msl | --load-triple-rg-metallib LIB | --triple-source | --emit-triple-msl | --load-triple-metallib LIB | --dual-source | --emit-dual-msl | --load-dual-metallib LIB | --interp-x-source | --interp-z-source | --expect-interp-wrong-mode | --expect-interp-wrong-channel | --emit-interp-x-msl | --emit-interp-z-msl | --load-interp-x-metallib LIB | --load-interp-z-metallib LIB | --multi-source | --emit-multi-msl | --load-multi-metallib LIB | --packed-rg-source | --emit-packed-rg-msl | --load-packed-rg-metallib LIB | --wait-depth-source | --emit-wait-depth-msl | --load-wait-depth-metallib LIB | --expect-late-depth-read | --early-depth-source | --emit-early-depth-msl | --load-early-depth-metallib LIB | --depth-source | --emit-depth-msl | --load-depth-metallib LIB | --packed-source | --emit-packed-msl | --load-packed-metallib LIB | --emit-msl | --emit-mutated-msl | --load-metallib LIB | --load-mutated-metallib LIB | {--bake-archive|--replay-archive|--replay-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-owned-metal-miss MUTATED_LIB ARCHIVE]".into()),
+            _ => return Err("usage: shader-metal-graphics-lift [--expect-swapped-triple | --triple-rg-source | --emit-triple-rg-msl | --load-triple-rg-metallib LIB | --triple-source | --emit-triple-msl | --load-triple-metallib LIB | --dual-source | --emit-dual-msl | --load-dual-metallib LIB | --interp-x-source | --interp-z-source | --expect-interp-wrong-mode | --expect-interp-wrong-channel | --emit-interp-x-msl | --emit-interp-z-msl | --load-interp-x-metallib LIB | --load-interp-z-metallib LIB | --unpack-{byte,uint}-source | --emit-unpack-{byte,uint}-msl | --load-unpack-{byte,uint}-metallib LIB | --multi-source | --emit-multi-msl | --load-multi-metallib LIB | --packed-rg-source | --emit-packed-rg-msl | --load-packed-rg-metallib LIB | --wait-depth-source | --emit-wait-depth-msl | --load-wait-depth-metallib LIB | --expect-late-depth-read | --early-depth-source | --emit-early-depth-msl | --load-early-depth-metallib LIB | --depth-source | --emit-depth-msl | --load-depth-metallib LIB | --packed-source | --emit-packed-msl | --load-packed-metallib LIB | --emit-msl | --emit-mutated-msl | --load-metallib LIB | --load-mutated-metallib LIB | {--bake-archive|--replay-archive|--replay-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-owned-metal-miss MUTATED_LIB ARCHIVE]".into()),
         };
         if matches!(mode, Mode::Archive(..) | Mode::ExpectStrictMiss(..))
             && std::env::var_os("MTL_SHADER_VALIDATION").is_some()
@@ -233,6 +241,10 @@ mod gpu {
             Mode::InterpSource(f) | Mode::InterpLoad(_, f) => Some(f),
             _ => None,
         };
+        let unpack = match mode {
+            Mode::UnpackSource(uint) | Mode::UnpackLoad(_, uint) => Some(uint),
+            _ => None,
+        };
         let multi = matches!(mode, Mode::MultiSource | Mode::MultiLoad(_));
         let fixture = match mode {
             Mode::MrtSource(f) | Mode::MrtLoad(_, f) => Some(f),
@@ -253,6 +265,7 @@ mod gpu {
             | Mode::DepthSource(_)
             | Mode::WaitDepthSource(_)
             | Mode::InterpSource(_)
+            | Mode::UnpackSource(_)
             | Mode::MultiSource
             | Mode::MrtSource(_)
             | Mode::SwappedTripleSource => {
@@ -260,6 +273,8 @@ mod gpu {
                     graphics_lift::translate_mrt_fixture(fixture)
                 } else if let Some(interp) = interp {
                     graphics_lift::translate_interp_fixture(interp)
+                } else if let Some(uint) = unpack {
+                    graphics_lift::translate_unpack_fixture(uint)
                 } else if multi {
                     graphics_lift::translate_multi_vertex_fixture()
                 } else if wait_depth {
@@ -278,6 +293,7 @@ mod gpu {
             }
             Mode::PackedLoad(path, _)
             | Mode::InterpLoad(path, _)
+            | Mode::UnpackLoad(path, _)
             | Mode::MultiLoad(path)
             | Mode::MrtLoad(path, _)
             | Mode::DepthLoad(path, _)
@@ -293,6 +309,8 @@ mod gpu {
         const DEPTH_FORMAT: MTLPixelFormat = MTLPixelFormat::Depth32Float;
         let (format, pixel_bytes, default_ps) = if let Some(fixture) = fixture {
             (MTLPixelFormat::RGBA32Float, 16, fixture.entry())
+        } else if unpack.is_some() {
+            (MTLPixelFormat::RGBA32Float, 16, "unpack_ps")
         } else if interp.is_some() {
             (MTLPixelFormat::RGBA32Float, 16, "interp_ps")
         } else if multi {
@@ -503,6 +521,40 @@ mod gpu {
             }
             enc.set_vertex_bytes(0, std::mem::size_of_val(&data) as u64, data.as_ptr().cast());
         }
+        if unpack.is_some() {
+            // Each pair drives a two-column stripe with the same words at
+            // all three vertices. The MSB of the shift source is discarded.
+            for (stripe, [a, b]) in [
+                [1, 0x8000_0000],
+                [0x0200_0003, 0x8000_0001],
+                [0x0200_0007, 0xffff_fffe],
+                [0xffff_ffff, 0xffff_ffff],
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let data: [[u32; 8]; 3] = vertices.map(|v| {
+                    [
+                        v[0].to_bits(),
+                        v[1].to_bits(),
+                        v[2].to_bits(),
+                        v[3].to_bits(),
+                        a,
+                        b,
+                        0,
+                        0,
+                    ]
+                });
+                enc.set_vertex_bytes(0, std::mem::size_of_val(&data) as u64, data.as_ptr().cast());
+                enc.set_scissor_rect(MTLScissorRect {
+                    x: (2 * stripe) as u64,
+                    y: 0,
+                    width: 2,
+                    height: SIDE as u64,
+                });
+                enc.draw_primitives(MTLPrimitiveType::Triangle, 0, 3);
+            }
+        }
         if let Some(state) = depth_state.as_ref() {
             enc.set_depth_stencil_state(state);
             let draws = if wait_depth {
@@ -552,7 +604,7 @@ mod gpu {
                 inputs.as_ptr().cast(),
             );
         }
-        if !depth {
+        if !depth && unpack.is_none() {
             enc.draw_primitives(MTLPrimitiveType::Triangle, 0, 3);
         }
         enc.end_encoding();
@@ -587,6 +639,44 @@ mod gpu {
         }
         // The GPU writes have completed and the owned buffer remains alive through the last read.
         let pixels = unsafe { std::slice::from_raw_parts(ptr, extent) };
+        if let Some(uint) = unpack {
+            // Independent expected [2*x-1, 1-2*y, x, y]. The U32 table
+            // explicitly fixes both ties at 2^25 and the carry to 2^32.
+            let expected: [[f32; 4]; 4] = if uint {
+                [
+                    [-1., 1., 0., 0.],
+                    [67_108_864., -3., 33_554_432., 2.],
+                    [67_108_880., 1., 33_554_440., 0.],
+                    [8_589_934_592., -3., 4_294_967_296., 2.],
+                ]
+            } else {
+                [
+                    [-1., 1., 0., 0.],
+                    [3., -3., 2., 2.],
+                    [3., 1., 2., 0.],
+                    [3., -3., 2., 2.],
+                ]
+            };
+            for y in 0..SIDE {
+                for x in 0..SIDE {
+                    let want = expected[x / 2].map(f32::to_bits);
+                    let at = y * STRIDE + x * 16;
+                    let got: [u32; 4] = std::array::from_fn(|i| {
+                        u32::from_le_bytes(pixels[at + 4 * i..at + 4 * i + 4].try_into().unwrap())
+                    });
+                    if got != want {
+                        return Err(format!(
+                            "unpack uint={uint} ({x},{y}): expected {want:08x?}, got {got:08x?}"
+                        ));
+                    }
+                }
+            }
+            println!(
+                "{} owned native VS unpack/FMA (uint={uint}): 64/64 pixels bit-exact",
+                dev.name()
+            );
+            return Ok(());
+        }
         if let Some(interp) = interp {
             let negative = matches!(
                 interp,

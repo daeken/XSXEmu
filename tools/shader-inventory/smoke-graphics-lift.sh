@@ -98,6 +98,14 @@ compile wait-depth
 compile multi
 "$p" --load-multi-metallib "$d/multi.metallib"
 
+# Native vertex byte extraction and full unsigned conversion, with fused FMA.
+for kind in byte uint; do
+    "$p" "--unpack-$kind-source"
+    "$p" "--emit-unpack-$kind-msl" > "$d/unpack-$kind.metal"
+    compile "unpack-$kind"
+    "$p" "--load-unpack-$kind-metallib" "$d/unpack-$kind.metallib"
+done
+
 # Owned native VS→native PS PARAM0 and exact interpolation pairs.
 for channel in x z; do
     "$p" "--interp-$channel-source"

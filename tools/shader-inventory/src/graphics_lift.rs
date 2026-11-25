@@ -6,6 +6,7 @@ use crate::graphics_decode::{DecodeError, FloatSource, Op, Target, Vgpr, decode}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Stage {
     Vertex,
+    UnpackVertex,
     MultiVertex,
     Pixel,
     PackedPixel,
@@ -113,7 +114,7 @@ const EARLY_DEPTH_PS: &[u32] = &[0xf800_0081, 2, 0xf800_1c0f, 1, 0xbf81_0000];
 impl Stage {
     fn input_registers(self) -> usize {
         match self {
-            Stage::Vertex => 8,
+            Stage::Vertex | Stage::UnpackVertex => 8,
             Stage::MultiVertex => 32,
             Stage::Pixel => 4,
             Stage::PackedPixel => 2,
@@ -125,7 +126,9 @@ impl Stage {
 
     fn exports(self) -> &'static [(Target, bool)] {
         match self {
-            Stage::Vertex => &[(Target::Parameter(0), false), (Target::Position, true)],
+            Stage::Vertex | Stage::UnpackVertex => {
+                &[(Target::Parameter(0), false), (Target::Position, true)]
+            }
             Stage::MultiVertex => &[
                 (Target::Parameter(0), false),
                 (Target::Parameter(1), false),
@@ -181,12 +184,25 @@ fn lift(stage: Stage, words: &[u32]) -> Result<Vec<Op>, Reject> {
             return Err(Reject::BadEnd(pc));
         }
         match op {
+            Op::ShiftLeftOne { dst, src }
+            | Op::AndMask { dst, src, .. }
+            | Op::ConvertUint { dst, src, .. }
+            | Op::FmaUnpack { dst, src, .. } => {
+                if stage != Stage::UnpackVertex {
+                    return Err(Reject::Unsupported(pc));
+                }
+                require(src)?;
+                live[usize::from(dst.0)] = true;
+            }
             Op::Move { dst, src } | Op::AddF32Literal { dst, src, .. } => {
                 require(src)?;
                 live[usize::from(dst.0)] = true;
             }
             Op::CompareNonzero { src } => {
-                if matches!(stage, Stage::Vertex | Stage::MultiVertex) {
+                if matches!(
+                    stage,
+                    Stage::Vertex | Stage::UnpackVertex | Stage::MultiVertex
+                ) {
                     return Err(Reject::Unsupported(pc));
                 }
                 require(src)?;
@@ -361,6 +377,39 @@ fn emit_body(out: &mut String, ops: &[Op], packed_color_lvalue: &str, multi: boo
                 ..
             } => {
                 writeln!(out, "  r[{dst}] = as_type<uint>(fma(as_type<float>(r[{a}]), as_type<float>(r[{b}]), as_type<float>(r[{c}])));").unwrap();
+            }
+            Op::ShiftLeftOne {
+                dst: Vgpr(d),
+                src: Vgpr(s),
+            } => writeln!(out, "  r[{d}] = r[{s}] << 1u;").unwrap(),
+            Op::AndMask {
+                dst: Vgpr(d),
+                src: Vgpr(s),
+                mask,
+            } => writeln!(out, "  r[{d}] = r[{s}] & {mask}u;").unwrap(),
+            Op::ConvertUint {
+                dst: Vgpr(d),
+                src: Vgpr(s),
+                byte0,
+            } => {
+                let mask = if byte0 { " & 255u" } else { "" };
+                writeln!(out, "  r[{d}] = as_type<uint>(float(r[{s}]{mask}));").unwrap();
+            }
+            Op::FmaUnpack {
+                dst: Vgpr(d),
+                src: Vgpr(s),
+                negative,
+            } => {
+                let (a, b) = if negative {
+                    ("-2.0f", "1.0f")
+                } else {
+                    ("2.0f", "-1.0f")
+                };
+                writeln!(
+                    out,
+                    "  r[{d}] = as_type<uint>(fma(as_type<float>(r[{s}]), {a}, {b}));"
+                )
+                .unwrap();
             }
             Op::Export {
                 target,
@@ -865,6 +914,53 @@ pub(crate) fn translate_interp_fixture(fixture: InterpFixture) -> Result<String,
     Ok(msl)
 }
 
+const UNPACK_BYTE_VS: [u32; 14] = [
+    0x3410_0a81,
+    0x3612_0882,
+    0x3614_1082,
+    0x7e16_2309,
+    0x7e18_230a,
+    0xd54b_000d,
+    0x03cd_e90b,
+    0xd54b_000e,
+    0x03c9_eb0c,
+    0xf800_020f,
+    0x0c0b_0e0d,
+    0xf800_08cf,
+    0x0302_0100,
+    0xbf81_0000,
+];
+const UNPACK_UINT_VS: [u32; 14] = {
+    let mut words = UNPACK_BYTE_VS;
+    words[1] = 0x3612_08c2;
+    words[3] = 0x7e16_0d09;
+    words
+};
+
+#[allow(dead_code)]
+pub(crate) fn translate_unpack_fixture(uint: bool) -> Result<String, Reject> {
+    let vs = lift(
+        Stage::UnpackVertex,
+        if uint {
+            &UNPACK_UINT_VS
+        } else {
+            &UNPACK_BYTE_VS
+        },
+    )?;
+    // The packed words enter as integer bits, not as a floating vertex format.
+    let mut msl = vertex_module(&vs)
+        .replace("float4 parameter; };", "uint4 parameter; };")
+        .replace(
+            "as_type<uint4>(input[vid].parameter)",
+            "input[vid].parameter",
+        )
+        .replace("center_no_perspective", "user(param0), flat");
+    msl.push_str(
+        "fragment float4 unpack_ps(Varyings input [[stage_in]]) { return input.parameter; }\n",
+    );
+    Ok(msl)
+}
+
 fn vertex_module(vs: &[Op]) -> String {
     // Only the entry/binding convention and one interpolation rule are authored
     // here. All moves, arithmetic, output operands and returns come from the lift.
@@ -901,6 +997,14 @@ mod tests {
         for (sgpr, component) in [(9, "x"), (14, "z")] {
             writeln!(asm, "s_mov_b32 m0, s{sgpr}\nv_interp_p1_f32_e32 v2, v0, attr0.{component}\nv_interp_p2_f32_e32 v2, v1, attr0.{component}\nexp mrt0 v2, v2, v2, v2 done\ns_endpgm").unwrap();
         }
+        for uint in [false, true] {
+            let (mask, cvt) = if uint {
+                ("-2", "v_cvt_f32_u32_e32")
+            } else {
+                ("2", "v_cvt_f32_ubyte0_e32")
+            };
+            writeln!(asm, "v_lshlrev_b32_e32 v8, 1, v5\nv_and_b32_e32 v9, {mask}, v4\nv_and_b32_e32 v10, 2, v8\n{cvt} v11, v9\nv_cvt_f32_ubyte0_e32 v12, v10\nv_fma_f32 v13, v11, 2.0, -1.0\nv_fma_f32 v14, v12, -2.0, 1.0\nexp param0 v13, v14, v11, v12\nexp pos0 v0, v1, v2, v3 done\ns_endpgm").unwrap();
+        }
         for n in 0..7 {
             let r = 4 + 4 * n;
             writeln!(asm, "exp param{n} v{r}, v{}, v{}, v{}", r + 1, r + 2, r + 3).unwrap();
@@ -925,6 +1029,8 @@ mod tests {
             .chain(TRIPLE_RG_PS)
             .chain(INTERP_X_PS)
             .chain(INTERP_Z_PS)
+            .chain(&UNPACK_BYTE_VS)
+            .chain(&UNPACK_UINT_VS)
             .chain(MULTI_VS)
             .flat_map(|w| w.to_le_bytes())
             .collect();
@@ -952,6 +1058,33 @@ mod tests {
                 .collect();
             assert_eq!(bytes, expected, "{cpu}");
         }
+    }
+
+    #[test]
+    fn unpack_checks_exact_masks_selectors_modifiers_and_live_inputs() {
+        assert!(lift(Stage::UnpackVertex, &UNPACK_BYTE_VS).is_ok());
+        assert!(lift(Stage::UnpackVertex, &UNPACK_UINT_VS).is_ok());
+        assert!(lift(Stage::Vertex, &UNPACK_BYTE_VS).is_err());
+        for (at, bit) in [
+            (0, 1),
+            (1, 1),
+            (1, 1 << 8),
+            (3, 1 << 9),
+            (5, 1 << 8),
+            (6, 1 << 28),
+            (6, 1 << 29),
+            (6, 1 << 9),
+        ] {
+            let mut changed = UNPACK_BYTE_VS;
+            changed[at] ^= bit;
+            assert!(lift(Stage::UnpackVertex, &changed).is_err(), "{at}:{bit}");
+        }
+        let mut changed = UNPACK_BYTE_VS;
+        changed[0] ^= 1 << 14;
+        assert!(matches!(
+            lift(Stage::UnpackVertex, &changed),
+            Err(Reject::Uninitialized(0, _))
+        ));
     }
 
     #[test]
