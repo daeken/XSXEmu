@@ -1127,6 +1127,37 @@ pub(crate) fn translate_red_fixture() -> Result<String, Reject> {
     Ok(msl)
 }
 
+// Owned M0=s9 (zero), then the raw P0 of attr0.x.
+const PARAM_MOV_PS: &[u32] = &[0xbefc_0309, 0xc80a_0002, 0xf800_1801, 2, 0xbf81_0000];
+
+fn param_mov_source(words: &[u32], m0: u32) -> Result<String, Reject> {
+    let [init, read, tail @ ..] = words else {
+        return Err(Reject::Unsupported(0));
+    };
+    if m0 != 0 || decode(&[*init], 0) != Ok((1, Op::InitInterpM0 { sgpr: 9 })) {
+        return Err(Reject::Unsupported(0));
+    }
+    if read & 0xfc03_ffff != 0xc802_0002 {
+        return Err(Reject::Unsupported(1));
+    }
+    let dst = Vgpr((read >> 18) as u8);
+    if decode(tail, 0) != Ok((2, Op::ExportRed { src: dst }))
+        || tail.get(2..) != Some(&[0xbf81_0000])
+    {
+        return Err(Reject::BadExports(2));
+    }
+    let mut msl = vertex_module(&lift(Stage::Vertex, VS)?);
+    msl.push_str("fragment float4 param_mov_ps(constant uint &bound_p0_attr0_x [[buffer(0)]]) { uint r[256]; float4 out;\n");
+    writeln!(msl, "  r[{}] = bound_p0_attr0_x;", dst.0).unwrap();
+    body(&mut msl, &[Op::ExportRed { src: dst }, Op::End]);
+    Ok(msl)
+}
+
+#[allow(dead_code)]
+pub(crate) fn translate_param_mov_fixture() -> Result<String, Reject> {
+    param_mov_source(PARAM_MOV_PS, 0)
+}
+
 const POS_FIRST_VS: &[u32] = &[
     0xf800_08cf,
     0x0302_0100, // POS0 DONE
@@ -1367,6 +1398,7 @@ mod tests {
         );
         asm.push_str("v_mul_f32_e32 v14, v0, v1\nv_add_f32_e32 v15, v0, v1\n");
         asm.push_str("v_sub_f32_e32 v12, 0, v0\nv_sub_f32_e32 v13, 0, v1\n");
+        asm.push_str("s_mov_b32 m0, s9\nv_interp_mov_f32_e32 v2, p0, attr0.x\nexp mrt0 v2, off, off, off done vm\ns_endpgm\n");
         for (sgpr, component) in [(9, "x"), (14, "z"), (9, "z")] {
             writeln!(asm, "s_mov_b32 m0, s{sgpr}\nv_interp_p1_f32_e32 v2, v0, attr0.{component}\nv_interp_p2_f32_e32 v2, v1, attr0.{component}\nexp mrt0 v2, v2, v2, v2 done\ns_endpgm").unwrap();
         }
@@ -1413,6 +1445,7 @@ mod tests {
             .chain(EDGE_MUL)
             .chain(EDGE_ADD)
             .chain(EDGE_SUB)
+            .chain(PARAM_MOV_PS)
             .chain(INTERP_X_PS)
             .chain(INTERP_Z_PS)
             .chain(&bound::archive_affine(true).unwrap().2)
@@ -1510,6 +1543,27 @@ mod tests {
             lift(Stage::ConstantRtzPixel, &words),
             Err(Reject::Uninitialized(2, 4))
         );
+    }
+
+    #[test]
+    fn owned_parameter_move_rejects_unbound_or_cross_wired_inputs() {
+        assert!(translate_param_mov_fixture().is_ok());
+        assert!(decode(PARAM_MOV_PS, 1).is_err());
+        assert!(param_mov_source(PARAM_MOV_PS, 1).is_err());
+        for (index, bits) in [
+            (0, 1),
+            (1, 2),
+            (1, 3),
+            (1, 0x100),
+            (1, 0x400),
+            (1, 0x40000),
+            (3, 1),
+            (4, 1),
+        ] {
+            let mut words = PARAM_MOV_PS.to_vec();
+            words[index] ^= bits;
+            assert!(param_mov_source(&words, 0).is_err());
+        }
     }
 
     #[test]

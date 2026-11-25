@@ -258,12 +258,26 @@ fn exact_opcode(
     })
 }
 
+pub(super) const INTERP_MOV_GAP: &str = "v_interp_mov_f32_e32/4B/operands-unclassified";
+
+// VINTERP e32 opcode 2, exact documented selector byte. Do not admit this
+// to the lowering decoder: it reads a raw LDS coefficient, not a varying.
+fn interp_mov_fields(w: u32) -> Option<(u8, u8, u8)> {
+    let attr = ((w >> 10) & 63) as u8;
+    (w & 0xfc03_0000 == 0xc802_0000 && w as u8 <= 2 && attr <= 32).then_some((
+        w as u8,
+        attr,
+        ((w >> 8) & 3) as u8,
+    ))
+}
+
 #[derive(Default)]
 pub(super) struct DirectGaps {
     pub missing: BTreeMap<String, usize>,
     pub ordinary_vgpr_mul: usize,
     pub ordinary_vgpr_add: usize,
     pub contiguous: bool,
+    pub interp_mov: BTreeMap<Option<(u8, u8, u8)>, usize>,
     pub packed_mrt0_noncanonical: [usize; 2], // RG / RGBA
 }
 
@@ -301,6 +315,9 @@ pub(super) fn direct_gaps(dis: &mut Disassembler, bytes: &[u8], slot: usize) -> 
                 Some((1, crate::graphics_decode::Op::MulF32 { .. }))
             ));
         } else {
+            if name == "v_interp_mov_f32_e32" && len == 4 {
+                *gaps.interp_mov.entry(interp_mov_fields(first)).or_default() += 1;
+            }
             *gaps
                 .missing
                 .entry(nearest_form(name, first, len, text))

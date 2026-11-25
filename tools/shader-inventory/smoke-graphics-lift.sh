@@ -75,12 +75,14 @@ compile packed-rg
 "$p" --expect-packed-rg-all-mask "$d/packed-rg.metallib"
 
 # Locally proven packed RTZ constants, including above-midpoint and signed zero.
-for variant in constant-rtz constant-rtz-rg red; do
+for variant in constant-rtz constant-rtz-rg red param-mov; do
     "$p" "--$variant-source"
     "$p" "--emit-$variant-msl" > "$d/$variant.metal"
     compile "$variant"
     "$p" "--load-$variant-metallib" "$d/$variant.metallib"
 done
+
+"$p" --expect-param-mov-other-coefficient "$d/param-mov.metallib"
 
 # Explicitly bound raw input, no PS live-ins, and full/RG export contracts.
 for variant in bound bound-rg; do

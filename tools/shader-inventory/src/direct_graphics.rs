@@ -205,6 +205,7 @@ struct GapCounts {
     ordinary_mul: (usize, usize),
     ordinary_add: (usize, usize),
     packed_cleared: [usize; 2],
+    interp_sole: BTreeMap<(usize, Option<(u8, u8, u8)>), usize>,
     packed_requirements: [BTreeMap<crate::graphics_semantics::Outcome, usize>; 2],
     linear_sole: BTreeMap<String, usize>,
     distances: BTreeMap<usize, usize>,
@@ -268,6 +269,12 @@ impl GapCounts {
                 );
             }
         }
+        if !self.interp_sole.is_empty() {
+            println!(
+                "    sole interp MOV form sites by (gaps in window, (selector, attribute, channel)): {:?}",
+                self.interp_sole
+            );
+        }
         let distances: Vec<_> = self.distances.into_iter().take(3).collect();
         println!("    nearest (unsupported sites, windows): {distances:?}");
         let mut leverage: Vec<_> = self.sole_forms.into_iter().collect();
@@ -297,6 +304,7 @@ pub(super) fn run_gaps(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), B
     );
     let mut waves = [llvm.context(cpu, false)?, llvm.context(cpu, true)?];
     let mut distinct = HashSet::new();
+    let mut interp_spans = HashSet::new();
     let mut packed_spans = [HashSet::new(), HashSet::new()];
     let mut counts: [[[GapCounts; 2]; STARTS.len()]; 2] = Default::default();
     for row in lib.graphics() {
@@ -319,6 +327,21 @@ pub(super) fn run_gaps(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), B
                 for (w, wave) in waves.iter_mut().enumerate() {
                     if let Some(gaps) = direct_gaps(wave, window, slot) {
                         counts[slot][i][w].note(&gaps);
+                        if slot == 0
+                            && gaps.contiguous
+                            && gaps.missing.len() == 1
+                            && let Some(&sites) = gaps
+                                .missing
+                                .get(super::graphics_reachability::INTERP_MOV_GAP)
+                        {
+                            interp_spans.insert(reference.program);
+                            for (&shape, &count) in &gaps.interp_mov {
+                                *counts[slot][i][w]
+                                    .interp_sole
+                                    .entry((sites, shape))
+                                    .or_default() += count;
+                            }
+                        }
                         if slot == 0 && gaps.contiguous && gaps.missing.is_empty() {
                             for (form, only_one) in [[1, 0], [0, 1]].into_iter().enumerate() {
                                 if gaps.packed_mrt0_noncanonical == only_one {
@@ -337,6 +360,10 @@ pub(super) fn run_gaps(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), B
             }
         }
     }
+    println!(
+        "  Distinct PS spans with sole interp MOV gap bucket across hypotheses: {}",
+        interp_spans.len()
+    );
     println!(
         "  Distinct PS spans with sole prior packed-selector blocker across hypotheses (RG / RGBA): {:?}",
         packed_spans.map(|spans| spans.len())

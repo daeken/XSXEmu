@@ -134,6 +134,8 @@ mod gpu {
         BoundAffineControl(InterpFixture),
         BoundAffineLoad(&'a Path, bool),
         BoundAffineMutatedLoad(&'a Path),
+        ParamMovSource,
+        ParamMovLoad(&'a Path, bool),
         RedSource,
         RedLoad(&'a Path),
         ConstantRtzSource(bool),
@@ -217,6 +219,12 @@ mod gpu {
                 print!("{}", graphics_lift::translate_interp_fixture(fixture).map_err(|e| format!("interpolation lift rejected: {e:?}"))?);
                 return Ok(());
             }
+            [mode] if mode == "--param-mov-source" => Mode::ParamMovSource,
+            [mode, lib] if mode == "--load-param-mov-metallib" || mode == "--expect-param-mov-other-coefficient" => Mode::ParamMovLoad(Path::new(lib), mode == "--expect-param-mov-other-coefficient"),
+            [mode] if mode == "--emit-param-mov-msl" => {
+                print!("{}", graphics_lift::translate_param_mov_fixture().map_err(|e| format!("P0 move rejected: {e:?}"))?);
+                return Ok(());
+            }
             [mode] if mode == "--red-source" => Mode::RedSource,
             [mode, lib] if mode == "--load-red-metallib" => Mode::RedLoad(Path::new(lib)),
             [mode] if mode == "--emit-red-msl" => {
@@ -294,7 +302,7 @@ mod gpu {
             [mode, lib, archive, compiler] if mode == "--bake-bound-affine-archive" || mode == "--replay-bound-affine-archive" || mode == "--replay-bound-affine-mutated-archive" => Mode::Archive(Path::new(lib), Path::new(archive), mode == "--bake-bound-affine-archive", mode == "--replay-bound-affine-mutated-archive", owned_graphics_artifact::compiler_profile(compiler)?, true),
             [mode, lib, archive] if mode == "--expect-owned-metal-miss" => Mode::ExpectStrictMiss(Path::new(lib), Path::new(archive), false),
             [mode, lib, archive, compiler] if mode == "--bake-archive" || mode == "--replay-archive" || mode == "--replay-mutated-archive" => Mode::Archive(Path::new(lib), Path::new(archive), mode == "--bake-archive", mode == "--replay-mutated-archive", owned_graphics_artifact::compiler_profile(compiler)?, false),
-            _ => return Err("usage: shader-metal-graphics-lift [--expect-swapped-triple | --triple-rg-source | --emit-triple-rg-msl | --load-triple-rg-metallib LIB | --triple-source | --emit-triple-msl | --load-triple-metallib LIB | --dual-source | --emit-dual-msl | --load-dual-metallib LIB | --bound-two-affine-source | --expect-bound-two-affine-swapped | --emit-bound-two-affine-msl | --load-bound-two-affine-metallib LIB | --expect-bound-affine-wrong-mode | --expect-bound-affine-wrong-channel | --bound-affine-{x,z}-source | --emit-bound-affine-{x,z}-msl | --load-bound-affine-{x,z}-metallib LIB | --interp-x-source | --interp-z-source | --expect-interp-wrong-mode | --expect-interp-wrong-channel | --emit-interp-x-msl | --emit-interp-z-msl | --load-interp-x-metallib LIB | --load-interp-z-metallib LIB | --constant-rtz[-rg]-source | --emit-constant-rtz[-rg]-msl | --load-constant-rtz[-rg]-metallib LIB | --expect-bound-swapped-component | --bound[-rg]-source | --emit-bound[-rg]-msl | --load-bound[-rg]-metallib LIB | --pos-first-source | --emit-pos-first-msl | --load-pos-first-metallib LIB | --wait-pos-source | --emit-wait-pos-msl | --load-wait-pos-metallib LIB | --expect-late-pos-read | --unpack-{byte,uint}-source | --emit-unpack-{byte,uint}-msl | --load-unpack-{byte,uint}-metallib LIB | --multi-source | --emit-multi-msl | --load-multi-metallib LIB | --expect-packed-rg-all-mask LIB | --packed-rg-source | --emit-packed-rg-msl | --load-packed-rg-metallib LIB | --wait-depth-source | --emit-wait-depth-msl | --load-wait-depth-metallib LIB | --expect-late-depth-read | --early-depth-source | --emit-early-depth-msl | --load-early-depth-metallib LIB | --depth-source | --emit-depth-msl | --load-depth-metallib LIB | --packed-source | --emit-packed-msl | --load-packed-metallib LIB | --emit-msl | --emit-mutated-msl | --load-metallib LIB | --load-mutated-metallib LIB | {--bake-archive|--replay-archive|--replay-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-owned-metal-miss MUTATED_LIB ARCHIVE | --emit-bound-affine-mutated-msl | --load-bound-affine-mutated-metallib LIB | {--bake-bound-affine-archive|--replay-bound-affine-archive|--replay-bound-affine-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-bound-affine-metal-miss MUTATED_LIB ARCHIVE]".into()),
+            _ => return Err("usage: shader-metal-graphics-lift [--param-mov-source | --emit-param-mov-msl | --load-param-mov-metallib LIB | --expect-param-mov-other-coefficient LIB | --expect-swapped-triple | --triple-rg-source | --emit-triple-rg-msl | --load-triple-rg-metallib LIB | --triple-source | --emit-triple-msl | --load-triple-metallib LIB | --dual-source | --emit-dual-msl | --load-dual-metallib LIB | --bound-two-affine-source | --expect-bound-two-affine-swapped | --emit-bound-two-affine-msl | --load-bound-two-affine-metallib LIB | --expect-bound-affine-wrong-mode | --expect-bound-affine-wrong-channel | --bound-affine-{x,z}-source | --emit-bound-affine-{x,z}-msl | --load-bound-affine-{x,z}-metallib LIB | --interp-x-source | --interp-z-source | --expect-interp-wrong-mode | --expect-interp-wrong-channel | --emit-interp-x-msl | --emit-interp-z-msl | --load-interp-x-metallib LIB | --load-interp-z-metallib LIB | --constant-rtz[-rg]-source | --emit-constant-rtz[-rg]-msl | --load-constant-rtz[-rg]-metallib LIB | --expect-bound-swapped-component | --bound[-rg]-source | --emit-bound[-rg]-msl | --load-bound[-rg]-metallib LIB | --pos-first-source | --emit-pos-first-msl | --load-pos-first-metallib LIB | --wait-pos-source | --emit-wait-pos-msl | --load-wait-pos-metallib LIB | --expect-late-pos-read | --unpack-{byte,uint}-source | --emit-unpack-{byte,uint}-msl | --load-unpack-{byte,uint}-metallib LIB | --multi-source | --emit-multi-msl | --load-multi-metallib LIB | --expect-packed-rg-all-mask LIB | --packed-rg-source | --emit-packed-rg-msl | --load-packed-rg-metallib LIB | --wait-depth-source | --emit-wait-depth-msl | --load-wait-depth-metallib LIB | --expect-late-depth-read | --early-depth-source | --emit-early-depth-msl | --load-early-depth-metallib LIB | --depth-source | --emit-depth-msl | --load-depth-metallib LIB | --packed-source | --emit-packed-msl | --load-packed-metallib LIB | --emit-msl | --emit-mutated-msl | --load-metallib LIB | --load-mutated-metallib LIB | {--bake-archive|--replay-archive|--replay-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-owned-metal-miss MUTATED_LIB ARCHIVE | --emit-bound-affine-mutated-msl | --load-bound-affine-mutated-metallib LIB | {--bake-bound-affine-archive|--replay-bound-affine-archive|--replay-bound-affine-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-bound-affine-metal-miss MUTATED_LIB ARCHIVE]".into()),
         };
         if matches!(mode, Mode::Archive(..) | Mode::ExpectStrictMiss(..))
             && std::env::var_os("MTL_SHADER_VALIDATION").is_some()
@@ -357,7 +365,9 @@ mod gpu {
             }),
             _ => None,
         };
-        let red = matches!(mode, Mode::RedSource | Mode::RedLoad(_));
+        let param_mov = matches!(mode, Mode::ParamMovSource | Mode::ParamMovLoad(..));
+        let other_coefficient = matches!(mode, Mode::ParamMovLoad(_, true));
+        let red = param_mov || matches!(mode, Mode::RedSource | Mode::RedLoad(_));
         let constant_rtz = match mode {
             Mode::ConstantRtzSource(rg) | Mode::ConstantRtzLoad(_, rg) => Some(rg),
             _ => None,
@@ -409,6 +419,7 @@ mod gpu {
             | Mode::BoundAffineSource(_)
             | Mode::BoundAffineControl(_)
             | Mode::RedSource
+            | Mode::ParamMovSource
             | Mode::ConstantRtzSource(_)
             | Mode::BoundSource(_)
             | Mode::BoundSwappedSource
@@ -451,6 +462,8 @@ mod gpu {
                     graphics_lift::translate_interp_fixture(interp)
                 } else if let Some(plan) = &bound_pair {
                     Ok(plan.source.clone())
+                } else if param_mov {
+                    graphics_lift::translate_param_mov_fixture()
                 } else if red {
                     graphics_lift::translate_red_fixture()
                 } else if let Some(rg) = constant_rtz {
@@ -483,6 +496,7 @@ mod gpu {
             | Mode::BoundTwoAffineLoad(path)
             | Mode::BoundAffineLoad(path, _)
             | Mode::BoundAffineMutatedLoad(path)
+            | Mode::ParamMovLoad(path, _)
             | Mode::RedLoad(path)
             | Mode::ConstantRtzLoad(path, _)
             | Mode::BoundLoad(path, _)
@@ -507,7 +521,11 @@ mod gpu {
         } else if bound_pair.is_some() {
             (MTLPixelFormat::RGBA32Float, 16, "bound_ps")
         } else if red {
-            (MTLPixelFormat::RGBA32Float, 16, "red_ps")
+            (
+                MTLPixelFormat::RGBA32Float,
+                16,
+                if param_mov { "param_mov_ps" } else { "red_ps" },
+            )
         } else if constant_rtz.is_some() {
             (MTLPixelFormat::RGBA32Float, 16, "constant_rtz_ps")
         } else if pos_first {
@@ -855,6 +873,14 @@ mod gpu {
                 enc.draw_primitives(MTLPrimitiveType::Triangle, 0, 3);
             }
         } else if red {
+            if param_mov {
+                let p0 = if other_coefficient {
+                    0xbe00_0000u32
+                } else {
+                    0x3f20_0000
+                };
+                enc.set_fragment_bytes(0, 4, (&p0 as *const u32).cast());
+            }
             enc.set_scissor_rect(MTLScissorRect {
                 x: 2,
                 y: 1,
@@ -963,8 +989,21 @@ mod gpu {
                 for x in 0..SIDE {
                     let at = y * STRIDE + x * 16;
                     let covered = (2..6).contains(&x) && (1..6).contains(&y);
-                    let expected =
-                        [if covered { 0.25f32 } else { 1. }, 0.5, 1., 0.75].map(f32::to_bits);
+                    let expected = [
+                        if !covered {
+                            1.
+                        } else if other_coefficient {
+                            -0.125f32
+                        } else if param_mov {
+                            0.625
+                        } else {
+                            0.25
+                        },
+                        0.5,
+                        1.,
+                        0.75,
+                    ]
+                    .map(f32::to_bits);
                     let actual: [u32; 4] = std::array::from_fn(|i| {
                         u32::from_le_bytes(pixels[at + 4 * i..at + 4 * i + 4].try_into().unwrap())
                     });
@@ -974,6 +1013,13 @@ mod gpu {
                         ));
                     }
                 }
+            }
+            if param_mov {
+                println!(
+                    "{} owned explicit attr0.x P0 move (substituted={other_coefficient}): 64/64 pixels bit-exact, 20 coefficient writes",
+                    dev.name()
+                );
+                return Ok(());
             }
             println!(
                 "{} owned final MRT0 R-only export: 64/64 pixels bit-exact (20 red writes, GBA preserved)",
