@@ -119,6 +119,21 @@ fn ambiguous_missing_unsupported_and_inconsistent_evidence_cannot_key() {
 }
 
 #[test]
+fn fixed_float_pipeline_has_distinct_identity_and_requires_graphics_pair() {
+    let mut r = owned();
+    let rgba8 = r.admit().unwrap();
+    valid(&mut r.descriptor).pipeline = Pipeline::ProceduralTriangleRgba32Float;
+    let float = r.admit().unwrap();
+    assert_ne!(float, rgba8);
+    r.stages.reverse();
+    assert_eq!(r.admit(), Ok(float));
+    r.stages.pop();
+    assert_eq!(r.admit(), Err(Failure::Unsupported));
+    r.stages = vec![stage(Stage::Compute, "owned_cs")];
+    assert_eq!(r.admit(), Err(Failure::Unsupported));
+}
+
+#[test]
 fn compute_shape_and_launch_key() {
     let mut r = owned();
     r.stages = vec![stage(Stage::Compute, "owned_cs")];

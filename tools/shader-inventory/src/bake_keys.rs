@@ -83,6 +83,9 @@ pub enum Pipeline {
         alpha_blend: bool,
         depth: Depth,
     },
+    /// Procedural triangle list, filled, no culling, one sample, one linear
+    /// RGBA32Float attachment, all channels written, no blend, depth or stencil.
+    ProceduralTriangleRgba32Float,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -209,6 +212,10 @@ impl Request {
                     return Err(Failure::Invalid);
                 }
                 pipeline.extend([2, write_mask, u8::from(alpha_blend), depth as u8]);
+            }
+            (Pipeline::ProceduralTriangleRgba32Float, [Stage::Vertex, Stage::Fragment]) => {
+                // Tag 3 fully specifies the fixed profile; tags 1 and 2 are unchanged.
+                pipeline.push(3);
             }
             _ => return Err(Failure::Unsupported),
         }
