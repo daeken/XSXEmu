@@ -7,6 +7,14 @@ use registry::{Geometry, GuestVa, HeapHandle, SlotHandle, TitleDescriptorHeaps};
 use std::ops::Range;
 
 const MEASURED_COUNTS: [u32; 3] = [0x20000, 0x30000, 0x8000];
+const MEASURED_KIND: u64 = 0;
+const PAGE_BYTES: usize = ALIGNMENT as usize;
+
+#[repr(C, align(65536))]
+struct AlignedPage([u8; PAGE_BYTES]);
+
+const _: () = assert!(std::mem::size_of::<AlignedPage>() == PAGE_BYTES);
+const _: () = assert!(PAGE_BYTES % OWNED_INCREMENT as usize == 0);
 const ALIGNMENT: u64 = 0x10000;
 const OWNED_INCREMENT: u32 = 32; // Original opaque-byte policy, not a measured console stride.
 const FIXTURE_FILL: u8 = 0xcc;
@@ -21,6 +29,8 @@ enum Error {
     BackingLimit,
     BackingAllocation,
     WrongRecordWidth,
+    WrongHeapKind,
+    WrongPlacedBase,
     Registry(registry::Error),
 }
 
@@ -86,43 +96,62 @@ struct OwnedBacking {
     base: GuestVa,
     regions: [RegionSize; 2],
     addresses: TitleDescriptorHeaps,
-    bytes: Vec<u8>,
+    kind: u64,
+    pages: Vec<AlignedPage>,
 }
 
 impl OwnedBacking {
-    fn new(base: GuestVa, counts: [u32; 3]) -> Result<Self, Error> {
-        if base.0 % ALIGNMENT != 0 {
-            return Err(registry::Error::MisalignedBase.into());
+    fn new(kind: u64, counts: [u32; 3]) -> Result<Self, Error> {
+        if kind != MEASURED_KIND {
+            return Err(Error::WrongHeapKind);
         }
         let (regions, total) = sizing_inputs(counts, OWNED_INCREMENT)?;
         if total > MAX_OWNED_BYTES {
             return Err(Error::BackingLimit);
         }
-        let end = base.0.checked_add(total).ok_or(Error::Overflow)?;
-        let addresses = TitleDescriptorHeaps::new(base..GuestVa(end))?;
-        let len = usize::try_from(total).map_err(|_| Error::Overflow)?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(len)
+        let page_count = usize::try_from(total / ALIGNMENT).map_err(|_| Error::Overflow)?;
+        let mut pages = Vec::new();
+        pages
+            .try_reserve_exact(page_count)
             .map_err(|_| Error::BackingAllocation)?;
-        bytes.resize(len, FIXTURE_FILL);
+        pages.resize_with(page_count, || AlignedPage([FIXTURE_FILL; PAGE_BYTES]));
+        // The address registry only uses numbers. No address-to-pointer cast or
+        // raw dereference is used: records are reached via checked slice indices.
+        let base = GuestVa(pages.as_ptr().addr() as u64);
+        let addresses = TitleDescriptorHeaps::new(backing_window(base, total)?)?;
         Ok(Self {
             base,
             regions,
             addresses,
-            bytes,
+            kind,
+            pages,
         })
     }
 
+    fn check_kind(&self, kind: u64) -> Result<(), Error> {
+        if kind != self.kind {
+            return Err(Error::WrongHeapKind);
+        }
+        Ok(())
+    }
+
     /// Claim one of the two checked spans without interpreting its bytes.
-    fn place(&mut self, region: Region) -> Result<HeapHandle, Error> {
+    fn place(
+        &mut self,
+        region: Region,
+        kind: u64,
+        supplied_base: GuestVa,
+    ) -> Result<HeapHandle, Error> {
+        self.check_kind(kind)?;
         let (offset, size) = match region {
             Region::Primary => (0, self.regions[0]),
             Region::Secondary => (self.regions[0].bytes, self.regions[1]),
         };
-        let base = GuestVa(self.base.0.checked_add(offset).ok_or(Error::Overflow)?);
+        if supplied_base.0 != self.base.0.checked_add(offset).ok_or(Error::Overflow)? {
+            return Err(Error::WrongPlacedBase);
+        }
         Ok(self.addresses.register(
-            base,
+            supplied_base,
             size.slots,
             Geometry {
                 stride: u64::from(OWNED_INCREMENT),
@@ -131,7 +160,21 @@ impl OwnedBacking {
         )?)
     }
 
-    fn slot_bytes(&self, token: &SlotHandle) -> Result<Range<usize>, Error> {
+    fn cpu_start(&self, heap: &HeapHandle, kind: u64) -> Result<GuestVa, Error> {
+        self.check_kind(kind)?;
+        Ok(self
+            .addresses
+            .resolve(&self.addresses.slot(heap, 0)?)?
+            .start)
+    }
+
+    fn locate(&self, address: GuestVa, kind: u64) -> Result<SlotHandle, Error> {
+        self.check_kind(kind)?;
+        Ok(self.addresses.locate(address)?)
+    }
+
+    fn slot_bytes(&self, token: &SlotHandle, kind: u64) -> Result<(usize, Range<usize>), Error> {
+        self.check_kind(kind)?;
         let range = self.addresses.resolve(token)?;
         let offset = |address: GuestVa| {
             address
@@ -140,27 +183,51 @@ impl OwnedBacking {
                 .and_then(|delta| usize::try_from(delta).ok())
                 .ok_or(Error::Overflow)
         };
-        Ok(offset(range.start)?..offset(range.end)?)
+        let start = offset(range.start)?;
+        let end = offset(range.end)?;
+        let page = start / PAGE_BYTES;
+        let origin = page * PAGE_BYTES;
+        Ok((page, start - origin..end - origin))
     }
 
-    fn write(&mut self, token: &SlotHandle, record: &[u8]) -> Result<(), Error> {
-        let range = self.slot_bytes(token)?;
+    fn write(&mut self, token: &SlotHandle, kind: u64, record: &[u8]) -> Result<(), Error> {
+        let (page, range) = self.slot_bytes(token, kind)?;
         if record.len() != range.len() {
             return Err(Error::WrongRecordWidth);
         }
-        self.bytes
-            .get_mut(range)
+        self.pages
+            .get_mut(page)
+            .and_then(|page| page.0.get_mut(range))
             .ok_or(registry::Error::OutsideWindow)?
             .copy_from_slice(record);
         Ok(())
     }
 
-    fn read(&self, token: &SlotHandle) -> Result<&[u8], Error> {
+    fn read(&self, token: &SlotHandle, kind: u64) -> Result<&[u8], Error> {
+        let (page, range) = self.slot_bytes(token, kind)?;
         Ok(self
-            .bytes
-            .get(self.slot_bytes(token)?)
+            .pages
+            .get(page)
+            .and_then(|page| page.0.get(range))
             .ok_or(registry::Error::OutsideWindow)?)
     }
+
+    fn assert_bytes(&self, expected: &[u8]) {
+        assert_eq!(self.pages.len() * PAGE_BYTES, expected.len());
+        for (page, expected) in self.pages.iter().zip(expected.chunks_exact(PAGE_BYTES)) {
+            assert_eq!(&page.0[..], expected);
+        }
+    }
+}
+
+fn backing_window(base: GuestVa, bytes: u64) -> Result<Range<GuestVa>, Error> {
+    if base.0 % ALIGNMENT != 0 {
+        return Err(registry::Error::MisalignedBase.into());
+    }
+    if base.0 == 0 {
+        return Err(registry::Error::InvalidWindow.into());
+    }
+    Ok(base..GuestVa(base.0.checked_add(bytes).ok_or(Error::Overflow)?))
 }
 
 #[test]
@@ -209,33 +276,67 @@ fn measured_spans_round_trip_without_identifying_a_unique_increment() {
 
 #[test]
 fn exact_cpu_handles_write_one_record_in_the_correct_owned_span() {
-    let base = GuestVa(0x12_0000_0000);
-    let mut backing = OwnedBacking::new(base, MEASURED_COUNTS).unwrap();
-    let primary = backing.place(Region::Primary).unwrap();
-    let secondary = backing.place(Region::Secondary).unwrap();
+    let mut backing = OwnedBacking::new(MEASURED_KIND, MEASURED_COUNTS).unwrap();
+    let base = GuestVa(backing.pages[0].0.as_ptr().addr() as u64);
+    let second_base = GuestVa(backing.pages[0xa0].0.as_ptr().addr() as u64);
+    assert_eq!(base.0 % ALIGNMENT, 0);
+    assert_eq!(second_base.0 % ALIGNMENT, 0);
+    assert_eq!(second_base.0, base.0 + 0xa00000);
+    for wrong_base in [second_base, GuestVa(base.0 + 32)] {
+        assert_eq!(
+            backing
+                .place(Region::Primary, MEASURED_KIND, wrong_base)
+                .unwrap_err(),
+            Error::WrongPlacedBase
+        );
+    }
+    let wrong_kind = 1u64 << 32; // low dword still matches
+    assert_eq!(
+        backing
+            .place(Region::Primary, wrong_kind, base)
+            .unwrap_err(),
+        Error::WrongHeapKind
+    );
+    let primary = backing.place(Region::Primary, MEASURED_KIND, base).unwrap();
+    let secondary = backing
+        .place(Region::Secondary, MEASURED_KIND, second_base)
+        .unwrap();
+    assert_eq!(backing.cpu_start(&primary, MEASURED_KIND), Ok(base));
+    assert_eq!(
+        backing.cpu_start(&secondary, MEASURED_KIND),
+        Ok(second_base)
+    );
+    assert_eq!(
+        backing.cpu_start(&primary, wrong_kind),
+        Err(Error::WrongHeapKind)
+    );
     let stride = u64::from(OWNED_INCREMENT);
     let mut expected = vec![FIXTURE_FILL; 0xb00000];
     for (heap, region_base, index, expected_offset, mark) in [
         (&primary, base.0, 0, 0, 1),
         (&primary, base.0, 1, 0x20, 2),
+        (&primary, base.0, 0x7ff, 0xffe0, 6),
+        (&primary, base.0, 0x800, 0x10000, 7),
         (&primary, base.0, 0x4ffff, 0x9fffe0, 3),
         (&secondary, base.0 + 0xa00000, 0, 0xa00000, 4),
         (&secondary, base.0 + 0xa00000, 0x7fff, 0xafffe0, 5),
     ] {
         let address = GuestVa(region_base + index * stride);
         assert_eq!(address.0, base.0 + expected_offset as u64);
-        let looked_up = backing.addresses.locate(address).unwrap();
+        let looked_up = backing.locate(address, MEASURED_KIND).unwrap();
         let indexed = backing.addresses.slot(heap, index).unwrap();
         assert_eq!(
             backing.addresses.resolve(&indexed),
             Ok(address..GuestVa(address.0 + stride))
         );
         let record = [mark; OWNED_INCREMENT as usize];
-        backing.write(&indexed, &record).unwrap();
-        assert_eq!(backing.read(&looked_up).unwrap(), &record);
+        backing.write(&indexed, MEASURED_KIND, &record).unwrap();
+        let bytes = backing.read(&looked_up, MEASURED_KIND).unwrap();
+        assert_eq!(bytes.as_ptr().addr() as u64, address.0);
+        assert_eq!(bytes, &record);
         expected[expected_offset..expected_offset + record.len()].copy_from_slice(&record);
     }
-    assert_eq!(backing.bytes, expected);
+    backing.assert_bytes(&expected);
 
     for (heap, count) in [(&primary, 0x50000), (&secondary, 0x8000)] {
         assert_eq!(
@@ -260,44 +361,79 @@ fn exact_cpu_handles_write_one_record_in_the_correct_owned_span() {
     let last_primary = backing.addresses.slot(&primary, 0x4ffff).unwrap();
     for wrong_width in [0, 31, 33] {
         assert_eq!(
-            backing.write(&last_primary, &vec![0xff; wrong_width]),
+            backing.write(&last_primary, MEASURED_KIND, &vec![0xff; wrong_width]),
             Err(Error::WrongRecordWidth)
         );
     }
-    assert_eq!(backing.bytes, expected);
+    assert_eq!(
+        backing.locate(base, wrong_kind).unwrap_err(),
+        Error::WrongHeapKind
+    );
+    assert_eq!(
+        backing.read(&last_primary, wrong_kind),
+        Err(Error::WrongHeapKind)
+    );
+    assert_eq!(
+        backing.write(&last_primary, wrong_kind, &[0xff; 32]),
+        Err(Error::WrongHeapKind)
+    );
+    backing.assert_bytes(&expected);
 }
 
 #[test]
 fn stale_and_foreign_tokens_cannot_touch_bytes_after_same_address_reuse() {
-    let base = GuestVa(0x12_0000_0000);
-    let mut backing = OwnedBacking::new(base, MEASURED_COUNTS).unwrap();
-    let mut other = OwnedBacking::new(base, MEASURED_COUNTS).unwrap();
-    let old_heap = backing.place(Region::Primary).unwrap();
-    let old = backing.addresses.locate(base).unwrap();
-    let other_heap = other.place(Region::Primary).unwrap();
+    let mut backing = OwnedBacking::new(MEASURED_KIND, MEASURED_COUNTS).unwrap();
+    let mut other = OwnedBacking::new(MEASURED_KIND, MEASURED_COUNTS).unwrap();
+    let (base, other_base) = (backing.base, other.base);
+    assert_ne!(base, other_base);
+    let old_heap = backing.place(Region::Primary, MEASURED_KIND, base).unwrap();
+    let old = backing.locate(base, MEASURED_KIND).unwrap();
+    let other_heap = other
+        .place(Region::Primary, MEASURED_KIND, other_base)
+        .unwrap();
+    assert_eq!(
+        backing
+            .place(Region::Primary, MEASURED_KIND, other_base)
+            .unwrap_err(),
+        Error::WrongPlacedBase
+    );
+    assert_eq!(
+        backing.cpu_start(&other_heap, MEASURED_KIND),
+        Err(registry::Error::StaleOrForeignHeap.into())
+    );
     let foreign = other.addresses.slot(&other_heap, 0).unwrap();
     backing.addresses.unregister(&old_heap).unwrap();
     assert_eq!(
         backing.addresses.locate(base).unwrap_err(),
         registry::Error::UnregisteredAddress
     );
-    let replacement = backing.place(Region::Primary).unwrap();
+    let replacement = backing.place(Region::Primary, MEASURED_KIND, base).unwrap();
+    assert_eq!(backing.cpu_start(&replacement, MEASURED_KIND), Ok(base));
+    assert_eq!(
+        backing.cpu_start(&old_heap, MEASURED_KIND),
+        Err(registry::Error::StaleOrForeignHeap.into())
+    );
     let current = backing.addresses.slot(&replacement, 0).unwrap();
     let record = [0x11; OWNED_INCREMENT as usize];
-    backing.write(&current, &record).unwrap();
+    backing.write(&current, MEASURED_KIND, &record).unwrap();
     for invalid in [old, foreign] {
         assert_eq!(
-            backing.write(&invalid, &[0x22; OWNED_INCREMENT as usize]),
+            backing.write(&invalid, MEASURED_KIND, &[0x22; OWNED_INCREMENT as usize]),
             Err(registry::Error::StaleOrForeignHeap.into())
         );
         assert_eq!(
-            backing.read(&invalid),
+            backing.read(&invalid, MEASURED_KIND),
             Err(registry::Error::StaleOrForeignHeap.into())
         );
     }
-    assert_eq!(backing.read(&current).unwrap(), &record);
+    assert_eq!(backing.read(&current, MEASURED_KIND).unwrap(), &record);
     assert_eq!(
-        other.read(&other.addresses.locate(base).unwrap()).unwrap(),
+        other
+            .read(
+                &other.locate(other_base, MEASURED_KIND).unwrap(),
+                MEASURED_KIND
+            )
+            .unwrap(),
         &[FIXTURE_FILL; OWNED_INCREMENT as usize]
     );
 }
@@ -315,19 +451,25 @@ fn rejects_bad_sizing_and_unrepresentable_or_unbounded_windows() {
         Err(Error::Overflow)
     );
     assert!(matches!(
-        OwnedBacking::new(GuestVa(0), MEASURED_COUNTS),
+        backing_window(GuestVa(0), 0xb00000),
         Err(Error::Registry(registry::Error::InvalidWindow))
     ));
     assert!(matches!(
-        OwnedBacking::new(GuestVa(ALIGNMENT + 1), MEASURED_COUNTS),
+        backing_window(GuestVa(ALIGNMENT + 1), 0xb00000),
         Err(Error::Registry(registry::Error::MisalignedBase))
     ));
     assert!(matches!(
-        OwnedBacking::new(GuestVa(u64::MAX & !(ALIGNMENT - 1)), MEASURED_COUNTS),
+        backing_window(GuestVa(u64::MAX & !(ALIGNMENT - 1)), 0xb00000),
         Err(Error::Overflow)
     ));
     assert!(matches!(
-        OwnedBacking::new(GuestVa(ALIGNMENT), [0x10_0000, 0, 1]),
+        OwnedBacking::new(MEASURED_KIND, [0x10_0000, 0, 1]),
         Err(Error::BackingLimit)
     ));
+    for kind in [1, 2, 3, 1 << 32] {
+        assert!(matches!(
+            OwnedBacking::new(kind, MEASURED_COUNTS),
+            Err(Error::WrongHeapKind)
+        ));
+    }
 }
