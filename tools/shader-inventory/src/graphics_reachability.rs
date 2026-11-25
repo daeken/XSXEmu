@@ -509,6 +509,75 @@ pub(super) fn direct_gaps(dis: &mut Disassembler, bytes: &[u8], slot: usize) -> 
     (ended && qualifies).then_some(gaps)
 }
 
+pub(super) const SETPRIO3_FORM: &str = "s_setprio/imm-3/4B";
+const SETPRIO3: u32 = 0xbf8f_0003;
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum SetprioPlacement {
+    WindowHead,
+    ImmediatelyAfterPrefetch3,
+    LaterBeforeFirstExport,
+    AfterAnExport,
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct SetprioProjection {
+    placement: SetprioPlacement,
+    dataflow: crate::graphics_semantics::Outcome,
+}
+
+// Audit only: model the other words to count residual dataflow predicates.
+// This neither lowers the scheduling write nor changes original closure.
+pub(super) fn project_sole_setprio3(
+    dis: &mut Disassembler,
+    bytes: &[u8],
+) -> Option<SetprioProjection> {
+    use crate::graphics_decode::{Op, decode};
+    let mut words = Vec::new();
+    let mut valid = true;
+    let mut site = None;
+    let mut first_export = None;
+    let exp = project_exports_observe(dis, bytes, false, |tail, len, text| {
+        let pc = words.len();
+        let name = text.split_ascii_whitespace().next().unwrap_or_default();
+        let first = word(tail, 0).unwrap_or_default() as u32;
+        let pair = [first, word(tail, 4).unwrap_or_default() as u32];
+        let Some(inst) = pair.get(..len / 4) else {
+            valid = false;
+            return;
+        };
+        valid &= tail.len() + pc * 4 == bytes.len();
+        if name == "s_setprio" && len == 4 && first == SETPRIO3 {
+            valid &= site.replace(pc).is_none();
+            // Preserve dword positions, for this private counterfactual only.
+            words.push(0xbf80_0000);
+        } else {
+            valid &= exact_opcode(decode(inst, 0).ok(), len, name);
+            if name == "exp" {
+                first_export.get_or_insert(pc);
+            }
+            words.extend_from_slice(inst);
+        }
+    })
+    .ok()?;
+    if !valid || exp.positions[0] & !1 == 0 || words.last() != Some(&0xbf81_0000) {
+        return None;
+    }
+    let site = site?;
+    let placement = match site {
+        0 => SetprioPlacement::WindowHead,
+        1 if decode(&words, 0) == Ok((1, Op::PrefetchThreeLines)) => {
+            SetprioPlacement::ImmediatelyAfterPrefetch3
+        }
+        _ if site < first_export? => SetprioPlacement::LaterBeforeFirstExport,
+        _ => SetprioPlacement::AfterAnExport,
+    };
+    Some(SetprioProjection {
+        placement,
+        dataflow: crate::graphics_semantics::audit(&words, true),
+    })
+}
+
 fn checked_exports(dis: &mut Disassembler, bytes: &[u8]) -> Result<Exports, ResultClass> {
     project_exports(dis, bytes, false)
 }
@@ -2160,6 +2229,66 @@ mod tests {
         changed.swap(6, 7);
         assert_eq!(check(&changed), ShapeUnproven);
         assert_eq!(check(&exact[..12]), ShapeUnproven);
+    }
+
+    #[test]
+    fn setprio_projection_is_exact_and_does_not_clear_encoding_gap() {
+        use crate::graphics_decode::decode;
+        use crate::graphics_semantics::{Need, VertexOrder};
+        assert!(decode(&[SETPRIO3], 0).is_err());
+        let Some(path) = std::env::var_os("LLVM_DISASM_LIB") else {
+            return;
+        };
+        let _serial_llvm = crate::llvm::test_lock();
+        let llvm = Llvm::load(&path).unwrap();
+        let exact = [
+            0xbfa0_0003u32,
+            SETPRIO3,
+            0xf800_08cf,
+            0x0302_0100,
+            0xf800_0203,
+            0x0504,
+            0xbf81_0000,
+        ];
+        let bytes = |words: &[u32]| {
+            words
+                .iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect::<Vec<_>>()
+        };
+        for cpu in [Cpu::Gfx1013, Cpu::Gfx1030] {
+            for wave32 in [false, true] {
+                let mut dis = llvm.context(cpu, wave32).unwrap();
+                for (start, placement) in [
+                    (0, SetprioPlacement::ImmediatelyAfterPrefetch3),
+                    (1, SetprioPlacement::WindowHead),
+                ] {
+                    let window = bytes(&exact[start..]);
+                    let gaps = direct_gaps(&mut dis, &window, 1).unwrap();
+                    assert_eq!(gaps.operand_forms, [(SETPRIO3_FORM.into(), 1)].into());
+                    let projection = project_sole_setprio3(&mut dis, &window).unwrap();
+                    assert_eq!(projection.placement, placement);
+                    assert!(projection.dataflow.gaps.is_empty());
+                    assert_eq!(
+                        projection.dataflow.needs,
+                        [Need::EntryVgpr, Need::VertexOutputLink].into()
+                    );
+                    assert_eq!(
+                        projection.dataflow.vertex_order,
+                        Some(VertexOrder::PositionFirst)
+                    );
+                }
+                let mut other_imm = exact;
+                other_imm[1] ^= 1;
+                let mut duplicate = exact.to_vec();
+                duplicate.insert(2, SETPRIO3);
+                let mut with_wait = exact.to_vec();
+                with_wait.insert(2, WAIT_EXPORT_ZERO);
+                for words in [other_imm.as_slice(), &duplicate, &with_wait, &exact[..6]] {
+                    assert!(project_sole_setprio3(&mut dis, &bytes(words)).is_none());
+                }
+            }
+        }
     }
 
     #[test]

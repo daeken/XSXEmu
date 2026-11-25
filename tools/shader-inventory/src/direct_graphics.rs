@@ -2,7 +2,8 @@
 use crate::{
     ARCHIVE_LIMIT, BLOB_LIMIT,
     graphics_reachability::{
-        DirectGaps, DirectResult as ResultClass, direct_gaps, direct_result, exact_semantics,
+        DirectGaps, DirectResult as ResultClass, SETPRIO3_FORM, SetprioProjection, direct_gaps,
+        direct_result, exact_semantics, project_sole_setprio3,
     },
     llvm::{Cpu, Llvm},
     wrapped_library::library_to_final_marker,
@@ -455,6 +456,9 @@ pub(super) fn run_gaps(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), B
     let mut interp_spans = HashSet::new();
     let mut partial_param_spans = HashSet::new();
     let mut inline_first_fma_spans = [HashSet::new(), HashSet::new()];
+    let mut setprio_spans = HashSet::new();
+    let mut setprio: [[BTreeMap<Option<SetprioProjection>, usize>; 2]; STARTS.len()] =
+        Default::default();
     let mut packed_spans = [HashSet::new(), HashSet::new()];
     let mut vs_sets = BTreeMap::<Vec<String>, HashMap<_, (usize, u8)>>::new();
     let mut pair_spans = [PairSpans::new(), PairSpans::new()];
@@ -485,6 +489,15 @@ pub(super) fn run_gaps(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), B
                         }
                         if slot == 1 && gaps.partial_param0 != 0 {
                             partial_param_spans.insert(reference.program);
+                        }
+                        if slot == 1
+                            && gaps.operand_forms.len() == 1
+                            && gaps.operand_forms.get(SETPRIO3_FORM) == Some(&1)
+                        {
+                            setprio_spans.insert(reference.program);
+                            *setprio[i][w]
+                                .entry(project_sole_setprio3(wave, window))
+                                .or_default() += 1;
                         }
                         if slot == 1 && !gaps.operand_forms.is_empty() {
                             let key = gaps.operand_forms.keys().cloned().collect();
@@ -555,6 +568,19 @@ pub(super) fn run_gaps(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), B
         "  Distinct spans with either exact inline-first VOP3 FMA across hypotheses (PS / VS): {:?}",
         inline_first_fma_spans.map(|spans| spans.len())
     );
+    println!(
+        "  Sole one-site SETPRIO imm3: {} distinct VS spans across hypotheses",
+        setprio_spans.len()
+    );
+    for (start, waves) in STARTS.into_iter().zip(setprio) {
+        for (wave, projections) in [64, 32].into_iter().zip(waves) {
+            for (projection, n) in projections {
+                println!(
+                    "    +{start} wave{wave}: {n} windows; SETPRIO dataflow-only projection (not encoding coverage): {projection:?}"
+                );
+            }
+        }
+    }
     let mut vs_sets: Vec<_> = vs_sets.into_iter().collect();
     vs_sets.sort_unstable_by(|(a, x), (b, y)| {
         a.len()
