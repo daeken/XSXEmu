@@ -165,6 +165,8 @@ audited_bridges! {
         crate::win_window::native::create_window_ex_a, (ex: u32, class: usize, title: usize, style: u32, x: i32, y: i32, width: i32, height: i32, parent: usize, menu: usize, instance: usize, param: usize) -> usize;
     xsxemu_tls_def_window_proc_a, def_window_proc_a: b"ext-ms-win-rtcore-ntuser-window-ansi-l1-1-0.dll", b"DefWindowProcA",
         crate::win_window::native::def_window_proc_a, (hwnd: usize, msg: u32, wp: usize, lp: usize) -> isize;
+    xsxemu_tls_show_window, show_window: b"ext-ms-win-rtcore-ntuser-window-l1-1-0.dll", b"ShowWindow",
+        crate::win_window::native::show_window, (hwnd: usize, command: i32) -> i32;
     xsxemu_tls_register_class_ex_a, register_class_ex_a: b"ext-ms-win-rtcore-ntuser-window-ansi-l1-1-0.dll", b"RegisterClassExA",
         crate::win_class::native::register_class_ex_a, (class: usize) -> u16;
     xsxemu_tls_register_app_state, register_app_state: b"api-ms-win-core-psm-appnotify-l1-1-0.dll", b"RegisterAppStateChangeNotification",

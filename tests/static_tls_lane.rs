@@ -3416,6 +3416,15 @@ unsafe extern "C" {
 
 #[test]
 fn owned_appkit_window_uses_checked_synchronous_creation_callbacks() {
+    run_owned_appkit_window(false);
+}
+
+#[test]
+fn owned_appkit_show_normal_reports_prior_visibility() {
+    run_owned_appkit_window(true);
+}
+
+fn run_owned_appkit_window(show: bool) {
     if !rosetta() {
         return;
     }
@@ -3432,7 +3441,7 @@ fn owned_appkit_window_uses_checked_synchronous_creation_callbacks() {
     }
     unsafe { CFRelease(session) };
     let scratch = Scratch::new();
-    let exe = create_window_fixture(true, false);
+    let exe = create_window_fixture(true, show);
     let path = scratch.write("owned-real-window.exe", &exe);
     let output = run(&path, &[OPT, TRUSTED, "--rust-providers"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -3448,6 +3457,10 @@ fn owned_appkit_window_uses_checked_synchronous_creation_callbacks() {
         32,
         "{stderr}"
     );
+    if show {
+        assert!(stderr.contains("command=1 (guest error 1400)"), "{stderr}");
+        assert!(stderr.contains("command=5 (guest error 50)"), "{stderr}");
+    }
     expect(output, 54, "Guest entry returned 54");
 }
 
@@ -3483,7 +3496,16 @@ fn create_window_fixture(admit_callback: bool, import_show: bool) -> Vec<u8> {
             fixture.entry
         } as usize,
     );
-    w32(&mut exe, file(MODE) + 4, usize::from(!admit_callback));
+    assert!(admit_callback || !import_show);
+    w32(
+        &mut exe,
+        file(MODE) + 4,
+        if import_show {
+            2
+        } else {
+            usize::from(!admit_callback)
+        },
+    );
     exe[file(TEXT)..file(TEXT) + RAW].fill(0xcc);
     put(&mut exe, file(TEXT), &fixture.code);
     w32(&mut exe, OP + 16, TEXT + fixture.entry as usize);
@@ -3522,22 +3544,26 @@ fn create_window_fixture(admit_callback: bool, import_show: bool) -> Vec<u8> {
 }
 
 #[test]
-fn exact_show_window_stays_unbound_even_with_creation_imports() {
+fn show_window_requires_trusted_offline_and_exact_neutral_contract() {
     if !rosetta() {
         return;
     }
     let scratch = Scratch::new();
-    let path = scratch.write(
-        "owned-no-show-window.exe",
-        &create_window_fixture(true, true),
-    );
-    let output = run(&path, &[OPT, TRUSTED, "--rust-providers"]);
-    let diagnostic = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        diagnostic.contains("ext-ms-win-rtcore-ntuser-window-l1-1-0.dll"),
-        "{diagnostic}"
-    );
-    expect(output, 1, "incomplete dependency graph");
+    let neutral = b"ext-ms-win-rtcore-ntuser-window-l1-1-0.dll\0";
+    for (dll, flags) in [
+        (neutral.as_slice(), &[OPT, "--rust-providers"][..]),
+        (neutral.as_slice(), &[OPT, TRUSTED][..]),
+        (WINDOW_CLASS_DLL, &[OPT, TRUSTED, "--rust-providers"][..]),
+        (
+            b"user32.dll\0".as_slice(),
+            &[OPT, TRUSTED, "--rust-providers"][..],
+        ),
+    ] {
+        let mut exe = image(Kind::Solo);
+        dir_import_one(&mut exe, dll, b"ShowWindow\0");
+        let path = scratch.write("owned-no-show-window.exe", &exe);
+        expect(run(&path, flags), 1, "incomplete dependency graph");
+    }
 }
 
 #[test]

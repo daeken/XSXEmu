@@ -85,7 +85,7 @@ impl Ui {
             if app == 0 {
                 return None;
             }
-            // No activation, launch notification, ordering, or event pump.
+            // No activation, launch notification, or event pump.
             Some(Self {
                 next: 0x10000,
                 windows: BTreeMap::new(),
@@ -184,6 +184,25 @@ impl Ui {
                 win.ready = true;
                 Ok(hwnd)
             }
+            Operation::ShowNormal { hwnd } => {
+                let win = self
+                    .windows
+                    .get(&hwnd)
+                    .filter(|win| win.ready)
+                    .ok_or(INVALID_HANDLE)?;
+                // The only admitted state is a normal, owned top-level window.
+                // Do not activate the host app, pump messages, or call the guest.
+                unsafe {
+                    let previous = send!(win.object, c"isVisible"; i8) != 0;
+                    if !previous {
+                        send!(win.object, c"orderFrontRegardless"; ());
+                    }
+                    if send!(win.object, c"isVisible"; i8) == 0 {
+                        return Err(UNAVAILABLE);
+                    }
+                    Ok(usize::from(previous))
+                }
+            }
         }
     }
 }
@@ -197,6 +216,9 @@ pub(crate) enum Operation {
     Finish {
         hwnd: usize,
         commit: bool,
+    },
+    ShowNormal {
+        hwnd: usize,
     },
 }
 

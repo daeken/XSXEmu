@@ -160,6 +160,8 @@ Lwin_rollback_loop:
     leaq Lwin_text(%rip),%r11
     decl 176(%rsp)
     jne Lwin_rollback_loop
+    movq {mode_delta}+8(%r11),%rax /* save the last vetoed HWND */
+    movq %rax,176(%rsp)
     create_window 640
     testq %rax,%rax
     jz Lwin_bad
@@ -175,6 +177,45 @@ Lwin_rollback_loop:
     jne Lwin_bad
     movq %gs:0x58,%rax
     cmpq %rax,{mode_delta}+24(%r11)
+    jne Lwin_bad
+    cmpl $2,{mode_delta}+4(%r11)  /* only the owned show fixture imports it */
+    jne Lwin_success
+    movq 176(%rsp),%rcx
+    movl $1,%edx
+    callq *{iat_delta}+32(%r11)
+    testl %eax,%eax
+    jne Lwin_bad
+    cmpl $1400,%gs:0x68
+    jne Lwin_bad
+
+    leaq Lwin_text(%rip),%r11
+    movq {mode_delta}+8(%r11),%rcx
+    movl $5,%edx                 /* not the observed mode */
+    callq *{iat_delta}+32(%r11)
+    testl %eax,%eax
+    jne Lwin_bad
+    cmpl $50,%gs:0x68
+    jne Lwin_bad
+
+    movl $0x89abcdef,%gs:0x68
+    leaq Lwin_text(%rip),%r11
+    movq {mode_delta}+8(%r11),%rcx
+    movl $1,%edx
+    callq *{iat_delta}+32(%r11)
+    testl %eax,%eax              /* was hidden, now really visible */
+    jne Lwin_bad
+    cmpl $0x89abcdef,%gs:0x68
+    jne Lwin_bad
+    leaq Lwin_text(%rip),%r11
+    movq {mode_delta}+8(%r11),%rcx
+    movl $1,%edx
+    callq *{iat_delta}+32(%r11)
+    cmpl $1,%eax                 /* already visible */
+    jne Lwin_bad
+    cmpl $0x89abcdef,%gs:0x68
+    jne Lwin_bad
+    leaq Lwin_text(%rip),%r11
+    cmpl $4,{mode_delta}(%r11)   /* no additional WndProc callbacks */
     jne Lwin_bad
 Lwin_success:
     movl $54,%eax

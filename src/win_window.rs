@@ -1,9 +1,11 @@
-//! Bounded hidden top-level Win32 creation. No guest message pump.
+//! Bounded top-level Win32 creation and normal show. No guest message pump.
 use crate::providers::HostExport;
 const DLL: &str = "ext-ms-win-rtcore-ntuser-window-ansi-l1-1-0.dll";
 pub(crate) const CREATE: HostExport = HostExport::private_bridge(DLL, "CreateWindowExA");
 pub(crate) const DEF_PROC: HostExport = HostExport::private_bridge(DLL, "DefWindowProcA");
-pub(crate) const BRIDGES: [HostExport; 2] = [CREATE, DEF_PROC];
+pub(crate) const SHOW: HostExport =
+    HostExport::private_bridge("ext-ms-win-rtcore-ntuser-window-l1-1-0.dll", "ShowWindow");
+pub(crate) const BRIDGES: [HostExport; 3] = [CREATE, DEF_PROC, SHOW];
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 pub(crate) mod native {
@@ -188,5 +190,25 @@ pub(crate) mod native {
             unsafe { _exit(86) }
         }
         isize::from(msg == WM_NCCREATE)
+    }
+
+    pub(crate) extern "win64" fn show_window(hwnd: usize, command: i32) -> i32 {
+        const SW_SHOWNORMAL: i32 = 1;
+        let result = if command == SW_SHOWNORMAL {
+            request(Operation::ShowNormal { hwnd })
+        } else {
+            Err(ERROR_NOT_SUPPORTED)
+        };
+        match result {
+            Ok(previous) => previous as i32,
+            Err(error) => {
+                set_last_error(error);
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "xsxemu: ShowWindow: rejected hwnd={hwnd:#x} command={command} (guest error {error})"
+                );
+                0
+            }
+        }
     }
 }
