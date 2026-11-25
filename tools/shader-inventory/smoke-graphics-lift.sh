@@ -148,6 +148,15 @@ done
 "$p" --expect-interp-wrong-mode
 "$p" --expect-interp-wrong-channel
 
+# The same native pair encodings through the reusable explicitly bound API.
+for channel in x z; do
+    variant=bound-affine-$channel
+    "$p" "--$variant-source"
+    "$p" "--emit-$variant-msl" > "$d/$variant.metal"
+    compile "$variant"
+    "$p" "--load-$variant-metallib" "$d/$variant.metallib"
+done
+
 # Two explicitly mapped FP16_ABGR exports, each with independent readback.
 "$p" --dual-source
 "$p" --emit-dual-msl > "$d/dual.metal"
