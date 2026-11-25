@@ -233,11 +233,11 @@ fn terminal_request_failure() -> ! {
     const MESSAGE: &[u8] =
         b"xsxemu: AppKit window request did not complete; terminating guest child\n";
     unsafe extern "C" {
-        fn write(fd: i32, bytes: *const u8, len: usize) -> isize;
+        fn write(fd: std::ffi::c_int, bytes: *const std::ffi::c_void, len: usize) -> isize;
         fn _exit(status: i32) -> !;
     }
     unsafe {
-        write(2, MESSAGE.as_ptr(), MESSAGE.len());
+        write(2, MESSAGE.as_ptr().cast(), MESSAGE.len());
         _exit(86)
     }
 }
