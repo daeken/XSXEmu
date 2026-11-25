@@ -1013,6 +1013,88 @@ pub(crate) fn translate_constant_rtz_fixture(rg: bool) -> Result<String, Reject>
     Ok(msl)
 }
 
+const POS_FIRST_VS: &[u32] = &[
+    0xf800_08cf,
+    0x0302_0100, // POS0 DONE
+    0x0610_08ff,
+    0x3e80_0000, // v8 = 0.25 + v4
+    0xf800_020f,
+    0x0706_0508, // PARAM0 (not DONE)
+    0xbf81_0000,
+];
+
+fn lift_pos_first(words: &[u32]) -> Result<[Op; 4], Reject> {
+    if words.len() != 7 {
+        return Err(Reject::Extent);
+    }
+    let Ok((
+        2,
+        pos @ Op::Export {
+            target: Target::Position,
+            src: position,
+            done: true,
+        },
+    )) = decode(words, 0)
+    else {
+        return Err(Reject::BadExports(0));
+    };
+    let Ok((
+        2,
+        add @ Op::AddF32Literal {
+            dst,
+            src,
+            literal_bits: 0x3e80_0000,
+        },
+    )) = decode(words, 2)
+    else {
+        return Err(Reject::Unsupported(2));
+    };
+    if position.contains(&dst) {
+        // The hardware may not have read POS0 yet.
+        return Err(Reject::Unsupported(2));
+    }
+    if let Some(r) = position.into_iter().chain([src]).find(|r| r.0 >= 8) {
+        return Err(Reject::Uninitialized(
+            if src == r && !position.contains(&r) {
+                2
+            } else {
+                0
+            },
+            r.0,
+        ));
+    }
+    let Ok((
+        2,
+        param @ Op::Export {
+            target: Target::Parameter(0),
+            src: parameter,
+            done: false,
+        },
+    )) = decode(words, 4)
+    else {
+        return Err(Reject::BadExports(4));
+    };
+    if parameter[0] != dst {
+        return Err(Reject::BadExports(4));
+    }
+    if let Some(r) = parameter.into_iter().find(|&r| r.0 >= 8 && r != dst) {
+        return Err(Reject::Uninitialized(4, r.0));
+    }
+    if decode(words, 6) != Ok((1, Op::End)) {
+        return Err(Reject::BadEnd(6));
+    }
+    Ok([pos, add, param, Op::End])
+}
+
+#[allow(dead_code)]
+pub(crate) fn translate_pos_first_fixture() -> Result<String, Reject> {
+    let mut msl = vertex_module(&lift_pos_first(POS_FIRST_VS)?);
+    msl.push_str(
+        "fragment float4 pos_first_ps(Varyings input [[stage_in]]) { return input.parameter; }\n",
+    );
+    Ok(msl)
+}
+
 const WAIT_POS_VS: &[u32] = &[
     0xf800_08cf,
     0x0302_0100,
@@ -1173,6 +1255,7 @@ mod tests {
         asm.push_str("exp pos0 v0, v1, v2, v3 done\ns_waitcnt expcnt(0)\nv_mov_b32_e32 v0, v4\nexp param0 v0, v5, v6, v7\ns_endpgm\n");
         asm.push_str("v_mov_b32_e32 v0, 0x3f801800\nv_mov_b32_e32 v1, 0xc0001800\nv_cvt_pkrtz_f16_f32_e32 v2, v0, v1\nv_mov_b32_e32 v0, 0x80000000\nv_mov_b32_e32 v1, 0x38800000\nv_cvt_pkrtz_f16_f32_e32 v3, v0, v1\nexp mrt0 v2, v2, v3, v3 done compr vm\ns_endpgm\n");
         asm.push_str("v_mov_b32_e32 v0, 0x3f801800\nv_mov_b32_e32 v1, 0xc0001800\nv_cvt_pkrtz_f16_f32_e32 v2, v0, v1\nexp mrt0 v2, v2, off, off done compr vm\ns_endpgm\n");
+        asm.push_str("exp pos0 v0, v1, v2, v3 done\nv_add_f32_e32 v8, 0.25, v4\nexp param0 v8, v5, v6, v7\ns_endpgm\n");
         for uint in [false, true] {
             let (mask, cvt) = if uint {
                 ("-2", "v_cvt_f32_u32_e32")
@@ -1209,6 +1292,7 @@ mod tests {
             .chain(WAIT_POS_VS)
             .chain(CONSTANT_RTZ_PS)
             .chain(CONSTANT_RTZ_RG_PS)
+            .chain(POS_FIRST_VS)
             .chain(&UNPACK_BYTE_VS)
             .chain(&UNPACK_UINT_VS)
             .chain(MULTI_VS)
@@ -1237,6 +1321,24 @@ mod tests {
                 .map(|hex| u8::from_str_radix(hex.trim().strip_prefix("0x").unwrap(), 16).unwrap())
                 .collect();
             assert_eq!(bytes, expected, "{cpu}");
+        }
+    }
+
+    #[test]
+    fn position_done_still_requires_param_and_real_end_without_clobber() {
+        assert!(lift_pos_first(POS_FIRST_VS).is_ok());
+        for (index, word, err) in [
+            (0, 0xf800_00cf, Reject::BadExports(0)),
+            (2, 0x0600_08ff, Reject::Unsupported(2)), // v0 overlaps pending POS0
+            (2, 0x0610_12ff, Reject::Uninitialized(2, 9)),
+            (4, 0xf800_0a0f, Reject::BadExports(4)),
+            (4, 0xbf81_0000, Reject::BadExports(4)),
+            (5, 0x0706_0504, Reject::BadExports(4)),
+            (6, 0xbf80_0000, Reject::BadEnd(6)),
+        ] {
+            let mut words = POS_FIRST_VS.to_vec();
+            words[index] = word;
+            assert_eq!(lift_pos_first(&words), Err(err));
         }
     }
 

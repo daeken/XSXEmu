@@ -115,6 +115,8 @@ mod gpu {
         InterpLoad(&'a Path, InterpFixture),
         ConstantRtzSource(bool),
         ConstantRtzLoad(&'a Path, bool),
+        PosFirstSource,
+        PosFirstLoad(&'a Path),
         WaitPosSource(bool),
         WaitPosLoad(&'a Path),
         UnpackSource(bool),
@@ -181,6 +183,12 @@ mod gpu {
                 print!("{}", graphics_lift::translate_constant_rtz_fixture(mode == "--emit-constant-rtz-rg-msl").map_err(|e| format!("constant RTZ rejected: {e:?}"))?);
                 return Ok(());
             }
+            [mode] if mode == "--pos-first-source" => Mode::PosFirstSource,
+            [mode, lib] if mode == "--load-pos-first-metallib" => Mode::PosFirstLoad(Path::new(lib)),
+            [mode] if mode == "--emit-pos-first-msl" => {
+                print!("{}", graphics_lift::translate_pos_first_fixture().map_err(|e| format!("POS0 first lift rejected: {e:?}"))?);
+                return Ok(());
+            }
             [mode] if mode == "--wait-pos-source" || mode == "--expect-late-pos-read" => Mode::WaitPosSource(mode == "--expect-late-pos-read"),
             [mode, lib] if mode == "--load-wait-pos-metallib" => Mode::WaitPosLoad(Path::new(lib)),
             [mode] if mode == "--emit-wait-pos-msl" => {
@@ -225,7 +233,7 @@ mod gpu {
             [mode, lib] if mode == "--load-metallib" || mode == "--load-mutated-metallib" => Mode::Load(Path::new(lib), mode == "--load-mutated-metallib"),
             [mode, lib, archive] if mode == "--expect-owned-metal-miss" => Mode::ExpectStrictMiss(Path::new(lib), Path::new(archive)),
             [mode, lib, archive, compiler] if mode == "--bake-archive" || mode == "--replay-archive" || mode == "--replay-mutated-archive" => Mode::Archive(Path::new(lib), Path::new(archive), mode == "--bake-archive", mode == "--replay-mutated-archive", owned_graphics_artifact::compiler_profile(compiler)?),
-            _ => return Err("usage: shader-metal-graphics-lift [--expect-swapped-triple | --triple-rg-source | --emit-triple-rg-msl | --load-triple-rg-metallib LIB | --triple-source | --emit-triple-msl | --load-triple-metallib LIB | --dual-source | --emit-dual-msl | --load-dual-metallib LIB | --interp-x-source | --interp-z-source | --expect-interp-wrong-mode | --expect-interp-wrong-channel | --emit-interp-x-msl | --emit-interp-z-msl | --load-interp-x-metallib LIB | --load-interp-z-metallib LIB | --constant-rtz[-rg]-source | --emit-constant-rtz[-rg]-msl | --load-constant-rtz[-rg]-metallib LIB | --wait-pos-source | --emit-wait-pos-msl | --load-wait-pos-metallib LIB | --expect-late-pos-read | --unpack-{byte,uint}-source | --emit-unpack-{byte,uint}-msl | --load-unpack-{byte,uint}-metallib LIB | --multi-source | --emit-multi-msl | --load-multi-metallib LIB | --packed-rg-source | --emit-packed-rg-msl | --load-packed-rg-metallib LIB | --wait-depth-source | --emit-wait-depth-msl | --load-wait-depth-metallib LIB | --expect-late-depth-read | --early-depth-source | --emit-early-depth-msl | --load-early-depth-metallib LIB | --depth-source | --emit-depth-msl | --load-depth-metallib LIB | --packed-source | --emit-packed-msl | --load-packed-metallib LIB | --emit-msl | --emit-mutated-msl | --load-metallib LIB | --load-mutated-metallib LIB | {--bake-archive|--replay-archive|--replay-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-owned-metal-miss MUTATED_LIB ARCHIVE]".into()),
+            _ => return Err("usage: shader-metal-graphics-lift [--expect-swapped-triple | --triple-rg-source | --emit-triple-rg-msl | --load-triple-rg-metallib LIB | --triple-source | --emit-triple-msl | --load-triple-metallib LIB | --dual-source | --emit-dual-msl | --load-dual-metallib LIB | --interp-x-source | --interp-z-source | --expect-interp-wrong-mode | --expect-interp-wrong-channel | --emit-interp-x-msl | --emit-interp-z-msl | --load-interp-x-metallib LIB | --load-interp-z-metallib LIB | --constant-rtz[-rg]-source | --emit-constant-rtz[-rg]-msl | --load-constant-rtz[-rg]-metallib LIB | --pos-first-source | --emit-pos-first-msl | --load-pos-first-metallib LIB | --wait-pos-source | --emit-wait-pos-msl | --load-wait-pos-metallib LIB | --expect-late-pos-read | --unpack-{byte,uint}-source | --emit-unpack-{byte,uint}-msl | --load-unpack-{byte,uint}-metallib LIB | --multi-source | --emit-multi-msl | --load-multi-metallib LIB | --packed-rg-source | --emit-packed-rg-msl | --load-packed-rg-metallib LIB | --wait-depth-source | --emit-wait-depth-msl | --load-wait-depth-metallib LIB | --expect-late-depth-read | --early-depth-source | --emit-early-depth-msl | --load-early-depth-metallib LIB | --depth-source | --emit-depth-msl | --load-depth-metallib LIB | --packed-source | --emit-packed-msl | --load-packed-metallib LIB | --emit-msl | --emit-mutated-msl | --load-metallib LIB | --load-mutated-metallib LIB | {--bake-archive|--replay-archive|--replay-mutated-archive} LIB ARCHIVE COMPILER_SHA256 | --expect-owned-metal-miss MUTATED_LIB ARCHIVE]".into()),
         };
         if matches!(mode, Mode::Archive(..) | Mode::ExpectStrictMiss(..))
             && std::env::var_os("MTL_SHADER_VALIDATION").is_some()
@@ -263,6 +271,7 @@ mod gpu {
         };
         let partial = partial || constant_rtz == Some(true);
         let wait_pos = matches!(mode, Mode::WaitPosSource(_) | Mode::WaitPosLoad(_));
+        let pos_first = matches!(mode, Mode::PosFirstSource | Mode::PosFirstLoad(_));
         let late_pos = matches!(mode, Mode::WaitPosSource(true));
         let unpack = match mode {
             Mode::UnpackSource(uint) | Mode::UnpackLoad(_, uint) => Some(uint),
@@ -289,6 +298,7 @@ mod gpu {
             | Mode::WaitDepthSource(_)
             | Mode::InterpSource(_)
             | Mode::ConstantRtzSource(_)
+            | Mode::PosFirstSource
             | Mode::WaitPosSource(_)
             | Mode::UnpackSource(_)
             | Mode::MultiSource
@@ -300,6 +310,8 @@ mod gpu {
                     graphics_lift::translate_interp_fixture(interp)
                 } else if let Some(rg) = constant_rtz {
                     graphics_lift::translate_constant_rtz_fixture(rg)
+                } else if pos_first {
+                    graphics_lift::translate_pos_first_fixture()
                 } else if wait_pos {
                     graphics_lift::translate_wait_pos_fixture(late_pos)
                 } else if let Some(uint) = unpack {
@@ -323,6 +335,7 @@ mod gpu {
             Mode::PackedLoad(path, _)
             | Mode::InterpLoad(path, _)
             | Mode::ConstantRtzLoad(path, _)
+            | Mode::PosFirstLoad(path)
             | Mode::WaitPosLoad(path)
             | Mode::UnpackLoad(path, _)
             | Mode::MultiLoad(path)
@@ -342,6 +355,8 @@ mod gpu {
             (MTLPixelFormat::RGBA32Float, 16, fixture.entry())
         } else if constant_rtz.is_some() {
             (MTLPixelFormat::RGBA32Float, 16, "constant_rtz_ps")
+        } else if pos_first {
+            (MTLPixelFormat::RGBA32Float, 16, "pos_first_ps")
         } else if wait_pos {
             (MTLPixelFormat::RGBA32Float, 16, "wait_pos_ps")
         } else if unpack.is_some() {
@@ -556,8 +571,9 @@ mod gpu {
             }
             enc.set_vertex_bytes(0, std::mem::size_of_val(&data) as u64, data.as_ptr().cast());
         }
-        if wait_pos {
-            // Constant replacement x makes the late-read triangle degenerate.
+        if wait_pos || pos_first {
+            // The wait control uses constant replacement X to degenerate the triangle.
+            // The non-overlapping POS0-first path adds 0.25 to this red varying.
             let data = vertices.map(|v| [v[0], v[1], v[2], v[3], 0.25, 0.5, 0.75, 1.]);
             enc.set_scissor_rect(MTLScissorRect {
                 x: 2,
@@ -712,14 +728,14 @@ mod gpu {
             );
             return Ok(());
         }
-        if wait_pos {
+        if wait_pos || pos_first {
             let mut writes = 0;
             for y in 0..SIDE {
                 for x in 0..SIDE {
                     let covered = (2..6).contains(&x) && (1..6).contains(&y);
                     writes += usize::from(covered);
                     let want: [f32; 4] = if covered && !late_pos {
-                        [0.25, 0.5, 0.75, 1.]
+                        [if pos_first { 0.5 } else { 0.25 }, 0.5, 0.75, 1.]
                     } else {
                         [1., 0., 1., 0.]
                     };
@@ -728,15 +744,20 @@ mod gpu {
                         let got = f32::from_le_bytes(part.try_into().unwrap());
                         if !got.is_finite() || (got - value).abs() > 0.000001 {
                             return Err(format!(
-                                "POS0 snapshot (late={late_pos}) ({x},{y}): expected {value}, got {got}"
+                                "POS0 (position-first={pos_first}, late={late_pos}) ({x},{y}): expected {value}, got {got}"
                             ));
                         }
                     }
                 }
             }
             println!(
-                "{} owned POS0 export snapshot (late={late_pos}): 64/64 pixels matched; {}",
+                "{} owned POS0 {} (late={late_pos}): 64/64 pixels matched; {}",
                 dev.name(),
+                if pos_first {
+                    "DONE → ADD → PARAM0"
+                } else {
+                    "export snapshot"
+                },
                 if late_pos {
                     format!("{writes} expected writes lost")
                 } else {

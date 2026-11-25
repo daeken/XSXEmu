@@ -107,6 +107,12 @@ compile wait-pos
 "$p" --load-wait-pos-metallib "$d/wait-pos.metallib"
 "$p" --expect-late-pos-read
 
+# POS0 DONE is not an instruction terminator; a distinct ADD feeds PARAM0.
+"$p" --pos-first-source
+"$p" --emit-pos-first-msl > "$d/pos-first.metal"
+compile pos-first
+"$p" --load-pos-first-metallib "$d/pos-first.metallib"
+
 # Seven explicit native PARAM outputs linked by name with a synthetic consumer.
 "$p" --multi-source
 "$p" --emit-multi-msl > "$d/multi.metal"
