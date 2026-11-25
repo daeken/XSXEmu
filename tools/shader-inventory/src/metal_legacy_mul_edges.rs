@@ -6,6 +6,8 @@ mod graphics_decode;
 mod graphics_lift;
 #[cfg(target_os = "macos")]
 mod metal_artifact;
+#[cfg(target_os = "macos")]
+mod owned_vertex_xyz;
 
 #[cfg(target_os = "macos")]
 mod gpu {
@@ -13,13 +15,26 @@ mod gpu {
     use std::path::Path;
 
     pub fn run() -> Result<(), Box<dyn std::error::Error>> {
-        let args: Vec<_> = std::env::args_os().skip(1).collect();
-        if args.len() == 1 && args[0] == "--emit-msl" {
-            print!(
-                "{}",
+        let mut args: Vec<_> = std::env::args_os().skip(1).collect();
+        let xyz = args.first().is_some_and(|a| a == "--vertex-xyz");
+        if xyz {
+            args.remove(0);
+        }
+        let source = || {
+            if xyz {
+                Ok(include_str!("owned_vertex_xyz.metal").to_owned())
+            } else {
                 super::graphics_lift::translate_legacy_edge_fixture()
-                    .map_err(|e| format!("decode: {e:?}"))?
-            );
+                    .map_err(|e| format!("decode: {e:?}"))
+            }
+        };
+        let entry = if xyz {
+            "owned_vertex_xyz"
+        } else {
+            "legacy_edges"
+        };
+        if args.len() == 1 && args[0] == "--emit-msl" {
+            print!("{}", source()?);
             return Ok(());
         }
         if std::env::var_os("MTL_SHADER_VALIDATION").is_some() {
@@ -28,20 +43,19 @@ mod gpu {
         let dev = Device::system_default().ok_or("no Metal device")?;
         let (pipeline, profile) = match args.as_slice() {
             [mode] if mode == "--source" => {
-                let msl = super::graphics_lift::translate_legacy_edge_fixture()
-                    .map_err(|e| format!("decode: {e:?}"))?;
+                let msl = source()?;
                 let options = CompileOptions::new();
                 options.set_language_version(MTLLanguageVersion::V3_1);
                 options.set_fast_math_enabled(false);
                 let lib = dev.new_library_with_source(&msl, &options)?;
-                let function = lib.get_function("legacy_edges", None)?;
+                let function = lib.get_function(entry, None)?;
                 (dev.new_compute_pipeline_state_with_function(&function)?, "source")
             }
             [mode, lib, path] if mode == "--bake" || mode == "--replay" => {
                 let bake = mode == "--bake";
                 super::metal_artifact::file_url(Path::new(lib), false)?;
                 let lib = dev.new_library_with_file(Path::new(lib))?;
-                let function = lib.get_function("legacy_edges", None)?;
+                let function = lib.get_function(entry, None)?;
                 let url = super::metal_artifact::file_url(Path::new(path), bake)?;
                 let ad = BinaryArchiveDescriptor::new();
                 if !bake {
@@ -63,8 +77,11 @@ mod gpu {
                 )?;
                 (pipeline, if bake { "strict offline bake" } else { "strict offline replay" })
             }
-            _ => return Err("usage: shader-legacy-mul-edges --emit-msl | --source | <--bake|--replay> LIB ARCHIVE".into()),
+            _ => return Err("usage: shader-legacy-mul-edges [--vertex-xyz] --emit-msl | --source | <--bake|--replay> LIB ARCHIVE".into()),
         };
+        if xyz {
+            return super::owned_vertex_xyz::check(&dev, &pipeline, profile);
+        }
         const P0: u32 = 0;
         const N0: u32 = 0x8000_0000;
         const INF: u32 = 0x7f80_0000;
