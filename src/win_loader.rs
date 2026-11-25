@@ -202,6 +202,8 @@ pub(crate) mod native {
     struct Image {
         base: usize,
         end: usize,
+        #[cfg(target_os = "macos")]
+        executable: Vec<std::ops::Range<usize>>,
         filename: Vec<u16>,
         path_key: String,
         link_name: String,
@@ -217,6 +219,8 @@ pub(crate) mod native {
 
     struct Graph {
         images: Vec<Image>,
+        #[cfg(target_os = "macos")]
+        window_classes: std::sync::Mutex<crate::win_class::native::Registry>,
         rust_providers: bool,
         #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
         entropy_module: Option<usize>,
@@ -442,6 +446,20 @@ pub(crate) mod native {
                 let mut image = Image {
                     base,
                     end,
+                    #[cfg(target_os = "macos")]
+                    executable: pe
+                        .sections
+                        .iter()
+                        .filter_map(|s| {
+                            if !s.executable() || s.writable() || s.raw_size == 0 {
+                                return None;
+                            }
+                            let start = base.checked_add(s.virtual_address as usize)?;
+                            // Exclude virtual zero-fill and page-rounding padding.
+                            let stop = start.checked_add(s.raw_size as usize)?;
+                            (stop <= end).then_some(start..stop)
+                        })
+                        .collect(),
                     filename: guest_path.encode_utf16().collect(),
                     path_key: path_key(&guest_path),
                     link_name: basename(path).to_owned(),
@@ -495,6 +513,8 @@ pub(crate) mod native {
             }
             Registration::install(Arc::new(Graph {
                 images,
+                #[cfg(target_os = "macos")]
+                window_classes: Default::default(),
                 rust_providers,
                 entropy_module,
                 xgameruntime: xgameruntime.map(|i| (i, Default::default())),
@@ -910,6 +930,31 @@ pub(crate) mod native {
         graph(|g| {
             g.and_then(|g| g.by_handle(base))
                 .is_some_and(|image| !image.disable_thread_calls.load(Ordering::Acquire))
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn register_window_class(
+        class: crate::win_class::native::Class,
+    ) -> Result<u16, u32> {
+        use crate::win_class::native::{ERROR_INVALID_PARAMETER, ERROR_NOT_ENOUGH_MEMORY};
+        graph(|graph| {
+            let graph = graph.ok_or(ERROR_INVALID_PARAMETER)?;
+            if graph.by_handle(class.instance).is_none()
+                || !graph.containing(class.wndproc).is_some_and(|image| {
+                    image
+                        .executable
+                        .iter()
+                        .any(|span| span.contains(&class.wndproc))
+                })
+            {
+                return Err(ERROR_INVALID_PARAMETER);
+            }
+            graph
+                .window_classes
+                .lock()
+                .map_err(|_| ERROR_NOT_ENOUGH_MEMORY)?
+                .insert(class)
         })
     }
 

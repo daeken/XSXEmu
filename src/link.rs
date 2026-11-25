@@ -531,6 +531,17 @@ impl Builder<'_> {
             return Ok(BindingTarget::Rust(startup));
         }
 
+        // Class registration is a direct-root IAT bridge, not a USER32 alias.
+        let register_class = crate::win_class::REGISTER;
+        if importer == 0
+            && self.options.rust_providers
+            && self.options.trusted_offline
+            && dll.eq_ignore_ascii_case(register_class.provider.as_bytes())
+            && matches!(symbol, Symbol::Name(name) if name == register_class.symbol.as_bytes())
+        {
+            return Ok(BindingTarget::Rust(register_class));
+        }
+
         // Match only the original root ordinal, not names, API-set aliases,
         // forwarders or DLL imports. The facade has no discoverable exports.
         use crate::gameinput as gi;
@@ -1170,6 +1181,63 @@ mod tests {
         assert!(!providers::has_dll(b"ws2_32.dll"));
         assert!(providers::lookup(b"ws2_32.dll", b"WSAStartup").is_none());
         assert!(providers::lookup(b"ws2_32.dll", b"#115").is_none());
+    }
+
+    #[test]
+    fn window_class_bridge_is_private_to_the_exact_direct_root_import() {
+        let temp = TempDir::new();
+        let exe = temp.0.join("Owned.exe");
+        let bridge = crate::win_class::REGISTER;
+        fs::write(
+            &exe,
+            image(
+                &[
+                    (
+                        bridge.provider,
+                        &[
+                            Slot::Name(bridge.symbol),
+                            Slot::Name("registerclassexa"),
+                            Slot::Ord(1),
+                        ],
+                    ),
+                    ("user32.dll", &[Slot::Name(bridge.symbol)]),
+                    ("front.dll", &[Slot::Ord(1)]),
+                ],
+                None,
+            ),
+        )
+        .unwrap();
+        let forwarded = format!(
+            "{}.{}",
+            bridge.provider.trim_end_matches(".dll"),
+            bridge.symbol
+        );
+        fs::write(
+            temp.0.join("front.dll"),
+            dll_image(
+                &[(bridge.provider, &[Slot::Name(bridge.symbol)])],
+                Some((1, &[], Some(&forwarded))),
+            ),
+        )
+        .unwrap();
+        let plan = build_configured(
+            &exe,
+            &[],
+            Options {
+                trusted_offline: true,
+                rust_providers: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            plan.modules[0].iat[0].target,
+            Ok(BindingTarget::Rust(bridge))
+        );
+        assert!(plan.modules[0].iat[1..].iter().all(|b| b.target.is_err()));
+        assert!(plan.modules[1].iat[0].target.is_err());
+        assert!(bridge.address().is_none());
+        assert!(providers::lookup(bridge.provider.as_bytes(), bridge.symbol.as_bytes()).is_none());
     }
 
     #[test]

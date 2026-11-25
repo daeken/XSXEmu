@@ -3351,6 +3351,69 @@ fn dir_import_one(b: &mut [u8], dll: &[u8], symbol: &[u8]) {
     put(b, file(imports) + 0x72, symbol);
 }
 
+const WINDOW_CLASS_CAPACITY: usize = 0x500;
+const WINDOW_CLASS_DLL: &[u8] = b"ext-ms-win-rtcore-ntuser-window-ansi-l1-1-0.dll\0";
+#[repr(C)]
+struct WindowClassFixture {
+    entry: u32,
+    code: [u8; WINDOW_CLASS_CAPACITY],
+}
+
+global_asm!(include_str!("fixtures/static_tls_window_class.S"),
+    capacity = const WINDOW_CLASS_CAPACITY,
+    iat_delta = const IAT - TEXT,
+    text = const TEXT,
+    options(att_syntax),
+);
+unsafe extern "C" {
+    static static_tls_window_class_fixture: WindowClassFixture;
+}
+
+#[test]
+fn window_class_registration_owns_name_and_validates_guest_inputs() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let mut exe = image(Kind::Solo);
+    let fixture = unsafe { &static_tls_window_class_fixture };
+    exe[file(TEXT)..file(TEXT) + RAW].fill(0xcc);
+    put(&mut exe, file(TEXT), &fixture.code);
+    w32(&mut exe, OP + 16, TEXT + fixture.entry as usize);
+    w64(&mut exe, file(ARRAY), PREFERRED + TEXT);
+    dir_import_one(&mut exe, WINDOW_CLASS_DLL, b"RegisterClassExA\0");
+    let path = scratch.write("owned-window-class.exe", &exe);
+    for flags in [&[OPT, "--rust-providers"][..], &[OPT, TRUSTED][..]] {
+        expect(run(&path, flags), 1, "incomplete dependency graph");
+    }
+    let output = run(&path, &[OPT, TRUSTED, "--rust-providers"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.matches("registered guest ANSI class").count(),
+        2,
+        "{stderr}"
+    );
+    expect(output, 53, "Guest entry returned 53");
+}
+
+#[test]
+fn window_creation_and_def_window_proc_stay_unbound() {
+    if !rosetta() {
+        return;
+    }
+    let scratch = Scratch::new();
+    for symbol in [b"CreateWindowExA\0".as_slice(), b"DefWindowProcA\0"] {
+        let mut exe = image(Kind::Solo);
+        dir_import_one(&mut exe, WINDOW_CLASS_DLL, symbol);
+        let path = scratch.write("window-frontier.exe", &exe);
+        expect(
+            run(&path, &[OPT, TRUSTED, "--rust-providers"]),
+            1,
+            "incomplete dependency graph",
+        );
+    }
+}
+
 const APPNOTIFY_CAPACITY: usize = 0x200;
 #[repr(C)]
 struct AppNotifyFixture {
