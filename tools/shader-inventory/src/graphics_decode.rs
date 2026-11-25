@@ -114,6 +114,9 @@ pub(crate) enum Op {
         slot: u8,
         src: Vgpr,
     },
+    PackedBa {
+        src: Vgpr,
+    },
     PackedRg {
         slot: u8,
         src: Vgpr,
@@ -472,6 +475,15 @@ pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeErro
             Op::PackedRg {
                 slot: ((w >> 4) & 0x3f) as u8,
                 src: Vgpr(fields as u8),
+            },
+        ));
+    }
+    // Exact final packed MRT0 EN12: only VSRC1 is active (B low, A high).
+    if w == 0xf800_1c0c {
+        return Ok((
+            2,
+            Op::PackedBa {
+                src: Vgpr((ext()? >> 8) as u8),
             },
         ));
     }

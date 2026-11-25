@@ -251,6 +251,7 @@ fn exact_opcode(
                 | Op::ExportParam0Xy { .. }
                 | Op::PackedColor { .. }
                 | Op::PackedRg { .. }
+                | Op::PackedBa { .. }
                 | Op::ExportRed { .. }
                 | Op::PixelDepth { .. } => name == "exp",
                 Op::PackHalfRtz { neg_first, .. } => {
@@ -440,6 +441,7 @@ pub(super) struct DirectGaps {
     pub partial_param0_noncanonical: usize,
     pub contiguous: bool,
     pub interp_mov: BTreeMap<Option<(u8, u8, u8)>, usize>,
+    pub packed_ba: usize,
     pub packed_mrt0_noncanonical: [usize; 2], // RG / RGBA
     pub inline_bfrev_sites: usize,
     pub scalar_depth_noncanonical: usize,
@@ -501,6 +503,10 @@ pub(super) fn direct_gaps(dis: &mut Disassembler, bytes: &[u8], slot: usize) -> 
             gaps.inline_bfrev_sites += 1;
         }
         if exact_opcode(decoded, len, name) {
+            gaps.packed_ba += usize::from(matches!(
+                decoded,
+                Some((2, crate::graphics_decode::Op::PackedBa { .. }))
+            ));
             // Count exactly the final MRT0 forms that used to fail the
             // disabled-selector canonical-zero constraint.
             if name == "exp" && len == 8 {

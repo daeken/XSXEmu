@@ -42,6 +42,7 @@ fn shape(bytes: &[u8]) -> Option<Shape> {
             Op::End => return (!s.color.is_empty() || s.depth).then_some(s),
             Op::PackedColor { .. }
             | Op::PackedRg { .. }
+            | Op::PackedBa { .. }
             | Op::ExportRed { .. }
             | Op::Export {
                 target: Target::Color,

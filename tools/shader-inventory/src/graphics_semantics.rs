@@ -254,6 +254,7 @@ pub(crate) fn audit(words: &[u32], vertex: bool) -> Outcome {
             | Op::ExportParam0Xy { .. }
             | Op::PackedColor { .. }
             | Op::PackedRg { .. }
+            | Op::PackedBa { .. }
             | Op::ExportRed { .. }
             | Op::PixelDepth { .. }) => {
                 // Only exact decoder EXP forms reach this arm. Use the checked
@@ -262,7 +263,7 @@ pub(crate) fn audit(words: &[u32], vertex: bool) -> Outcome {
                     Op::Export { target, src, .. } => (Some(*target), src),
                     Op::ExportParam0Xy { src } => (Some(Target::Parameter(0)), src),
                     Op::PackedColor { src, .. } => (Some(Target::Color), src),
-                    Op::PackedRg { src, .. } | Op::ExportRed { src, .. } => {
+                    Op::PackedRg { src, .. } | Op::PackedBa { src } | Op::ExportRed { src, .. } => {
                         (Some(Target::Color), std::slice::from_ref(src))
                     }
                     Op::PixelDepth { src, .. } => (None, std::slice::from_ref(src)),

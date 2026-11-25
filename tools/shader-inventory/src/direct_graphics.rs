@@ -233,6 +233,8 @@ struct GapCounts {
     partial_param0: [usize; 3],
     bfrev_depth: BTreeMap<[usize; 7], usize>,
     packed_cleared: [usize; 2],
+    packed_ba: (usize, usize), // sites, windows
+    packed_ba_requirements: BTreeMap<Option<crate::graphics_semantics::Outcome>, usize>,
     interp_sole: BTreeMap<(usize, Option<(u8, u8, u8)>), usize>,
     packed_requirements: [BTreeMap<crate::graphics_semantics::Outcome, usize>; 2],
     linear_sole: BTreeMap<String, usize>,
@@ -371,6 +373,15 @@ impl GapCounts {
             "    exact inline-first VOP3 FMA (sites, windows) for (+2,v,-1) / (-2,v,+1): {:?}",
             self.inline_first_fma
         );
+        if stage == "PS" {
+            let (sites, windows) = self.packed_ba;
+            println!("    exact final packed MRT0 EN12: {sites} sites in {windows} windows");
+            for (outcome, n) in self.packed_ba_requirements {
+                println!(
+                    "    EN12-covered contiguous exact PS: {n} windows, local requirements: {outcome:?}"
+                );
+            }
+        }
         if stage == "VS" {
             println!(
                 "    exact partial PARAM0 EN3 (sites, windows, sites with nonzero disabled selectors): {:?}",
@@ -501,6 +512,8 @@ pub(super) fn run_gaps(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), B
     let mut setprio: [[BTreeMap<Option<SetprioProjection>, usize>; 2]; STARTS.len()] =
         Default::default();
     let mut packed_spans = [HashSet::new(), HashSet::new()];
+    let mut ba_spans = HashSet::new();
+    let mut ba_cleared = HashSet::new();
     let mut vs_sets = BTreeMap::<Vec<String>, HashMap<_, (usize, u8)>>::new();
     let mut pair_spans = [PairSpans::new(), PairSpans::new()];
     let mut refined_spans = [PairSpans::new(), PairSpans::new()];
@@ -524,7 +537,20 @@ pub(super) fn run_gaps(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), B
                 }
                 for (w, wave) in waves.iter_mut().enumerate() {
                     if let Some(gaps) = direct_gaps(wave, window, slot) {
-                        counts[slot][i][w].note(&gaps);
+                        let tally = &mut counts[slot][i][w];
+                        tally.note(&gaps);
+                        if slot == 0 && gaps.packed_ba != 0 {
+                            tally.packed_ba.0 += gaps.packed_ba;
+                            tally.packed_ba.1 += 1;
+                            ba_spans.insert(reference.program);
+                            if gaps.missing.is_empty() && gaps.contiguous {
+                                ba_cleared.insert(reference.program);
+                                *tally
+                                    .packed_ba_requirements
+                                    .entry(exact_semantics(wave, window, false))
+                                    .or_default() += 1;
+                            }
+                        }
                         if gaps.inline_one_sub != 0 {
                             inline_one_sub_spans[slot].insert(reference.program);
                         }
@@ -595,6 +621,11 @@ pub(super) fn run_gaps(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), B
     println!(
         "  Distinct PS spans with sole interp MOV gap bucket across hypotheses: {}",
         interp_spans.len()
+    );
+    println!(
+        "  Distinct PS spans with exact final packed MRT0 EN12 across hypotheses: {}; contiguous encoding-complete: {}",
+        ba_spans.len(),
+        ba_cleared.len()
     );
     println!(
         "  Distinct PS spans with sole prior packed-selector blocker across hypotheses (RG / RGBA): {:?}",

@@ -17,6 +17,7 @@ enum Stage {
     ConstantRtzPixel,
     ConstantRtzRgPixel,
     PackedRgPixel,
+    PackedBaPixel,
     DualPackedPixel,
     TriplePackedPixel,
     TriplePackedRgPixel,
@@ -83,6 +84,8 @@ const PACKED_PS: &[u32] = &[
     0xbf81_0000,
 ];
 
+// Live VSRC1 = v0, with deliberately nonzero disabled selectors.
+const PACKED_BA_PS: &[u32] = &[0xf800_1c0c, 0xfcfd_0007, 0xbf81_0000];
 const PACKED_RG_PS: &[u32] = &[0xf800_1c03, 0xfcfd_fe01, 0xbf81_0000];
 
 const DUAL_PS: &[u32] = &[0xf800_040f, 1, 0xf800_1c1f, 0x100, 0xbf81_0000];
@@ -134,6 +137,7 @@ impl Stage {
             Stage::ConstantRedPixel | Stage::ConstantRtzPixel | Stage::ConstantRtzRgPixel => 0,
             Stage::PackedPixel => 2,
             Stage::PackedRgPixel => 2,
+            Stage::PackedBaPixel => 1,
             Stage::DualPackedPixel | Stage::TriplePackedPixel | Stage::TriplePackedRgPixel => 2,
             Stage::DepthPixel | Stage::EarlyDepthPixel => 3,
         }
@@ -160,6 +164,7 @@ impl Stage {
             | Stage::ConstantRtzPixel
             | Stage::ConstantRtzRgPixel
             | Stage::PackedRgPixel
+            | Stage::PackedBaPixel
             | Stage::DepthPixel
             | Stage::EarlyDepthPixel
             | Stage::DualPackedPixel
@@ -172,6 +177,7 @@ impl Stage {
         match self {
             Stage::PackedPixel
             | Stage::PackedRgPixel
+            | Stage::PackedBaPixel
             | Stage::ConstantRedPixel
             | Stage::ConstantRtzPixel
             | Stage::ConstantRtzRgPixel => 1,
@@ -391,6 +397,13 @@ fn lift(stage: Stage, words: &[u32]) -> Result<Vec<Op>, Reject> {
                 for r in src {
                     require(r)?;
                 }
+                exported += 1;
+            }
+            Op::PackedBa { src } => {
+                if stage != Stage::PackedBaPixel || exported != 0 {
+                    return Err(Reject::BadExports(pc));
+                }
+                require(src)?;
                 exported += 1;
             }
             Op::PackedRg { slot, src } => {
@@ -636,6 +649,10 @@ fn emit_body(out: &mut String, ops: &[Op], packed_color_lvalue: &str, multi: boo
                 )
                 .unwrap();
             }
+            Op::PackedBa { src: Vgpr(ba) } => {
+                // Metal return-value placeholders; R/G stores are disabled by the owned PSO.
+                writeln!(out, "  {packed_color_lvalue} = float4(0.0f, 0.0f, float(as_type<half>(ushort(r[{ba}]))), float(as_type<half>(ushort(r[{ba}] >> 16))));").unwrap();
+            }
             Op::PackedRg {
                 slot,
                 src: Vgpr(rg),
@@ -849,6 +866,19 @@ pub fn translate_packed_color_fixture(partial: bool) -> Result<String, Reject> {
         "(constant uint2 &input [[buffer(0)]]) {\n\
   uint r[256]; float4 out;\n\
   r[0] = input.x; r[1] = input.y;\n",
+    );
+    body(&mut msl, &ps);
+    Ok(msl)
+}
+
+#[allow(dead_code)] // Separate owned render probe, not the keyed graphics fixture.
+pub fn translate_packed_ba_fixture() -> Result<String, Reject> {
+    let vs = lift(Stage::Vertex, VS)?;
+    let ps = lift(Stage::PackedBaPixel, PACKED_BA_PS)?;
+    let mut msl = vertex_module(&vs);
+    msl.push_str(
+        "fragment float4 packed_ba_ps(constant uint &input [[buffer(0)]]) {\n\
+  uint r[256]; float4 out; r[0] = input;\n",
     );
     body(&mut msl, &ps);
     Ok(msl)
@@ -1612,6 +1642,7 @@ mod tests {
             "v_cvt_pkrtz_f16_f32_e32 v5, v0, v1\nv_cvt_pkrtz_f16_f32_e64 v22, -v0, v1\n",
             1,
         );
+        asm = asm.replacen("exp mrt0 v1, v1, off, off done compr vm\ns_endpgm\n", "exp mrt0 v1, v1, off, off done compr vm\ns_endpgm\nexp mrt0 off, off, v0, v0 done compr vm\ns_endpgm\n", 1);
         asm.push_str(
             "v_mov_b32_e32 v2, 0x3e800000\nexp mrt0 v2, off, off, off done vm\ns_endpgm\n",
         );
@@ -1669,6 +1700,8 @@ mod tests {
             .chain(EDGE_SELECT)
             .chain([PACKED_PS[0], 1, PACKED_PS[2]].iter())
             .chain([PACKED_RG_PS[0], 1, PACKED_RG_PS[2]].iter())
+            // MC writes canonical zero to all disabled VSRC fields.
+            .chain([PACKED_BA_PS[0], PACKED_BA_PS[1] & 0xff00, PACKED_BA_PS[2]].iter())
             .chain(DEPTH_PS)
             .chain(EARLY_DEPTH_PS)
             .chain(WAIT_DEPTH_PS)
@@ -2351,13 +2384,43 @@ mod tests {
             lift(Stage::PackedRgPixel, &[0xf800_1c03, 7, 0xbf81_0000]),
             Err(Reject::Uninitialized(0, 7))
         );
-        for header in [0xf800_1c0c, 0xf800_1c13, 0xf800_3c03] {
+        for header in [0xf800_1c0d, 0xf800_1c13, 0xf800_3c03] {
             assert_eq!(decode(&[header, 1], 0), Err(DecodeError::Unsupported(0)));
         }
         assert_eq!(
             decode(&[0xf800_0413, 0x0101], 0),
             Err(DecodeError::Unsupported(0))
         );
+    }
+
+    #[test]
+    fn packed_ba_checks_only_live_vsrc1_and_exact_export_header() {
+        let expected = Ok((2, Op::PackedBa { src: Vgpr(0) }));
+        assert_eq!(decode(PACKED_BA_PS, 0), expected);
+        assert_eq!(decode(&[PACKED_BA_PS[0], 0], 0), expected);
+        assert_eq!(
+            decode(&[PACKED_BA_PS[0]], 0),
+            Err(DecodeError::Truncated(0))
+        );
+        assert_eq!(lift(Stage::PackedBaPixel, PACKED_BA_PS).unwrap().len(), 2);
+        assert_eq!(
+            lift(Stage::PackedRgPixel, PACKED_BA_PS),
+            Err(Reject::BadExports(0))
+        );
+        assert_eq!(
+            lift(
+                Stage::PackedBaPixel,
+                &[PACKED_BA_PS[0], 0x100, PACKED_BA_PS[2]]
+            ),
+            Err(Reject::Uninitialized(0, 1))
+        );
+        assert!(lift(Stage::PackedBaPixel, &PACKED_BA_PS[..2]).is_err());
+        for changed in [1, 1 << 4, 1 << 10, 1 << 11, 1 << 12, 1 << 13] {
+            assert_eq!(
+                decode(&[PACKED_BA_PS[0] ^ changed, 0], 0),
+                Err(DecodeError::Unsupported(0))
+            );
+        }
     }
 
     #[test]
