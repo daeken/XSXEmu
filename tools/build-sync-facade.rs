@@ -74,7 +74,7 @@ pub fn image() -> Vec<u8> {
             0x74, 0x1a, // jz unsupported
             0x48, 0x83, 0x39, 0x00, // cmp qword [rcx],0
             0x75, 0x14, // jne unsupported
-            0x45, 0x85, 0xc9, // test r9d,r9d           (milliseconds)
+            0x45, 0x85, 0xc0, // test r8d,r8d           (third argument: milliseconds)
             0x75, 0x0f, // jne unsupported
             0x65, 0xc7, 0x04, 0x25, 0x68, 0, 0, 0, 0xb4, 5, 0, 0, // GS:[68h] = ERROR_TIMEOUT
             0x31, 0xc0, 0xc3, // xor eax,eax; ret

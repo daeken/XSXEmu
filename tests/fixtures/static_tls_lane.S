@@ -1036,7 +1036,7 @@ Lprocessor_topology_next:
  * and an exclusively held critical section. There are no possible peers, so
  * releasing and reacquiring on a zero-timeout poll has no observable effect. */
 Lsync_sleep:
-    testl %r9d, %r9d
+    testl %r8d, %r8d
     jne Lbad                             /* A blocking wait is unsupported. */
     movl $1460, %gs:0x68                 /* ERROR_TIMEOUT */
     xorl %eax, %eax
@@ -1116,12 +1116,14 @@ Lsync_entry:
     jne Lbad
     leaq 32(%rsp), %rcx
     leaq 40(%rsp), %rdx
-    xorl %r9d, %r9d                      /* Poll except in mode 2. */
+    xorl %r8d, %r8d                      /* Win64 timeout: poll except in modes 2 and 4. */
     cmpl $2, {mode_delta}(%r11)
-    sete %r9b
+    sete %r8b
     cmpl $4, {mode_delta}(%r11)
     sete %r10b
-    orb %r10b, %r9b
+    orb %r10b, %r8b
+    movl %r8d, %r9d
+    xorl $1, %r9d                        /* Poison the unused argument with the opposite value. */
     callq *{dispatch_delta}(%r11)
     testl %eax, %eax
     jne Lbad
@@ -1433,6 +1435,7 @@ Lruntime_probe:
 4:
     addq $56, %rsp
     retq
+    .p2align 1                           /* UTF-16 inputs stay aligned as fixture code changes. */
 Lruntime_path:
     .short 46,47  /* ./ */
 Lruntime_name:
