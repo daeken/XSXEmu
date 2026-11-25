@@ -191,6 +191,22 @@ pub(super) fn run(path: &Path, reference: &OsStr, cpu: Cpu) -> Result<(), Box<dy
                 all_ps[i].len(),
                 all_rows[i]
             );
+            let (mut other_rows, mut rows_with_gaps) = (0, 0);
+            let (mut needs, mut gaps) = (BTreeMap::new(), BTreeMap::new());
+            for (e, t) in rank.iter().filter(|(e, _)| !e.only_attachment) {
+                other_rows += t.rows;
+                rows_with_gaps += if e.gaps.is_empty() { 0 } else { t.rows };
+                for &need in &e.needs {
+                    *needs.entry(need).or_insert(0) += t.rows;
+                }
+                for &gap in &e.gaps {
+                    *gaps.entry(gap).or_insert(0) += t.rows;
+                }
+            }
+            println!(
+                "    non-attachment-only rows={other_rows}, rows with local gaps={rows_with_gaps}"
+            );
+            println!("    non-exclusive unresolved requirements: {needs:?}; local gaps: {gaps:?}");
             for (e, t) in rank {
                 println!(
                     "    {e:?}: rows={}, PS={}, pair-stage companions={}, program pairs={}, state IDs={}",

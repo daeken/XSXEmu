@@ -225,6 +225,10 @@ Run `--direct-ps-attachments "$INFLATED_LIBRARY" "$TRUSTED_LLVM_21_DYLIB" gfx101
 
 Ranked by exact row occurrences in the attachment-only cohort: scalar MRT0 EN1 (349 rows, 346 with MS and 3 with VS); packed MRT0 EN15 (8 VS rows); packed MRT0 EN3 (7 VS rows); packed MRT0 EN15 with scalar depth (2 MS rows). For a VS+PS attachment contract, prioritize packed EN15, then packed EN3, then scalar red. The nine other encoding-complete PS rows have no local semantic gaps, but all need entry VGPRs in addition to attachment format/mask. Four PS+MS rows with packed MRT0 and scalar MRT1 require only that additional entry predicate. The five single-color rows also require entry SGPRs, interpolation linkage, and F32 mode (four PS+VS and one PS+MS); the three packed-color rows among those five additionally require the packed RTZ domain. No companion-stage eligibility is inferred.
 
+The counts are non-exclusive: among the nine rows, attachment format/mask and entry VGPRs each affect 9; entry SGPRs, interpolation linkage, and F32 mode each affect 5; packed RTZ domain affects 3. Local semantic gaps affect 0 rows. These are outstanding requirements, not invalid decoded instructions.
+
+The older [state residual comparison](shader-pipeline-library.md) is historical and is not used by this classifier.
+
 No independently verified attachment format or write mask is joined to these exact rows. Native export EN/COMPR describe shader export operands, not attachment format or write mask. The owned render probes validate explicitly supplied test bindings, not shipped state. The next evidence is an exact same-build draw or PSO binding that ties the resident program and state to ordered color formats, color write masks, sample count, and, for MRTZ, depth format and state. No entry, attachment defaults, translation admission, bake, or runtime behavior changed.
 
 ## Independent evidence for distinguishing starts
