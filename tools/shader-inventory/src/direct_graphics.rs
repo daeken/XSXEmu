@@ -224,6 +224,7 @@ struct GapCounts {
     exact: usize,
     ordinary_mul: (usize, usize),
     ordinary_add: (usize, usize),
+    bfrev_depth: BTreeMap<[usize; 7], usize>,
     packed_cleared: [usize; 2],
     interp_sole: BTreeMap<(usize, Option<(u8, u8, u8)>), usize>,
     packed_requirements: [BTreeMap<crate::graphics_semantics::Outcome, usize>; 2],
@@ -245,6 +246,24 @@ impl GapCounts {
         let missing = &gaps.missing;
         self.eligible += 1;
         self.exact += usize::from(missing.is_empty());
+        if contiguous
+            && gaps.inline_bfrev_sites != 0
+            && gaps.scalar_depth_noncanonical != 0
+            && missing.values().sum::<usize>() <= 2
+        {
+            *self
+                .bfrev_depth
+                .entry([
+                    gaps.inline_bfrev_sites,
+                    gaps.scalar_depth_noncanonical,
+                    gaps.adjacent_bfrev_depth,
+                    gaps.same_prior_bfrev_depth,
+                    gaps.prior_bfrev_color,
+                    gaps.prior_bfrev_ba,
+                    gaps.depth_before_bfrev,
+                ])
+                .or_default() += 1;
+        }
         if !missing.is_empty() {
             *self.distances.entry(missing.values().sum()).or_default() += 1;
         }
@@ -317,6 +336,12 @@ impl GapCounts {
         }
         let distances: Vec<_> = self.distances.into_iter().take(3).collect();
         println!("    nearest (unsupported sites, windows): {distances:?}");
+        if !self.bfrev_depth.is_empty() {
+            println!(
+                "    near BFREV+MRTZ windows by (inline-60 sites, noncanonical scalar depth sites, adjacent BFREV→depth, matching prior BFREV dst/depth src, matching prior BFREV dst/packed color src, matching prior BFREV dst/BA, depth before BFREV): {:?}",
+                self.bfrev_depth
+            );
+        }
         Self::report_pairs("gap buckets", self.pairs);
         Self::report_pairs("operand forms", self.refined_pairs);
         let mut leverage: Vec<_> = self.sole_forms.into_iter().collect();

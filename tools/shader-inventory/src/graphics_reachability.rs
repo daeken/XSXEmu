@@ -225,6 +225,7 @@ fn exact_opcode(
         width * 4 == len
             && match op {
                 Op::Move { .. } | Op::MoveBits { .. } => name == "v_mov_b32_e32",
+                Op::BfrevInline60 { .. } => name == "v_bfrev_b32_e32",
                 Op::InitInterpM0 { .. } => name == "s_mov_b32",
                 Op::InterpPhase { second: false, .. } => name == "v_interp_p1_f32_e32",
                 Op::InterpPhase { second: true, .. } => name == "v_interp_p2_f32_e32",
@@ -349,6 +350,13 @@ pub(super) struct DirectGaps {
     pub contiguous: bool,
     pub interp_mov: BTreeMap<Option<(u8, u8, u8)>, usize>,
     pub packed_mrt0_noncanonical: [usize; 2], // RG / RGBA
+    pub inline_bfrev_sites: usize,
+    pub scalar_depth_noncanonical: usize,
+    pub adjacent_bfrev_depth: usize,
+    pub same_prior_bfrev_depth: usize,
+    pub prior_bfrev_color: usize,
+    pub prior_bfrev_ba: usize,
+    pub depth_before_bfrev: usize,
 }
 
 /// Count only checked instructions in a closed stage-export-qualified window.
@@ -358,6 +366,7 @@ pub(super) fn direct_gaps(dis: &mut Disassembler, bytes: &[u8], slot: usize) -> 
     let mut ended = false;
     let mut next_len = bytes.len();
     gaps.contiguous = true;
+    let mut previous_bfrev = None;
     let exp = project_exports_observe(dis, bytes, false, |tail, len, text| {
         gaps.contiguous &= next_len == tail.len();
         next_len = tail.len() - len;
@@ -366,6 +375,40 @@ pub(super) fn direct_gaps(dis: &mut Disassembler, bytes: &[u8], slot: usize) -> 
         ended |= len == 4 && first == 0xbf810000 && name == "s_endpgm";
         let words = [first, word(tail, 4).unwrap_or_default() as u32];
         let decoded = words.get(..len / 4).and_then(|w| decode(w, 0).ok());
+        if len == 8 && name == "exp" && first == 0xf800_0081 && words[1] >> 8 != 0 {
+            gaps.scalar_depth_noncanonical += 1;
+            gaps.adjacent_bfrev_depth +=
+                usize::from(previous_bfrev == Some((tail.len(), words[1] as u8)));
+            gaps.same_prior_bfrev_depth +=
+                usize::from(previous_bfrev.is_some_and(|(_, dst)| dst == words[1] as u8));
+        }
+        if matches!(
+            decoded,
+            Some((
+                2,
+                crate::graphics_decode::Op::PackedColor {
+                    slot: 0,
+                    done: true,
+                    vm: true,
+                    ..
+                }
+            ))
+        ) && name == "exp"
+        {
+            gaps.prior_bfrev_ba +=
+                usize::from(previous_bfrev.is_some_and(|(_, dst)| dst == (words[1] >> 8) as u8));
+            gaps.prior_bfrev_color += usize::from(
+                previous_bfrev.is_some_and(|(_, dst)| words[1].to_le_bytes()[..2].contains(&dst)),
+            );
+        }
+        if len == 4
+            && name == "v_bfrev_b32_e32"
+            && let Some(dst) = crate::graphics_decode::bfrev_inline_60(first)
+        {
+            previous_bfrev = Some((next_len, dst.0));
+            gaps.depth_before_bfrev += usize::from(gaps.scalar_depth_noncanonical != 0);
+            gaps.inline_bfrev_sites += 1;
+        }
         if exact_opcode(decoded, len, name) {
             // Count exactly the final MRT0 forms that used to fail the
             // disabled-selector canonical-zero constraint.

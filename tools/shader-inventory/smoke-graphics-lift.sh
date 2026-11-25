@@ -107,6 +107,13 @@ compile depth
 compile early-depth
 "$p" --load-early-depth-metallib "$d/early-depth.metallib"
 
+# Inline BFREV supplies packed color, not the nonfinal scalar depth source.
+"$p" --bfrev-depth-source
+"$p" --emit-bfrev-depth-msl > "$d/bfrev-depth.metal"
+compile bfrev-depth
+"$p" --load-bfrev-depth-metallib "$d/bfrev-depth.metallib"
+"$p" --expect-bfrev-as-depth "$d/bfrev-depth.metallib"
+
 # EXPCNT(0) protects the old MRTZ value from reuse as packed MRT0 RG.
 "$p" --wait-depth-source
 "$p" --emit-wait-depth-msl > "$d/wait-depth.metal"

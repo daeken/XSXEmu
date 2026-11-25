@@ -115,6 +115,14 @@ const DEPTH_PS: &[u32] = &[
     0xbf81_0000,
 ];
 
+const BFREV_DEPTH_PS: &[u32] = &[
+    0x7e06_70bc,
+    0xf800_0081,
+    0x4381_7602,
+    0xf800_1c0f,
+    0x301,
+    0xbf81_0000,
+];
 const EARLY_DEPTH_PS: &[u32] = &[0xf800_0081, 2, 0xf800_1c0f, 1, 0xbf81_0000];
 
 impl Stage {
@@ -303,6 +311,12 @@ fn lift(stage: Stage, words: &[u32]) -> Result<Vec<Op>, Reject> {
                 require(when_true)?;
                 live[usize::from(dst.0)] = true;
             }
+            Op::BfrevInline60 { dst } => {
+                if stage != Stage::EarlyDepthPixel {
+                    return Err(Reject::Unsupported(pc));
+                }
+                live[usize::from(dst.0)] = true;
+            }
             Op::MoveBits { dst, .. } => live[usize::from(dst.0)] = true,
             // All admitted profiles have no native memory, clocks, or timing-
             // observable operations. Not valid for arbitrary guest instruction streams.
@@ -467,6 +481,10 @@ fn emit_body(out: &mut String, ops: &[Op], packed_color_lvalue: &str, multi: boo
                 dst: Vgpr(dst),
                 bits,
             } => {
+                writeln!(out, "  r[{dst}] = 0x{bits:08x}u;").unwrap();
+            }
+            Op::BfrevInline60 { dst: Vgpr(dst) } => {
+                let bits = crate::graphics_decode::BFREV_INLINE_60_BITS;
                 writeln!(out, "  r[{dst}] = 0x{bits:08x}u;").unwrap();
             }
             Op::NopOneCycle | Op::PrefetchThreeLines => {}
@@ -764,9 +782,11 @@ pub fn translate_packed_color_fixture(partial: bool) -> Result<String, Reject> {
 }
 
 #[allow(dead_code)] // Separate owned depth probe, not the keyed graphics fixture.
-pub fn translate_depth_fixture(early: bool) -> Result<String, Reject> {
+pub fn translate_depth_fixture(early: bool, bfrev: bool) -> Result<String, Reject> {
     let vs = lift(Stage::Vertex, VS)?;
-    let (stage, native, entry) = if early {
+    let (stage, native, entry) = if bfrev {
+        (Stage::EarlyDepthPixel, BFREV_DEPTH_PS, "bfrev_depth_ps")
+    } else if early {
         (Stage::EarlyDepthPixel, EARLY_DEPTH_PS, "early_depth_ps")
     } else {
         (Stage::DepthPixel, DEPTH_PS, "depth_ps")
@@ -1472,6 +1492,7 @@ mod tests {
         asm.push_str(
             "exp mrt0 v1, v1, v0, v0 compr\nexp mrt1 v0, off, off, off done vm\ns_endpgm\n",
         );
+        asm.push_str("v_bfrev_b32_e32 v3, 60\nexp mrtz v2, off, off, off\nexp mrt0 v1, v1, v3, v3 done compr vm\ns_endpgm\n");
         let expected: Vec<u8> = VS
             .iter()
             .chain(PS)
@@ -1511,6 +1532,14 @@ mod tests {
             .chain(&UNPACK_UINT_VS)
             .chain(MULTI_VS)
             .chain(&[DUAL_RED_PS[0], 1, DUAL_RED_PS[2], 0, DUAL_RED_PS[4]])
+            .chain(&[
+                BFREV_DEPTH_PS[0],
+                BFREV_DEPTH_PS[1],
+                2,
+                BFREV_DEPTH_PS[3],
+                BFREV_DEPTH_PS[4],
+                BFREV_DEPTH_PS[5],
+            ])
             .flat_map(|w| w.to_le_bytes())
             .collect();
         for cpu in ["gfx1013", "gfx1030"] {
@@ -2026,7 +2055,7 @@ mod tests {
         ps[1] = 0x102;
         assert_eq!(
             lift(Stage::EarlyDepthPixel, &ps),
-            Err(Reject::Unsupported(0))
+            lift(Stage::EarlyDepthPixel, EARLY_DEPTH_PS)
         );
         ps[1] = 3;
         assert_eq!(
@@ -2044,6 +2073,29 @@ mod tests {
         assert_eq!(
             lift(Stage::EarlyDepthPixel, &ps),
             Err(Reject::Unsupported(2))
+        );
+    }
+
+    #[test]
+    fn inline_bfrev_and_scalar_depth_keep_exact_selectors() {
+        assert_eq!(crate::graphics_decode::BFREV_INLINE_60_BITS, 0x3c00_0000);
+        assert!(lift(Stage::EarlyDepthPixel, BFREV_DEPTH_PS).is_ok());
+        let mut ps = BFREV_DEPTH_PS.to_vec();
+        ps[0] ^= 1;
+        assert_eq!(
+            lift(Stage::EarlyDepthPixel, &ps),
+            Err(Reject::Unsupported(0))
+        );
+        ps[0] = BFREV_DEPTH_PS[0];
+        ps[1] = 0xf800_1881;
+        assert_eq!(
+            lift(Stage::EarlyDepthPixel, &ps),
+            Err(Reject::Unsupported(1))
+        );
+        ps[1] = 0xf800_0083;
+        assert_eq!(
+            lift(Stage::EarlyDepthPixel, &ps),
+            Err(Reject::Unsupported(1))
         );
     }
 

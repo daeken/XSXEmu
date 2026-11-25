@@ -46,6 +46,21 @@ fn expected_depth(x: usize, y: usize, raster: bool, writes: bool) -> [f32; 4] {
     color
 }
 
+// The decoded BFREV word supplies BA=(0,1) in both draws. Distinct RG
+// identifies depth winners. Substituting BFREV for both depths creates a tie.
+#[cfg(any(test, target_os = "macos"))]
+fn expected_bfrev_depth(x: usize, y: usize, tied: bool) -> [f32; 4] {
+    if (1..6).contains(&y) {
+        if (if tied { 6 } else { 4 }..8).contains(&x) {
+            return [0., 1., 0., 1.];
+        }
+        if (2..6).contains(&x) {
+            return [-2., 0.25, 0., 1.];
+        }
+    }
+    [1., 0., 1., 0.]
+}
+
 // Literal expected colors, not decoded from input bits. The first draw
 // owns the overlap because its snapped Z is 1/8 (strictly less than 1/4).
 #[cfg(any(test, target_os = "macos"))]
@@ -276,10 +291,12 @@ mod gpu {
                 print!("{}", graphics_lift::translate_wait_depth_fixture(false).map_err(|e| format!("wait depth lift rejected: {e:?}"))?);
                 return Ok(());
             }
+            [mode] if mode == "--bfrev-depth-source" => Mode::DepthSource(true),
+            [mode, lib] if mode == "--load-bfrev-depth-metallib" || mode == "--expect-bfrev-as-depth" => Mode::DepthLoad(Path::new(lib), true),
             [mode] if mode == "--depth-source" || mode == "--early-depth-source" => Mode::DepthSource(mode == "--early-depth-source"),
             [mode, lib] if mode == "--load-depth-metallib" || mode == "--load-early-depth-metallib" => Mode::DepthLoad(Path::new(lib), mode == "--load-early-depth-metallib"),
-            [mode] if mode == "--emit-depth-msl" || mode == "--emit-early-depth-msl" => {
-                print!("{}", graphics_lift::translate_depth_fixture(mode == "--emit-early-depth-msl").map_err(|e| format!("depth lift rejected: {e:?}"))?);
+            [mode] if mode == "--emit-depth-msl" || mode == "--emit-early-depth-msl" || mode == "--emit-bfrev-depth-msl" => {
+                print!("{}", graphics_lift::translate_depth_fixture(mode == "--emit-early-depth-msl", mode == "--emit-bfrev-depth-msl").map_err(|e| format!("depth lift rejected: {e:?}"))?);
                 return Ok(());
             }
             [mode] if mode == "--packed-source" || mode == "--packed-rg-source" => Mode::PackedSource(mode == "--packed-rg-source"),
@@ -339,6 +356,11 @@ mod gpu {
         let late_read = matches!(mode, Mode::WaitDepthSource(true));
         let depth = wait_depth || matches!(mode, Mode::DepthSource(_) | Mode::DepthLoad(..));
         let early_depth = matches!(mode, Mode::DepthSource(true) | Mode::DepthLoad(_, true));
+        let wrong_bfrev_depth = early_depth && args[0] == "--expect-bfrev-as-depth";
+        let bfrev_depth = early_depth
+            && (args[0] == "--bfrev-depth-source"
+                || args[0] == "--load-bfrev-depth-metallib"
+                || wrong_bfrev_depth);
         let two_affine = matches!(
             mode,
             Mode::BoundTwoAffineSource(_) | Mode::BoundTwoAffineLoad(_)
@@ -483,7 +505,7 @@ mod gpu {
                 } else if wait_depth {
                     graphics_lift::translate_wait_depth_fixture(late_read)
                 } else if depth {
-                    graphics_lift::translate_depth_fixture(early_depth)
+                    graphics_lift::translate_depth_fixture(early_depth, bfrev_depth)
                 } else if packed {
                     graphics_lift::translate_packed_color_fixture(partial)
                 } else {
@@ -551,6 +573,8 @@ mod gpu {
                 16,
                 if wait_depth {
                     "wait_depth_ps"
+                } else if bfrev_depth {
+                    "bfrev_depth_ps"
                 } else if early_depth {
                     "early_depth_ps"
                 } else {
@@ -859,7 +883,12 @@ mod gpu {
                     (4, 0.125f32, [0x3c00_0000u32, 0x3c00_0000, 0x3e80_0000, 0]),
                 ]
             };
-            for (x, clip_z, inputs) in draws {
+            for (x, clip_z, mut inputs) in draws {
+                if wrong_bfrev_depth {
+                    inputs[2] = 0x3c00_0000;
+                } else if bfrev_depth && x == 4 {
+                    inputs[2] = 0x3b80_0000; // 1/256, nearer than the first draw's 1/8.
+                }
                 let mut tri = vertices;
                 for vertex in &mut tri {
                     vertex[2] = clip_z;
@@ -1255,10 +1284,14 @@ mod gpu {
                         .to_owned();
                     &fp32
                 } else if depth {
-                    fp32 = expected_depth(x, y, false, true)
-                        .map(f32::to_le_bytes)
-                        .as_flattened()
-                        .to_owned();
+                    fp32 = (if bfrev_depth {
+                        expected_bfrev_depth(x, y, wrong_bfrev_depth)
+                    } else {
+                        expected_depth(x, y, false, true)
+                    })
+                    .map(f32::to_le_bytes)
+                    .as_flattened()
+                    .to_owned();
                     &fp32
                 } else if packed || mrt {
                     // Independent numeric oracle; this does not unpack input dwords.
@@ -1326,6 +1359,10 @@ mod gpu {
                         ));
                     }
                 }
+                if wrong_bfrev_depth {
+                    let normal = expected_bfrev_depth(x, y, false).map(f32::to_le_bytes);
+                    mapping_mismatches += usize::from(got != normal.as_flattened());
+                }
                 if got != expected {
                     return Err(format!(
                         "pixel ({x},{y}): expected {expected:?}, got {got:?}"
@@ -1340,6 +1377,25 @@ mod gpu {
             println!(
                 "late depth source read rejected by oracle: all 64 pixels cleared, including {late_read_differences} expected color writes"
             );
+            return Ok(());
+        }
+        if bfrev_depth {
+            if wrong_bfrev_depth {
+                if mapping_mismatches != 10 {
+                    return Err(format!(
+                        "expected 10 depth winner mismatches, got {mapping_mismatches}"
+                    ));
+                }
+                println!(
+                    "{} BFREV-as-depth control: 64/64 pixels match control oracle; {mapping_mismatches} overlap pixels fail normal oracle",
+                    dev.name()
+                );
+            } else {
+                println!(
+                    "{} owned inline BFREV and independent scalar depth: 64/64 pixels bit-exact",
+                    dev.name()
+                );
+            }
             return Ok(());
         }
         if dual_red_all {

@@ -138,6 +138,9 @@ pub(crate) fn audit(words: &[u32], vertex: bool) -> Outcome {
                 f.write(dst, bits);
             }
             Op::MoveBits { dst, bits } => f.write(dst, Some(bits)),
+            Op::BfrevInline60 { dst } => {
+                f.write(dst, Some(crate::graphics_decode::BFREV_INLINE_60_BITS))
+            }
             Op::ShiftLeftOne { dst, src } => {
                 let bits = f.read(src).map(|n| n << 1);
                 f.write(dst, bits);

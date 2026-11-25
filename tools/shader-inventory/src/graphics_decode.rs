@@ -29,6 +29,9 @@ pub(crate) enum Op {
         dst: Vgpr,
         bits: u32,
     },
+    BfrevInline60 {
+        dst: Vgpr,
+    },
     InitInterpM0 {
         sgpr: u8,
     },
@@ -147,11 +150,19 @@ pub(crate) fn decode_interp_phase(w: u32, attribute: u8) -> Option<Op> {
     })
 }
 
+pub(crate) const BFREV_INLINE_60_BITS: u32 = 60u32.reverse_bits();
+pub(crate) fn bfrev_inline_60(w: u32) -> Option<Vgpr> {
+    (w & 0xfe01_ffff == 0x7e00_70bc).then_some(Vgpr((w >> 17) as u8))
+}
+
 pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeError> {
     let w = words[pc];
     let ext = || words.get(pc + 1).copied().ok_or(DecodeError::Truncated(pc));
     if w == 0xbf81_0000 {
         return Ok((1, Op::End));
+    }
+    if let Some(dst) = bfrev_inline_60(w) {
+        return Ok((1, Op::BfrevInline60 { dst }));
     }
     // Scalar M0 copies from two ordinary stage-input SGPR selectors, not a
     // general scalar register file. VINTRP accepts only attr0 X/Z, P1/P2.
@@ -359,11 +370,11 @@ pub(crate) fn decode(words: &[u32], pc: usize) -> Result<(usize, Op), DecodeErro
             },
         ));
     }
-    // Scalar MRTZ, either nonfinal or DONE+VM, with no reserved bits. Off operands
-    // must have the canonical zero source bytes for this subset.
+    // Scalar MRTZ, either nonfinal or DONE+VM, with no reserved bits. Only
+    // exact nonfinal EN1 is verified to accept nonzero inactive source bytes here.
     if matches!(w, 0xf800_0081 | 0xf800_1881) {
         let fields = ext()?;
-        if fields >> 8 != 0 {
+        if w == 0xf800_1881 && fields >> 8 != 0 {
             return Err(DecodeError::Unsupported(pc));
         }
         return Ok((
