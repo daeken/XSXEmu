@@ -763,6 +763,7 @@ impl LiftGaps {
                         Op::InitInterpM0 { .. } => name == "s_mov_b32",
                         Op::InterpPhase { second: false, .. } => name == "v_interp_p1_f32_e32",
                         Op::InterpPhase { second: true, .. } => name == "v_interp_p2_f32_e32",
+                        Op::SubFromPositiveZero { .. } => name == "v_sub_f32_e32",
                         Op::ShiftLeftOne { .. } => name == "v_lshlrev_b32_e32",
                         Op::AndMask { .. } => name == "v_and_b32_e32",
                         Op::ConvertUint { byte0: true, .. } => name == "v_cvt_f32_ubyte0_e32",

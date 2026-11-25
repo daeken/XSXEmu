@@ -213,3 +213,9 @@ The next independently verifiable encoding gain is smaller but simpler: the two 
 The separate owned fixture admits the exact POS0 DONE → `expcnt(0)` → VGPR MOV → PARAM0 → `s_endpgm` stream, with one pending export and initialized position/parameter inputs. LLVM MC confirms the entire sequence on both reference CPUs. It rejects wrong counters or order, an undefined operand, or a MOV not linking the two exports. The Metal lowerer assigns the complete position output from the pre-MOV values and uses the post-MOV value only for the named PARAM0 link; it does not implement a general wait or barrier.
 
 Apple M4 matched 64/64 pixels from source and again from offline metallib: 20 covered pixels carry the replacement X as PARAM0 red (with the other three checked channels) and 44 retain clear. In a deliberate late-position read, every clip X becomes the same constant and the triangle degenerates; all 64 remain clear and exactly 20 expected writes disappear. The fixture makes no change to the reference decoder, general lift, keyed archive or retail admission.
+
+### Exact positive-zero subtraction
+
+LLVM MC confirms `v_sub_f32_e32` with inline positive zero (selector 128) and an ordinary VGPR on both references. The lowerer emits an actual floating-point subtraction, not sign-bit inversion. Apple M4 strict arithmetic archive bake and replay each match 8/8 raw result words against literal goldens for both signed zeros, finite normals and both infinities under the owned compiler mode. The test does not establish denormal, NaN-payload or retail floating-point behavior.
+
+Both wave checks agree: the exact form adds 6,117 / 167 matched PS sites and 14 / 3 VS sites for `gfx1013` / `gfx1030`. Whole encoding-complete PS rises by two each to 333/12,091 and 333/6,188. Whole VS stays at 114 per reference; no wait or title admission changes.

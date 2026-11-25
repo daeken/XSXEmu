@@ -174,8 +174,25 @@ mod gpu {
                 .into());
             }
         }
+        // +0 minus either signed zero is +0 under round-to-nearest; a
+        // sign-bit XOR would incorrectly make the +0 input negative zero.
+        for (i, expected) in [
+            (2, [P0, INF]),
+            (4, [P0, 0x4000_0000]),
+            (6, [0xc040_0000, 0x4000_0000]),
+            (0, [P0, NINF]),
+        ] {
+            let got = unsafe { out.add(3 * i + 2).read() };
+            if got[2..] != expected {
+                return Err(format!(
+                    "subtract row {i}: got {:08x?}, expected {expected:08x?}",
+                    &got[2..]
+                )
+                .into());
+            }
+        }
         println!(
-            "{}: strict arithmetic archive, 16/16 legacy words, 2/2 FMAC words, 3/3 packed RTZ words, {mov_words}/{mov_words} raw MOV words and 8/8 select words",
+            "{}: strict arithmetic archive, 16/16 legacy words, 2/2 FMAC words, 3/3 packed RTZ words, {mov_words}/{mov_words} raw MOV words 8/8 select words and 8/8 subtract words",
             dev.name(),
             mov_words = 4 * inputs.len()
         );
