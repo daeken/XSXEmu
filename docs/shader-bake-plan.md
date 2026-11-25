@@ -43,6 +43,20 @@ The optional wrapped DXBC directory adds a read-only join using the same checked
 
 2 rows have an edge with no checked digest; 25 have a missing wrapper family and 2,143 have an ambiguous wrapper family. Counts are independent and coexist with the native ABI and state blockers. The report also gives per-stage edge counts, which include repeated references and are not family counts.
 
+## Future captured graphics PSO evidence join (owned tests only)
+
+After the [reader provenance stop](graphics-binding-cohorts.md#bounded-reader-to-pso-trace-stopped-at-provenance), the planner still has no shipped capture producer. The following contract is exercised by a test-only scaffold, not a public schema, serializer, or admission path:
+
+| Edge | Required evidence | Reject rather than substitute |
+|---|---|---|
+| Capture scope | Trusted verification of executable/build, exact inflated library pin, versioned capture producer and verified creation consumer, session and PSO creation occurrence | A self-declared digest, stale build, reused address/handle, another event |
+| Library occurrence | Graphics table ordinal plus exact full row references, including state, input-layout, slots and stage metadata; resolve against the *same* pinned bytes | Opaque key alone, state ID alone, equal reference tuple at another ordinal |
+| Stage | Exact slot-wise correspondence, resident byte extent, actual entry and wave, independently tied to the same creation; a real producer must also name the native role and prove any fixups | Source digest or entry hypothesis, omitted companion, unknown slot, byte mismatch, overflow or assumed wave |
+| Creation fields | Verified consumer values by ordered slot (with explicit absent slots), format and write mask independently, sample count/quality, depth format and applicable depth/stencil state | Compaction, export EN as write mask, unknown treated as disabled, inferred sample/depth defaults, mixed capture sources |
+| Draw fields (separate) | Same creation object generation and session, specific draw/command occurrence, ordered RTV/DSV views with generation and draw-time overrides | Promoting creation to a draw, stitching view evidence across events, silently dropping a conflicting draw claim |
+
+The owned model verifies exact unrelocated subspan equality and uses typed fixtures for the attachment fields and view records. It does not implement native code boundary validation, graphics attachment semantics, fixup provenance, effective state derivation, or a complete depth/stencil schema. A real verifier must establish completeness and reject ambiguous, duplicate, or conflicting inputs before yielding trusted evidence. The fixture's trusted observation is constructed only in tests; a parsed capture must never be able to mark itself verified. A matching creation observation, or even a matching bound-view observation, is **not** a ready pipeline: remaining entry/ABI, resource, linkage, other-stage, lowering and target-contract gates still stand. The existing planner never produces a ready row, key, job or artifact from this join.
+
 ## Exact-evidence key admission (owned tests only)
 
 The in-process `bake_keys::Request` contract is separate from source-family reporting. Trusted producers must supply a verified build namespace, an exact selected native program/entry and variant contract, stage ABI, exact translated module/entry, an explicitly supported normalized descriptor, and an exact target contract. The API is not a sidecar reader and does not authenticate a caller's `Validated` assertion. No retail producer currently calls it. Missing, ambiguous, unsupported, conflicting or malformed inputs produce no key. Unknown render state cannot be projected onto the narrow procedural render subset. Its ABI is supplied by the validator, not baked into the schema.

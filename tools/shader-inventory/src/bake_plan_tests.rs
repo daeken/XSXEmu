@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "captured_graphics_join_tests.rs"]
+mod captured_graphics_join;
+
 const G: usize = 128;
 const C: usize = G + 3 * 112;
 const B: usize = C + 3 * 24;
