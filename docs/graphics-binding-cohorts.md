@@ -246,14 +246,37 @@ Run `--direct-ps-attachments "$INFLATED_LIBRARY" "$TRUSTED_LLVM_21_DYLIB" gfx101
 
 | Exact slot set | All rows / distinct PS spans | Encoding-complete PS rows / spans | Attachment-only PS rows / spans |
 |---|---:|---:|---:|
-| PS+VS | 13,383 / 2,921 | 22 / 13 | 18 / 10 |
-| PS+MS | 10,726 / 7,132 | 353 / 214 | 348 / 211 |
+| PS+VS | 13,383 / 2,921 | 30 / 19 | 23 / 14 |
+| PS+MS | 10,726 / 7,132 | 356 / 216 | 348 / 211 |
 | PS+VS+unknown slot 6 | 2 / 1 | 0 / 0 | 0 / 0 |
-| Total (PS spans deduplicated across slot sets) | 24,111 / 9,996 | 375 / 225 | 366 / 219 |
+| Total (PS spans deduplicated across slot sets) | 24,111 / 9,996 | 386 / 233 | 371 / 223 |
 
-Ranked by exact row occurrences in the attachment-only cohort: scalar MRT0 EN1 (349 rows, 346 with MS and 3 with VS); packed MRT0 EN15 (8 VS rows); packed MRT0 EN3 (7 VS rows); packed MRT0 EN15 with scalar depth (2 MS rows). For a VS+PS attachment contract, prioritize packed EN15, then packed EN3, then scalar red. The nine other encoding-complete PS rows have no local semantic gaps, but all need entry VGPRs in addition to attachment format/mask. Four PS+MS rows with packed MRT0 and scalar MRT1 require only that additional entry predicate. The five single-color rows also require entry SGPRs, interpolation linkage, and F32 mode (four PS+VS and one PS+MS); the three packed-color rows among those five additionally require the packed RTZ domain. No companion-stage eligibility is inferred.
+Compared with the 225-span checkpoint, the encoding-complete cohort grows by 11 rows and 8 PS spans. The attachment-only cohort grows by five rows and four spans, all PS+VS. Two of the 233 distinct PS spans occur in both exact two-slot cohorts. No companion-stage eligibility is implied: [the strict VS census is still zero](#exact-e32-unsigned-conversion-from-s10), and [the eligible PS+MS rows all encounter a mesh blocker](graphics-reachability.md#direct-mesh-companions-of-encoding-complete-pixels).
 
-The counts are non-exclusive: among the nine rows, attachment format/mask and entry VGPRs each affect 9; entry SGPRs, interpolation linkage, and F32 mode each affect 5; packed RTZ domain affects 3. Local semantic gaps affect 0 rows. These are outstanding requirements, not invalid decoded instructions.
+| Attachment-only PS export shape (in reached order) | PS+VS rows | PS+MS rows |
+|---|---:|---:|
+| Scalar MRT0 EN1 | 3 | 346 |
+| Packed MRT0 EN15 | 8 | 0 |
+| Packed MRT0 EN3 | 7 | 0 |
+| Packed MRT0 EN12 | 2 | 0 |
+| Packed MRT0 EN15 and scalar depth | 0 | 2 |
+| Packed MRT0 EN12 → MRT1 EN12 | 1 | 0 |
+| Packed MRT0 EN15 → MRT1 EN3 | 1 | 0 |
+| Packed MRT0 EN15 → MRT1 EN3 → MRT2 EN15 | 1 | 0 |
+
+For a VS+PS capture, packed MRT0 EN15 is still the largest group by rows (8 rows with two PS spans, one VS companion and eight state IDs), followed by EN3 (7 rows, five PS spans, seven VS companions and five state IDs). The two MRT0 EN12 rows share the same PS/VS pair and state ID. Each of the three multi-target attachment-only shapes has one PS+VS row; use an exact row as a discriminator for ordered slots and per-slot masks, not as proof that export EN supplies the hardware mask. The 346 PS+MS scalar MRT0 rows span 312 program pairs and 24 state IDs; repeated rows do not imply repeated native bindings.
+
+The remaining 15 encoding-complete rows have no local semantic gaps, but all need `EntryVgpr` and `AttachmentFormatAndMask`. Counts below overlap; the latter applies to all 386 encoding-complete rows, not just these 15.
+
+| Additional pixel requirement | PS+VS rows (of 7) | PS+MS rows (of 8) | Total |
+|---|---:|---:|---:|
+| Entry VGPR | 7 | 8 | 15 |
+| Entry SGPR | 5 | 4 | 9 |
+| Interpolation link | 5 | 4 | 9 |
+| F32 arithmetic mode | 7 | 4 | 11 |
+| Packed RTZ domain | 4 | 3 | 7 |
+
+The four PS+MS rows with packed MRT0 then scalar MRT1 need only entry VGPRs beyond attachment binding. Two PS+VS rows with packed MRT0 EN3 also need F32 arithmetic mode, but not entry SGPRs or interpolation. All other non-attachment-only rows need entry SGPRs, interpolation and F32 mode; seven of those nine additionally require the packed RTZ domain. These are unresolved predicates, not invalid decoded instructions.
 
 The older [state residual comparison](shader-pipeline-library.md) is historical and is not used by this classifier.
 
