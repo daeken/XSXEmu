@@ -696,7 +696,7 @@ struct LiftGaps {
     no_encoding_gap: usize,
     profile_vertex: Option<bool>,
     profile_non_linear: usize,
-    profiles: BTreeMap<crate::graphics_lift::ProfileResult, usize>,
+    semantics: BTreeMap<crate::graphics_semantics::Outcome, usize>,
     no_exp_gap: usize,
     only_exp_gap: usize,
     sites: usize,
@@ -839,8 +839,8 @@ impl LiftGaps {
                         .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
                         .collect();
                     *self
-                        .profiles
-                        .entry(crate::graphics_lift::audit_profile(&words, vertex))
+                        .semantics
+                        .entry(crate::graphics_semantics::audit(&words, vertex))
                         .or_default() += 1;
                 } else {
                     self.profile_non_linear += 1;
@@ -899,9 +899,36 @@ impl LiftGaps {
             );
         }
         if self.profile_vertex.is_some() {
+            let (mut local, mut no_entry_regs, mut no_fp_or_domain, mut fully_proven) =
+                (0, 0, 0, 0);
+            use crate::graphics_semantics::Need::*;
             println!(
-                "    owned straight-line profile audit (not bindings): {:?}; non-linear={}",
-                self.profiles, self.profile_non_linear
+                "    static full-path semantic predicates (no defaults; aggregate intersections):"
+            );
+            for (outcome, count) in &self.semantics {
+                let no_entry = !outcome
+                    .needs
+                    .iter()
+                    .any(|p| matches!(p, EntryVgpr | EntryVcc | EntrySgpr | EntryM0));
+                let no_fp = !outcome.needs.iter().any(|p| {
+                    matches!(
+                        p,
+                        F32ArithmeticMode | UintConversionRounding | PackedRtzDomain
+                    )
+                });
+                local += usize::from(outcome.gaps.is_empty()) * count;
+                no_entry_regs += usize::from(no_entry) * count;
+                no_fp_or_domain += usize::from(no_fp) * count;
+                fully_proven +=
+                    usize::from(outcome.gaps.is_empty() && outcome.needs.is_empty()) * count;
+                println!(
+                    "      {count}: local gaps={:?}, unresolved predicates={:?}, VS order={:?}, PARAM slots={:?}",
+                    outcome.gaps, outcome.needs, outcome.vertex_order, outcome.vertex_parameters
+                );
+            }
+            println!(
+                "    static subtotal: local gaps clear={local}; no entry register reads={no_entry_regs}; no FP/Rtz prerequisites={no_fp_or_domain}; fully resolved without bindings={fully_proven}; non-linear={}",
+                self.profile_non_linear
             );
         }
         self.nearest.report();

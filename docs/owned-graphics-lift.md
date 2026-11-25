@@ -222,7 +222,7 @@ Both wave checks agree: the exact form adds 6,117 / 167 matched PS sites and 14 
 
 ### Full-path owned-profile audit and packed constant RTZ
 
-`--graphics-lift-gaps` now reports a separate profile histogram for encoding-complete VS and PS graphs. It passes only the contiguous reached prefix through the real `s_endpgm` to the same Rust validator used for the owned fixtures, without decoding trailing storage. Nonlinear graphs are counted separately. It tries the generic straight-line stage profiles with synthetic inputs and exports, not the dedicated interpolation or export-wait fixtures. If no profile passes, the reported blocker is the rejection at the furthest instruction offset among applicable profiles (ties follow the fixed profile order); this is not a census of every missing semantic in a program.
+The initial owned-profile experiment recorded a separate histogram for encoding-complete VS and PS graphs. It has since been replaced in the CLI by the no-default static census below. It passes only the contiguous reached prefix through the real `s_endpgm` to the same Rust validator used for the owned fixtures, without decoding trailing storage. Nonlinear graphs are counted separately. It tries the generic straight-line stage profiles with synthetic inputs and exports, not the dedicated interpolation or export-wait fixtures. If no profile passes, the reported blocker is the rejection at the furthest instruction offset among applicable profiles (ties follow the fixed profile order); this is not a census of every missing semantic in a program.
 
 Before admitting local constant RTZ, none of the encoding-complete graphs fit: the `gfx1013` blocker breakdown was 114 VS export profile mismatches and 333 PS rejections (325 packed RTZ, 8 interpolation). With the new RTZ profiles, both CPU references and both wave checks report the same result:
 
@@ -236,3 +236,20 @@ None of these encoding-complete graphs is nonlinear; encoding counts are unchang
 The two RTZ pixel profiles assume no live-in VGPRs. Each pack needs two values proven by local raw moves to be signed zeros or to have magnitudes from the minimum normal half through the maximum finite half, inclusive. A pack invalidates its destination's constant fact. The validator rejects unknown values, subnormal-domain inputs, overflow-domain inputs, infinities, NaNs, and wrong export shapes. It uses the existing integer RTZ helper and explicit packed MRT0 format and write-mask contracts, with no new decoder encodings.
 
 LLVM MC matches both complete owned pixel streams on both references. Apple M4 readback matched 64/64 bit-exact `RGBA32Float` pixels for each full and RG-only shader, both from generated source and offline metallib. The positive and negative normal inputs above the half midpoint distinguish truncation from nearest rounding. The full output also checks negative zero and minimum positive normal half; the RG-only descriptor preserves nonzero clear B/A. The owned keyed archive and live admission are unchanged.
+
+### No-default static full-path census
+
+`--graphics-lift-gaps` now audits only encoding-complete, contiguous reference paths through the reached `s_endpgm`. It walks every operation on each initially active lane, with no seeded register values or pipeline state. An ordinary VGPR read before local write records an entry dependency. Exact FMAC and interpolation P2 read their old destination, CNDMASK depends on local CMP or entry VCC, and interpolation checks local M0 and an adjacent matching phase pair without guessing barycentric inputs or M0 contents. Raw MOV/shift/AND propagate known bits; unknown float computations invalidate their destination facts. Byte conversion is exact, full unsigned conversion can require rounding evidence, and F32 arithmetic remains conditional on the required FP mode. Packed RTZ is proven only within the previously verified value domain.
+
+The export check uses RDNA 2 ISA §§11.1–11.4: POS0 DONE does not terminate PARAM exports; PARAM must not set DONE. PS needs a final DONE and at least one VM. An export source overwritten after issue would need a separate completion proof and is not silently accepted. Vertex output linkage and pixel attachment format/mask remain external even when the instruction order is locally valid. This is a bounded reference check, not a proof of the launch state, native ABI, Metal equivalence or Xbox execution.
+
+Both CPU references and both wave checks agree:
+
+| Stage | No local pair/order/overwrite gap | No entry register reads | No additional FP mode or RTZ domain predicate | Fully resolved without bindings |
+|---|---:|---:|---:|---:|
+| VS | 114/114 | 10 | 10 | 0 |
+| PS | 333/333 | 321 | 321 | 0 |
+
+The same 10 VS and 321 PS in the two middle columns still require their output contracts. The other 104 VS need VGPR inputs and F32 arithmetic mode evidence; two of those also require full unsigned conversion rounding evidence. Of the other 12 PS, four need entry VGPRs and RTZ operand proof, while eight also need SGPR state, interpolation linkage and F32 mode. There are no nonlinear paths in this cohort. In particular, the six previously rejected PS export profiles are not six violations of the checked native DONE/VM protocol.
+
+All 114 VS have POS0 first, followed by dense PARAM exports with DONE clear: 95 with only PARAM0, six with PARAM0–1, three with PARAM0–2 and ten with PARAM0–6. This is the largest independently testable **owned profile** mismatch, not a native ordering defect. The next fixture should use the 95-graph single-PARAM shape: POS0 DONE followed by PARAM0 and actual END, with a supported intervening write to a distinct non-POS source (no wait substitution), explicit owned linkage, and independent coverage and varying readback. It should reject PARAM DONE and a write clobbering a pending position operand.
