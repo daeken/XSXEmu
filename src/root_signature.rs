@@ -254,9 +254,11 @@ fn validate(desc: &RootSignature<'_>) -> Result<usize, Error> {
                 .all(|a| (1..=5).contains(a))
             || !(-16.0..=15.99).contains(&s.mip_lod_bias)
             || s.max_anisotropy > 16
+            || (filter == 0x55 && s.max_anisotropy == 0)
             || (s.filter & 0x180 == 0x80 && !(1..=8).contains(&s.comparison_func))
             || s.min_lod.is_nan()
             || s.max_lod.is_nan()
+            || s.min_lod > s.max_lod
         {
             return Err(Error::Invalid("invalid static sampler"));
         }
@@ -365,4 +367,87 @@ pub fn serialize_1_1(desc: &RootSignature<'_>) -> Result<Vec<u8>, Error> {
     let checksum = checksum::retail(&bytes[20..]);
     bytes[4..20].copy_from_slice(&checksum);
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLER: StaticSampler = StaticSampler {
+        filter: 0x55,
+        address_u: 1,
+        address_v: 1,
+        address_w: 1,
+        mip_lod_bias: 0.0,
+        max_anisotropy: 1,
+        comparison_func: 1,
+        border_color: 0,
+        min_lod: 0.0,
+        max_lod: f32::MAX,
+        register: 0,
+        space: 0,
+        visibility: 0,
+    };
+
+    fn serialize_sampler(sampler: StaticSampler) -> Result<Vec<u8>, Error> {
+        serialize_1_1(&RootSignature {
+            flags: 0,
+            parameters: &[],
+            samplers: &[sampler],
+        })
+    }
+
+    #[test]
+    fn rejects_inverted_static_sampler_lod_bounds() {
+        for (min_lod, max_lod) in [(1.0, 0.0), (-1.0, -2.0), (f32::MAX, -f32::MAX)] {
+            assert_eq!(
+                serialize_sampler(StaticSampler {
+                    min_lod,
+                    max_lod,
+                    ..SAMPLER
+                }),
+                Err(Error::Invalid("invalid static sampler"))
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_zero_anisotropy_for_all_anisotropic_filters() {
+        for filter in [0x55, 0xd5, 0x155, 0x1d5] {
+            assert_eq!(
+                serialize_sampler(StaticSampler {
+                    filter,
+                    max_anisotropy: 0,
+                    ..SAMPLER
+                }),
+                Err(Error::Invalid("invalid static sampler"))
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_valid_static_sampler_boundaries_and_ignored_anisotropy() {
+        for filter in [0x55, 0xd5, 0x155, 0x1d5] {
+            for max_anisotropy in [1, 16] {
+                assert!(
+                    serialize_sampler(StaticSampler {
+                        filter,
+                        max_anisotropy,
+                        min_lod: 2.0,
+                        max_lod: 2.0,
+                        ..SAMPLER
+                    })
+                    .is_ok()
+                );
+            }
+        }
+        assert!(
+            serialize_sampler(StaticSampler {
+                filter: 0,
+                max_anisotropy: 0,
+                ..SAMPLER
+            })
+            .is_ok()
+        );
+    }
 }
