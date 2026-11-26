@@ -89,31 +89,59 @@ enum Reject {
     Exhausted,
 }
 
+fn guarded_extent(bytes: u64, page: u64) -> Result<(u64, u64), Reject> {
+    if bytes == 0 || !page.is_power_of_two() {
+        return Err(Reject::Bounds);
+    }
+    let data = bytes.checked_next_multiple_of(page).ok_or(Reject::Bounds)?;
+    let guards = page.checked_mul(2).ok_or(Reject::Bounds)?;
+    let total = data.checked_add(guards).ok_or(Reject::Bounds)?;
+    Ok((data, total))
+}
+
 struct Mapping {
     start: u64,
     page: u64,
+    data_len: u64,
     size: u64,
 }
 
 impl Mapping {
     fn new() -> Self {
+        Self::with_bytes(1).unwrap()
+    }
+
+    fn with_bytes(bytes: u64) -> Result<Self, Reject> {
         // SAFETY: getpagesize has no inputs or pointer effects.
         let page = u64::try_from(unsafe { getpagesize() }).unwrap();
         assert!(page.is_power_of_two() && page >= 0x1000);
-        let size = page.checked_mul(3).unwrap();
+        let (data_len, size) = guarded_extent(bytes, page)?;
         let mut start = 0;
         // SAFETY: allocate a private zero-filled range at a kernel-selected address.
-        assert_eq!(unsafe { mach_vm_allocate(task(), &mut start, size, 1) }, 0);
-        let map = Self { start, page, size };
+        if unsafe { mach_vm_allocate(task(), &mut start, size, 1) } != 0 {
+            return Err(Reject::Exhausted);
+        }
+        let map = Self {
+            start,
+            page,
+            data_len,
+            size,
+        };
         assert!(start != 0 && start.is_multiple_of(page) && start.checked_add(size).is_some());
-        for (at, prot) in [(start, NONE), (map.data(), RW), (map.data() + page, NONE)] {
+        for (at, len, prot) in [
+            (start, page, NONE),
+            (map.data(), data_len, RW),
+            (map.data() + data_len, page, NONE),
+        ] {
             for max in [0, 1] {
-                // SAFETY: each call changes one page of this exclusive mapping.
-                assert_eq!(unsafe { mach_vm_protect(task(), at, page, max, prot) }, 0);
+                // SAFETY: each call protects an exact extent of this exclusive mapping.
+                if unsafe { mach_vm_protect(task(), at, len, max, prot) } != 0 {
+                    return Err(Reject::Publish);
+                }
             }
         }
         map.verify();
-        map
+        Ok(map)
     }
 
     fn fresh() -> Result<Self, Reject> {
@@ -141,17 +169,19 @@ impl Mapping {
         // Darwin can coalesce adjacent no-access guards from independent
         // allocations. Check full protection coverage, not the kernel's
         // choice of region boundaries. The interior RW extent stays exact.
-        for guard in [self.start, self.data() + self.page] {
+        for guard in [self.start, self.data() + self.data_len] {
             let (start, len, current, max) = region(guard).unwrap();
             assert!(start <= guard && start.checked_add(len).unwrap() >= guard + self.page);
             assert_eq!((current, max), (NONE, NONE));
         }
-        assert_eq!(region(self.data()), Some((self.data(), self.page, RW, RW)));
+        for addr in [self.data(), self.data() + self.data_len - 1] {
+            assert_eq!(region(addr), Some((self.data(), self.data_len, RW, RW)));
+        }
     }
 
     fn write(&self, offset: usize, val: u8) {
-        assert!(offset < self.page as usize);
-        // SAFETY: this exclusive mapping owns an initialized RW page. No Rust
+        assert!(offset < self.data_len as usize);
+        // SAFETY: this exclusive mapping owns initialized RW pages. No Rust
         // references to the mapped bytes are created, and Rc keeps it single-threaded.
         unsafe {
             std::ptr::with_exposed_provenance_mut::<u8>(self.data() as usize + offset).write(val)
@@ -159,8 +189,8 @@ impl Mapping {
     }
 
     fn read(&self, offset: usize) -> u8 {
-        assert!(offset < self.page as usize);
-        // SAFETY: checked byte in the same live, demand-zero RW page.
+        assert!(offset < self.data_len as usize);
+        // SAFETY: checked byte in the same live, demand-zero RW extent.
         unsafe { std::ptr::with_exposed_provenance::<u8>(self.data() as usize + offset).read() }
     }
 }
@@ -676,4 +706,163 @@ fn guarded_cpu_freelist_preserves_nonlink_bytes_and_refuses_corruption() {
     foreign.verify();
     drop(foreign);
     unmapped(unrelated);
+}
+
+// Owned models, not native descriptor geometry or encoding.
+struct MultiPageHeap {
+    map: Rc<Mapping>,
+    slots: usize,
+    logical_len: usize,
+}
+
+impl MultiPageHeap {
+    fn bytes(slots: usize, stride: usize) -> Result<usize, Reject> {
+        if slots == 0 || stride != 16 {
+            return Err(Reject::Policy);
+        }
+        slots
+            .checked_mul(stride)
+            .filter(|&n| n <= 0x10000)
+            .ok_or(Reject::Bounds)
+    }
+
+    fn publish(slots: usize, commit: impl FnOnce(&Self) -> bool) -> Result<Self, Reject> {
+        let logical_len = Self::bytes(slots, 16)?;
+        let map = Rc::new(Mapping::with_bytes(logical_len as u64)?);
+        let heap = Self {
+            map,
+            slots,
+            logical_len,
+        };
+        for i in 0..heap.map.data_len as usize {
+            heap.map.write(i, Self::canary(i));
+        }
+        for slot in 0..slots {
+            let next = if slot + 1 == slots {
+                u32::MAX
+            } else {
+                slot as u32 + 1
+            };
+            let at = heap.link_offset(slot)?;
+            for (byte, v) in next.to_le_bytes().into_iter().enumerate() {
+                heap.map.write(at + byte, v);
+            }
+        }
+        if !commit(&heap) {
+            return Err(Reject::Publish);
+        }
+        Ok(heap)
+    }
+
+    fn canary(i: usize) -> u8 {
+        ((i ^ (i >> 8) ^ (i >> 16)) as u8)
+            .wrapping_mul(31)
+            .wrapping_add(0x65)
+    }
+
+    fn link_offset(&self, slot: usize) -> Result<usize, Reject> {
+        if slot >= self.slots {
+            return Err(Reject::Bounds);
+        }
+        slot.checked_mul(16)
+            .filter(|&at| at.checked_add(4).is_some_and(|end| end <= self.logical_len))
+            .ok_or(Reject::Bounds)
+    }
+
+    fn read(&self, offset: usize) -> Result<u8, Reject> {
+        if offset >= self.logical_len {
+            return Err(Reject::Bounds);
+        }
+        Ok(self.map.read(offset))
+    }
+
+    fn verify_links_and_canaries(&self) {
+        self.map.verify();
+        let page = self.map.page as usize;
+        let mut probes = vec![0, self.slots - 1];
+        for seam in (page..self.logical_len).step_by(page) {
+            probes.extend([seam / 16 - 1, seam / 16]);
+        }
+        for slot in probes {
+            let at = self.link_offset(slot).unwrap();
+            let link = u32::from_le_bytes(std::array::from_fn(|i| self.read(at + i).unwrap()));
+            assert_eq!(
+                link,
+                if slot + 1 == self.slots {
+                    u32::MAX
+                } else {
+                    slot as u32 + 1
+                }
+            );
+        }
+        assert_eq!(self.link_offset(self.slots), Err(Reject::Bounds));
+        assert_eq!(self.link_offset(usize::MAX), Err(Reject::Bounds));
+        assert!(self.read(self.logical_len - 1).is_ok());
+        assert_eq!(self.read(self.logical_len), Err(Reject::Bounds));
+        for i in 0..self.map.data_len as usize {
+            if i >= self.logical_len || i % 16 >= 4 {
+                assert_eq!(self.map.read(i), Self::canary(i));
+            }
+        }
+    }
+}
+
+#[test]
+fn separately_owned_multipage_cpu_descriptor_storage() {
+    let _guard = VM_TEST.lock().unwrap();
+    assert_eq!(MultiPageHeap::bytes(0, 16), Err(Reject::Policy));
+    assert_eq!(MultiPageHeap::bytes(2048, 0), Err(Reject::Policy));
+    assert_eq!(MultiPageHeap::bytes(2048, 32), Err(Reject::Policy));
+    assert_eq!(MultiPageHeap::bytes(usize::MAX, 16), Err(Reject::Bounds));
+    assert_eq!(MultiPageHeap::bytes(4097, 16), Err(Reject::Bounds));
+    assert_eq!(guarded_extent(1, 3), Err(Reject::Bounds));
+    assert_eq!(guarded_extent(u64::MAX, 0x4000), Err(Reject::Bounds)); // roundup
+    assert_eq!(
+        guarded_extent(u64::MAX - 0x3fff, 0x4000),
+        Err(Reject::Bounds)
+    ); // guards
+
+    let snapshot = |heap: &MultiPageHeap| {
+        (0..heap.map.data_len as usize)
+            .map(|i| heap.map.read(i))
+            .collect::<Vec<_>>()
+    };
+    let raw2 = MultiPageHeap::publish(4096, |_| true).unwrap();
+    let a = snapshot(&raw2);
+    let raw3 = MultiPageHeap::publish(2048, |_| true).unwrap();
+    assert_eq!(snapshot(&raw2), a);
+    assert_eq!((raw2.logical_len, raw3.logical_len), (0x10000, 0x8000));
+    assert!(disjoint(raw2.map.extent(), raw3.map.extent()));
+    assert!(raw2.map.data_len > raw2.map.page && raw3.map.data_len > raw3.map.page);
+    for heap in [&raw2, &raw3] {
+        heap.verify_links_and_canaries();
+    }
+    let b = snapshot(&raw3);
+    let mut rejected = None;
+    assert!(matches!(
+        MultiPageHeap::publish(2047, |candidate| {
+            assert!(candidate.map.data_len > candidate.logical_len as u64);
+            candidate.verify_links_and_canaries();
+            assert!(disjoint(candidate.map.extent(), raw2.map.extent()));
+            assert!(disjoint(candidate.map.extent(), raw3.map.extent()));
+            rejected = Some(candidate.map.extent());
+            false
+        }),
+        Err(Reject::Publish)
+    ));
+    unmapped(rejected.unwrap());
+    assert_eq!(snapshot(&raw2), a);
+    assert_eq!(snapshot(&raw3), b);
+    let a_extent = raw2.map.extent();
+    let b_extent = raw3.map.extent();
+    let lease = Rc::clone(&raw2.map);
+    drop(raw2);
+    lease.verify();
+    assert_eq!(lease.read(0), 1);
+    drop(lease);
+    unmapped(a_extent);
+    raw3.verify_links_and_canaries();
+    assert_eq!(snapshot(&raw3), b);
+    drop(raw3);
+    unmapped(b_extent);
 }
