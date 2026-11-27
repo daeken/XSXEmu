@@ -4,9 +4,10 @@
 
 use std::arch::asm;
 use xsxemu::compute_capture::{
-    CatalogEntry, CodeScope, DispatchShape, GpuHeap, LifetimeId, ListCapture, ProfileId,
-    ProgramEvidence, ProgramId, ProgramSnapshot, ProgramStamp, RootParameter, TableEvidence,
-    TableValue, identify,
+    CatalogEntry, CodeScope, DispatchOccurrence, DispatchShape, GpuHeap, LifetimeId, ListCapture,
+    ProfileId, ProgramEvidence, ProgramId, ProgramSnapshot, ProgramStamp, RootParameter,
+    ScalarLoadObservation, TableEvidence, TableReadReceipt, TableSlotSnapshot, TableValue,
+    identify,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,7 +153,7 @@ fn owned_win64_calls_capture_order_and_full_width_table_handles() {
 }
 
 #[test]
-fn owned_win64_capture_joins_program_and_the_last_bound_table() {
+fn owned_win64_capture_ingests_one_table_base_read() {
     let slots = vtable();
     let mut list = List {
         vtable: slots.as_ptr(),
@@ -163,14 +164,16 @@ fn owned_win64_capture_joins_program_and_the_last_bound_table() {
     let heap = LifetimeId(23);
     let root = LifetimeId(29);
     let pipeline = LifetimeId(31);
-    let base = 0x1122_0000_0000_0040;
+    // The first test independently exercises a nonzero high word. Here use a
+    // zero-extendable synthetic address to test the narrow scalar read seam.
+    let base = 0x1122_0040;
     let heap_arg = [heap.0];
     // SAFETY: slots and input are exclusively owned by the fixture, as above.
     unsafe {
         call::<33>(&mut list, root.0, 0, 0);
         call::<32>(&mut list, 1, heap_arg.as_ptr() as u64, 0);
         call::<35>(&mut list, 7, base, 0);
-        call::<35>(&mut list, 7, base + 36, 0);
+        call::<35>(&mut list, 7, base + 48, 0);
         call::<25>(&mut list, pipeline.0, 0, 0);
         call::<14>(&mut list, 47, 53, 59);
     }
@@ -190,15 +193,22 @@ fn owned_win64_capture_joins_program_and_the_last_bound_table() {
         heap,
         Some(GpuHeap {
             start: base,
-            count: 8.try_into().unwrap(),
-            stride: 12.try_into().unwrap(),
+            count: 4.try_into().unwrap(),
+            stride: 16.try_into().unwrap(),
         }),
     )]
     .into();
     let parameter = RootParameter { root, ordinal: 7 };
-    let mut capture = ListCapture::new(LifetimeId(37));
+    let occurrence = DispatchOccurrence {
+        session: 17,
+        list: LifetimeId(37),
+        ordinal: 5,
+    };
+    let mut capture = ListCapture::new(occurrence.list);
+    let backing = [[91, 92, 93, 94], [0; 4], [0; 4], [101, 102, 103, 104]];
+    let mut owned_user_word = None;
     let mut dispatch = None;
-    for event in list.events.into_iter().flatten() {
+    for (sequence, event) in list.events.into_iter().flatten().enumerate() {
         match event {
             Event::RootSignature(root) => capture.bind_root(LifetimeId(root)),
             Event::Heaps(values, count) => capture.bind_heaps(
@@ -209,21 +219,58 @@ fn owned_win64_capture_joins_program_and_the_last_bound_table() {
                     .collect(),
             ),
             Event::Table { parameter, handle } => {
-                capture.set_table(parameter, TableValue::Full(handle))
+                capture.set_table(parameter, TableValue::Full(handle));
+                // Owned consumer contract: root parameter 7 feeds the input word.
+                // This does not model an Xbox root signature or SGPR assignment.
+                if parameter == 7 {
+                    owned_user_word = Some(u32::try_from(handle).unwrap());
+                }
             }
             Event::Pipeline(pipeline) => capture.bind_pipeline(LifetimeId(pipeline)),
             Event::Dispatch(groups) => {
                 assert!(dispatch.is_none());
-                dispatch = Some(capture.dispatch(
+                let observed = capture.dispatch_at(
+                    occurrence.session,
+                    sequence as u64,
                     DispatchShape::DirectGroups(groups),
                     Some(parameter),
                     &pipelines,
                     &heaps,
-                ));
+                );
+                // Independently exercise one owned software load at the input
+                // address; do not generate its words from the correlated slot.
+                let user_sgpr_word = owned_user_word.unwrap();
+                let address = u64::from(user_sgpr_word);
+                let offset = address.checked_sub(base).unwrap();
+                assert_eq!(offset % 16, 0);
+                let words = backing[(offset / 16) as usize];
+                let load = ScalarLoadObservation {
+                    occurrence,
+                    parameter,
+                    user_sgpr_word,
+                    address,
+                    words,
+                };
+                let slot = TableSlotSnapshot {
+                    occurrence,
+                    heap,
+                    address: base + 48,
+                    words: [101, 102, 103, 104],
+                };
+                assert_eq!(
+                    observed.validate_table_base_read(Some(&slot), Some(&load)),
+                    Ok(TableReadReceipt {
+                        occurrence,
+                        heap,
+                        index: 3
+                    })
+                );
+                dispatch = Some(observed);
             }
         }
     }
-    let dispatch = dispatch.unwrap();
+    let observed = dispatch.unwrap();
+    let dispatch = observed.record();
     assert_eq!(dispatch.shape, DispatchShape::DirectGroups([47, 53, 59]));
     assert_eq!(
         dispatch.program,
@@ -243,7 +290,7 @@ fn owned_win64_capture_joins_program_and_the_last_bound_table() {
         TableEvidence::Slot {
             heap,
             index: 3,
-            gpu_range: base + 36..base + 48
+            gpu_range: base + 48..base + 64
         }
     );
 }

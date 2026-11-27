@@ -187,6 +187,129 @@ pub struct DispatchRecord {
     pub table: TableEvidence,
 }
 
+/// Observer-assigned key for one dispatch in one build-pinned capture session.
+/// Use a non-reused session ID and an ordinal that does not repeat within the
+/// list lifetime (including after reset). A repeated submission needs a distinct
+/// occurrence, even if it executes the exact same recorded command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DispatchOccurrence {
+    pub session: u64,
+    pub list: LifetimeId,
+    pub ordinal: u64,
+}
+
+/// Independent snapshot of the live slot at consumption, not an earlier CPU
+/// write or an address-only lookup. The observer verifies mapping and lifetime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TableSlotSnapshot {
+    pub occurrence: DispatchOccurrence,
+    pub heap: LifetimeId,
+    pub address: u64,
+    pub words: [u32; 4],
+}
+
+/// Independently checked shader observation. `parameter` is proven to supply
+/// this user-SGPR word on the reached path; matching numbers cannot prove that.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScalarLoadObservation {
+    pub occurrence: DispatchOccurrence,
+    pub parameter: RootParameter,
+    pub user_sgpr_word: u32,
+    pub address: u64,
+    pub words: [u32; 4],
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum TableReadFailure {
+    NotDirectWork,
+    UnidentifiedPipeline,
+    UnresolvedTable,
+    MissingObservation,
+    DifferentOccurrence,
+    DifferentBinding,
+    AddressOrSpan,
+    DifferentWords,
+}
+
+/// A consistency receipt for one table-base load; not a descriptor decode or
+/// proof of a store, native submission, or replay eligibility. No raw words.
+#[derive(Debug, PartialEq, Eq)]
+pub struct TableReadReceipt {
+    pub occurrence: DispatchOccurrence,
+    pub heap: LifetimeId,
+    pub index: u64,
+}
+
+/// An in-memory pairing of the existing capture record with its occurrence key.
+pub struct ObservedDispatch {
+    occurrence: DispatchOccurrence,
+    record: DispatchRecord,
+}
+
+impl ObservedDispatch {
+    pub fn record(&self) -> &DispatchRecord {
+        &self.record
+    }
+
+    /// Ingest the narrow case of a 4-dword load directly from the table base via
+    /// a zero-extended user-SGPR word. All inputs come from checked observers;
+    /// this is not an authenticator. None leaves the join incomplete.
+    pub fn validate_table_base_read(
+        &self,
+        slot: Option<&TableSlotSnapshot>,
+        load: Option<&ScalarLoadObservation>,
+    ) -> Result<TableReadReceipt, TableReadFailure> {
+        use TableReadFailure::*;
+        let record = &self.record;
+        let occurrence = self.occurrence;
+        if !matches!(record.shape, DispatchShape::DirectGroups(groups) if !groups.contains(&0)) {
+            return Err(NotDirectWork);
+        }
+        if record.pipeline.is_none() || !matches!(record.program, ProgramEvidence::Exact { .. }) {
+            return Err(UnidentifiedPipeline);
+        }
+        let (
+            Some(parameter),
+            TableEvidence::Slot {
+                heap,
+                index,
+                gpu_range,
+            },
+        ) = (record.parameter, &record.table)
+        else {
+            return Err(UnresolvedTable);
+        };
+        let (Some(slot), Some(load)) = (slot, load) else {
+            return Err(MissingObservation);
+        };
+        if occurrence != slot.occurrence || occurrence != load.occurrence {
+            return Err(DifferentOccurrence);
+        }
+        if record.root != Some(parameter.root) || parameter != load.parameter || *heap != slot.heap
+        {
+            return Err(DifferentBinding);
+        }
+        if load.address != u64::from(load.user_sgpr_word)
+            || load.address != slot.address
+            || load.address != gpu_range.start
+            || load
+                .address
+                .checked_add(16)
+                .is_none_or(|end| end > gpu_range.end)
+        {
+            return Err(AddressOrSpan);
+        }
+        if slot.words != load.words {
+            return Err(DifferentWords);
+        }
+        Ok(TableReadReceipt {
+            occurrence,
+            heap: *heap,
+            index: *index,
+        })
+    }
+}
+
 /// State for one list lifetime. Feed only ordered, already verified observations.
 /// If any events may have been missed (including inline writes), call `gap` before
 /// interpreting more events. Dropping state is preferred to assuming D3D defaults.
@@ -276,6 +399,28 @@ impl ListCapture {
             }
         }
         TableEvidence::NoSlot(raw)
+    }
+
+    /// Stamp the existing dispatch record for later shader observation ingestion.
+    /// The observer must allocate unique keys and correlate the actually executed
+    /// command to this occurrence; a recording event alone is not execution.
+    pub fn dispatch_at(
+        &self,
+        session: u64,
+        ordinal: u64,
+        shape: DispatchShape,
+        parameter: Option<RootParameter>,
+        pipelines: &LivePipelines,
+        heaps: &LiveHeaps,
+    ) -> ObservedDispatch {
+        ObservedDispatch {
+            occurrence: DispatchOccurrence {
+                session,
+                list: self.list,
+                ordinal,
+            },
+            record: self.dispatch(shape, parameter, pipelines, heaps),
+        }
     }
 
     /// Join at a dispatch command boundary, not GPU execution or resource validation.

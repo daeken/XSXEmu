@@ -203,3 +203,179 @@ fn a_gap_or_root_change_prevents_reusing_old_state() {
     assert_eq!(unknown.root, None);
     assert_eq!(unknown.table, TableEvidence::NoneObserved);
 }
+
+#[test]
+fn table_base_receipt_rejects_missing_or_mismatched_observations() {
+    use TableReadFailure::*;
+
+    let occurrence = DispatchOccurrence {
+        session: 1,
+        list: LifetimeId(2),
+        ordinal: 3,
+    };
+    let parameter = RootParameter {
+        root: LifetimeId(4),
+        ordinal: 5,
+    };
+    let pipeline = LifetimeId(6);
+    let heap = LifetimeId(7);
+    let address = 0x1000;
+    let mut cap = ListCapture::new(occurrence.list);
+    cap.bind_root(parameter.root);
+    cap.bind_pipeline(pipeline);
+    cap.bind_heaps(vec![heap]);
+    cap.set_table(parameter.ordinal, TableValue::Full(address));
+    let snapshot = ProgramSnapshot {
+        profile: ProfileId(1),
+        scope: CodeScope::Executable { start: 0 },
+        code: b"owned program",
+        launch_state: b"owned state",
+    };
+    let program = identify(
+        snapshot,
+        &[CatalogEntry {
+            id: ProgramId(1),
+            snapshot,
+        }],
+    );
+    let pipelines = [(pipeline, program)].into();
+    let words = [13, 17, 19, 23];
+    let slot = TableSlotSnapshot {
+        occurrence,
+        heap,
+        address,
+        words,
+    };
+    let load = ScalarLoadObservation {
+        occurrence,
+        parameter,
+        user_sgpr_word: address as u32,
+        address,
+        words,
+    };
+    let direct = DispatchShape::DirectGroups([1, 1, 1]);
+    let heaps = [(heap, Some(geometry(address, 2, 16)))].into();
+    let observe =
+        |c: &ListCapture, session, ordinal, shape, pipelines: &LivePipelines, heaps: &LiveHeaps| {
+            c.dispatch_at(session, ordinal, shape, Some(parameter), pipelines, heaps)
+        };
+    let good = observe(
+        &cap,
+        occurrence.session,
+        occurrence.ordinal,
+        direct,
+        &pipelines,
+        &heaps,
+    );
+    let validate = |d: &ObservedDispatch| d.validate_table_base_read(Some(&slot), Some(&load));
+    assert_eq!(
+        validate(&good),
+        Ok(TableReadReceipt {
+            occurrence,
+            heap,
+            index: 0
+        })
+    );
+    assert_eq!(
+        good.validate_table_base_read(None, Some(&load)),
+        Err(MissingObservation)
+    );
+    assert_eq!(
+        good.validate_table_base_read(Some(&slot), None),
+        Err(MissingObservation)
+    );
+    for (session, ordinal) in [(1, 4), (9, 3)] {
+        let repeat = observe(&cap, session, ordinal, direct, &pipelines, &heaps);
+        assert_eq!(good.record(), repeat.record());
+        assert_eq!(validate(&repeat), Err(DifferentOccurrence));
+    }
+    let other_slot = TableSlotSnapshot {
+        occurrence: DispatchOccurrence {
+            list: LifetimeId(11),
+            ..occurrence
+        },
+        ..slot
+    };
+    assert_eq!(
+        good.validate_table_base_read(Some(&other_slot), Some(&load)),
+        Err(DifferentOccurrence)
+    );
+    let replaced = TableSlotSnapshot {
+        heap: LifetimeId(11),
+        ..slot
+    };
+    assert_eq!(
+        good.validate_table_base_read(Some(&replaced), Some(&load)),
+        Err(DifferentBinding)
+    );
+    for (bad_load, error) in [
+        (
+            ScalarLoadObservation {
+                parameter: RootParameter {
+                    ordinal: 8,
+                    ..parameter
+                },
+                ..load
+            },
+            DifferentBinding,
+        ),
+        (
+            ScalarLoadObservation {
+                user_sgpr_word: 0x1004,
+                ..load
+            },
+            AddressOrSpan,
+        ),
+        (
+            ScalarLoadObservation {
+                words: [13, 17, 19, 0],
+                ..load
+            },
+            DifferentWords,
+        ),
+    ] {
+        assert_eq!(
+            good.validate_table_base_read(Some(&slot), Some(&bad_load)),
+            Err(error)
+        );
+    }
+    for shape in [
+        DispatchShape::IndirectOpaque,
+        DispatchShape::DirectGroups([1, 0, 1]),
+    ] {
+        let d = observe(&cap, 1, 3, shape, &pipelines, &heaps);
+        assert_eq!(validate(&d), Err(NotDirectWork));
+    }
+    let d = observe(&cap, 1, 3, direct, &LivePipelines::new(), &heaps);
+    assert_eq!(validate(&d), Err(UnidentifiedPipeline));
+    let d = observe(&cap, 1, 3, direct, &pipelines, &LiveHeaps::new());
+    assert_eq!(validate(&d), Err(UnresolvedTable));
+    let short_slot = [(heap, Some(geometry(address, 2, 12)))].into();
+    let d = observe(&cap, 1, 3, direct, &pipelines, &short_slot);
+    assert_eq!(validate(&d), Err(AddressOrSpan));
+
+    // Identical low words and contents cannot authenticate a high GPU address.
+    let wide_address = address | (1 << 32);
+    let wide_heap = [(heap, Some(geometry(wide_address, 2, 16)))].into();
+    cap.set_table(parameter.ordinal, TableValue::Full(wide_address));
+    let d = observe(&cap, 1, 3, direct, &pipelines, &wide_heap);
+    assert_eq!(
+        d.validate_table_base_read(
+            Some(&TableSlotSnapshot {
+                address: wide_address,
+                ..slot
+            }),
+            Some(&ScalarLoadObservation {
+                address: wide_address,
+                ..load
+            })
+        ),
+        Err(AddressOrSpan)
+    );
+    cap.set_table(parameter.ordinal, TableValue::LowWord(address as u32));
+    let d = observe(&cap, 1, 3, direct, &pipelines, &heaps);
+    assert_eq!(validate(&d), Err(UnresolvedTable));
+    cap.gap();
+    let d = observe(&cap, 1, 3, direct, &pipelines, &heaps);
+    assert_eq!(validate(&d), Err(UnidentifiedPipeline));
+}
